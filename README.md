@@ -64,6 +64,7 @@ The library's `ServiceLayout::current_account()` derives fixed paths from the ef
 | --- | --- |
 | Host configuration | `config/host.json` |
 | Versioned signed releases | `releases/` |
+| Current release selection | `releases/current` |
 | Selected daemon executable | `releases/current/handkited` |
 | Private runtime socket | `runtime/handkite.sock` |
 | Process ownership lock | `runtime/handkite.lock` |

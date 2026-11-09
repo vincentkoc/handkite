@@ -32,9 +32,14 @@ impl ServiceLayout {
         self.root().join("releases")
     }
 
-    /// Fixed path for the future release-selection protocol; no pointer is created.
+    /// Fixed relative-symlink location; no selection is read, created, or changed.
+    pub fn current_release_selection(&self) -> PathBuf {
+        self.releases_directory().join("current")
+    }
+
+    /// Fixed executable path through the future release-selection protocol.
     pub fn current_release_executable(&self) -> PathBuf {
-        self.releases_directory().join("current/handkited")
+        self.current_release_selection().join("handkited")
     }
 
     pub fn runtime_directory(&self) -> PathBuf {
@@ -165,6 +170,10 @@ pub(crate) mod tests {
             assert_eq!(layout.root(), root);
             assert_eq!(layout.config_file(), root.join("config/host.json"));
             assert_eq!(layout.releases_directory(), root.join("releases"));
+            assert_eq!(
+                layout.current_release_selection(),
+                root.join("releases/current")
+            );
             assert_eq!(
                 layout.current_release_executable(),
                 root.join("releases/current/handkited")
