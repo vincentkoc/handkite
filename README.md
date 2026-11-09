@@ -23,6 +23,22 @@ For `act`, `receipt.accepted` is `true` or `false` for a known acknowledgment, o
 
 Lock retains the existing lease, pinned-identity, revision, and unlocked-screen preconditions. Native querying has a five-second command timeout and an eight-second process budget. The complete action has no shared deadline across its WDA steps, so the local client's 65-second read timeout can expire before a result arrives. A timeout leaves delivery and lock state unknown to that caller; inspect fresh native state before deciding what to do. The controller never automatically resends a lock action. This receipt behavior is covered offline; a live Handkite lock cycle remains unqualified.
 
+## Staged Mac service layout
+
+The library's `ServiceLayout::current_account()` derives fixed paths from the effective user's OS account home, independent of `HOME` and the working directory. It accepts no alternate root. All paths below are relative to `Library/Application Support/Handkite` under that home:
+
+| Purpose | Path |
+| --- | --- |
+| Host configuration | `config/host.json` |
+| Versioned signed releases | `releases/` |
+| Private runtime socket | `runtime/handkite.sock` |
+| Durable state | `state/` |
+| Staged launchd descriptor | `launchd/com.handkite.host.plist` |
+
+`validate_existing_directories()` requires every listed parent directory to exist. The home, Library, Application Support, Handkite root, and state directory must belong to the effective user and reject group/other write access. Config, releases, runtime, and launchd directories must additionally be mode 0700. Ancestors above the home must belong to root or that user and reject group/other writes. Symlinks and non-directory components fail closed. This metadata preflight is a point-in-time check; a future installer must use anchored directory descriptors to prevent path replacement races and validate each file separately.
+
+This is stage-only library code, with no live installation or daemon integration. It creates no directories, config, sockets, releases, descriptors, or stop markers. The descriptor is outside launchd's automatically loaded directories. Signed builds, install/rollback commands, and launchd supervision remain pending. The existing `state/iphone/UNLOCK-DISABLED` gate keeps its current path, permission rules, and behavior; layout checks never open or migrate it.
+
 ## MCP bridge
 
 `handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
