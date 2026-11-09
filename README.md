@@ -33,6 +33,16 @@ For remote use, an authenticated SSH key must be bound to a restricted forced co
 
 The bridge has passed a previous live read-only capture through the device host's protected socket. Navigation is qualified only by offline fixtures; no live navigation or OpenClaw acceptance is claimed. Observation returns private screen content to the calling agent.
 
+An authorized client with both capabilities follows this sequence after MCP initialization:
+
+1. Call `handkite_acquire_control` with `{}`.
+2. Call `handkite_status` with `{}` and read its `revision`.
+3. Call `handkite_launch_clock` with only `expected_revision` set to that integer.
+4. Inspect the receipt and effect. Obtain a fresh status before calling `handkite_home` with its new revision.
+5. Call `handkite_release_control` with `{}` when finished.
+
+Use `handkite_observe` only when the agent needs private screen content. A navigation-only client needs a current revision supplied through a separately authorized observation path. A stale or missing revision cannot authorize input; do not guess revisions. After unknown delivery, inspect a fresh observation before deciding on a new action; repeating the earlier request is not recovery proof. The bridge never switches to another device or fallback route.
+
 ## Device doctor
 
 `handkite-doctor --config /path/to/config.json` checks the pinned USB device, WDA status, the existing WDA session, and native lock state. It reports only readiness flags and lock state as JSON; it does not create a WDA session or send device input. Exit code 0 means the locked or unlocked phone can be observed. It does not mean app actions or PIN entry are qualified.
