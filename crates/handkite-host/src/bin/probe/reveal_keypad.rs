@@ -84,10 +84,10 @@ trait Device {
 
 fn run(device: &mut impl Device, expected: &HardwareId) -> Result<(), Error> {
     let before = device.capture().map_err(Error::Refused)?;
-    let first_geometry =
+    let first_evidence =
         validate(&before, expected, device.now(), false).map_err(Error::Refused)?;
     let current = device.capture().map_err(Error::Refused)?;
-    let second_geometry =
+    let second_evidence =
         validate(&current, expected, device.now(), false).map_err(Error::Refused)?;
     if current.session != before.session {
         return Err(Error::Refused(Refusal::Session));
@@ -98,7 +98,10 @@ fn run(device: &mut impl Device, expected: &HardwareId) -> Result<(), Error> {
     {
         return Err(Error::Refused(Refusal::Freshness));
     }
-    if first_geometry != second_geometry {
+    if first_evidence.proud_visible != second_evidence.proud_visible {
+        return Err(Error::Refused(Refusal::Screen));
+    }
+    if first_evidence != second_evidence {
         return Err(Error::Refused(Refusal::Geometry));
     }
     let input_started = device.now();
@@ -116,9 +119,16 @@ fn run(device: &mut impl Device, expected: &HardwareId) -> Result<(), Error> {
 }
 
 #[derive(PartialEq)]
-struct Geometry {
+struct Evidence {
     screen: (f64, f64),
     image: (u32, u32),
+    proud_visible: Option<bool>,
+}
+
+#[derive(Debug, PartialEq)]
+struct NormalLockScreen {
+    size: (f64, f64),
+    proud_visible: bool,
 }
 
 fn native_locked(native: NativeLock) -> Result<(), Refusal> {
@@ -140,7 +150,7 @@ fn validate(
     expected: &HardwareId,
     now: Instant,
     after: bool,
-) -> Result<Geometry, Refusal> {
+) -> Result<Evidence, Refusal> {
     if snapshot.raw.connected_usb != *expected || snapshot.raw.wda_target != *expected {
         return Err(Refusal::Identity);
     }
@@ -162,16 +172,18 @@ fn validate(
         return Err(Refusal::Freshness);
     }
     let xml = &snapshot.raw.accessibility_tree;
-    let size = if after {
+    let (size, proud_visible) = if after {
         if !super::lock_ui_attrs::empty_keypad(xml) {
             return Err(Refusal::Screen);
         }
-        pin_screen::parse(xml)
+        let size = pin_screen::parse(xml)
             .map_err(|_| Refusal::Screen)?
             .screen_size
-            .ok_or(Refusal::Screen)?
+            .ok_or(Refusal::Screen)?;
+        (size, None)
     } else {
-        normal_lock_screen(xml)?
+        let normal = normal_lock_screen(xml)?;
+        (normal.size, Some(normal.proud_visible))
     };
     let png = &snapshot.raw.screenshot.bytes;
     if png.len() < 24 || !png.starts_with(b"\x89PNG\r\n\x1a\n") || &png[12..16] != b"IHDR" {
@@ -185,13 +197,14 @@ fn validate(
     {
         return Err(Refusal::Capture);
     }
-    Ok(Geometry {
+    Ok(Evidence {
         screen: size,
         image: (width, height),
+        proud_visible,
     })
 }
 
-fn normal_lock_screen(xml: &str) -> Result<(f64, f64), Refusal> {
+fn normal_lock_screen(xml: &str) -> Result<NormalLockScreen, Refusal> {
     if xml.is_empty() || xml.len() > 2 * 1024 * 1024 {
         return Err(Refusal::Screen);
     }
@@ -199,6 +212,7 @@ fn normal_lock_screen(xml: &str) -> Result<(f64, f64), Refusal> {
     let mut stack = Vec::new();
     let (mut roots, mut apps, mut proud) = (0, 0, 0);
     let mut size = None;
+    let mut proud_visible = None;
     loop {
         let event = reader.read_event().map_err(|_| Refusal::Screen)?;
         let start = matches!(event, Event::Start(_));
@@ -215,7 +229,7 @@ fn normal_lock_screen(xml: &str) -> Result<(f64, f64), Refusal> {
                 }
                 let (mut name, mut label, mut bundle) = (None, None, None);
                 let (mut width, mut height) = (None, None);
-                let mut visible = false;
+                let mut visible = None;
                 for attr in node.attributes() {
                     let attr = attr.map_err(|_| Refusal::Screen)?;
                     let value = attr
@@ -225,7 +239,13 @@ fn normal_lock_screen(xml: &str) -> Result<(f64, f64), Refusal> {
                         b"name" => name = Some(value.into_owned()),
                         b"label" => label = Some(value.into_owned()),
                         b"bundleId" => bundle = Some(value == SPRINGBOARD),
-                        b"visible" => visible = value == "true",
+                        b"visible" => {
+                            visible = match value.as_ref() {
+                                "true" => Some(true),
+                                "false" => Some(false),
+                                _ => None,
+                            };
+                        }
                         b"width" => width = value.parse::<f64>().ok(),
                         b"height" => height = value.parse::<f64>().ok(),
                         _ => {}
@@ -273,9 +293,10 @@ fn normal_lock_screen(xml: &str) -> Result<(f64, f64), Refusal> {
                     });
                 }
                 if name.as_deref() == Some("proud-lock") {
-                    if !inside || kind.as_ref() != b"XCUIElementTypeOther" || !visible {
+                    if !inside || kind.as_ref() != b"XCUIElementTypeOther" || visible.is_none() {
                         return Err(Refusal::Screen);
                     }
+                    proud_visible = visible;
                     proud += 1;
                 }
                 if start {
@@ -298,7 +319,10 @@ fn normal_lock_screen(xml: &str) -> Result<(f64, f64), Refusal> {
     if roots != 1 || apps != 1 || proud != 1 || !stack.is_empty() {
         return Err(Refusal::Screen);
     }
-    size.ok_or(Refusal::Screen)
+    Ok(NormalLockScreen {
+        size: size.ok_or(Refusal::Screen)?,
+        proud_visible: proud_visible.ok_or(Refusal::Screen)?,
+    })
 }
 
 trait HidTransport {
@@ -562,9 +586,18 @@ mod tests {
 
     #[test]
     fn exactly_one_dispatch_and_one_postcheck_confirm_only_an_empty_keypad() {
-        for hidden in [false, true] {
+        for (proud_visible, hidden) in [(true, false), (true, true), (false, false), (false, true)]
+        {
             let mut fake = Fake::new();
             let expiry = fake.captures[1].as_ref().unwrap().fresh_until;
+            for index in [0, 1] {
+                fake.captures[index]
+                    .as_mut()
+                    .unwrap()
+                    .raw
+                    .accessibility_tree =
+                    NORMAL.replace("visible=\"true\"", &format!("visible=\"{proud_visible}\""));
+            }
             if hidden {
                 let after = fake.captures[2].as_mut().unwrap();
                 after.raw.accessibility_tree = after
@@ -576,6 +609,40 @@ mod tests {
             assert_eq!(fake.posts, [("fixture-session".into(), expiry)]);
             assert_eq!(fake.captures_called, 3);
             assert!(fake.captures.is_empty());
+        }
+    }
+
+    #[test]
+    fn visibility_must_be_explicit_unique_and_equal_in_both_precaptures() {
+        for attribute in [
+            "",
+            "visible=\"invalid\"",
+            "visible=\"0\"",
+            "visible=\"TRUE\"",
+            "visible=\"true\" visible=\"false\"",
+        ] {
+            for index in [0, 1] {
+                let mut fake = Fake::new();
+                fake.captures[index]
+                    .as_mut()
+                    .unwrap()
+                    .raw
+                    .accessibility_tree = NORMAL.replace("visible=\"true\"", attribute);
+                assert_eq!(run(&mut fake, &id()), Err(Error::Refused(Refusal::Screen)));
+                assert!(fake.posts.is_empty());
+                assert_eq!(fake.captures_called, index + 1);
+            }
+        }
+        for hidden_index in [0, 1] {
+            let mut fake = Fake::new();
+            fake.captures[hidden_index]
+                .as_mut()
+                .unwrap()
+                .raw
+                .accessibility_tree = NORMAL.replace("visible=\"true\"", "visible=\"false\"");
+            assert_eq!(run(&mut fake, &id()), Err(Error::Refused(Refusal::Screen)));
+            assert!(fake.posts.is_empty());
+            assert_eq!(fake.captures_called, 2);
         }
     }
 
@@ -698,7 +765,17 @@ mod tests {
 
     #[test]
     fn normal_screen_rejects_keypads_overlays_ambiguity_and_malformed_xml() {
-        assert_eq!(normal_lock_screen(NORMAL), Ok((400.0, 800.0)));
+        for visible in [true, false] {
+            assert_eq!(
+                normal_lock_screen(
+                    &NORMAL.replace("visible=\"true\"", &format!("visible=\"{visible}\""))
+                ),
+                Ok(NormalLockScreen {
+                    size: (400.0, 800.0),
+                    proud_visible: visible
+                })
+            );
+        }
         let with = |extra| {
             NORMAL.replace(
                 "</XCUIElementTypeApplication>",
@@ -718,7 +795,7 @@ mod tests {
             with("<XCUIElementTypeOther name=\"proud-lock\" visible=\"true\"/>"),
             with("<XCUIElementTypeApplication name=\"SpringBoard\"/>"),
             NORMAL.replace("proud-lock", "unknown"),
-            NORMAL.replace("visible=\"true\"", "visible=\"false\""),
+            NORMAL.replace("visible=\"true\"", ""),
             NORMAL.replace("SpringBoard", "OtherApp"),
             NORMAL.replace("width=\"400\"", "width=\"NaN\""),
             NORMAL.replace("</AppiumAUT>", ""),
@@ -730,6 +807,20 @@ mod tests {
             with("<node name=\"a\" name=\"b\"/>"),
         ] {
             assert_eq!(normal_lock_screen(&xml), Err(Refusal::Screen));
+            for visible in [true, false] {
+                for index in [0, 1] {
+                    let mut fake = Fake::new();
+                    fake.captures[index]
+                        .as_mut()
+                        .unwrap()
+                        .raw
+                        .accessibility_tree =
+                        xml.replace("visible=\"true\"", &format!("visible=\"{visible}\""));
+                    assert_eq!(run(&mut fake, &id()), Err(Error::Refused(Refusal::Screen)));
+                    assert!(fake.posts.is_empty());
+                    assert_eq!(fake.captures_called, index + 1);
+                }
+            }
         }
     }
 

@@ -194,6 +194,9 @@ device, unchanged existing WDA session, matching screen/image dimensions, native
 and WDA locked state, prior unlock since boot, and no keypad or field. Overlapping
 or reused capture windows refuse input. PNG header/aspect checks do not classify
 screenshot content or establish an atomic visual-state proof.
+The unique in-app proud-lock marker must carry an explicit visibility boolean,
+true or false, which must agree across both captures; missing or invalid evidence
+refuses input.
 It sends one fixed HID event, then checks once for a valid empty six-digit
 keypad while still locked. Output is fixed `confirmed`, `unknown`, or refusal
 categories. It has no retry, swipe, PIN read, or stop-marker access. This command
