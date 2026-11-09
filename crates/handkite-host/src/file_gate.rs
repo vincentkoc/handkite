@@ -72,7 +72,13 @@ impl AttemptGate for FileAttemptGate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use handkite_core::passcode::Passcode;
+    use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId, LockState};
+    use handkite_core::unlock::{
+        BackendError, PasscodeBackend, PasscodeScreen, UnlockError, UnlockPolicy, unlock_once,
+    };
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
 
@@ -135,5 +141,70 @@ mod tests {
         assert!(gate.is_disabled().unwrap());
         assert!(gate.mark_uncertain().is_err());
         assert_eq!(fs::read(&target).unwrap(), b"keep");
+    }
+
+    struct DroppedPhone {
+        id: HardwareId,
+        presses: usize,
+    }
+
+    impl PasscodeBackend for DroppedPhone {
+        fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError> {
+            Ok(PasscodeScreen {
+                connected_usb: self.id.clone(),
+                wda_target: self.id.clone(),
+                native_lock: LockState::Locked,
+                visible_lock: LockState::Locked,
+                wda_lock: LockState::Locked,
+                keypad_ready: true,
+                secure_field_value: Some("0 of 6 digits".into()),
+                before_first_unlock: false,
+                trust_prompt: false,
+            })
+        }
+
+        fn show_keypad(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+
+        fn press_digit(&mut self, _: u8) -> Result<(), BackendError> {
+            self.presses += 1;
+            Ok(())
+        }
+
+        fn delete_digit(&mut self) -> Result<(), BackendError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn incomplete_digit_blocks_attempt_after_gate_reopen() {
+        let dir = PrivateDir::new();
+        let key = DeviceKey::new("fixture-phone").unwrap();
+        let id = HardwareId::new("fixture-usb").unwrap();
+        let binding = DeviceBinding {
+            key: key.clone(),
+            usb_id: id.clone(),
+        };
+        let mut phone = DroppedPhone { id, presses: 0 };
+        let code = Passcode::new("123456".into()).unwrap();
+        let policy = UnlockPolicy {
+            progress_polls: 0,
+            final_polls: 0,
+            poll_delay: Duration::ZERO,
+        };
+        let mut first = FileAttemptGate::new(dir.marker()).unwrap();
+        assert_eq!(
+            unlock_once(&mut phone, &mut first, &binding, &key, &code, policy),
+            Err(UnlockError::Incomplete { digit: 1 })
+        );
+        drop(first);
+        let mut reopened = FileAttemptGate::new(dir.marker()).unwrap();
+        assert!(reopened.is_disabled().unwrap());
+        assert_eq!(
+            unlock_once(&mut phone, &mut reopened, &binding, &key, &code, policy),
+            Err(UnlockError::Disabled)
+        );
+        assert_eq!(phone.presses, 1);
     }
 }
