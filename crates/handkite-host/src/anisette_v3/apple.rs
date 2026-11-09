@@ -205,10 +205,10 @@ fn candidate_url(value: &str) -> Result<Url, &'static str> {
     if authority.contains(['@', '%', '[', ']']) {
         return Err(INVALID_LOOKUP);
     }
-    if let Some((_, port)) = authority.split_once(':') {
-        if port != "443" {
-            return Err(INVALID_LOOKUP);
-        }
+    if let Some((_, port)) = authority.split_once(':')
+        && port != "443"
+    {
+        return Err(INVALID_LOOKUP);
     }
     let url = Url::parse(value).map_err(|_| INVALID_LOOKUP)?;
     let host = url.host_str().ok_or(INVALID_LOOKUP)?;

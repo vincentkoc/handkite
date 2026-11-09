@@ -179,13 +179,13 @@ fn rename(
     #[cfg(test)]
     {
         hooks.renames.push(which);
-        if let Some((at, errno, applied)) = hooks.rename_error {
-            if at == which {
-                if applied {
-                    native_rename(parent, from, to)?;
-                }
-                return Err(io::Error::from_raw_os_error(errno));
+        if let Some((at, errno, applied)) = hooks.rename_error
+            && at == which
+        {
+            if applied {
+                native_rename(parent, from, to)?;
             }
+            return Err(io::Error::from_raw_os_error(errno));
         }
     }
     #[cfg(not(test))]

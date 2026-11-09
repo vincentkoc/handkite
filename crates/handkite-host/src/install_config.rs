@@ -268,10 +268,10 @@ mod macos {
             }
             held.revalidate()?;
             let binding = parse(&bytes)?;
-            if let Some(expected) = expected {
-                if binding.key != expected.key || binding.usb_id != expected.usb_id {
-                    return Err(UNSAFE);
-                }
+            if let Some(expected) = expected
+                && (binding.key != expected.key || binding.usb_id != expected.usb_id)
+            {
+                return Err(UNSAFE);
             }
             held.revalidate()?;
             Ok((ProtectedConfig { held, bytes }, binding))

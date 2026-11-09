@@ -163,10 +163,10 @@ impl<A: DeviceAdapter> Controller<A> {
         if request.device != self.binding.key {
             return Err(ControllerError::DeviceMismatch);
         }
-        if let Some(expected) = request.expected_revision {
-            if inner.last.as_ref().map(|observation| observation.revision) != Some(expected) {
-                return Err(ControllerError::StaleRevision);
-            }
+        if let Some(expected) = request.expected_revision
+            && inner.last.as_ref().map(|observation| observation.revision) != Some(expected)
+        {
+            return Err(ControllerError::StaleRevision);
         }
         let (usb, wda) = inner
             .adapter

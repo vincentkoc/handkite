@@ -258,35 +258,35 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
                         field = node.value;
                     }
                 } else if node.kind == "XCUIElementTypeKey" {
-                    if let Some(name) = node.name {
-                        if name.len() == 1 && name.as_bytes()[0].is_ascii_digit() {
-                            let digit = usize::from(name.as_bytes()[0] - b'0');
-                            if seen_digit[digit] {
-                                return Err(ParseError);
-                            }
-                            seen_digit[digit] = true;
-                            if node.visible == Some(true) {
-                                digit_keys_visible += 1;
-                            } else if node.visible == Some(false) {
-                                digit_keys_explicitly_hidden += 1;
-                            }
-                            if node.enabled == Some(true) {
-                                digit_keys_enabled += 1;
-                            }
-                            if node.enabled == Some(true) {
-                                if let (Some(point), Some(rect)) = (node.point, node.rect) {
-                                    keys[digit] = Some((point, rect));
-                                }
-                            }
+                    if let Some(name) = node.name
+                        && name.len() == 1
+                        && name.as_bytes()[0].is_ascii_digit()
+                    {
+                        let digit = usize::from(name.as_bytes()[0] - b'0');
+                        if seen_digit[digit] {
+                            return Err(ParseError);
+                        }
+                        seen_digit[digit] = true;
+                        if node.visible == Some(true) {
+                            digit_keys_visible += 1;
+                        } else if node.visible == Some(false) {
+                            digit_keys_explicitly_hidden += 1;
+                        }
+                        if node.enabled == Some(true) {
+                            digit_keys_enabled += 1;
+                        }
+                        if node.enabled == Some(true)
+                            && let (Some(point), Some(rect)) = (node.point, node.rect)
+                        {
+                            keys[digit] = Some((point, rect));
                         }
                     }
                 } else if node.kind == "XCUIElementTypeButton"
                     && node.visible == Some(true)
                     && node.enabled == Some(true)
+                    && let (Some(point), Some(rect)) = (node.point, node.rect)
                 {
-                    if let (Some(point), Some(rect)) = (node.point, node.rect) {
-                        buttons.push((point, rect));
-                    }
+                    buttons.push((point, rect));
                 }
             }
             Event::Eof => break,

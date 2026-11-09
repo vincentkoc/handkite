@@ -49,10 +49,10 @@ fn run(
         _ => return Err(USAGE.into()),
     };
     let layout = ServiceLayout::current_account().map_err(|_| "service layout unavailable")?;
-    if let Some((config, runtime)) = supplied_paths {
-        if config != layout.config_file() || runtime != layout.runtime_directory() {
-            return Err("daemon requires the fixed service configuration and runtime paths".into());
-        }
+    if let Some((config, runtime)) = supplied_paths
+        && (config != layout.config_file() || runtime != layout.runtime_directory())
+    {
+        return Err("daemon requires the fixed service configuration and runtime paths".into());
     }
     serve(layout)?;
     Ok(0)
