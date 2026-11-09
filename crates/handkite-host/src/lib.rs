@@ -4,6 +4,8 @@ pub mod file_gate;
 pub mod host_config;
 pub mod local_client;
 pub mod local_socket;
+pub mod native_lock;
+pub mod pin_screen;
 pub mod usb;
 pub mod wda_action;
 pub mod wda_adapter;

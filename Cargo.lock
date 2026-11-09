@@ -199,6 +199,7 @@ dependencies = [
  "handkite-core",
  "idevice",
  "libc",
+ "quick-xml",
  "serde",
  "serde_json",
  "tokio",
