@@ -198,6 +198,7 @@ dependencies = [
  "base64",
  "handkite-core",
  "idevice",
+ "serde",
  "serde_json",
  "tokio",
 ]

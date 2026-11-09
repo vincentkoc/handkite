@@ -24,7 +24,8 @@ pub trait DeviceAdapter {
     fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError>;
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
 pub struct LeaseId(u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
