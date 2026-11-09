@@ -1,10 +1,37 @@
-//! Pure codec for the relative symlink target at `releases/current`.
+//! Strict target codec and read-only inspection of `releases/current`.
 //!
 //! Syntax is not trust. A future transaction must independently verify the
 //! manifest pin, anchored symlink and destination, and ownership before use.
-//! These functions perform no filesystem access or activation.
+//! Encoding and parsing are pure. Inspection never follows the destination,
+//! changes selection, or activates anything.
 
 use crate::install_plan::ManifestDigest;
+use crate::service_layout::ServiceLayout;
+
+#[cfg(target_os = "macos")]
+mod macos;
+
+/// Observe the fixed current-selection link without opening its target.
+///
+/// Only an absent `current` entry under verified existing parents returns `None`.
+/// A digest is an observation, not release trust or installation authority; even
+/// a dangling target can be observed. Same-account changes between observations
+/// or after return remain possible. Non-macOS calls fail closed.
+pub fn inspect(layout: &ServiceLayout) -> Result<Option<ManifestDigest>, &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::inspect(
+            layout,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = layout;
+        Err("current-selection inspection requires macOS")
+    }
+}
 
 /// Encode exactly one lowercase hexadecimal manifest-digest directory name.
 pub fn encode_target(manifest: &ManifestDigest) -> [u8; 64] {
