@@ -1,5 +1,6 @@
 //! Mac service ownership and protected local state.
 
+mod account_home;
 pub mod anisette_v3;
 pub mod device_health;
 pub mod file_gate;

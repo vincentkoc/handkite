@@ -1,11 +1,9 @@
+use crate::account_home::account_home;
 use crate::file_gate::FileAttemptGate;
 use handkite_core::unlock::GateError;
-use std::ffi::{CStr, OsStr};
 use std::fs;
-use std::mem::MaybeUninit;
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const STATE_COMPONENTS: [&str; 5] = [
     "Library",
@@ -17,41 +15,7 @@ const STATE_COMPONENTS: [&str; 5] = [
 
 /// Open the one-phone stop gate without creating or relocating account state.
 pub fn iphone_gate() -> Result<FileAttemptGate, GateError> {
-    gate_for_home(&account_home()?)
-}
-
-fn account_home() -> Result<PathBuf, GateError> {
-    let uid = unsafe { libc::geteuid() };
-    let mut buffer = vec![0_u8; 1024];
-    loop {
-        let mut record = MaybeUninit::<libc::passwd>::uninit();
-        let mut result = std::ptr::null_mut();
-        // The OS record points into this buffer, which stays alive until the path is copied.
-        let status = unsafe {
-            libc::getpwuid_r(
-                uid,
-                record.as_mut_ptr(),
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
-        if status == libc::ERANGE && buffer.len() < 1024 * 1024 {
-            buffer.resize(buffer.len() * 2, 0);
-            continue;
-        }
-        if status != 0 || result.is_null() {
-            return Err(GateError);
-        }
-        let directory = unsafe { (*result).pw_dir };
-        if directory.is_null() {
-            return Err(GateError);
-        }
-        let home = PathBuf::from(OsStr::from_bytes(unsafe {
-            CStr::from_ptr(directory).to_bytes()
-        }));
-        return home.is_absolute().then_some(home).ok_or(GateError);
-    }
+    gate_for_home(&account_home().ok_or(GateError)?)
 }
 
 fn gate_for_home(home: &Path) -> Result<FileAttemptGate, GateError> {
@@ -84,6 +48,7 @@ fn validate_directory(path: &Path, uid: u32) -> Result<(), GateError> {
 mod tests {
     use super::*;
     use handkite_core::unlock::AttemptGate;
+    use std::path::PathBuf;
     use std::process::Command;
     use std::sync::atomic::{AtomicU64, Ordering};
 
