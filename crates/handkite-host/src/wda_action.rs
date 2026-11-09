@@ -13,8 +13,27 @@ pub struct WdaActions {
 }
 
 impl WdaActions {
-    pub async fn prepare(&mut self, wda: &UsbWda) -> Result<(), AdapterError> {
-        self.session_id(wda).await.map(|_| ())
+    pub async fn prepare_existing(&mut self, wda: &UsbWda) -> Result<(), AdapterError> {
+        let response = wda
+            .request("GET", "/status", b"", Duration::from_secs(10))
+            .await
+            .map_err(|_| AdapterError)?;
+        let json = response_ok(response)?;
+        let id = json["sessionId"].as_str().ok_or(AdapterError)?;
+        if !valid_session_id(id) {
+            return Err(AdapterError);
+        }
+        if let Some(current) = &self.session {
+            return (current == id).then_some(()).ok_or(AdapterError);
+        }
+        let path = format!("/session/{id}");
+        let validation = wda
+            .request("GET", &path, b"", Duration::from_secs(10))
+            .await
+            .map_err(|_| AdapterError)?;
+        response_ok(validation)?;
+        self.session = Some(id.into());
+        Ok(())
     }
 
     pub async fn execute(
@@ -23,6 +42,23 @@ impl WdaActions {
         action: &Action,
     ) -> Result<TransportReceipt, AdapterError> {
         let session = self.session_id(wda).await?;
+        Self::execute_on(wda, action, &session).await
+    }
+
+    pub async fn execute_existing(
+        &self,
+        wda: &UsbWda,
+        action: &Action,
+    ) -> Result<TransportReceipt, AdapterError> {
+        let session = self.session.as_deref().ok_or(AdapterError)?;
+        Self::execute_on(wda, action, session).await
+    }
+
+    async fn execute_on(
+        wda: &UsbWda,
+        action: &Action,
+        session: &str,
+    ) -> Result<TransportReceipt, AdapterError> {
         let (endpoint, body) = payload(action)?;
         let path = format!("/session/{session}{endpoint}");
         let body = serde_json::to_vec(&body).map_err(|_| AdapterError)?;
@@ -52,17 +88,20 @@ impl WdaActions {
             .as_str()
             .or_else(|| json["value"]["sessionId"].as_str())
             .ok_or(AdapterError)?;
-        if id.is_empty()
-            || id.len() > 128
-            || !id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
+        if !valid_session_id(id) {
             return Err(AdapterError);
         }
         self.session = Some(id.into());
         Ok(id.into())
     }
+}
+
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn response_ok(response: HttpResponse) -> Result<Value, AdapterError> {
@@ -128,6 +167,19 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::usb::PinnedUsb;
+    use handkite_core::protocol::HardwareId;
+
+    #[tokio::test]
+    async fn pin_action_refuses_to_create_a_session() {
+        let wda = UsbWda::new(PinnedUsb::new(HardwareId::new("fixture-device").unwrap()));
+        assert!(
+            WdaActions::default()
+                .execute_existing(&wda, &Action::Home)
+                .await
+                .is_err()
+        );
+    }
 
     #[test]
     fn lock_uses_the_verified_shortcut() {

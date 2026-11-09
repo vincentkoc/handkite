@@ -36,7 +36,7 @@ impl NativePasscodeBackend {
     fn request_action(&mut self, action: &Action) -> Result<(), BackendError> {
         let wda = UsbWda::new(self.usb.clone());
         self.runtime
-            .block_on(self.actions.execute(&wda, action))
+            .block_on(self.actions.execute_existing(&wda, action))
             .map_err(|_| BackendError::Unavailable)?;
         self.last_view = None;
         Ok(())
@@ -88,7 +88,7 @@ impl PasscodeBackend for NativePasscodeBackend {
         let started = Instant::now();
         let wda = UsbWda::new(self.usb.clone());
         self.runtime
-            .block_on(self.actions.prepare(&wda))
+            .block_on(self.actions.prepare_existing(&wda))
             .map_err(|_| BackendError::Unavailable)?;
         let (source, reported_lock) = self.runtime.block_on(async {
             tokio::join!(
