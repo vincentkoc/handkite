@@ -93,7 +93,7 @@ fn read_private_file(path: &Path, limit: usize) -> Result<Zeroizing<Vec<u8>>, &'
 
 fn pem_items(bytes: &[u8]) -> Result<Vec<Item>, &'static str> {
     const ERROR: &str = "Anisette identity PEM is invalid";
-    // Reject skipped text and unknown PEM labels as well as malformed DER.
+    // Reject skipped text and unknown PEM labels before rustls validates the identity.
     let text = std::str::from_utf8(bytes).map_err(|_| ERROR)?;
     let mut remaining = text.trim();
     let mut items = Vec::new();
