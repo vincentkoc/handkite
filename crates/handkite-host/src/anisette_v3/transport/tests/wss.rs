@@ -68,11 +68,13 @@ struct FixtureProvider {
     finishes: usize,
     stall: bool,
     fail: bool,
+    start_delay: Duration,
 }
 
 impl ProvisioningDataProvider for FixtureProvider {
     async fn start(&mut self) -> Result<StartProvisioningData, ProvisioningDataError> {
         self.starts += 1;
+        tokio::time::sleep(self.start_delay).await;
         if self.stall {
             std::future::pending::<()>().await;
         }
@@ -141,6 +143,75 @@ async fn wss_provisions_once_with_shared_mtls_and_routing_info() {
     let result = client.provision([7; 16], &mut provider).await.unwrap();
     assert_eq!(result.as_bytes(), state([7; 16]).as_bytes());
     assert_eq!((provider.starts, provider.finishes), (1, 1));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn wss_delayed_challenge_gets_a_fresh_reply_deadline() {
+    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        .wss(|mut socket| async move {
+            challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                challenge(
+                    &mut socket,
+                    serde_json::json!({"result":"GiveStartProvisioningData"})
+                )
+                .await,
+                serde_json::json!({"spim":"YQ=="})
+            );
+            challenge(
+                &mut socket,
+                serde_json::json!({"result":"GiveEndProvisioningData","cpim":"Yg=="}),
+            )
+            .await;
+            socket.send(Message::Text(serde_json::json!({
+                "result":"ProvisioningSuccess", "adi_pb":STANDARD.encode(state([7; 16]).as_bytes())
+            }).to_string().into())).await.unwrap();
+            assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+        })
+        .await;
+    let mut provider = FixtureProvider {
+        start_delay: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let result = client.provision([7; 16], &mut provider).await.unwrap();
+    assert_eq!(result.as_bytes(), state([7; 16]).as_bytes());
+    assert_eq!((provider.starts, provider.finishes), (1, 1));
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn wss_fresh_reply_budget_cannot_extend_the_conversation_deadline() {
+    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        .wss(|mut socket| async move {
+            challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            socket
+                .send(Message::Text(
+                    r#"{"result":"GiveStartProvisioningData"}"#.into(),
+                ))
+                .await
+                .unwrap();
+            assert!(!matches!(socket.next().await, Some(Ok(Message::Text(_)))));
+        })
+        .await;
+    let mut provider = FixtureProvider {
+        start_delay: Duration::from_secs(2),
+        ..Default::default()
+    };
+    let result = client
+        .provision_until(
+            [7; 16],
+            &mut provider,
+            Instant::now() + Duration::from_secs(1),
+        )
+        .await;
+    assert!(matches!(
+        result,
+        Err("Anisette provisioning stage timed out")
+    ));
+    assert_eq!((provider.starts, provider.finishes), (1, 0));
     server.await.unwrap();
 }
 

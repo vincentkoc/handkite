@@ -22,6 +22,7 @@ const PROVISIONING_URL: &str = "wss://anisette.example.invalid/v3/provisioning_s
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const STAGE_TIMEOUT: Duration = Duration::from_secs(3);
+const CONVERSATION_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_CONTROL_FRAMES: usize = 16;
 const MAX_CLIENT_MESSAGE_BYTES: usize = 2 * MAX_CPIM_BYTES.div_ceil(3) * 4 + 1024;
 
@@ -163,11 +164,24 @@ impl AnisetteClient {
         identifier: [u8; 16],
         provider: &mut P,
     ) -> Result<MacosProvisionedState, &'static str> {
-        let mut socket = self.connect().await?;
+        self.provision_until(identifier, provider, Instant::now() + CONVERSATION_TIMEOUT)
+            .await
+    }
+
+    async fn provision_until<P: ProvisioningDataProvider>(
+        &self,
+        identifier: [u8; 16],
+        provider: &mut P,
+        conversation_deadline: Instant,
+    ) -> Result<MacosProvisionedState, &'static str> {
+        let mut socket = timeout_at(conversation_deadline, self.connect())
+            .await
+            .map_err(|_| "Anisette provisioning conversation timed out")??;
         let mut conversation = ProvisioningConversation::default();
         loop {
-            let deadline = Instant::now() + STAGE_TIMEOUT;
-            let message = receive(&mut socket, deadline).await?;
+            let read_deadline = (Instant::now() + STAGE_TIMEOUT).min(conversation_deadline);
+            let message = receive(&mut socket, read_deadline).await?;
+            let deadline = (Instant::now() + STAGE_TIMEOUT).min(conversation_deadline);
             match conversation.accept(&message)? {
                 ProvisioningEvent::GiveIdentifier => {
                     #[derive(Serialize)]
