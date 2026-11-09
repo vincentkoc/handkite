@@ -8,6 +8,8 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
+mod publication;
+
 pub(super) const NAMES: [ArtifactName; 3] =
     [ArtifactName::Daemon, ArtifactName::Cli, ArtifactName::Mcp];
 const UNSAFE: &str = "unsafe or changed release files";
@@ -38,6 +40,15 @@ impl From<Metadata> for Fingerprint {
             modified: (meta.mtime(), meta.mtime_nsec()),
             changed: (meta.ctime(), meta.ctime_nsec()),
         }
+    }
+}
+
+impl Fingerprint {
+    /// A rename may change ctime, but not identity, access, contents, or mtime.
+    pub(super) fn matches_after_rename(&self, original: &Self) -> bool {
+        let mut compared = self.clone();
+        compared.changed = original.changed;
+        compared == *original
     }
 }
 
@@ -123,10 +134,14 @@ impl AnchoredRelease {
                 }
             }
         }
-        inventory(&walked)?;
+        self.revalidate_artifacts(&walked)
+    }
+
+    fn revalidate_artifacts(&self, directory: &File) -> Result<(), &'static str> {
+        inventory(directory)?;
         for (name, held) in NAMES.into_iter().zip(&self.artifacts) {
             let current = open_at(
-                walked.as_raw_fd(),
+                directory.as_raw_fd(),
                 &CString::new(name.filename()).unwrap(),
                 false,
             )?;

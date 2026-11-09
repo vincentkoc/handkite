@@ -1,10 +1,12 @@
-//! Guard-bound copying into a new private stage, without release selection or activation.
+//! Guard-bound staging and publication, without release selection or activation.
 
 use crate::installer_lock::InstallerLock;
 use std::path::Path;
 
 #[cfg(target_os = "macos")]
 mod macos;
+mod publication;
+pub use publication::{PublicationFailure, PublicationPhase, PublishedRelease, publish};
 
 /// Retains destination descriptors, exact bounded manifest bytes, and the trust
 /// inputs used for staging, while borrowing installer ownership.

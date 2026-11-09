@@ -50,7 +50,13 @@ pub(super) struct Hooks<'a> {
 }
 
 #[cfg(test)]
-impl Hooks<'_> {
+impl<'a> Hooks<'a> {
+    pub(super) fn with_check(check: Check<'a>) -> Self {
+        Self {
+            check: Some(check),
+            ..Self::production()
+        }
+    }
     pub(super) fn production() -> Self {
         Self {
             check: None,

@@ -164,6 +164,10 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn selected_digest(&self) -> Option<ManifestDigest> {
+        self.observation.as_ref().map(|value| value.manifest)
+    }
+
     pub(crate) fn capture(layout: &ServiceLayout) -> Result<Self, &'static str> {
         capture(
             layout,
@@ -173,7 +177,6 @@ impl Snapshot {
     }
 
     /// Parent entry changes may be deliberate; the original current link may not change.
-    #[cfg_attr(not(test), allow(dead_code))] // Publication integration is a separate slice.
     pub(crate) fn reobserve_unchanged(&self) -> Result<(), &'static str> {
         self.reobserve(
             #[cfg(test)]
