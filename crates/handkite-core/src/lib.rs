@@ -2,3 +2,4 @@
 
 pub mod passcode;
 pub mod protocol;
+pub mod unlock;

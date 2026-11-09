@@ -19,6 +19,10 @@ impl Passcode {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
+
+    pub(crate) fn digit(&self, index: usize) -> u8 {
+        self.0.as_bytes()[index] - b'0'
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
