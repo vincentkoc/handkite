@@ -75,8 +75,6 @@ pub trait ProvisioningDataProvider {
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct ClientInfo {
     client_info: String,
     user_agent: String,
@@ -91,9 +89,19 @@ impl ClientInfo {
         &self.user_agent
     }
 
-    fn parse(body: &[u8]) -> Result<Self, &'static str> {
-        let info: Self =
+    pub(super) fn parse(body: &[u8]) -> Result<Self, &'static str> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            client_info: String,
+            user_agent: String,
+        }
+        let fields: Fields =
             serde_json::from_slice(body).map_err(|_| "Anisette client information is invalid")?;
+        let info = Self {
+            client_info: fields.client_info,
+            user_agent: fields.user_agent,
+        };
         if [&info.client_info, &info.user_agent].iter().any(|value| {
             value.is_empty()
                 || value.len() > 4096
@@ -165,6 +173,17 @@ impl AnisetteClient {
         provider: &mut P,
     ) -> Result<MacosProvisionedState, &'static str> {
         self.provision_until(identifier, provider, Instant::now() + CONVERSATION_TIMEOUT)
+            .await
+    }
+
+    /// Lookup and exact endpoint approval complete before opening the sidecar WSS.
+    /// The production policy currently rejects this operation before any network IO.
+    pub async fn provision_apple(
+        &self,
+        context: super::apple::AppleProvisioningContext,
+    ) -> Result<MacosProvisionedState, &'static str> {
+        let mut provider = super::apple::AppleProvisioningProvider::discover(context).await?;
+        self.provision(*provider.identifier().as_bytes(), &mut provider)
             .await
     }
 

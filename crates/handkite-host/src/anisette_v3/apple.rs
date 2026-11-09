@@ -1,4 +1,4 @@
-//! Offline Apple provisioning formats. Parsing never approves a network destination.
+//! Apple provisioning formats and a callback gated by exact endpoint approval.
 
 use reqwest::Url;
 use zeroize::Zeroizing;
@@ -8,7 +8,14 @@ use super::{
     validate_base64,
 };
 
+mod client;
+mod context;
 mod plist;
+mod provider;
+pub use context::{AppleProvisioningContext, ProvisioningIdentifier};
+pub use provider::AppleProvisioningProvider;
+#[cfg(test)]
+pub(crate) use provider::tests::fixture_provider;
 
 const MAX_LOOKUP_BYTES: usize = 64 * 1024;
 const MAX_URL_BYTES: usize = 4096;

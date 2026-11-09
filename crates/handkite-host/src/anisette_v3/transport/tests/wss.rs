@@ -147,6 +147,60 @@ async fn wss_provisions_once_with_shared_mtls_and_routing_info() {
 }
 
 #[tokio::test]
+async fn wss_composes_with_approved_apple_https_callbacks() {
+    let (mut provider, apple_server) = crate::anisette_v3::apple::fixture_provider().await;
+    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        .wss(|mut socket| async move {
+            through_finish(&mut socket).await;
+            socket.send(Message::Text(serde_json::json!({
+                "result":"ProvisioningSuccess", "adi_pb":STANDARD.encode(state([7; 16]).as_bytes())
+            }).to_string().into())).await.unwrap();
+            assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+        })
+        .await;
+    let result = client
+        .provision(*provider.identifier().as_bytes(), &mut provider)
+        .await
+        .unwrap();
+    assert_eq!(result.as_bytes(), state([7; 16]).as_bytes());
+    assert!(provider.start().await.is_err());
+    assert!(provider.finish("Yg==").await.is_err());
+    assert_eq!(apple_server.await.unwrap().len(), 3);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn production_apple_policy_rejects_before_sidecar_connection() {
+    let fixture = TlsFixture::new("anisette.example.invalid", true, true);
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = AnisetteClient {
+        http: http_builder(&fixture.client)
+            .resolve("anisette.example.invalid", address)
+            .build()
+            .unwrap(),
+        tls: fixture.client.config,
+        test_port: Some(address.port()),
+    };
+    let context = crate::anisette_v3::apple::AppleProvisioningContext::new(
+        crate::anisette_v3::apple::ProvisioningIdentifier::new([7; 16]),
+        ClientInfo::parse(br#"{"client_info":"synthetic client","user_agent":"fixture/1"}"#)
+            .unwrap(),
+    );
+    assert!(matches!(
+        client.provision_apple(context).await,
+        Err("Apple provisioning destinations are not approved")
+    ));
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn wss_delayed_challenge_gets_a_fresh_reply_deadline() {
     let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
         .wss(|mut socket| async move {
