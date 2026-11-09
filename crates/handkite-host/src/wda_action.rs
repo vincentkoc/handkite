@@ -13,6 +13,10 @@ pub struct WdaActions {
 }
 
 impl WdaActions {
+    pub async fn prepare(&mut self, wda: &UsbWda) -> Result<(), AdapterError> {
+        self.session_id(wda).await.map(|_| ())
+    }
+
     pub async fn execute(
         &mut self,
         wda: &UsbWda,

@@ -2,12 +2,13 @@ use crate::native_lock;
 use crate::pin_screen::{self, ParsedPasscodeView};
 use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
-use crate::wda_adapter::SCREEN_SOURCE;
 use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::protocol::{Action, HardwareId, LockState, Point};
 use handkite_core::unlock::{BackendError, PasscodeBackend, PasscodeScreen};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 
 pub struct NativePasscodeBackend {
     expected: HardwareId,
@@ -84,10 +85,14 @@ fn keypad_swipe(size: (f64, f64)) -> Result<Action, BackendError> {
 
 impl PasscodeBackend for NativePasscodeBackend {
     fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError> {
+        let started = Instant::now();
         let wda = UsbWda::new(self.usb.clone());
+        self.runtime
+            .block_on(self.actions.prepare(&wda))
+            .map_err(|_| BackendError::Unavailable)?;
         let (source, reported_lock) = self.runtime.block_on(async {
             tokio::join!(
-                wda.request("GET", SCREEN_SOURCE, b"", Duration::from_secs(10)),
+                wda.request("GET", PIN_SOURCE, b"", Duration::from_secs(10)),
                 wda.request("GET", "/wda/locked", b"", Duration::from_secs(10)),
             )
         });
@@ -96,6 +101,10 @@ impl PasscodeBackend for NativePasscodeBackend {
         let xml = source.as_str().ok_or(BackendError::Unavailable)?;
         let parsed = pin_screen::parse(xml).map_err(|_| BackendError::Unavailable)?;
         let native = native_lock::query(&self.expected);
+        if started.elapsed() > Duration::from_secs(5) {
+            self.last_view = None;
+            return Err(BackendError::Unavailable);
+        }
         let wda_lock = match reported_lock.as_bool() {
             Some(true) => LockState::Locked,
             Some(false) => LockState::Unlocked,
