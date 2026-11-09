@@ -18,11 +18,20 @@ use std::time::Duration;
 mod clock_attrs;
 #[path = "probe/lock_ui_attrs.rs"]
 mod lock_ui_attrs;
+#[path = "probe/reveal_keypad.rs"]
+mod reveal_keypad;
 #[path = "probe/touch_trial.rs"]
 mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "reveal-keypad") {
+        if let Err(error) = reveal_keypad::command(&args[1..]) {
+            eprintln!("reveal_keypad={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "lock-ui-attrs") {
         if let Err(error) = lock_ui_attrs::command(&args[1..]) {
             eprintln!("lock_ui_attrs={error}");

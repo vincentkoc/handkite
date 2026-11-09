@@ -413,6 +413,10 @@ fn parse(xml: &str) -> Result<Summary, Refusal> {
     })
 }
 
+pub(super) fn empty_keypad(xml: &str) -> bool {
+    parse(xml).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

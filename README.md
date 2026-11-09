@@ -181,6 +181,18 @@ control flow only; live touch delivery and PIN entry remain unqualified.
 
 ## PIN stop gate
 
+`handkite-probe reveal-keypad --config PRIVATE_FILE` is a separate one-shot
+diagnostic that sends USB keyboard Return only after two distinct fresh captures
+whose accessibility trees identify a normal lock screen. Both require the pinned
+device, unchanged existing WDA session, matching screen/image dimensions, native
+and WDA locked state, prior unlock since boot, and no keypad or field. Overlapping
+or reused capture windows refuse input. PNG header/aspect checks do not classify
+screenshot content or establish an atomic visual-state proof.
+It sends one fixed HID event, then checks once for a valid empty six-digit
+keypad while still locked. Output is fixed `confirmed`, `unknown`, or refusal
+categories. It has no retry, swipe, PIN read, or stop-marker access. This command
+sends input; its offline fixtures do not qualify live delivery.
+
 `handkite-probe lock-ui-attrs --config PRIVATE_FILE` is a read-only Cancel-button
 diagnostic for an already open locked passcode screen. It requires prior unlock
 since boot, an existing WDA session, native and WDA lock confirmation, valid

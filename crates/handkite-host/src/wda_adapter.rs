@@ -13,6 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=visible,accessible,focused,enabled,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
+const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 
 pub struct WdaAdapter {
     expected: HardwareId,
@@ -98,6 +99,14 @@ impl WdaAdapter {
     pub fn observe_with_attributes(&mut self) -> Result<(RawObservation, Instant), AdapterError> {
         self.runtime
             .block_on(Self::capture(&self.usb, &self.expected, ATTRIBUTE_SOURCE))
+    }
+
+    /// Paired diagnostic capture with the PIN parser's visible/enabled attributes.
+    pub fn observe_pin_with_attributes(
+        &mut self,
+    ) -> Result<(RawObservation, Instant), AdapterError> {
+        self.runtime
+            .block_on(Self::capture(&self.usb, &self.expected, PIN_SOURCE))
     }
 }
 
