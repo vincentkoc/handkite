@@ -1,7 +1,7 @@
 use handkite_core::controller::Controller;
 use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
 use handkite_host::usb::PinnedUsb;
-use handkite_host::wda_read::WdaReadAdapter;
+use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_transport::UsbWda;
 use std::time::Duration;
 
@@ -51,8 +51,7 @@ async fn status(wda: &UsbWda) -> Result<(), String> {
 
 fn observe(expected: HardwareId) -> Result<(), String> {
     let key = DeviceKey::new("iphone-15-pro").map_err(|error| error.to_string())?;
-    let adapter =
-        WdaReadAdapter::new(expected.clone()).map_err(|_| "cannot initialize WDA reader")?;
+    let adapter = WdaAdapter::new(expected.clone()).map_err(|_| "cannot initialize WDA reader")?;
     let controller = Controller::new(
         DeviceBinding {
             key: key.clone(),

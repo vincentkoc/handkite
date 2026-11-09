@@ -11,13 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=visible,accessible,focused,enabled,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 
-pub struct WdaReadAdapter {
+pub struct WdaAdapter {
     expected: HardwareId,
     usb: PinnedUsb,
     runtime: tokio::runtime::Runtime,
 }
 
-impl WdaReadAdapter {
+impl WdaAdapter {
     pub fn new(expected: HardwareId) -> Result<Self, AdapterError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -85,7 +85,7 @@ impl WdaReadAdapter {
     }
 }
 
-impl DeviceAdapter for WdaReadAdapter {
+impl DeviceAdapter for WdaAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
         self.runtime
             .block_on(self.usb.provider())
