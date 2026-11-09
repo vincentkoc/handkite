@@ -1,8 +1,8 @@
 use handkite_core::unlock::{AttemptGate, UnlockOutcome, UnlockPolicy, unlock_once};
-use handkite_host::file_gate::FileAttemptGate;
 use handkite_host::host_config;
 use handkite_host::pin_backend::NativePasscodeBackend;
 use handkite_host::pin_input;
+use handkite_host::unlock_state;
 use std::path::Path;
 
 fn main() {
@@ -15,16 +15,18 @@ fn main() {
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     let supervised_visibility_fallback =
-        args.len() == 6 && args[5] == "--supervised-visibility-fallback";
-    if !(args.len() == 5 || supervised_visibility_fallback)
-        || args[1] != "--config"
-        || args[3] != "--state-dir"
-    {
-        return Err("usage: handkite-unlock-once --config FILE --state-dir DIRECTORY [--supervised-visibility-fallback]".into());
+        args.len() == 4 && args[3] == "--supervised-visibility-fallback";
+    if !(args.len() == 3 || supervised_visibility_fallback) || args[1] != "--config" {
+        return Err(
+            "usage: handkite-unlock-once --config FILE [--supervised-visibility-fallback]".into(),
+        );
     }
     let binding = host_config::load(Path::new(&args[2])).map_err(str::to_owned)?;
-    let mut gate = FileAttemptGate::new(Path::new(&args[4]).join("UNLOCK-DISABLED"))
-        .map_err(|_| "state directory must be private and absolute")?;
+    if binding.key.as_str() != "iphone" {
+        return Err("PIN entry requires the fixed device key iphone".into());
+    }
+    let mut gate =
+        unlock_state::iphone_gate().map_err(|_| "account PIN state is unavailable or insecure")?;
     if gate
         .is_disabled()
         .map_err(|_| "cannot read PIN stop marker")?

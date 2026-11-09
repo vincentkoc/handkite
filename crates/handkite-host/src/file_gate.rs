@@ -17,7 +17,10 @@ impl FileAttemptGate {
         }
         let parent = path.parent().ok_or(GateError)?;
         let meta = fs::symlink_metadata(parent).map_err(|_| GateError)?;
-        if !meta.file_type().is_dir() || meta.permissions().mode() & 0o077 != 0 {
+        if !meta.file_type().is_dir()
+            || meta.permissions().mode() & 0o777 != 0o700
+            || meta.uid() != unsafe { libc::geteuid() }
+        {
             return Err(GateError);
         }
         Ok(Self {
@@ -145,11 +148,13 @@ mod tests {
 
     struct DroppedPhone {
         id: HardwareId,
+        snapshots: usize,
         presses: usize,
     }
 
     impl PasscodeBackend for DroppedPhone {
         fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError> {
+            self.snapshots += 1;
             Ok(PasscodeScreen {
                 connected_usb: self.id.clone(),
                 wda_target: self.id.clone(),
@@ -178,6 +183,38 @@ mod tests {
     }
 
     #[test]
+    fn preexisting_marker_blocks_before_backend_access() {
+        let dir = PrivateDir::new();
+        fs::write(dir.marker(), b"existing-stop\n").unwrap();
+        let key = DeviceKey::new("iphone").unwrap();
+        let id = HardwareId::new("fixture-usb").unwrap();
+        let binding = DeviceBinding {
+            key: key.clone(),
+            usb_id: id.clone(),
+        };
+        let mut phone = DroppedPhone {
+            id,
+            snapshots: 0,
+            presses: 0,
+        };
+        let mut gate = FileAttemptGate::new(dir.marker()).unwrap();
+        let code = Passcode::new("123456".into()).unwrap();
+        assert_eq!(
+            unlock_once(
+                &mut phone,
+                &mut gate,
+                &binding,
+                &key,
+                &code,
+                UnlockPolicy::default(),
+            ),
+            Err(UnlockError::Disabled)
+        );
+        assert_eq!((phone.snapshots, phone.presses), (0, 0));
+        assert_eq!(fs::read(dir.marker()).unwrap(), b"existing-stop\n");
+    }
+
+    #[test]
     fn incomplete_digit_blocks_attempt_after_gate_reopen() {
         let dir = PrivateDir::new();
         let key = DeviceKey::new("fixture-phone").unwrap();
@@ -186,7 +223,11 @@ mod tests {
             key: key.clone(),
             usb_id: id.clone(),
         };
-        let mut phone = DroppedPhone { id, presses: 0 };
+        let mut phone = DroppedPhone {
+            id,
+            snapshots: 0,
+            presses: 0,
+        };
         let code = Passcode::new("123456".into()).unwrap();
         let policy = UnlockPolicy {
             progress_polls: 0,

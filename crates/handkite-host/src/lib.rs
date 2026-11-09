@@ -11,6 +11,7 @@ pub mod native_lock;
 pub mod pin_backend;
 pub mod pin_input;
 pub mod pin_screen;
+pub mod unlock_state;
 pub mod usb;
 pub mod wda_action;
 pub mod wda_adapter;
