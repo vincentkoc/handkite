@@ -1,10 +1,62 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroize;
 
 pub const ROUTING_INFO_HEADER: &str = "X-Apple-I-MD-RINFO";
 const MAX_SERVER_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 4096;
 const MAX_CPIM_BYTES: usize = 64 * 1024;
 const MAX_ADI_STATE_BYTES: usize = 3 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct StateEnvelope {
+    provider: String,
+    version: u32,
+    binary_sha256: String,
+    identifier: [u8; 16],
+}
+
+pub struct MacosProvisionedState {
+    bytes: Vec<u8>,
+}
+
+impl MacosProvisionedState {
+    pub fn parse(mut bytes: Vec<u8>, identifier: [u8; 16]) -> Result<Self, &'static str> {
+        let validation = || {
+            if bytes.is_empty() || bytes.len() > MAX_ADI_STATE_BYTES {
+                return Err("Anisette state size is invalid");
+            }
+            let envelope: StateEnvelope =
+                serde_json::from_slice(&bytes).map_err(|_| "Anisette state is invalid")?;
+            if envelope.provider != "macos-adid"
+                || envelope.version != 1
+                || envelope.identifier != identifier
+                || envelope.binary_sha256.len() != 64
+                || !envelope
+                    .binary_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err("Anisette state identity or backend mismatch");
+            }
+            Ok(())
+        };
+        if let Err(error) = validation() {
+            bytes.zeroize();
+            return Err(error);
+        }
+        Ok(Self { bytes })
+    }
+
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
+impl Drop for MacosProvisionedState {
+    fn drop(&mut self) {
+        self.bytes.zeroize();
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProvisioningStage {
@@ -245,5 +297,32 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn macos_state_cannot_cross_backend_or_identifier() {
+        let identifier = [7_u8; 16];
+        let state = serde_json::json!({
+            "provider": "macos-adid",
+            "version": 1,
+            "binary_sha256": "a".repeat(64),
+            "identifier": identifier,
+            "host_uuid": vec![8_u8; 16],
+            "files": {}
+        });
+        let bytes = serde_json::to_vec(&state).unwrap();
+        assert_eq!(
+            MacosProvisionedState::parse(bytes.clone(), identifier)
+                .unwrap()
+                .as_bytes(),
+            bytes
+        );
+        assert!(MacosProvisionedState::parse(bytes.clone(), [9_u8; 16]).is_err());
+        let mut wrong_backend = state;
+        wrong_backend["provider"] = "android".into();
+        assert!(
+            MacosProvisionedState::parse(serde_json::to_vec(&wrong_backend).unwrap(), identifier)
+                .is_err()
+        );
     }
 }
