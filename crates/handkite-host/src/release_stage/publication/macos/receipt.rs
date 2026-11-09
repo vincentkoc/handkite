@@ -64,6 +64,20 @@ pub(super) fn check_named(
 }
 
 impl Receipt {
+    pub(super) fn open_existing(
+        parent: &File,
+        name: CString,
+        bytes: &[u8],
+    ) -> Result<Self, &'static str> {
+        let file = open_at(parent.as_raw_fd(), &name, false)?;
+        let fingerprint = check_named(&file, parent, &name, 0o400, bytes)?;
+        Ok(Self {
+            file,
+            fingerprint,
+            name,
+        })
+    }
+
     pub(super) fn reopen(
         writer: File,
         parent: &File,

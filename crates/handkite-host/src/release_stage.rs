@@ -6,7 +6,9 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 mod macos;
 mod publication;
-pub use publication::{PublicationFailure, PublicationPhase, PublishedRelease, publish};
+pub use publication::{
+    PublicationFailure, PublicationPhase, PublishedRelease, publish, reopen_published,
+};
 
 /// Retains destination descriptors, exact bounded manifest bytes, and the trust
 /// inputs used for staging, while borrowing installer ownership.

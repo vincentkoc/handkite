@@ -16,6 +16,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::Duration;
 
+mod retained;
+
 const CERTIFICATE: &str = "1111111111111111111111111111111111111111";
 const NONCE: [u8; 16] = [0x24; 16];
 const TEMPORARY: &str = ".receipt-24242424242424242424242424242424";

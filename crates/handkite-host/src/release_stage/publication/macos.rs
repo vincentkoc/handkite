@@ -12,7 +12,9 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::Path;
 
 mod receipt;
+mod retained;
 pub(super) use receipt::Receipt;
+pub(super) use retained::{reopen_published, revalidate};
 
 const UNSAFE: &str = "unsafe or changed publication files";
 
