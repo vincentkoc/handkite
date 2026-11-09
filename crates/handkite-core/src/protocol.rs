@@ -1,7 +1,7 @@
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::fmt;
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 #[serde(transparent)]
 pub struct DeviceKey(String);
 
@@ -21,6 +21,13 @@ impl DeviceKey {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+}
+
+impl<'de> Deserialize<'de> for DeviceKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
     }
 }
 
@@ -262,5 +269,16 @@ mod tests {
             window.duration_ms(),
             Err(ContractError::InvalidObservationWindow)
         );
+    }
+
+    #[test]
+    fn decoded_device_key_still_obeys_identity_rules() {
+        assert_eq!(
+            serde_json::from_str::<DeviceKey>("\"phone_1\"").unwrap(),
+            DeviceKey::new("phone_1").unwrap()
+        );
+        for invalid in ["\"\"", "\"other phone\"", "\"../phone\""] {
+            assert!(serde_json::from_str::<DeviceKey>(invalid).is_err());
+        }
     }
 }
