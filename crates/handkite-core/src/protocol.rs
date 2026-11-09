@@ -122,7 +122,20 @@ pub struct Observation {
     pub window: ObservationWindow,
     pub state: DeviceState,
     pub accessibility_tree: String,
-    pub screenshot_jpeg: Vec<u8>,
+    pub screenshot: ScreenImage,
+}
+
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ScreenImage {
+    pub format: ImageFormat,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageFormat {
+    Png,
+    Jpeg,
 }
 
 #[derive(Clone, Serialize, Deserialize)]

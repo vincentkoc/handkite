@@ -1,5 +1,5 @@
 use super::*;
-use crate::protocol::{LockState, Point};
+use crate::protocol::{ImageFormat, LockState, Point, ScreenImage};
 
 struct FakeAdapter {
     usb: HardwareId,
@@ -55,7 +55,10 @@ impl DeviceAdapter for FakeAdapter {
                 foreground_app: Some(self.app.clone()),
             },
             accessibility_tree: format!("<app name=\"{}\" />", self.app),
-            screenshot_jpeg: self.app.as_bytes().to_vec(),
+            screenshot: ScreenImage {
+                format: ImageFormat::Png,
+                bytes: self.app.as_bytes().to_vec(),
+            },
         })
     }
 

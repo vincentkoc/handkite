@@ -1,6 +1,6 @@
 use crate::protocol::{
     Action, ActionRequest, ActionResult, DeviceBinding, DeviceKey, DeviceState, HardwareId,
-    Observation, ObservationWindow, ObservedEffect, Revision, TransportReceipt,
+    Observation, ObservationWindow, ObservedEffect, Revision, ScreenImage, TransportReceipt,
 };
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ pub struct RawObservation {
     pub window: ObservationWindow,
     pub state: DeviceState,
     pub accessibility_tree: String,
-    pub screenshot_jpeg: Vec<u8>,
+    pub screenshot: ScreenImage,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -156,7 +156,7 @@ impl<A: DeviceAdapter> Controller<A> {
                 let changed = inner.last.as_ref().is_some_and(|before| {
                     before.state != after.state
                         || before.accessibility_tree != after.accessibility_tree
-                        || before.screenshot_jpeg != after.screenshot_jpeg
+                        || before.screenshot != after.screenshot
                 });
                 let effect = if receipt.accepted && changed {
                     ObservedEffect::Changed
@@ -235,7 +235,7 @@ impl<A: DeviceAdapter> Controller<A> {
             window: raw.window,
             state: raw.state,
             accessibility_tree: raw.accessibility_tree,
-            screenshot_jpeg: raw.screenshot_jpeg,
+            screenshot: raw.screenshot,
         })
     }
 }
