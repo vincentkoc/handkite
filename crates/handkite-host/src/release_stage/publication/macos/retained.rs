@@ -47,7 +47,9 @@ pub(in crate::release_stage::publication) fn reopen_published<'lock>(
     Ok(value)
 }
 
-fn check_pair(value: &PublishedRelease<'_>) -> Result<(), &'static str> {
+pub(in crate::release_stage::publication) fn check_pair(
+    value: &PublishedRelease<'_>,
+) -> Result<(), &'static str> {
     let staged = &value.staged;
     staged._owner.revalidate()?;
     staged._destination.revalidate()?;

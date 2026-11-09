@@ -164,6 +164,12 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    pub(crate) fn selected_link_identity(&self) -> Option<(i32, u64)> {
+        self.observation
+            .as_ref()
+            .map(|value| (value.fingerprint.device, value.fingerprint.inode))
+    }
+
     pub(crate) fn selected_digest(&self) -> Option<ManifestDigest> {
         self.observation.as_ref().map(|value| value.manifest)
     }

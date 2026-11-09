@@ -24,6 +24,7 @@ pub mod release_manifest;
 pub mod release_signer;
 pub mod release_stage;
 pub mod release_verify;
+pub mod selection_intent;
 pub mod service_layout;
 pub mod service_lock;
 pub mod unlock_state;

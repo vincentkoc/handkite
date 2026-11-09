@@ -17,6 +17,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 mod retained;
+mod selection_intent;
 
 const CERTIFICATE: &str = "1111111111111111111111111111111111111111";
 const NONCE: [u8; 16] = [0x24; 16];

@@ -45,6 +45,23 @@ pub struct PublishedRelease<'lock> {
 }
 
 impl PublishedRelease<'_> {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn matches_owner_and_digest(
+        &self,
+        owner: &InstallerLock,
+        digest: &[u8; 32],
+    ) -> bool {
+        std::ptr::eq(self.staged._owner, owner)
+            && ring::digest::digest(&ring::digest::SHA256, &self.staged._canonical_manifest)
+                .as_ref()
+                == digest
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn revalidate_custody(&self) -> Result<(), &'static str> {
+        macos::check_pair(self)
+    }
+
     pub fn directory_name(&self) -> &str {
         self.staged.directory_name()
     }
