@@ -4,9 +4,40 @@ Handkite is a local-first control service for an explicitly selected iPhone. The
 
 The design specification is maintained outside this repository.
 
-## Local trial
+## Local setup
 
-Build `handkited` and `handkitectl` with `cargo build --release -p handkite-host --bins`. Stage the existing directory layout described below and place a JSON config such as `{"device_key":"phone","usb_id":"<PINNED_USB_ID>"}` in its regular mode-0600 `config/host.json`. With a normal account `HOME`, run:
+Handkite controls one explicitly selected iPhone over USB from the Mac it is
+attached to. You need:
+
+- an Apple Silicon Mac with Apple's command-line tools and the Rust toolchain
+  pinned in `rust-toolchain.toml`;
+- a test iPhone with Developer Mode enabled and **Settings > Developer > Enable
+  UI Automation** turned on, trusted by the Mac;
+- your own Apple development team to sign the XCTest runner (see the
+  [runner build guide](tools/wda/README.md)).
+
+Device PIN entry is never exposed through the MCP bridge. Optional PIN unlock
+runs as a separate one-shot local command, or through the supervised broker
+`tools/supervised_device.py`, guarded by stop markers; it is off until you
+create its state directory and supply a PIN source. See
+[PIN unlock](RELEASE.md#pin-unlock) and the [PIN stop gate](#pin-stop-gate).
+
+### Startup troubleshooting
+
+1. If the runner fails during automation initialization, check **Settings >
+   Developer > Enable UI Automation** on the phone. Toggling it off and on and
+   completing the XCTest authorization prompt has cleared failures reported
+   with LocalAuthentication code `-4`. Unlocking the phone alone does not
+   authorize XCTest.
+2. Keep the exact runner failure stage. A timeout or code `-4` alone does not
+   prove that the setting was off, that pairing broke, or that an account needs
+   repair.
+3. Retry startup once with exclusive device ownership. On another failure,
+   diagnose that stage; do not repeat startup or input blindly.
+
+### Running the service
+
+Build the service candidates using the pinned [Mac release inputs](RELEASE.md). Stage the existing directory layout described below and place a JSON config such as `{"device_key":"phone","usb_id":"<PINNED_USB_ID>"}` in its regular mode-0600 `config/host.json`. With a normal account `HOME`, run:
 
 ```sh
 handkited
