@@ -4,6 +4,7 @@ use quick_xml::events::{BytesStart, Event};
 
 const MAX_XML_BYTES: usize = 8 * 1024 * 1024;
 const ALIGN_TOLERANCE: f64 = 12.0;
+const FRAME_EDGE_TOLERANCE: f64 = 2.0;
 
 pub struct ParsedPasscodeView {
     pub visible_lock: LockState,
@@ -52,10 +53,10 @@ impl Rect {
     }
 
     fn overlaps(self, other: Self) -> bool {
-        self.x < other.x + other.width
-            && self.x + self.width > other.x
-            && self.y < other.y + other.height
-            && self.y + self.height > other.y
+        self.x < other.x + other.width - FRAME_EDGE_TOLERANCE
+            && self.x + self.width > other.x + FRAME_EDGE_TOLERANCE
+            && self.y < other.y + other.height - FRAME_EDGE_TOLERANCE
+            && self.y + self.height > other.y + FRAME_EDGE_TOLERANCE
     }
 }
 
@@ -440,6 +441,18 @@ mod tests {
             "XCUIElementTypeSecureTextField visible=\"false\"",
         );
         assert!(parse(&hidden_field).unwrap().secure_field_value.is_none());
+    }
+
+    #[test]
+    fn tolerates_two_pixel_frame_overlap_but_rejects_deep_overlap() {
+        let edge_jitter =
+            fixture().replace("width=\"80\" height=\"80\"", "width=\"102\" height=\"102\"");
+        assert!(parse(&edge_jitter).unwrap().keypad.is_some());
+        let deep_overlap = edge_jitter.replace(
+            "name=\"2\" visible=\"true\" enabled=\"true\" x=\"140\"",
+            "name=\"2\" visible=\"true\" enabled=\"true\" x=\"120\"",
+        );
+        assert!(parse(&deep_overlap).unwrap().keypad.is_none());
     }
 
     #[test]
