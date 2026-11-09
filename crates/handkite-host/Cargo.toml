@@ -9,4 +9,4 @@ base64 = "=0.22.1"
 handkite-core = { path = "../handkite-core" }
 idevice = { version = "=0.1.68", default-features = false, features = ["ring", "usbmuxd"] }
 serde_json = "1.0"
-tokio = { version = "=1.54.1", features = ["io-util", "rt", "time"] }
+tokio = { version = "=1.54.1", features = ["io-util", "macros", "rt", "time"] }
