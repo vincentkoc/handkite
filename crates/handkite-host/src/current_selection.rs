@@ -9,7 +9,7 @@ use crate::install_plan::ManifestDigest;
 use crate::service_layout::ServiceLayout;
 
 #[cfg(target_os = "macos")]
-mod macos;
+pub(crate) mod macos;
 
 /// Observe the fixed current-selection link without opening its target.
 ///

@@ -306,3 +306,99 @@ fn final_parent_check_rejects_change_after_the_second_link_read() {
     assert_eq!(inspect(&layout, Some(&mut hook)), Err(UNSAFE));
     assert_eq!(reads, 2);
 }
+
+#[test]
+fn snapshot_preserves_absence_or_dangling_target_across_parent_entry_changes() {
+    for present in [false, true] {
+        let (_scratch, layout) = fixture(present);
+        let snapshot = Snapshot::capture(&layout).unwrap();
+        assert_eq!(
+            snapshot.observation.as_ref().map(|value| value.manifest),
+            present.then_some(MANIFEST)
+        );
+        assert!(!layout.current_release_selection().exists());
+        snapshot.reobserve_unchanged().unwrap();
+        let sibling = layout.releases_directory().join("unrelated");
+        fs::create_dir(&sibling).unwrap();
+        chmod(&sibling, 0o700);
+        snapshot.reobserve_unchanged().unwrap();
+        fs::remove_dir(&sibling).unwrap();
+        snapshot.reobserve_unchanged().unwrap();
+        if present {
+            let metadata = fs::symlink_metadata(layout.current_release_selection()).unwrap();
+            let observed = snapshot.observation.as_ref().unwrap();
+            assert_eq!(observed.fingerprint.inode, metadata.ino());
+            assert_eq!(observed.fingerprint.size, 64);
+        }
+    }
+}
+
+#[test]
+fn snapshot_rejects_same_target_inode_replacement_and_presence_changes() {
+    for present in [false, true] {
+        for replacement in [false, true] {
+            let (_scratch, layout) = fixture(present);
+            let snapshot = Snapshot::capture(&layout).unwrap();
+            if present {
+                fs::rename(
+                    layout.current_release_selection(),
+                    layout.releases_directory().join("old-current"),
+                )
+                .unwrap();
+            }
+            if !present || replacement {
+                select(&layout, &encode_target(&MANIFEST));
+            }
+            assert_eq!(snapshot.reobserve_unchanged(), Err(UNSAFE));
+        }
+    }
+}
+
+#[test]
+fn snapshot_keeps_parent_identity_and_access_policy_fixed() {
+    for change in 0..4 {
+        let (_scratch, layout) = fixture(true);
+        let snapshot = Snapshot::capture(&layout).unwrap();
+        match change {
+            0 => {
+                let releases = layout.releases_directory();
+                fs::rename(&releases, releases.with_extension("old")).unwrap();
+                fs::create_dir(&releases).unwrap();
+                chmod(&releases, 0o700);
+                select(&layout, &encode_target(&MANIFEST));
+            }
+            1 => chmod(&layout.releases_directory(), 0o750),
+            2 => acl(&layout.releases_directory(), "everyone allow read"),
+            _ => {
+                let root = layout.root();
+                fs::rename(&root, root.with_extension("old")).unwrap();
+                fs::create_dir(&root).unwrap();
+                chmod(&root, 0o700);
+            }
+        }
+        assert_eq!(snapshot.reobserve_unchanged(), Err(UNSAFE));
+    }
+}
+
+#[test]
+fn snapshot_reobserve_requires_a_stable_parent_during_its_own_read() {
+    for change_link in [false, true] {
+        let (_scratch, layout) = fixture(true);
+        let snapshot = Snapshot::capture(&layout).unwrap();
+        let mut hook = |point| {
+            if point == InspectionPoint::BetweenObservations {
+                if change_link {
+                    fs::rename(
+                        layout.current_release_selection(),
+                        layout.releases_directory().join("old-current"),
+                    )
+                    .unwrap();
+                    select(&layout, &encode_target(&MANIFEST));
+                } else {
+                    fs::write(layout.releases_directory().join("unrelated"), b"changed").unwrap();
+                }
+            }
+        };
+        assert_eq!(snapshot.reobserve(Some(&mut hook)), Err(UNSAFE));
+    }
+}

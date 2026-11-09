@@ -63,6 +63,10 @@ impl Releases {
 
     /// Hold the fresh releases descriptor after comparing each root-anchored component.
     fn revalidate(&self) -> Result<File, &'static str> {
+        self.walk(false)
+    }
+
+    fn walk(&self, parent_changed: bool) -> Result<File, &'static str> {
         let mut walked = open_at(libc::AT_FDCWD, c"/", true)?;
         for (index, held) in self.directories.iter().enumerate() {
             if index != 0 {
@@ -70,7 +74,8 @@ impl Releases {
             }
             for file in [&held.file, &walked] {
                 let current = directory_policy(file, self.uid, held.private, held.account_owned)?;
-                if !directory_matches(&current, &held.fingerprint, held.private) {
+                if !directory_matches(&current, &held.fingerprint, held.private && !parent_changed)
+                {
                     return Err(UNSAFE);
                 }
             }
@@ -152,6 +157,63 @@ struct Observation {
     manifest: ManifestDigest,
 }
 
+/// Exact link observation plus retained parent identity; never destination trust.
+pub(crate) struct Snapshot {
+    held: Releases,
+    observation: Option<Observation>,
+}
+
+impl Snapshot {
+    pub(crate) fn capture(layout: &ServiceLayout) -> Result<Self, &'static str> {
+        capture(
+            layout,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Parent entry changes may be deliberate; the original current link may not change.
+    #[cfg_attr(not(test), allow(dead_code))] // Publication integration is a separate slice.
+    pub(crate) fn reobserve_unchanged(&self) -> Result<(), &'static str> {
+        self.reobserve(
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn reobserve(&self, #[cfg(test)] mut hook: Option<Hook<'_>>) -> Result<(), &'static str> {
+        let result = (|| {
+            let fresh = self.held.walk(true)?;
+            let parent_before = directory_policy(&fresh, self.held.uid, true, true)?;
+            let before = observe(
+                self.held.directory()?,
+                self.held.uid,
+                #[cfg(test)]
+                &mut hook,
+            )?;
+            #[cfg(test)]
+            if let Some(hook) = hook.as_mut() {
+                hook(InspectionPoint::BetweenObservations);
+            }
+            let after = observe(
+                &fresh,
+                self.held.uid,
+                #[cfg(test)]
+                &mut hook,
+            )?;
+            if before != self.observation || after != self.observation {
+                return Err(UNSAFE);
+            }
+            let final_parent = self.held.walk(true)?;
+            if directory_policy(&final_parent, self.held.uid, true, true)? != parent_before {
+                return Err(UNSAFE);
+            }
+            Ok(())
+        })();
+        result.map_err(|_| UNSAFE)
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum InspectionPoint {
@@ -203,8 +265,23 @@ fn observe(
 
 pub(super) fn inspect(
     layout: &ServiceLayout,
-    #[cfg(test)] mut hook: Option<Hook<'_>>,
+    #[cfg(test)] hook: Option<Hook<'_>>,
 ) -> Result<Option<ManifestDigest>, &'static str> {
+    #[cfg(test)]
+    let snapshot = if hook.is_some() {
+        capture(layout, hook)?
+    } else {
+        Snapshot::capture(layout)?
+    };
+    #[cfg(not(test))]
+    let snapshot = Snapshot::capture(layout)?;
+    Ok(snapshot.observation.map(|value| value.manifest))
+}
+
+fn capture(
+    layout: &ServiceLayout,
+    #[cfg(test)] mut hook: Option<Hook<'_>>,
+) -> Result<Snapshot, &'static str> {
     let result = (|| {
         let held = Releases::open(layout)?;
         let before = observe(
@@ -228,7 +305,10 @@ pub(super) fn inspect(
             return Err(UNSAFE);
         }
         held.revalidate()?;
-        Ok(before.map(|value| value.manifest))
+        Ok(Snapshot {
+            held,
+            observation: before,
+        })
     })();
     result.map_err(|_| UNSAFE)
 }

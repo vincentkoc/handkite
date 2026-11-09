@@ -645,6 +645,42 @@ fn production_names_are_bounded_random_relative_locators() {
     }
 }
 
+#[test]
+fn staged_custody_retains_exact_bounded_manifest_and_the_used_trust_inputs() {
+    let fixture = Fixture::new();
+    let mut supplied = fixture.manifest.clone();
+    let mut staged = stage(
+        &fixture.owner,
+        &fixture.source.stage,
+        &supplied,
+        &hash(&supplied),
+        CERTIFICATE,
+        &mut Hooks {
+            check: Some(&mut |_, _| Ok(())),
+            fault: None,
+            nonce: Some(NONCE),
+        },
+    )
+    .unwrap();
+    supplied.fill(b' ');
+    assert_eq!(
+        staged._canonical_manifest.as_ref(),
+        fixture.manifest.as_slice()
+    );
+    assert!(staged._canonical_manifest.len() <= crate::release_manifest::MAX_MANIFEST_BYTES);
+    assert_eq!(
+        staged._trust.manifest().canonical_json().unwrap(),
+        fixture.manifest
+    );
+    assert!(std::ptr::eq(staged._owner, &fixture.owner));
+    rehash_held(&mut staged._destination, &staged._trust).unwrap();
+    assert_eq!(
+        verify_held(&mut staged._destination, &staged._trust, None),
+        Err("artifact signature does not satisfy signer policy")
+    );
+    assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 3);
+}
+
 const CHILD_HOME: &str = "HANDKITE_TEST_STAGE_HOME";
 const CHILD_SOURCE: &str = "HANDKITE_TEST_STAGE_SOURCE";
 

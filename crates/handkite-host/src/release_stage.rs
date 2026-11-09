@@ -6,12 +6,17 @@ use std::path::Path;
 #[cfg(target_os = "macos")]
 mod macos;
 
-/// Retains the observed destination descriptors and borrows installer ownership.
+/// Retains destination descriptors, exact bounded manifest bytes, and the trust
+/// inputs used for staging, while borrowing installer ownership.
 /// This is not release acceptance or permission to select or execute the files.
 pub struct StagedRelease<'lock> {
     _owner: &'lock InstallerLock,
     #[cfg(target_os = "macos")]
     _destination: crate::release_files::AnchoredRelease,
+    #[cfg(target_os = "macos")]
+    _canonical_manifest: Box<[u8]>,
+    #[cfg(target_os = "macos")]
+    _trust: crate::release_verify::macos::ValidatedTrust,
     directory_name: String,
 }
 

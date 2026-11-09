@@ -219,6 +219,8 @@ pub(super) fn stage<'lock>(
         Ok(StagedRelease {
             _owner: owner,
             _destination: destination,
+            _canonical_manifest: manifest.into(),
+            _trust: trust,
             directory_name: name,
         })
     })();
