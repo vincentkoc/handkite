@@ -115,6 +115,47 @@ async fn pin_attrs(wda: &UsbWda) -> Result<(), String> {
         xml.contains("XCUIElementTypeKey"),
         started.elapsed().as_millis()
     );
+    let mut reader = quick_xml::Reader::from_str(xml);
+    loop {
+        match reader.read_event().map_err(|_| "invalid source XML")? {
+            quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element) => {
+                if element.name().as_ref() != b"XCUIElementTypeKey" {
+                    continue;
+                }
+                let mut attrs = std::collections::BTreeMap::new();
+                for attr in element.attributes() {
+                    let attr = attr.map_err(|_| "invalid source attribute")?;
+                    if matches!(
+                        attr.key.as_ref(),
+                        b"name" | b"x" | b"y" | b"width" | b"height"
+                    ) {
+                        let value = attr
+                            .decode_and_unescape_value(reader.decoder())
+                            .map_err(|_| "invalid source attribute")?;
+                        attrs.insert(
+                            String::from_utf8_lossy(attr.key.as_ref()).into_owned(),
+                            value.into_owned(),
+                        );
+                    }
+                }
+                if attrs
+                    .get("name")
+                    .is_some_and(|name| name.len() == 1 && name.as_bytes()[0].is_ascii_digit())
+                {
+                    println!(
+                        "key_geometry digit={} x={} y={} width={} height={}",
+                        attrs.get("name").map(String::as_str).unwrap_or("?"),
+                        attrs.get("x").map(String::as_str).unwrap_or("?"),
+                        attrs.get("y").map(String::as_str).unwrap_or("?"),
+                        attrs.get("width").map(String::as_str).unwrap_or("?"),
+                        attrs.get("height").map(String::as_str).unwrap_or("?")
+                    );
+                }
+            }
+            quick_xml::events::Event::Eof => break,
+            _ => {}
+        }
+    }
     Ok(())
 }
 
