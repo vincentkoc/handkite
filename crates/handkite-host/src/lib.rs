@@ -12,10 +12,11 @@ pub mod native_lock;
 pub mod pin_backend;
 pub mod pin_input;
 pub mod pin_screen;
-#[cfg(all(test, target_os = "macos"))]
+#[cfg(target_os = "macos")]
 mod release_files;
 pub mod release_manifest;
 pub mod release_signer;
+pub mod release_verify;
 pub mod service_layout;
 pub mod service_lock;
 pub mod unlock_state;
