@@ -19,11 +19,15 @@ For `act`, `receipt.accepted` is `true` or `false` for a known acknowledgment, o
 
 Lock retains the existing lease, pinned-identity, revision, and unlocked-screen preconditions. Native querying has a five-second command timeout and an eight-second process budget. The complete action has no shared deadline across its WDA steps, so the local client's 65-second read timeout can expire before a result arrives. A timeout leaves delivery and lock state unknown to that caller; inspect fresh native state before deciding what to do. The controller never automatically resends a lock action. This receipt behavior is covered offline; a live Handkite lock cycle remains unqualified.
 
-## Read-only MCP bridge
+## MCP bridge
 
-`handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. It advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key is fixed when the process starts, and tool arguments cannot select another phone or request input. Run it as the socket owner. For a remote agent, launch it through an authenticated SSH command to that owner rather than exposing the Unix socket or WDA on a network port.
+`handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
 
-The MCP bridge has passed local protocol tests and a live read-only capture through the device host's protected socket. It has not yet been connected to the intended OpenClaw agent. Its observation tool returns private screen content to the calling agent. There is no MCP action or PIN tool yet.
+The host can explicitly add `--capabilities navigation` or `--capabilities observation,navigation`. Navigation currently permits only `handkite_acquire_control` and `handkite_release_control`. It holds the controller's random token inside this process for a fixed two-minute lease, with no automatic renewal or reacquisition. Another live session receives `Busy`. EOF and input/output errors trigger best-effort release; a killed process relies on expiry. Navigation alone does not grant either observation tool. This intermediate session layer exposes no device input tools.
+
+For remote use, an authenticated SSH key must be bound to a restricted forced command that fixes the socket, device, and capabilities, disables forwarding and PTY allocation, and ignores client-supplied commands. Do not grant that principal an unrestricted shell or direct socket access. A CLI capability flag is host policy, not authentication; SSH access that lets a caller select another command or flags does not enforce capability separation. Keep the Unix socket and WDA off network listeners. Host identity, key enrollment, forced-command restrictions, and the intended OpenClaw connection remain unqualified and require separate setup and acceptance.
+
+The bridge has passed a previous live read-only capture through the device host's protected socket. Navigation is qualified only by offline fixtures; no live navigation or OpenClaw acceptance is claimed. Observation returns private screen content to the calling agent.
 
 ## Device doctor
 

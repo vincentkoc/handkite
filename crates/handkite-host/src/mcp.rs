@@ -1,21 +1,66 @@
 use crate::wire::Reply;
 use handkite_core::protocol::{DeviceKey, ImageFormat};
-mod catalog;
-mod response;
-use catalog::Tool;
-use response::{exchange_reply, metadata};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
+mod catalog;
+mod response;
+mod session;
+pub use catalog::Capabilities;
+use catalog::Tool;
+use response::{exchange_reply, metadata};
+use session::Session;
+
+#[cfg(test)]
+mod navigation_tests;
+
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 
-pub fn serve<R, W, F>(
+pub fn serve<R, W, F>(input: R, output: W, device: &DeviceKey, exchange: F) -> io::Result<()>
+where
+    R: BufRead,
+    W: Write,
+    F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
+{
+    serve_with_capabilities(input, output, device, Capabilities::Observation, exchange)
+}
+
+pub fn serve_with_capabilities<R, W, F>(
     mut input: R,
     mut output: W,
     device: &DeviceKey,
+    capabilities: Capabilities,
     mut exchange: F,
+) -> io::Result<()>
+where
+    R: BufRead,
+    W: Write,
+    F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
+{
+    let mut session = Session::default();
+    let result = serve_loop(
+        &mut input,
+        &mut output,
+        device,
+        capabilities,
+        &mut session,
+        &mut exchange,
+    );
+    // This also runs after a partial frame, failed read, or failed output write.
+    // A killed process cannot clean up; the daemon's fixed TTL remains the bound.
+    session.cleanup(&mut exchange);
+    result
+}
+
+fn serve_loop<R, W, F>(
+    input: &mut R,
+    output: &mut W,
+    device: &DeviceKey,
+    capabilities: Capabilities,
+    session: &mut Session,
+    exchange: &mut F,
 ) -> io::Result<()>
 where
     R: BufRead,
@@ -61,7 +106,7 @@ where
                 .get("id")
                 .map(|id| error(id.clone(), -32602, "invalid tool call"))
         } else {
-            process(&request, device, &mut exchange)
+            process(&request, device, capabilities, session, exchange)
         };
         if let Some(response) = response {
             let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
@@ -78,7 +123,13 @@ where
     }
 }
 
-fn process<F>(request: &Value, device: &DeviceKey, exchange: &mut F) -> Option<Value>
+fn process<F>(
+    request: &Value,
+    device: &DeviceKey,
+    capabilities: Capabilities,
+    session: &mut Session,
+    exchange: &mut F,
+) -> Option<Value>
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
@@ -100,10 +151,15 @@ where
             "serverInfo": {"name": "handkite", "version": env!("CARGO_PKG_VERSION")}
         }),
         Some("ping") => json!({}),
-        Some("tools/list") => catalog::catalog(),
+        Some("tools/list") => catalog::catalog(capabilities),
         Some("tools/call") => {
             let Ok(params) = serde_json::from_value::<ToolCall>(request["params"].clone()) else {
                 return Some(error(id, -32602, "invalid tool call"));
+            };
+            let Some(tool) =
+                Tool::from_name(&params.name).filter(|tool| tool.allowed(capabilities))
+            else {
+                return Some(error(id, -32602, "unknown or unauthorized tool"));
             };
             if !params
                 .arguments
@@ -112,9 +168,10 @@ where
             {
                 return Some(error(id, -32602, "tool arguments must be empty"));
             }
-            match Tool::from_name(&params.name) {
-                Some(tool) => tool_result(tool, device, exchange),
-                _ => return Some(error(id, -32602, "unknown tool")),
+            match tool {
+                Tool::Status | Tool::Observe => tool_result(tool, device, exchange),
+                Tool::Acquire => session.acquire(exchange),
+                Tool::Release => session.release(exchange),
             }
         }
         _ => return Some(error(id, -32601, "method not found")),
@@ -305,27 +362,55 @@ mod tests {
             let mut request = valid.clone();
             request["params"]["arguments"] = arguments;
             assert_eq!(
-                process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+                process(
+                    &request,
+                    &device,
+                    Capabilities::Observation,
+                    &mut Session::default(),
+                    &mut exchange
+                )
+                .unwrap()["error"]["code"],
                 -32602
             );
         }
         let mut request = valid.clone();
         request["params"]["device"] = json!("other");
         assert_eq!(
-            process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+            process(
+                &request,
+                &device,
+                Capabilities::Observation,
+                &mut Session::default(),
+                &mut exchange
+            )
+            .unwrap()["error"]["code"],
             -32602
         );
         let mut request = valid.clone();
         request["socket"] = json!("/other");
         assert_eq!(
-            process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+            process(
+                &request,
+                &device,
+                Capabilities::Observation,
+                &mut Session::default(),
+                &mut exchange
+            )
+            .unwrap()["error"]["code"],
             -32600
         );
         for id in [Value::Null, json!({}), json!(true), json!(1.5)] {
             let mut request = valid.clone();
             request["id"] = id;
             assert_eq!(
-                process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+                process(
+                    &request,
+                    &device,
+                    Capabilities::Observation,
+                    &mut Session::default(),
+                    &mut exchange
+                )
+                .unwrap()["error"]["code"],
                 -32600
             );
         }

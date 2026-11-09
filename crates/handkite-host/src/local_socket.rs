@@ -40,7 +40,10 @@ pub fn serve<A: DeviceAdapter>(
     Ok(())
 }
 
-fn handle<A: DeviceAdapter>(stream: &mut UnixStream, controller: &Controller<A>) -> io::Result<()> {
+pub(crate) fn handle<A: DeviceAdapter>(
+    stream: &mut UnixStream,
+    controller: &Controller<A>,
+) -> io::Result<()> {
     let reply = match read_request(stream) {
         Ok(bytes) => match serde_json::from_slice::<Request>(&bytes) {
             Ok(request) => dispatch(controller, request),
