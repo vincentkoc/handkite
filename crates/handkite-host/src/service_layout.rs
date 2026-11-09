@@ -121,6 +121,23 @@ pub(crate) mod tests {
         (scratch, layout)
     }
 
+    pub(crate) fn socket_fixture() -> (tempfile::TempDir, ServiceLayout) {
+        // Darwin limits Unix socket paths to 103 bytes plus the terminator.
+        let scratch = tempfile::Builder::new()
+            .prefix("h")
+            .rand_bytes(3)
+            .tempdir()
+            .unwrap();
+        let layout = ServiceLayout {
+            home: fs::canonicalize(scratch.path()).unwrap(),
+        };
+        for (directory, _) in layout.directories().into_iter().skip(1) {
+            fs::create_dir(&directory).unwrap();
+            fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        (scratch, layout)
+    }
+
     #[test]
     fn fixed_paths_ignore_home_and_working_directory() {
         const EXPECTED: &str = "HANDKITE_TEST_SERVICE_HOME";

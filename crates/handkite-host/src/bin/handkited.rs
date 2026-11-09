@@ -61,11 +61,8 @@ fn run(
 fn serve(layout: ServiceLayout) -> Result<(), String> {
     let owner = ServiceLock::acquire(layout).map_err(|_| "cannot acquire service ownership")?;
     let binding = host_config::load(&owner.layout().config_file()).map_err(str::to_owned)?;
-    owner
-        .validate_current()
-        .map_err(|_| "service ownership changed")?;
-    let listener = local_socket::bind_protected(&owner.layout().runtime_directory())
-        .map_err(|_| "cannot bind protected socket")?;
+    let listener =
+        local_socket::bind_service(&owner).map_err(|_| "cannot bind protected socket")?;
     let key = binding.key.clone();
     let adapter = WdaAdapter::new(binding.usb_id.clone())
         .map_err(|_| "cannot initialize pinned WDA adapter")?;
@@ -74,7 +71,9 @@ fn serve(layout: ServiceLayout) -> Result<(), String> {
         .observe(&key)
         .map_err(|_| "pinned device is not ready")?;
     eprintln!("handkited ready");
-    local_socket::serve(listener, &controller).map_err(|_| "local socket failed".into())
+    listener
+        .serve(&controller)
+        .map_err(|_| "local socket failed".into())
 }
 
 #[cfg(test)]

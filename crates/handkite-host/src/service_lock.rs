@@ -61,6 +61,10 @@ impl ServiceLock {
         &self.layout
     }
 
+    pub(crate) fn runtime_directory(&self) -> &File {
+        &self.directory
+    }
+
     pub fn validate_current(&self) -> io::Result<()> {
         self.layout.validate_existing_directories()?;
         let directory = self.directory.metadata()?;
