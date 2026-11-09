@@ -135,7 +135,7 @@ fn demo(expected: HardwareId) -> Result<(), String> {
             lease,
             ActionRequest {
                 device: key.clone(),
-                expected_revision: Some(after_settings.revision),
+                expected_revision: None,
                 action: Action::Home,
             },
         )
@@ -175,7 +175,7 @@ fn home(expected: HardwareId) -> Result<(), String> {
             lease,
             ActionRequest {
                 device: key.clone(),
-                expected_revision: Some(before.revision),
+                expected_revision: None,
                 action: Action::Home,
             },
         )
