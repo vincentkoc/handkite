@@ -5,7 +5,10 @@ use zeroize::Zeroize;
 mod tls;
 mod transport;
 pub use tls::AnisetteIdentity;
-pub use transport::{AnisetteClient, ClientInfo};
+pub use transport::{
+    AnisetteClient, ClientInfo, EndProvisioningData, ProvisioningDataError,
+    ProvisioningDataProvider, StartProvisioningData,
+};
 
 pub const ROUTING_INFO_HEADER: &str = "X-Apple-I-MD-RINFO";
 const MAX_SERVER_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 4096;
@@ -167,7 +170,7 @@ pub enum ProvisioningEvent {
 }
 
 #[derive(Deserialize)]
-#[serde(tag = "result", deny_unknown_fields)]
+#[serde(tag = "result")]
 enum ServerMessage {
     GiveIdentifier,
     GiveStartProvisioningData,
@@ -387,6 +390,22 @@ mod tests {
                     .accept(br#"{"result":"GiveIdentifier"}"#)
                     .is_err()
             );
+        }
+    }
+
+    #[test]
+    fn provisioning_errors_discard_server_detail() {
+        for result in ["StartProvisioningError", "EndProvisioningError"] {
+            let mut conversation = ProvisioningConversation::default();
+            let body = serde_json::to_vec(&serde_json::json!({
+                "result": result, "message": "private server detail"
+            }))
+            .unwrap();
+            assert!(matches!(
+                conversation.accept(&body),
+                Err("Anisette provisioning failed")
+            ));
+            assert_eq!(conversation.stage(), ProvisioningStage::Failed);
         }
     }
 

@@ -7,6 +7,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 
+mod wss;
+
 struct TlsFixture {
     server: Arc<ServerConfig>,
     client: AnisetteIdentity,
@@ -104,6 +106,7 @@ impl TlsFixture {
                 .resolve("anisette.example.invalid", address)
                 .build()
                 .unwrap(),
+            tls: self.client.config,
             test_port: Some(address.port()),
         };
         let server = tokio::spawn(async move {
