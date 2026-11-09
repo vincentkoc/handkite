@@ -28,3 +28,5 @@ The MCP bridge has passed local protocol tests and a live read-only capture thro
 ## Anisette
 
 The [deployment bundle](deploy/anisette/README.md) pins a separate V3 sidecar behind a loopback listener and a TLS client-authenticated proxy. It is staged only. The final domain, host, client certificate, provisioning flow, and signing result must be verified before use.
+
+The host library now validates the V3 provisioning message order, forwards Apple's nonzero routing information in the finish message, binds macOS state to its provider and 16-byte identity, and parses the signing-header response without exposing server error text. This is protocol preparation: there is no connected Anisette client or signing flow yet.
