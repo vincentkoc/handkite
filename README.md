@@ -101,6 +101,12 @@ Use `handkite_observe` only when the agent needs private screen content. A navig
 
 ## Device doctor
 
+Production USB discovery and transport use the Mac's fixed `/var/run/usbmuxd`
+socket. `USBMUXD_SOCKET_ADDRESS` cannot select a TCP bridge or alternate socket.
+Native lock queries invoke `/usr/bin/xcrun` by absolute path, so `PATH` cannot
+replace that executable. The selected Apple developer tools and their environment
+remain external inputs; this path pin does not qualify them.
+
 `handkite-doctor --config /path/to/config.json` checks the pinned USB device, WDA status, the existing WDA session, and native lock state. It reports only readiness flags and lock state as JSON; it does not create a WDA session or send device input. Exit code 0 means the locked or unlocked phone can be observed. It does not mean app actions or PIN entry are qualified.
 
 ## PIN stop gate

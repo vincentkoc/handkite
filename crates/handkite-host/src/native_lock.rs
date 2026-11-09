@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::ffi::CStr;
 use std::fs;
 use std::io::Read;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -77,18 +77,22 @@ pub fn query(id: &HardwareId) -> NativeLock {
     query_inner(id).unwrap_or_else(NativeLock::uncertain)
 }
 
-fn query_inner(id: &HardwareId) -> Option<NativeLock> {
-    let directory = QueryDirectory::new()?;
-    let mut child = Command::new("xcrun")
+fn query_command(id: &HardwareId, output: &Path) -> Command {
+    let mut command = Command::new("/usr/bin/xcrun");
+    command
         .args(["devicectl", "device", "info", "lockState", "--device"])
         .arg(id.as_str())
         .args(["--timeout", "5", "--json-output"])
-        .arg(directory.output())
+        .arg(output)
         .arg("--quiet")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::null());
+    command
+}
+
+fn query_inner(id: &HardwareId) -> Option<NativeLock> {
+    let directory = QueryDirectory::new()?;
+    let mut child = query_command(id, &directory.output()).spawn().ok()?;
     let deadline = Instant::now() + Duration::from_secs(8);
     loop {
         match child.try_wait() {
@@ -119,6 +123,29 @@ fn query_inner(id: &HardwareId) -> Option<NativeLock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_query_uses_fixed_tool_and_literal_arguments() {
+        let id = HardwareId::new("test-device").unwrap();
+        let command = query_command(&id, Path::new("/tmp/test-output/lock.json"));
+        assert_eq!(command.get_program(), "/usr/bin/xcrun");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [
+                "devicectl",
+                "device",
+                "info",
+                "lockState",
+                "--device",
+                "test-device",
+                "--timeout",
+                "5",
+                "--json-output",
+                "/tmp/test-output/lock.json",
+                "--quiet",
+            ]
+        );
+    }
 
     #[test]
     fn accepts_only_successful_typed_lock_results() {

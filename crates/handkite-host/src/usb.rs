@@ -23,7 +23,7 @@ impl PinnedUsb {
     pub fn new(expected: HardwareId) -> Self {
         Self {
             expected,
-            address: UsbmuxdAddr::from_env_var().unwrap_or_default(),
+            address: UsbmuxdAddr::UnixSocket("/var/run/usbmuxd".into()),
         }
     }
 
@@ -56,5 +56,37 @@ impl PinnedUsb {
             label: "handkite".into(),
         };
         Ok(Arc::new(provider))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    #[test]
+    fn production_route_ignores_ambient_mux_address() {
+        const CHILD: &str = "HANDKITE_TEST_USB_ROUTE";
+        if std::env::var_os(CHILD).is_some() {
+            let usb = PinnedUsb::new(HardwareId::new("test-device").unwrap());
+            assert_eq!(usb.expected.as_str(), "test-device");
+            assert!(matches!(
+                usb.address,
+                UsbmuxdAddr::UnixSocket(path) if path == "/var/run/usbmuxd"
+            ));
+            return;
+        }
+        for address in ["127.0.0.1:9", "/tmp/test-usbmuxd", "invalid:address"] {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "usb::tests::production_route_ignores_ambient_mux_address",
+                ])
+                .env(CHILD, "1")
+                .env("USBMUXD_SOCKET_ADDRESS", address)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        }
     }
 }
