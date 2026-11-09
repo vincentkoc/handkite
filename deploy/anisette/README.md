@@ -15,7 +15,7 @@ This bundle prepares a separate Anisette V3 sidecar for `anisette.example.invali
 2. Choose a domain you control, change the client's fixed origin (`anisette.example.invalid` in this source) to that name, and point it at the admitted host. Verify DNS from the device Mac before requesting a certificate.
 3. Create an absolute, service-owned mode-0700 data directory outside the checkout. Set `HANDKITE_ANISETTE_DATA` to that directory for Compose. Back it up without copying it to Git or an agent workspace.
 4. Install the Caddy site only after the client CA exists and the proxy configuration validates. The Mac's client key must be readable only by its device-service owner. Keep the upstream listener on loopback.
-5. Start the pinned image and verify `GET /v3/client_info` with the client certificate. Verify a request without a trusted client certificate fails. This is a readiness check, not a signing qualification.
+5. Start the pinned image. On the device Mac, run `handkite-anisette-doctor --cert /path/to/client.pem --key /path/to/client-key.pem`. It requests only `GET /v3/client_info` at the fixed hostname using verified TLS and the private client identity; success prints `anisette_client_info=valid`. Verify separately that a request without a trusted client certificate fails. This is a readiness check, not a signing qualification.
 6. Qualify a fresh V3 provisioning and signing flow through the final hostname. The client must forward `X-Apple-I-MD-RINFO` from Apple's finish-provisioning response for the macOS backend. Do not route production signing to this server until that flow succeeds.
 
 ## Rollback
