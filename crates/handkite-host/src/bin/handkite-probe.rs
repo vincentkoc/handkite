@@ -1,4 +1,5 @@
 use handkite_core::controller::Controller;
+use handkite_core::controller::DeviceAdapter;
 use handkite_core::protocol::{
     Action, ActionRequest, DeviceBinding, DeviceKey, HardwareId, LockState, Observation,
 };
@@ -8,6 +9,9 @@ use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_transport::UsbWda;
 use handkite_host::{native_lock, pin_screen};
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
 use std::time::Duration;
 
 fn main() {
@@ -51,6 +55,12 @@ fn main() {
         "show-keypad" => show_keypad(expected),
         "pin-diagnostic" => pin_diagnostic(expected, false),
         "pin-preflight" => pin_diagnostic(expected, true),
+        "pin-screenshot" => {
+            let path = std::env::args()
+                .nth(2)
+                .ok_or_else(|| "screenshot path required".to_owned());
+            path.and_then(|path| pin_screenshot(expected, Path::new(&path)))
+        }
         _ => Err("unknown probe command".into()),
     };
     if let Err(error) = result {
@@ -368,6 +378,35 @@ fn pin_diagnostic(expected: HardwareId, supervised: bool) -> Result<(), String> 
         }
         println!("pin_preflight=ready progress=0/6");
     }
+    Ok(())
+}
+
+fn pin_screenshot(expected: HardwareId, path: &Path) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or("private screenshot directory required")?;
+    if !parent.is_absolute()
+        || std::fs::metadata(parent)
+            .map_err(|_| "screenshot directory unavailable")?
+            .permissions()
+            .mode()
+            & 0o777
+            != 0o700
+    {
+        return Err("screenshot directory must be private".into());
+    }
+    let mut adapter = WdaAdapter::new(expected).map_err(|_| "WDA unavailable")?;
+    let observation = adapter.observe().map_err(|_| "screenshot unavailable")?;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+        .map_err(|_| "screenshot file unavailable")?;
+    file.write_all(&observation.screenshot.bytes)
+        .map_err(|_| "screenshot write failed")?;
+    println!("screenshot_saved=true");
     Ok(())
 }
 
