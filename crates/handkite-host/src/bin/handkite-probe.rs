@@ -1,8 +1,9 @@
-use base64::Engine;
-use handkite_core::protocol::HardwareId;
+use handkite_core::controller::Controller;
+use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
 use handkite_host::usb::PinnedUsb;
+use handkite_host::wda_read::WdaReadAdapter;
 use handkite_host::wda_transport::UsbWda;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn main() {
     let expected = match std::env::var("HANDKITE_DEVICE_UDID")
@@ -15,25 +16,22 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("Tokio runtime");
     let command = std::env::args().nth(1).unwrap_or_else(|| "status".into());
-    let wda = UsbWda::new(PinnedUsb::new(expected));
-    let result = runtime.block_on(async {
-        match command.as_str() {
-            "status" => status(&wda).await,
-            "observe" => observe(&wda).await,
-            _ => Err("unknown probe command".into()),
+    let result = match command.as_str() {
+        "status" => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("Tokio runtime");
+            let wda = UsbWda::new(PinnedUsb::new(expected));
+            runtime.block_on(status(&wda))
         }
-    });
-    match result {
-        Ok(()) => {}
-        Err(error) => {
-            eprintln!("probe_error={error}");
-            std::process::exit(1);
-        }
+        "observe" => observe(expected),
+        _ => Err("unknown probe command".into()),
+    };
+    if let Err(error) = result {
+        eprintln!("probe_error={error}");
+        std::process::exit(1);
     }
 }
 
@@ -51,47 +49,39 @@ async fn status(wda: &UsbWda) -> Result<(), String> {
         .ok_or_else(|| "WDA is not ready".into())
 }
 
-async fn observe(wda: &UsbWda) -> Result<(), String> {
-    let start = Instant::now();
-    let screenshot = wda
-        .request("GET", "/screenshot", b"", Duration::from_secs(20))
-        .await
+fn observe(expected: HardwareId) -> Result<(), String> {
+    let key = DeviceKey::new("iphone-15-pro").map_err(|error| error.to_string())?;
+    let adapter =
+        WdaReadAdapter::new(expected.clone()).map_err(|_| "cannot initialize WDA reader")?;
+    let controller = Controller::new(
+        DeviceBinding {
+            key: key.clone(),
+            usb_id: expected,
+        },
+        adapter,
+        5000,
+        5000,
+    );
+    let observation = controller
+        .observe(&key)
         .map_err(|error| format!("{error:?}"))?;
-    if screenshot.status != 200 {
-        return Err("screenshot request failed".into());
-    }
-    let screenshot: serde_json::Value =
-        serde_json::from_slice(&screenshot.body).map_err(|_| "invalid screenshot response")?;
-    let encoded = screenshot["value"]
-        .as_str()
-        .ok_or("screenshot is missing")?;
-    let png = base64::engine::general_purpose::STANDARD
-        .decode(encoded)
-        .map_err(|_| "screenshot is not base64")?;
-    if !png.starts_with(b"\x89PNG\r\n\x1a\n") || png.len() < 24 {
-        return Err("screenshot is not PNG".into());
+    let png = &observation.screenshot.bytes;
+    if png.len() < 24 {
+        return Err("screenshot is truncated".into());
     }
     let width = u32::from_be_bytes(png[16..20].try_into().map_err(|_| "invalid PNG width")?);
     let height = u32::from_be_bytes(png[20..24].try_into().map_err(|_| "invalid PNG height")?);
-
-    let source = wda
-        .request("GET", "/source", b"", Duration::from_secs(20))
-        .await
-        .map_err(|error| format!("{error:?}"))?;
-    if source.status != 200 {
-        return Err("accessibility request failed".into());
-    }
-    let source: serde_json::Value =
-        serde_json::from_slice(&source.body).map_err(|_| "invalid accessibility response")?;
-    let tree = source["value"]
-        .as_str()
-        .ok_or("accessibility tree is missing")?;
     println!(
-        "screenshot_png={}x{} source_nonempty={} window_ms={}",
+        "revision={} screenshot_png={}x{} source_nonempty={} lock={:?} window_ms={}",
+        observation.revision.0,
         width,
         height,
-        !tree.is_empty(),
-        start.elapsed().as_millis()
+        !observation.accessibility_tree.is_empty(),
+        observation.state.lock,
+        observation
+            .window
+            .duration_ms()
+            .map_err(|_| "invalid window")?
     );
     Ok(())
 }
