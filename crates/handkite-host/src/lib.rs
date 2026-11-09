@@ -2,3 +2,4 @@
 
 pub mod file_gate;
 pub mod usb;
+pub mod wda_http;
