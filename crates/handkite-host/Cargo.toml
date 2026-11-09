@@ -6,3 +6,5 @@ rust-version.workspace = true
 
 [dependencies]
 handkite-core = { path = "../handkite-core" }
+idevice = { version = "=0.1.68", default-features = false, features = ["ring", "usbmuxd"] }
+tokio = { version = "=1.54.1", features = ["time"] }
