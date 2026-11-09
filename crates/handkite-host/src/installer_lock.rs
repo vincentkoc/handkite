@@ -50,3 +50,24 @@ impl InstallerLock {
         Err(UNAVAILABLE)
     }
 }
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod unsupported_tests {
+    use super::*;
+    use crate::install_config::RetainedConfig;
+    use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
+
+    #[test]
+    fn retained_config_cannot_be_acquired_on_an_unsupported_platform() {
+        // Only this private test can construct an unsupported ownership value.
+        let owner = InstallerLock { _unsupported: () };
+        let expected = DeviceBinding {
+            key: DeviceKey::new("phone").unwrap(),
+            usb_id: HardwareId::new("test-device").unwrap(),
+        };
+        assert_eq!(
+            RetainedConfig::acquire(&owner, &expected).err(),
+            Some("protected configuration verification requires macOS")
+        );
+    }
+}

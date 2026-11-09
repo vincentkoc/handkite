@@ -10,6 +10,8 @@ use std::process::Command;
 
 const CONFIG: &[u8] = br#"{"device_key":"phone","usb_id":"test-device"}"#;
 
+mod retained;
+
 fn expected() -> DeviceBinding {
     DeviceBinding {
         key: DeviceKey::new("phone").unwrap(),

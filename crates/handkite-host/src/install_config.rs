@@ -1,7 +1,61 @@
 //! Protected reading of the fixed service configuration for startup and installation.
 
-use crate::service_layout::ServiceLayout;
+use crate::{installer_lock::InstallerLock, service_layout::ServiceLayout};
 use handkite_core::protocol::DeviceBinding;
+
+/// Retains the original protected config and borrows installer ownership.
+/// Binding agreement is not a device observation or installation authority.
+pub struct RetainedConfig<'lock> {
+    _owner: &'lock InstallerLock,
+    binding: DeviceBinding,
+    #[cfg(target_os = "macos")]
+    config: macos::ProtectedConfig,
+}
+
+impl<'lock> RetainedConfig<'lock> {
+    /// Read only the lock's fixed config and match both independent binding fields.
+    pub fn acquire(
+        owner: &'lock InstallerLock,
+        expected: &DeviceBinding,
+    ) -> Result<Self, &'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::retain(
+                owner,
+                expected,
+                #[cfg(test)]
+                None,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = (owner, expected);
+            Err("protected configuration verification requires macOS")
+        }
+    }
+
+    /// The originally matched config binding, not evidence of a connected device.
+    pub fn binding(&self) -> &DeviceBinding {
+        &self.binding
+    }
+
+    /// Recheck the original bytes, descriptors, metadata, and installer lock.
+    /// Replacements and changes fail without resetting the original baseline.
+    pub fn revalidate(&mut self) -> Result<(), &'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            macos::revalidate(
+                self,
+                #[cfg(test)]
+                None,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("protected configuration verification requires macOS")
+        }
+    }
+}
 
 /// Validate existing config bytes against an independently supplied device binding.
 ///
@@ -50,7 +104,7 @@ mod macos {
     };
     use std::ffi::CString;
     use std::fs::File;
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::MetadataExt;
 
@@ -69,6 +123,11 @@ mod macos {
         file: File,
         fingerprint: Fingerprint,
         uid: u32,
+    }
+
+    pub(super) struct ProtectedConfig {
+        held: AnchoredConfig,
+        bytes: Box<[u8]>,
     }
 
     impl AnchoredConfig {
@@ -138,6 +197,16 @@ mod macos {
             }
             Ok(())
         }
+
+        fn read_bytes(&mut self) -> Result<Box<[u8]>, &'static str> {
+            self.file.seek(SeekFrom::Start(0)).map_err(|_| UNSAFE)?;
+            let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES as usize + 1);
+            (&mut self.file)
+                .take(MAX_CONFIG_BYTES + 1)
+                .read_to_end(&mut bytes)
+                .map_err(|_| UNSAFE)?;
+            Ok(bytes.into_boxed_slice())
+        }
     }
 
     fn directory_policy(
@@ -172,14 +241,24 @@ mod macos {
         expected: Option<&DeviceBinding>,
         #[cfg(test)] after_read: Option<&mut dyn FnMut()>,
     ) -> Result<DeviceBinding, &'static str> {
+        read_anchored(
+            layout,
+            expected,
+            #[cfg(test)]
+            after_read,
+        )
+        .map(|(_, binding)| binding)
+    }
+
+    fn read_anchored(
+        layout: &ServiceLayout,
+        expected: Option<&DeviceBinding>,
+        #[cfg(test)] after_read: Option<&mut dyn FnMut()>,
+    ) -> Result<(ProtectedConfig, DeviceBinding), &'static str> {
         // Keep lower-level release helper errors inside this config boundary.
         let check = || {
             let mut held = AnchoredConfig::open(layout)?;
-            let mut bytes = Vec::with_capacity(MAX_CONFIG_BYTES as usize + 1);
-            (&mut held.file)
-                .take(MAX_CONFIG_BYTES + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|_| UNSAFE)?;
+            let bytes = held.read_bytes()?;
             #[cfg(test)]
             if let Some(after_read) = after_read {
                 after_read();
@@ -195,11 +274,82 @@ mod macos {
                 }
             }
             held.revalidate()?;
-            Ok(binding)
+            Ok((ProtectedConfig { held, bytes }, binding))
         };
         check().map_err(|_| UNSAFE)
     }
 
+    pub(super) fn retain<'lock>(
+        owner: &'lock InstallerLock,
+        expected: &DeviceBinding,
+        #[cfg(test)] after_read: Option<&mut dyn FnMut()>,
+    ) -> Result<RetainedConfig<'lock>, &'static str> {
+        let check = || -> Result<RetainedConfig<'lock>, &'static str> {
+            owner.revalidate()?;
+            let (config, binding) = read_anchored(
+                owner.layout(),
+                Some(expected),
+                #[cfg(test)]
+                after_read,
+            )?;
+            owner.revalidate()?;
+            config.held.revalidate()?;
+            owner.revalidate()?;
+            Ok(RetainedConfig {
+                _owner: owner,
+                binding,
+                config,
+            })
+        };
+        check().map_err(|_| UNSAFE)
+    }
+
+    pub(super) fn revalidate(
+        value: &mut RetainedConfig<'_>,
+        #[cfg(test)] after_read: Option<&mut dyn FnMut()>,
+    ) -> Result<(), &'static str> {
+        (|| {
+            value._owner.revalidate()?;
+            value.config.held.revalidate()?;
+            let bytes = value.config.held.read_bytes()?;
+            #[cfg(test)]
+            if let Some(after_read) = after_read {
+                after_read();
+            }
+            if bytes != value.config.bytes {
+                return Err(UNSAFE);
+            }
+            value.config.held.revalidate()?;
+            value._owner.revalidate()
+        })()
+        .map_err(|_| UNSAFE)
+    }
+
     #[cfg(test)]
     mod tests;
+}
+
+#[cfg(all(test, not(target_os = "macos")))]
+mod unsupported_tests {
+    use super::*;
+    use crate::service_layout::tests::fixture;
+    use handkite_core::protocol::{DeviceKey, HardwareId};
+
+    #[test]
+    fn config_loading_and_required_installer_ownership_fail_closed() {
+        let (_scratch, layout) = fixture();
+        let binding = DeviceBinding {
+            key: DeviceKey::new("phone").unwrap(),
+            usb_id: HardwareId::new("test-device").unwrap(),
+        };
+        assert!(InstallerLock::acquire(&layout).is_err());
+        assert_eq!(
+            load_protected(&layout).err(),
+            Some("protected configuration verification requires macOS")
+        );
+        assert_eq!(
+            verify(&layout, &binding),
+            Err("protected configuration verification requires macOS")
+        );
+    }
 }
