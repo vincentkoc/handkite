@@ -14,6 +14,7 @@ const STANDARD_DOCTYPE: &[u8] = b"plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
 pub(super) enum Value {
     Dictionary(BTreeMap<String, Value>),
     String(Zeroizing<String>),
+    Integer(i64),
     Other,
 }
 
@@ -28,6 +29,13 @@ impl Value {
     pub(super) fn string(&self) -> Result<&str, &'static str> {
         match self {
             Self::String(value) => Ok(value),
+            _ => Err(INVALID),
+        }
+    }
+
+    pub(super) fn integer(&self) -> Result<i64, &'static str> {
+        match self {
+            Self::Integer(value) => Ok(*value),
             _ => Err(INVALID),
         }
     }
@@ -168,8 +176,8 @@ impl<'a> Parser<'a> {
             b"string" => Ok(Value::String(self.text(b"string")?)),
             b"integer" => {
                 let text = self.text(b"integer")?;
-                text.trim().parse::<i64>().map_err(|_| INVALID)?;
-                Ok(Value::Other)
+                let value = text.trim().parse::<i64>().map_err(|_| INVALID)?;
+                Ok(Value::Integer(value))
             }
             b"true" | b"false" => {
                 if !self.text(start.name().as_ref())?.is_empty() {

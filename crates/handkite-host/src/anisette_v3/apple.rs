@@ -1,12 +1,99 @@
 //! Offline Apple provisioning formats. Parsing never approves a network destination.
 
 use reqwest::Url;
+use zeroize::Zeroizing;
+
+use super::{
+    EndProvisioningData, MAX_CPIM_BYTES, ROUTING_INFO_HEADER, RoutingInfo, StartProvisioningData,
+    validate_base64,
+};
 
 mod plist;
 
 const MAX_LOOKUP_BYTES: usize = 64 * 1024;
 const MAX_URL_BYTES: usize = 4096;
+const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+const MAX_HEADER_BYTES: usize = 16 * 1024;
+const MAX_HEADER_COUNT: usize = 128;
 const INVALID_LOOKUP: &str = "Apple provisioning lookup is invalid";
+const INVALID_RESPONSE: &str = "Apple provisioning response is invalid";
+const INVALID_ROUTING: &str = "Apple provisioning routing header is invalid";
+
+/// Builds the empty start request. This does not send an Apple request.
+pub fn encode_start_request() -> Zeroizing<String> {
+    Zeroizing::new("<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Header</key><dict/><key>Request</key><dict/></dict></plist>".to_owned())
+}
+
+/// Accepts only canonical, nonempty Base64 containing at most 64 KiB of data.
+pub fn encode_finish_request(cpim: &str) -> Result<Zeroizing<String>, &'static str> {
+    validate_base64(cpim, MAX_CPIM_BYTES)?;
+    // Canonical Base64 has no XML metacharacters.
+    Ok(Zeroizing::new(format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Header</key><dict/><key>Request</key><dict><key>cpim</key><string>{cpim}</string></dict></dict></plist>"
+    )))
+}
+
+pub fn parse_start_response(
+    http_status: u16,
+    body: &[u8],
+) -> Result<StartProvisioningData, &'static str> {
+    let root = successful_response(http_status, body)?;
+    StartProvisioningData::new(root.field("Response")?.field("spim")?.string()?.to_owned())
+}
+
+pub fn parse_finish_response(
+    http_status: u16,
+    body: &[u8],
+    headers: &[(&str, &[u8])],
+) -> Result<EndProvisioningData, &'static str> {
+    let root = successful_response(http_status, body)?;
+    let response = root.field("Response")?;
+    let ptm = response.field("ptm")?.string()?;
+    let tk = response.field("tk")?.string()?;
+    let routing_info = extract_routing_info(headers)?;
+    EndProvisioningData::new(ptm.to_owned(), tk.to_owned(), routing_info)
+}
+
+/// Read the original header list before any duplicate joining or replacement.
+pub fn extract_routing_info(headers: &[(&str, &[u8])]) -> Result<RoutingInfo, &'static str> {
+    if headers.len() > MAX_HEADER_COUNT {
+        return Err(INVALID_ROUTING);
+    }
+    let mut bytes = 0usize;
+    let mut routing = None;
+    for (name, value) in headers {
+        bytes = bytes
+            .checked_add(name.len())
+            .and_then(|bytes| bytes.checked_add(value.len()))
+            .filter(|bytes| *bytes <= MAX_HEADER_BYTES)
+            .ok_or(INVALID_ROUTING)?;
+        if name.eq_ignore_ascii_case(ROUTING_INFO_HEADER) {
+            if routing.is_some() || value.len() > 20 {
+                return Err(INVALID_ROUTING);
+            }
+            let value = std::str::from_utf8(value).map_err(|_| INVALID_ROUTING)?;
+            routing = Some(RoutingInfo::parse_apple_header(value).map_err(|_| INVALID_ROUTING)?);
+        }
+    }
+    routing.ok_or(INVALID_ROUTING)
+}
+
+fn successful_response(http_status: u16, body: &[u8]) -> Result<plist::Value, &'static str> {
+    if http_status != 200 {
+        return Err(INVALID_RESPONSE);
+    }
+    let root = plist::parse(body, MAX_RESPONSE_BYTES)?;
+    if root
+        .field("Response")?
+        .field("Status")?
+        .field("ec")?
+        .integer()?
+        != 0
+    {
+        return Err(INVALID_RESPONSE);
+    }
+    Ok(root)
+}
 
 /// Syntactically valid destinations supplied by untrusted lookup data.
 /// This type is deliberately distinct from reviewed endpoints.
