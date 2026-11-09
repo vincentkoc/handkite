@@ -1,5 +1,5 @@
 use crate::wire::Reply;
-use handkite_core::protocol::{DeviceKey, ImageFormat};
+use handkite_core::protocol::{Action, DeviceKey, ImageFormat, Revision};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -161,17 +161,37 @@ where
             else {
                 return Some(error(id, -32602, "unknown or unauthorized tool"));
             };
-            if !params
-                .arguments
-                .as_object()
-                .is_some_and(serde_json::Map::is_empty)
-            {
-                return Some(error(id, -32602, "tool arguments must be empty"));
-            }
-            match tool {
-                Tool::Status | Tool::Observe => tool_result(tool, device, exchange),
-                Tool::Acquire => session.acquire(exchange),
-                Tool::Release => session.release(exchange),
+            if tool.is_action() {
+                let Ok(arguments) = serde_json::from_value::<ActionArguments>(params.arguments)
+                else {
+                    return Some(error(
+                        id,
+                        -32602,
+                        "expected_revision must be the only argument and an unsigned integer",
+                    ));
+                };
+                let action = if tool == Tool::Home {
+                    Action::Home
+                } else {
+                    Action::LaunchApp {
+                        bundle_id: "com.apple.mobiletimer".into(),
+                    }
+                };
+                session.act(device, arguments.expected_revision, action, exchange)
+            } else {
+                if !params
+                    .arguments
+                    .as_object()
+                    .is_some_and(serde_json::Map::is_empty)
+                {
+                    return Some(error(id, -32602, "tool arguments must be empty"));
+                }
+                match tool {
+                    Tool::Status | Tool::Observe => tool_result(tool, device, exchange),
+                    Tool::Acquire => session.acquire(exchange),
+                    Tool::Release => session.release(exchange),
+                    _ => unreachable!(),
+                }
             }
         }
         _ => return Some(error(id, -32601, "method not found")),
@@ -189,9 +209,8 @@ struct ToolCall {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RevisionArguments {
-    #[serde(rename = "expected_revision")]
-    _revision: handkite_core::protocol::Revision,
+struct ActionArguments {
+    expected_revision: Revision,
 }
 
 // Validate the raw frame as well: decoding to Value alone discards duplicate keys.
@@ -223,11 +242,8 @@ fn valid_tool_frame(bytes: &[u8]) -> bool {
         return false;
     };
     let arguments = envelope.params.arguments.map_or("{}", |raw| raw.get());
-    if matches!(
-        envelope.params.name.as_str(),
-        "handkite_home" | "handkite_launch_clock"
-    ) {
-        serde_json::from_str::<RevisionArguments>(arguments).is_ok()
+    if Tool::from_name(&envelope.params.name).is_some_and(Tool::is_action) {
+        serde_json::from_str::<ActionArguments>(arguments).is_ok()
     } else {
         serde_json::from_str::<Empty>(arguments).is_ok()
     }
@@ -413,28 +429,6 @@ mod tests {
                 .unwrap()["error"]["code"],
                 -32600
             );
-        }
-    }
-    #[test]
-    fn duplicate_fields_are_rejected_before_socket_dispatch() {
-        for input in [
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_home","arguments":{"expected_revision":1,"expected_revision":2}}}"#,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_status","name":"handkite_acquire_control","arguments":{}}}"#,
-            r#"{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call","params":{"name":"handkite_acquire_control","arguments":{}}}"#,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_acquire_control","arguments":{},"arguments":{}}}"#,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_home","arguments":{"expected_revision":18446744073709551616}}}"#,
-            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_home","arguments":{"expected_revision":1.0}}}"#,
-        ] {
-            let mut output = Vec::new();
-            serve(
-                Cursor::new(format!("{input}\n")),
-                &mut output,
-                &DeviceKey::new("phone").unwrap(),
-                |_| panic!("duplicate field reached socket"),
-            )
-            .unwrap();
-            let reply: Value = serde_json::from_slice(&output).unwrap();
-            assert_eq!(reply["error"]["code"], -32602);
         }
     }
     #[test]

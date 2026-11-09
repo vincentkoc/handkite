@@ -15,6 +15,8 @@ pub(super) enum Tool {
     Observe,
     Acquire,
     Release,
+    Home,
+    Clock,
 }
 
 impl Tool {
@@ -24,6 +26,8 @@ impl Tool {
             "handkite_observe" => Some(Self::Observe),
             "handkite_acquire_control" => Some(Self::Acquire),
             "handkite_release_control" => Some(Self::Release),
+            "handkite_home" => Some(Self::Home),
+            "handkite_launch_clock" => Some(Self::Clock),
             _ => None,
         }
     }
@@ -39,6 +43,10 @@ impl Tool {
                 Capabilities::Navigation | Capabilities::ObservationAndNavigation
             ),
         }
+    }
+
+    pub(super) fn is_action(self) -> bool {
+        matches!(self, Self::Home | Self::Clock)
     }
 }
 
@@ -74,8 +82,13 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         .filter_map(|(name, description)| {
             let tool = Tool::from_name(name)?;
             tool.allowed(capabilities).then(|| {
-                let schema =
-                    json!({"type": "object", "properties": {}, "additionalProperties": false});
+                let schema = if tool.is_action() {
+                    json!({"type": "object", "properties": {
+                    "expected_revision": {"type": "integer", "minimum": 0, "maximum": u64::MAX}
+                }, "required": ["expected_revision"], "additionalProperties": false})
+                } else {
+                    json!({"type": "object", "properties": {}, "additionalProperties": false})
+                };
                 json!({"name": name, "description": description, "inputSchema": schema})
             })
         })

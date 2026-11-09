@@ -1,7 +1,8 @@
-use super::response::{exchange_reply, text_result};
+use super::response::{exchange_reply, metadata, text_result};
 use super::tool_error;
 use crate::wire::Reply;
 use handkite_core::controller::LeaseId;
+use handkite_core::protocol::{Action, DeviceKey, ObservedEffect, Revision};
 use serde_json::{Value, json};
 use std::io;
 
@@ -79,6 +80,67 @@ impl Session {
             let _ = self.release(exchange);
         }
     }
+
+    pub(super) fn act<F>(
+        &mut self,
+        device: &DeviceKey,
+        revision: Revision,
+        action: Action,
+        exchange: &mut F,
+    ) -> Value
+    where
+        F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
+    {
+        let Some(lease) = self.lease else {
+            return tool_error("explicit control acquisition required");
+        };
+        let kind = action.kind();
+        let response = exchange_reply(
+            json!({"method": "act", "owner": OWNER, "lease": lease,
+            "request": {"device": device, "expected_revision": revision, "action": action}}),
+            exchange,
+        );
+        match response {
+            Ok(Reply::Acted {
+                receipt,
+                after,
+                native_lock: None,
+                effect,
+            }) if receipt.action_kind == kind && effect != ObservedEffect::LockConfirmed => {
+                if after
+                    .as_ref()
+                    .is_some_and(|observation| &observation.device != device)
+                {
+                    return uncertain_result(kind);
+                }
+                text_result(json!({"receipt": receipt, "effect": effect,
+                    "after": after.as_ref().map(metadata)}))
+            }
+            Ok(Reply::Error { code }) => {
+                if code == "InvalidLease" {
+                    self.lease = None;
+                }
+                // Only these controller failures prove that execute was never called.
+                // Identity checks and response-size limits can also fail after input.
+                if matches!(
+                    code.as_str(),
+                    "InvalidLease" | "StaleRevision" | "LockedAction"
+                ) {
+                    service_error(&code)
+                } else {
+                    uncertain_result(kind)
+                }
+            }
+            _ => uncertain_result(kind),
+        }
+    }
+}
+
+fn uncertain_result(kind: &str) -> Value {
+    let mut result = text_result(json!({"receipt": {"accepted": null, "action_kind": kind},
+        "effect": "unconfirmed", "after": null, "delivery": "unknown"}));
+    result["isError"] = json!(true);
+    result
 }
 
 fn service_error(code: &str) -> Value {
