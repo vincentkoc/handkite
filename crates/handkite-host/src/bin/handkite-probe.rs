@@ -14,11 +14,20 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+#[path = "probe/clock_attrs.rs"]
+mod clock_attrs;
 #[path = "probe/touch_trial.rs"]
 mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "clock-attrs") {
+        if let Err(error) = clock_attrs::command(&args[1..]) {
+            eprintln!("clock_attrs={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "touch-trial") {
         if let Err(error) = touch_trial::command(&args[1..]) {
             eprintln!("touch_trial={error}");
