@@ -175,7 +175,15 @@ pub struct TransportReceipt {
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ActionResult {
     pub receipt: TransportReceipt,
-    pub after: Observation,
+    pub after: Option<Observation>,
+    pub effect: ObservedEffect,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObservedEffect {
+    Changed,
+    Unconfirmed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
