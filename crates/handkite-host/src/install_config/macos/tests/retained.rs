@@ -119,6 +119,9 @@ fn unsafe_config_is_neither_retained_nor_repaired() {
             parent_before,
             fs::metadata(path.parent().unwrap()).unwrap().into()
         );
+        if mutation == 6 {
+            clear_acl(path.parent().unwrap());
+        }
     }
 }
 
