@@ -6,6 +6,91 @@ pub const ROUTING_INFO_HEADER: &str = "X-Apple-I-MD-RINFO";
 const MAX_SERVER_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 4096;
 const MAX_CPIM_BYTES: usize = 64 * 1024;
 const MAX_ADI_STATE_BYTES: usize = 3 * 1024 * 1024;
+const MAX_HEADERS_RESPONSE_BYTES: usize = 16 * 1024;
+
+#[derive(Deserialize)]
+#[serde(tag = "result")]
+enum HeadersResponse {
+    Headers {
+        #[serde(rename = "X-Apple-I-MD")]
+        one_time_password: String,
+        #[serde(rename = "X-Apple-I-MD-M")]
+        machine_id: String,
+        #[serde(rename = "X-Apple-I-MD-RINFO")]
+        routing_info: String,
+    },
+    GetHeadersError,
+}
+
+pub struct AppleSigningHeaders {
+    one_time_password: String,
+    machine_id: String,
+    routing_info: RoutingInfo,
+}
+
+impl AppleSigningHeaders {
+    pub fn parse(status: u16, body: &[u8]) -> Result<Self, &'static str> {
+        if status != 200 || body.len() > MAX_HEADERS_RESPONSE_BYTES {
+            return Err("Anisette header response failed");
+        }
+        let response: HeadersResponse =
+            serde_json::from_slice(body).map_err(|_| "Anisette header response is invalid")?;
+        match response {
+            HeadersResponse::Headers {
+                mut one_time_password,
+                mut machine_id,
+                routing_info,
+            } => {
+                let validation = if !valid_header_value(&one_time_password)
+                    || !valid_header_value(&machine_id)
+                {
+                    Err("Anisette signing headers are invalid")
+                } else {
+                    RoutingInfo::parse_apple_header(&routing_info)
+                };
+                let routing_info = match validation {
+                    Ok(value) => value,
+                    Err(error) => {
+                        one_time_password.zeroize();
+                        machine_id.zeroize();
+                        return Err(error);
+                    }
+                };
+                Ok(Self {
+                    one_time_password,
+                    machine_id,
+                    routing_info,
+                })
+            }
+            HeadersResponse::GetHeadersError => Err("Anisette could not create signing headers"),
+        }
+    }
+
+    pub fn one_time_password(&self) -> &str {
+        &self.one_time_password
+    }
+
+    pub fn machine_id(&self) -> &str {
+        &self.machine_id
+    }
+
+    pub fn routing_info(&self) -> RoutingInfo {
+        self.routing_info
+    }
+}
+
+impl Drop for AppleSigningHeaders {
+    fn drop(&mut self) {
+        self.one_time_password.zeroize();
+        self.machine_id.zeroize();
+    }
+}
+
+fn valid_header_value(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 4096
+        && value.bytes().all(|byte| (0x21..=0x7e).contains(&byte))
+}
 
 #[derive(Deserialize)]
 struct StateEnvelope {
@@ -323,6 +408,30 @@ mod tests {
         assert!(
             MacosProvisionedState::parse(serde_json::to_vec(&wrong_backend).unwrap(), identifier)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn signing_headers_require_success_and_clean_values() {
+        let body = br#"{"result":"Headers","X-Apple-I-MD":"otp","X-Apple-I-MD-M":"machine","X-Apple-I-MD-RINFO":"17106176"}"#;
+        let headers = AppleSigningHeaders::parse(200, body).unwrap();
+        assert_eq!(headers.one_time_password(), "otp");
+        assert_eq!(headers.machine_id(), "machine");
+        assert_eq!(headers.routing_info().value(), 17106176);
+        assert!(AppleSigningHeaders::parse(503, body).is_err());
+        assert!(
+            AppleSigningHeaders::parse(
+                200,
+                br#"{"result":"GetHeadersError","message":"private detail"}"#
+            )
+            .is_err()
+        );
+        assert!(
+            AppleSigningHeaders::parse(
+                200,
+                br#"{"result":"Headers","X-Apple-I-MD":"bad\nvalue","X-Apple-I-MD-M":"machine","X-Apple-I-MD-RINFO":"17106176"}"#
+            )
+            .is_err()
         );
     }
 }
