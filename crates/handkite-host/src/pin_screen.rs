@@ -12,6 +12,10 @@ pub struct ParsedPasscodeView {
     pub keypad: Option<[Point; 10]>,
     pub delete_key: Option<Point>,
     pub has_alert: bool,
+    pub digit_keys_seen: usize,
+    pub digit_keys_eligible: usize,
+    pub field_seen: bool,
+    pub layout_valid: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -232,11 +236,14 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
             _ => {}
         }
     }
+    let digit_keys_seen = seen_digit.into_iter().filter(|seen| *seen).count();
+    let digit_keys_eligible = keys.iter().filter(|key| key.is_some()).count();
     let key_rects = keys
         .into_iter()
         .collect::<Option<Vec<_>>>()
         .and_then(|keys| keys.try_into().ok())
         .filter(|keys| screen_size.is_some_and(|screen| valid_keypad(keys, screen)));
+    let layout_valid = key_rects.is_some();
     let keypad = key_rects
         .as_ref()
         .map(|keys: &[(Point, Rect); 10]| keys.map(|key| key.0));
@@ -270,6 +277,10 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
         keypad,
         delete_key,
         has_alert,
+        digit_keys_seen,
+        digit_keys_eligible,
+        field_seen,
+        layout_valid,
     })
 }
 

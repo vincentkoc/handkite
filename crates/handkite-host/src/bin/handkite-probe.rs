@@ -214,9 +214,21 @@ fn show_keypad(expected: HardwareId) -> Result<(), String> {
     {
         return Err("passcode prompt precondition unavailable".into());
     }
-    backend
-        .show_keypad()
-        .map_err(|error| format!("show_keypad={error:?}"))?;
+    if let Err(error) = backend.show_keypad() {
+        if let Some(diag) = backend.diagnostics() {
+            println!(
+                "pin_diagnostic snapshot_ms={} screen_size={} field_seen={} field_accepted={} keys_seen={} keys_eligible={} layout_valid={}",
+                diag.snapshot_ms,
+                diag.screen_size,
+                diag.field_seen,
+                diag.field_accepted,
+                diag.keys_seen,
+                diag.keys_eligible,
+                diag.layout_valid
+            );
+        }
+        return Err(format!("show_keypad={error:?}"));
+    }
     let after = backend
         .snapshot()
         .map_err(|error| format!("snapshot_after={error:?}"))?;

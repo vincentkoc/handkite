@@ -16,6 +16,18 @@ pub struct NativePasscodeBackend {
     runtime: tokio::runtime::Runtime,
     actions: WdaActions,
     last_view: Option<ParsedPasscodeView>,
+    last_diagnostics: Option<PinDiagnostics>,
+}
+
+#[derive(Clone, Copy)]
+pub struct PinDiagnostics {
+    pub snapshot_ms: u128,
+    pub screen_size: bool,
+    pub field_seen: bool,
+    pub field_accepted: bool,
+    pub keys_seen: usize,
+    pub keys_eligible: usize,
+    pub layout_valid: bool,
 }
 
 impl NativePasscodeBackend {
@@ -30,7 +42,12 @@ impl NativePasscodeBackend {
             runtime,
             actions: WdaActions::default(),
             last_view: None,
+            last_diagnostics: None,
         })
+    }
+
+    pub fn diagnostics(&self) -> Option<PinDiagnostics> {
+        self.last_diagnostics
     }
 
     fn request_action(&mut self, action: &Action) -> Result<(), BackendError> {
@@ -101,6 +118,15 @@ impl PasscodeBackend for NativePasscodeBackend {
         let xml = source.as_str().ok_or(BackendError::Unavailable)?;
         let parsed = pin_screen::parse(xml).map_err(|_| BackendError::Unavailable)?;
         let native = native_lock::query(&self.expected);
+        self.last_diagnostics = Some(PinDiagnostics {
+            snapshot_ms: started.elapsed().as_millis(),
+            screen_size: parsed.screen_size.is_some(),
+            field_seen: parsed.field_seen,
+            field_accepted: parsed.secure_field_value.is_some(),
+            keys_seen: parsed.digit_keys_seen,
+            keys_eligible: parsed.digit_keys_eligible,
+            layout_valid: parsed.layout_valid,
+        });
         if started.elapsed() > Duration::from_secs(5) {
             self.last_view = None;
             return Err(BackendError::Unavailable);
@@ -133,7 +159,11 @@ impl PasscodeBackend for NativePasscodeBackend {
         {
             return Ok(());
         }
-        self.request_action(&Action::Home)?;
+        let wda = UsbWda::new(self.usb.clone());
+        self.runtime
+            .block_on(self.actions.wake_hid_existing(&wda))
+            .map_err(|_| BackendError::Unavailable)?;
+        self.last_view = None;
         thread::sleep(Duration::from_millis(300));
         let screen = self.snapshot()?;
         if screen.keypad_ready {
@@ -145,7 +175,7 @@ impl PasscodeBackend for NativePasscodeBackend {
             .and_then(|view| view.screen_size)
             .ok_or(BackendError::Unavailable)?;
         self.request_action(&keypad_swipe(size)?)?;
-        for _ in 0..8 {
+        for _ in 0..3 {
             thread::sleep(Duration::from_millis(150));
             if self.snapshot()?.keypad_ready {
                 return Ok(());

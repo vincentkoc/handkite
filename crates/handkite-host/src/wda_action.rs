@@ -54,6 +54,19 @@ impl WdaActions {
         Self::execute_on(wda, action, session).await
     }
 
+    pub async fn wake_hid_existing(&self, wda: &UsbWda) -> Result<(), AdapterError> {
+        let session = self.session.as_deref().ok_or(AdapterError)?;
+        let path = format!("/session/{session}/wda/performIoHidEvent");
+        let body = serde_json::to_vec(&json!({"page": 0x0c, "usage": 0x223, "duration": 0.05}))
+            .map_err(|_| AdapterError)?;
+        let response = wda
+            .request("POST", &path, &body, Duration::from_secs(10))
+            .await
+            .map_err(|_| AdapterError)?;
+        response_ok(response)?;
+        Ok(())
+    }
+
     async fn execute_on(
         wda: &UsbWda,
         action: &Action,
