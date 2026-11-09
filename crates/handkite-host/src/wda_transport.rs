@@ -33,7 +33,7 @@ impl UsbWda {
         }
     }
 
-    /// Bound a diagnostic input's freshness through discovery, connect and writes.
+    /// Bound an input's freshness through discovery, connect and writes.
     /// Existing transports remain unbounded unless explicitly wrapped here.
     pub fn with_write_deadline(&self, deadline: Instant) -> Self {
         Self {
@@ -264,6 +264,83 @@ mod tests {
                 assert!(matches!(result, Err(WdaError::ExpiredBeforeSend)));
                 assert_eq!(bytes.get(), 0);
             }
+        }
+    }
+
+    struct DelayedFlush {
+        clock: Rc<Cell<Instant>>,
+        expires: Instant,
+        bytes: Rc<Cell<usize>>,
+        flushes: Rc<Cell<usize>>,
+        pending_flush: bool,
+    }
+
+    impl AsyncWrite for DelayedFlush {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            assert_eq!(self.bytes.get(), 0, "input was sent again");
+            self.bytes.set(bytes.len());
+            if !self.pending_flush {
+                self.clock.set(self.expires);
+            }
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            assert!(self.clock.get() < self.expires, "expired flush was polled");
+            self.flushes.set(self.flushes.get() + 1);
+            self.clock.set(self.expires);
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncRead for DelayedFlush {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            panic!("expired flush cannot read a response");
+        }
+    }
+
+    #[tokio::test]
+    async fn deadline_survives_expiry_before_or_during_flush_without_retry() {
+        for pending_flush in [false, true] {
+            let started = Instant::now();
+            let clock = Rc::new(Cell::new(started));
+            let bytes = Rc::new(Cell::new(0));
+            let flushes = Rc::new(Cell::new(0));
+            let expires = started + Duration::from_secs(5);
+            let socket = DelayedFlush {
+                clock: clock.clone(),
+                expires,
+                bytes: bytes.clone(),
+                flushes: flushes.clone(),
+                pending_flush,
+            };
+            let request = b"POST /session/fixture/actions HTTP/1.1\r\n\r\n";
+            assert!(matches!(
+                exchange(
+                    async { Ok(socket) },
+                    request,
+                    Duration::from_secs(1),
+                    Some(expires),
+                    || clock.get(),
+                )
+                .await,
+                Err(WdaError::AfterSent)
+            ));
+            assert_eq!(bytes.get(), request.len());
+            assert_eq!(flushes.get(), usize::from(pending_flush));
         }
     }
 }
