@@ -1,4 +1,9 @@
-use handkite_core::protocol::DeviceKey;
+use crate::wire::Reply;
+use handkite_core::protocol::{DeviceKey, ImageFormat};
+mod catalog;
+mod response;
+use catalog::Tool;
+use response::{exchange_reply, metadata};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -95,18 +100,7 @@ where
             "serverInfo": {"name": "handkite", "version": env!("CARGO_PKG_VERSION")}
         }),
         Some("ping") => json!({}),
-        Some("tools/list") => json!({"tools": [
-            {
-                "name": "handkite_status",
-                "description": "Observe the pinned iPhone and return lock state and capture metadata without screen content.",
-                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-            },
-            {
-                "name": "handkite_observe",
-                "description": "Capture one paired screenshot and accessibility tree from the pinned iPhone. Screen content is private.",
-                "inputSchema": {"type": "object", "properties": {}, "additionalProperties": false}
-            }
-        ]}),
+        Some("tools/list") => catalog::catalog(),
         Some("tools/call") => {
             let Ok(params) = serde_json::from_value::<ToolCall>(request["params"].clone()) else {
                 return Some(error(id, -32602, "invalid tool call"));
@@ -118,10 +112,8 @@ where
             {
                 return Some(error(id, -32602, "tool arguments must be empty"));
             }
-            match params.name.as_str() {
-                "handkite_status" | "handkite_observe" => {
-                    tool_result(&params.name, device, exchange)
-                }
+            match Tool::from_name(&params.name) {
+                Some(tool) => tool_result(tool, device, exchange),
                 _ => return Some(error(id, -32602, "unknown tool")),
             }
         }
@@ -188,49 +180,27 @@ fn empty_arguments() -> Value {
     json!({})
 }
 
-fn tool_result<F>(name: &str, device: &DeviceKey, exchange: &mut F) -> Value
+fn tool_result<F>(tool: Tool, device: &DeviceKey, exchange: &mut F) -> Value
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
-    let request = json!({"method": "observe", "device": device});
-    let request = match serde_json::to_vec(&request) {
-        Ok(request) => request,
-        Err(_) => return tool_error("request encoding failed"),
+    let Ok(Reply::Observed { observation }) =
+        exchange_reply(json!({"method": "observe", "device": device}), exchange)
+    else {
+        return tool_error("device observation unavailable");
     };
-    let response = match exchange(&request) {
-        Ok(response) => response,
-        Err(_) => return tool_error("device service unavailable"),
-    };
-    let response: Value = match serde_json::from_slice(&response) {
-        Ok(response) => response,
-        Err(_) => return tool_error("invalid device response"),
-    };
-    if response.get("type") != Some(&json!("observed")) {
-        return tool_error("device observation failed");
-    }
-    let observation = &response["observation"];
-    if observation["device"] != json!(device) {
+    if &observation.device != device {
         return tool_error("device identity mismatch");
     }
-    let metadata = json!({
-        "device": device,
-        "revision": observation["revision"],
-        "window": observation["window"],
-        "state": observation["state"]
-    });
-    if name == "handkite_status" {
-        return json!({"content": [{"type": "text", "text": metadata.to_string()}]});
+    let metadata = metadata(&observation);
+    if tool == Tool::Status {
+        return response::text_result(metadata);
     }
-    let Some(tree) = observation["accessibility_tree"].as_str() else {
-        return tool_error("accessibility tree unavailable");
-    };
-    let Some(image) = observation["screenshot_base64"].as_str() else {
-        return tool_error("screenshot unavailable");
-    };
-    let mime = match observation["screenshot_format"].as_str() {
-        Some("png") => "image/png",
-        Some("jpeg") => "image/jpeg",
-        _ => return tool_error("unsupported screenshot format"),
+    let tree = observation.accessibility_tree;
+    let image = observation.screenshot_base64;
+    let mime = match observation.screenshot_format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
     };
     let text = json!({"metadata": metadata, "accessibility_tree": tree}).to_string();
     json!({"content": [
@@ -381,5 +351,17 @@ mod tests {
             let reply: Value = serde_json::from_slice(&output).unwrap();
             assert_eq!(reply["error"]["code"], -32602);
         }
+    }
+    #[test]
+    fn status_projects_typed_metadata_without_response_extensions() {
+        let observed = r#"{"type":"observed","lease":"private-token","observation":{"device":"phone","revision":3,"window":{"started_unix_ms":1,"finished_unix_ms":2,"secret":"private-token"},"state":{"lock":"locked","wda_ready":true,"foreground_app":null,"secret":"private-token"},"accessibility_tree":"<private-screen/>","screenshot_format":"png","screenshot_base64":"AQID"}}"#;
+        let replies = run(
+            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_status\",\"arguments\":{}}}\n",
+            observed,
+        );
+        let output = replies[0].to_string();
+        assert!(!output.contains("private-token"));
+        assert!(!output.contains("private-screen"));
+        assert!(!output.contains("AQID"));
     }
 }
