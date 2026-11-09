@@ -1,5 +1,7 @@
 use handkite_core::controller::Controller;
-use handkite_core::protocol::{DeviceBinding, HardwareId};
+use handkite_core::protocol::HardwareId;
+use handkite_host::service_layout::ServiceLayout;
+use handkite_host::service_lock::ServiceLock;
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::{device_health, host_config, local_socket};
 use std::ffi::OsString;
@@ -7,8 +9,7 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "usage: handkited --check --config FILE | handkited --config FILE --socket-dir DIRECTORY";
+const USAGE: &str = "usage: handkited | handkited --check --config FILE | handkited --config SERVICE_CONFIG --socket-dir SERVICE_RUNTIME";
 
 fn main() -> ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -29,28 +30,42 @@ fn main() -> ExitCode {
 fn run(
     args: &[OsString],
     inspect: impl FnOnce(HardwareId) -> device_health::DeviceHealth,
-    serve: impl FnOnce(DeviceBinding, &Path) -> Result<(), String>,
+    serve: impl FnOnce(ServiceLayout) -> Result<(), String>,
     mut output: impl Write,
 ) -> Result<u8, String> {
-    let (config, socket_dir) = match args {
-        [check, flag, file] if check == "--check" && flag == "--config" => (Path::new(file), None),
+    let supplied_paths = match args {
+        [check, flag, file] if check == "--check" && flag == "--config" => {
+            let binding = host_config::load(Path::new(file)).map_err(str::to_owned)?;
+            let health = inspect(binding.usb_id);
+            serde_json::to_writer(&mut output, &health)
+                .map_err(|_| "cannot write health result")?;
+            writeln!(output).map_err(|_| "cannot write health result")?;
+            return Ok(u8::from(!health.observation_ready()));
+        }
+        [] => None,
         [flag, file, socket, directory] if flag == "--config" && socket == "--socket-dir" => {
-            (Path::new(file), Some(Path::new(directory)))
+            Some((Path::new(file), Path::new(directory)))
         }
         _ => return Err(USAGE.into()),
     };
-    let binding = host_config::load(config).map_err(str::to_owned)?;
-    if let Some(directory) = socket_dir {
-        serve(binding, directory)?;
-        return Ok(0);
+    let layout = ServiceLayout::current_account().map_err(|_| "service layout unavailable")?;
+    if let Some((config, runtime)) = supplied_paths {
+        if config != layout.config_file() || runtime != layout.runtime_directory() {
+            return Err("daemon requires the fixed service configuration and runtime paths".into());
+        }
     }
-    let health = inspect(binding.usb_id);
-    serde_json::to_writer(&mut output, &health).map_err(|_| "cannot write health result")?;
-    writeln!(output).map_err(|_| "cannot write health result")?;
-    Ok(u8::from(!health.observation_ready()))
+    serve(layout)?;
+    Ok(0)
 }
 
-fn serve(binding: DeviceBinding, socket_dir: &Path) -> Result<(), String> {
+fn serve(layout: ServiceLayout) -> Result<(), String> {
+    let owner = ServiceLock::acquire(layout).map_err(|_| "cannot acquire service ownership")?;
+    let binding = host_config::load(&owner.layout().config_file()).map_err(str::to_owned)?;
+    owner
+        .validate_current()
+        .map_err(|_| "service ownership changed")?;
+    let listener = local_socket::bind_protected(&owner.layout().runtime_directory())
+        .map_err(|_| "cannot bind protected socket")?;
     let key = binding.key.clone();
     let adapter = WdaAdapter::new(binding.usb_id.clone())
         .map_err(|_| "cannot initialize pinned WDA adapter")?;
@@ -58,8 +73,6 @@ fn serve(binding: DeviceBinding, socket_dir: &Path) -> Result<(), String> {
     controller
         .observe(&key)
         .map_err(|_| "pinned device is not ready")?;
-    let listener = local_socket::bind_protected(socket_dir)
-        .map_err(|error| format!("cannot bind protected socket: {error}"))?;
     eprintln!("handkited ready");
     local_socket::serve(listener, &controller).map_err(|_| "local socket failed".into())
 }

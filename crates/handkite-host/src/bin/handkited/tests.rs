@@ -50,7 +50,7 @@ fn check_reports_only_health_and_never_serves() {
                     assert_eq!(id.as_str(), "fixture-usb");
                     health
                 },
-                |_, _| panic!("check must not initialize or serve the daemon"),
+                |_| panic!("check must not initialize or serve the daemon"),
                 &mut output,
             )
             .unwrap();
@@ -94,7 +94,7 @@ fn every_readiness_failure_returns_one_without_serving() {
             run(
                 &check_args(config.path()),
                 |_| health,
-                |_, _| panic!("failed check must not serve"),
+                |_| panic!("failed check must not serve"),
                 &mut output,
             )
             .unwrap(),
@@ -112,7 +112,7 @@ fn rejected_before_device_access(args: &[OsString]) -> String {
     let error = run(
         args,
         |_| panic!("invalid input must not inspect a device"),
-        |_, _| panic!("invalid input must not serve"),
+        |_| panic!("invalid input must not serve"),
         &mut output,
     )
     .unwrap_err();
@@ -145,7 +145,6 @@ fn only_exact_command_forms_are_accepted() {
     let config = valid_config();
     let path = config.path().as_os_str().to_owned();
     for args in [
-        vec![],
         vec!["--check".into()],
         vec!["--check".into(), "--config".into()],
         vec!["--config".into(), path.clone(), "--check".into()],
@@ -175,26 +174,53 @@ fn only_exact_command_forms_are_accepted() {
 }
 
 #[test]
-fn normal_daemon_mode_uses_only_the_serve_path() {
-    let config = valid_config();
-    let mut output = Vec::new();
-    let code = run(
-        &[
+fn normal_daemon_mode_uses_only_fixed_service_paths() {
+    let layout = ServiceLayout::current_account().unwrap();
+    for args in [
+        vec![],
+        vec![
             "--config".into(),
-            config.path().into(),
+            layout.config_file().into(),
             "--socket-dir".into(),
-            "/unused".into(),
+            layout.runtime_directory().into(),
         ],
-        |_| panic!("normal daemon startup does not run a separate preflight"),
-        |binding, directory| {
-            assert_eq!(binding.key.as_str(), "phone");
-            assert_eq!(binding.usb_id.as_str(), "fixture-usb");
-            assert_eq!(directory, Path::new("/unused"));
-            Ok(())
-        },
-        &mut output,
-    )
-    .unwrap();
-    assert_eq!(code, 0);
-    assert!(output.is_empty());
+    ] {
+        let mut output = Vec::new();
+        let code = run(
+            &args,
+            |_| panic!("normal daemon startup does not run a separate preflight"),
+            |resolved| {
+                assert_eq!(resolved, layout);
+                Ok(())
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn alternate_config_or_socket_directory_is_rejected_before_device_access() {
+    let config = valid_config();
+    let scratch = tempfile::tempdir().unwrap();
+    let layout = ServiceLayout::current_account().unwrap();
+    for (config, runtime) in [
+        (config.path().to_owned(), layout.runtime_directory()),
+        (layout.config_file(), scratch.path().to_owned()),
+        (config.path().to_owned(), scratch.path().to_owned()),
+    ] {
+        let error = rejected_before_device_access(&[
+            "--config".into(),
+            config.into(),
+            "--socket-dir".into(),
+            runtime.into(),
+        ]);
+        assert_eq!(
+            error,
+            "daemon requires the fixed service configuration and runtime paths"
+        );
+    }
+    assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
