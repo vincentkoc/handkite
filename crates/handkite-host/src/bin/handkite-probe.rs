@@ -2,6 +2,8 @@ use handkite_core::controller::Controller;
 use handkite_core::protocol::{
     Action, ActionRequest, DeviceBinding, DeviceKey, HardwareId, LockState, Observation,
 };
+use handkite_core::unlock::PasscodeBackend;
+use handkite_host::pin_backend::NativePasscodeBackend;
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_transport::UsbWda;
@@ -41,6 +43,7 @@ fn main() {
             Ok(())
         }
         "pin-shape" => pin_shape(expected),
+        "show-keypad" => show_keypad(expected),
         _ => Err("unknown probe command".into()),
     };
     if let Err(error) = result {
@@ -118,6 +121,43 @@ fn pin_shape(expected: HardwareId) -> Result<(), String> {
         parsed.keypad.is_some(),
         parsed.delete_key.is_some()
     );
+    Ok(())
+}
+
+fn show_keypad(expected: HardwareId) -> Result<(), String> {
+    let mut backend =
+        NativePasscodeBackend::new(expected).map_err(|_| "cannot initialize passcode backend")?;
+    let before = backend
+        .snapshot()
+        .map_err(|error| format!("snapshot_before={error:?}"))?;
+    if before.native_lock != LockState::Locked
+        || before.visible_lock != LockState::Locked
+        || before.before_first_unlock
+        || before.trust_prompt
+    {
+        return Err("passcode prompt precondition unavailable".into());
+    }
+    backend
+        .show_keypad()
+        .map_err(|error| format!("show_keypad={error:?}"))?;
+    let after = backend
+        .snapshot()
+        .map_err(|error| format!("snapshot_after={error:?}"))?;
+    println!(
+        "native_lock={:?} visible_lock={:?} keypad_ready={} secure_field={} trust_prompt={}",
+        after.native_lock,
+        after.visible_lock,
+        after.keypad_ready,
+        after.secure_field_value.is_some(),
+        after.trust_prompt,
+    );
+    if after.native_lock != LockState::Locked
+        || after.visible_lock != LockState::Locked
+        || !after.keypad_ready
+        || after.trust_prompt
+    {
+        return Err("passcode keypad unconfirmed".into());
+    }
     Ok(())
 }
 
