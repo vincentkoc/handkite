@@ -7,7 +7,7 @@ services:
     security_opt:
       - no-new-privileges:true
     ports:
-      - "127.0.0.1:${HANDKITE_ANISETTE_PORT:-6969}:6969"
+      - "127.0.0.1:6969:6969"
     volumes:
       - type: bind
         source: ${HANDKITE_ANISETTE_DATA:?set an absolute private data directory}
