@@ -128,6 +128,13 @@ pub(crate) mod macos {
         }
         // An early binary may change during a later signature check. Rehash ALL
         // three held descriptors after the final tool call, then check paths again.
+        rehash_held(held, trust)
+    }
+
+    pub(crate) fn rehash_held(
+        held: &mut AnchoredRelease,
+        trust: &ValidatedTrust,
+    ) -> Result<(), &'static str> {
         hash_all(held, trust.manifest())?;
         held.revalidate()
     }

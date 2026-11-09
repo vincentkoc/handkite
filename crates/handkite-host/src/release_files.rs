@@ -99,6 +99,16 @@ impl AnchoredRelease {
         self.path.join(name.filename())
     }
 
+    /// Descriptor identities in stage, parent order; no path resolution.
+    pub(super) fn private_directory_identities(&self) -> Result<[(u64, u64); 2], &'static str> {
+        let mut identities = [(0, 0); 2];
+        for (slot, directory) in identities.iter_mut().zip(self.directories.iter().rev()) {
+            let metadata = directory.file.metadata().map_err(|_| UNSAFE)?;
+            *slot = (metadata.dev(), metadata.ino());
+        }
+        Ok(identities)
+    }
+
     /// Compare held descriptors with a fresh nofollow walk from the root.
     pub(super) fn revalidate(&self) -> Result<(), &'static str> {
         let mut walked = open_at(libc::AT_FDCWD, c"/", true)?;

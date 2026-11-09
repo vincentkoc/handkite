@@ -12,6 +12,8 @@ const UNAVAILABLE: &str = "installer lock unavailable or unsafe";
 pub struct InstallerLock {
     #[cfg(target_os = "macos")]
     inner: macos::Guard,
+    #[cfg(target_os = "macos")]
+    layout: ServiceLayout,
     #[cfg(not(target_os = "macos"))]
     _unsupported: (),
 }
@@ -21,13 +23,21 @@ impl InstallerLock {
     pub fn acquire(layout: &ServiceLayout) -> Result<Self, &'static str> {
         #[cfg(target_os = "macos")]
         {
-            macos::acquire(layout).map(|inner| Self { inner })
+            macos::acquire(layout).map(|inner| Self {
+                inner,
+                layout: layout.clone(),
+            })
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = layout;
             Err(UNAVAILABLE)
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn layout(&self) -> &ServiceLayout {
+        &self.layout
     }
 
     /// Recheck held descriptors and a fresh root-anchored path while owning the lock.
