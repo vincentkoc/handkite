@@ -32,12 +32,15 @@ The library's `ServiceLayout::current_account()` derives fixed paths from the ef
 | Host configuration | `config/host.json` |
 | Versioned signed releases | `releases/` |
 | Private runtime socket | `runtime/handkite.sock` |
+| Process ownership lock | `runtime/handkite.lock` |
 | Durable state | `state/` |
 | Staged launchd descriptor | `launchd/com.handkite.host.plist` |
 
 `validate_existing_directories()` requires every listed parent directory to exist. The home, Library, Application Support, Handkite root, and state directory must belong to the effective user and reject group/other write access. Config, releases, runtime, and launchd directories must additionally be mode 0700. Ancestors above the home must belong to root or that user and reject group/other writes. Symlinks and non-directory components fail closed. This metadata preflight is a point-in-time check; a future installer must use anchored directory descriptors to prevent path replacement races and validate each file separately.
 
-This is stage-only library code, with no live installation or daemon integration. It creates no directories, config, sockets, releases, descriptors, or stop markers. The descriptor is outside launchd's automatically loaded directories. Signed builds, install/rollback commands, and launchd supervision remain pending. The existing `state/iphone/UNLOCK-DISABLED` gate keeps its current path, permission rules, and behavior; layout checks never open or migrate it.
+`ServiceLock::acquire` validates this layout, opens the runtime directory without following symlinks, and holds a nonblocking exclusive OS lock on a regular, single-link, owner-only mode-0600 file. The lock has one fixed name for the account's pinned-device service; device aliases cannot create separate ownership domains. The file is never truncated or removed, and process exit releases ownership without deleting state. Metadata and inode checks reject replaced locks or runtime directories. This is cooperative process ownership within the protected service account, not isolation from code already running as that account.
+
+This is stage-only library code, with no live installation or daemon integration. Layout validation creates no files; lock acquisition creates only the process lock in an existing runtime directory. Neither creates directories, config, sockets, releases, descriptors, or stop markers. The descriptor is outside launchd's automatically loaded directories. Signed builds, install/rollback commands, and launchd supervision remain pending. The existing `state/iphone/UNLOCK-DISABLED` gate keeps its current path, permission rules, and behavior; layout checks never open or migrate it.
 
 ## MCP bridge
 

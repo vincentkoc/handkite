@@ -7,7 +7,7 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// Fixed paths beneath the effective OS account home; callers cannot supply a root.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceLayout {
     home: PathBuf,
 }
@@ -38,6 +38,10 @@ impl ServiceLayout {
 
     pub fn socket(&self) -> PathBuf {
         self.runtime_directory().join("handkite.sock")
+    }
+
+    pub fn process_lock(&self) -> PathBuf {
+        self.runtime_directory().join("handkite.lock")
     }
 
     pub fn state_directory(&self) -> PathBuf {
@@ -100,12 +104,12 @@ fn unsafe_directory() -> io::Error {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use std::process::Command;
 
-    fn fixture() -> (tempfile::TempDir, ServiceLayout) {
+    pub(crate) fn fixture() -> (tempfile::TempDir, ServiceLayout) {
         let scratch = tempfile::tempdir().unwrap();
         let layout = ServiceLayout {
             home: fs::canonicalize(scratch.path()).unwrap().join("account"),
@@ -129,6 +133,7 @@ mod tests {
             assert_eq!(layout.releases_directory(), root.join("releases"));
             assert_eq!(layout.runtime_directory(), root.join("runtime"));
             assert_eq!(layout.socket(), root.join("runtime/handkite.sock"));
+            assert_eq!(layout.process_lock(), root.join("runtime/handkite.lock"));
             assert_eq!(layout.state_directory(), root.join("state"));
             assert_eq!(
                 layout.staged_launchd_descriptor(),
