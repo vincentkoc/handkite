@@ -71,7 +71,7 @@ impl WdaActions {
             .map_err(|_| AdapterError)?;
         response_ok(response)?;
         Ok(TransportReceipt {
-            accepted: true,
+            accepted: Some(true),
             action_kind: "tap".into(),
         })
     }
@@ -103,7 +103,7 @@ impl WdaActions {
             .map_err(|_| AdapterError)?;
         response_ok(response)?;
         Ok(TransportReceipt {
-            accepted: true,
+            accepted: Some(true),
             action_kind: action.kind().into(),
         })
     }

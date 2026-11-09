@@ -8,8 +8,12 @@ struct FakeAdapter {
     stale_capture: bool,
     fail_capture: bool,
     fail_after_action: bool,
+    lose_ack: bool,
+    mismatch_after_action: bool,
     locked: bool,
     actions: usize,
+    native_lock: LockState,
+    native_queries: usize,
 }
 
 impl FakeAdapter {
@@ -22,8 +26,12 @@ impl FakeAdapter {
             stale_capture: false,
             fail_capture: false,
             fail_after_action: false,
+            lose_ack: false,
+            mismatch_after_action: false,
             locked: false,
             actions: 0,
+            native_lock: LockState::Uncertain,
+            native_queries: 0,
         }
     }
 }
@@ -78,10 +86,25 @@ impl DeviceAdapter for FakeAdapter {
         if matches!(action, Action::Home) {
             self.app = "com.apple.springboard".into();
         }
+        if matches!(action, Action::Lock) {
+            self.app = "com.apple.shortcuts".into();
+        }
+        if self.mismatch_after_action {
+            self.wda = HardwareId::new("fixture-phone-b").unwrap();
+        }
+        if self.lose_ack {
+            return Err(AdapterError);
+        }
         Ok(TransportReceipt {
-            accepted: true,
+            accepted: Some(true),
             action_kind: action.kind().into(),
         })
+    }
+
+    fn native_lock_state(&mut self) -> LockState {
+        assert_eq!(self.actions, 1);
+        self.native_queries += 1;
+        self.native_lock
     }
 }
 
@@ -119,6 +142,9 @@ fn lease_rejects_a_competing_owner_and_a_stale_revision() {
     assert_eq!(result.effect, ObservedEffect::Changed);
     assert_eq!(result.after.as_ref().unwrap().revision, Revision(3));
     assert_eq!(result.receipt.action_kind, "home");
+    assert_eq!(result.receipt.accepted, Some(true));
+    assert_eq!(result.native_lock, None);
+    assert_eq!(controller.inner.lock().unwrap().adapter.native_queries, 0);
 
     let stale = ActionRequest {
         device: key.clone(),
@@ -174,6 +200,8 @@ fn missing_after_capture_is_not_reported_as_a_confirmed_effect() {
     let result = controller.act("agent", lease, request).unwrap();
     assert_eq!(result.effect, ObservedEffect::Unconfirmed);
     assert!(result.after.is_none());
+    assert_eq!(result.native_lock, None);
+    assert_eq!(controller.inner.lock().unwrap().adapter.native_queries, 0);
 
     let stale = ActionRequest {
         device: key,
@@ -230,4 +258,140 @@ fn changed_screen_or_lock_state_blocks_input_before_transport() {
         Some(ControllerError::LockedAction)
     );
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+}
+
+fn lock(
+    controller: &Controller<FakeAdapter>,
+    key: DeviceKey,
+) -> Result<ActionResult, ControllerError> {
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    controller.act(
+        "agent",
+        lease,
+        ActionRequest {
+            device: key,
+            expected_revision: None,
+            action: Action::Lock,
+        },
+    )
+}
+
+#[test]
+fn shortcuts_screen_change_does_not_confirm_lock() {
+    for native in [LockState::Unlocked, LockState::Uncertain] {
+        let (controller, key) = controller();
+        controller.inner.lock().unwrap().adapter.native_lock = native;
+        let result = lock(&controller, key).unwrap();
+        assert_eq!(result.receipt.accepted, Some(true));
+        assert_eq!(result.native_lock, Some(native));
+        assert_eq!(result.effect, ObservedEffect::Unconfirmed);
+        assert_eq!(
+            result.after.unwrap().state.foreground_app.as_deref(),
+            Some("com.apple.shortcuts")
+        );
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(inner.adapter.actions, 1);
+        assert_eq!(inner.adapter.native_queries, 1);
+    }
+}
+
+#[test]
+fn native_locked_confirms_postcondition_even_when_capture_fails() {
+    for fail_capture in [false, true] {
+        let (controller, key) = controller();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.native_lock = LockState::Locked;
+            inner.adapter.fail_after_action = fail_capture;
+        }
+        let result = lock(&controller, key).unwrap();
+        assert_eq!(result.receipt.accepted, Some(true));
+        assert_eq!(result.native_lock, Some(LockState::Locked));
+        assert_eq!(result.effect, ObservedEffect::LockConfirmed);
+        assert_eq!(result.after.is_none(), fail_capture);
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(inner.adapter.actions, 1);
+        assert_eq!(inner.adapter.native_queries, 1);
+        assert_eq!(inner.last.is_none(), fail_capture);
+    }
+}
+
+#[test]
+fn lost_lock_ack_preserves_native_proof_without_resending() {
+    for native in [LockState::Locked, LockState::Unlocked, LockState::Uncertain] {
+        for fail_capture in [false, true] {
+            let (controller, key) = controller();
+            {
+                let mut inner = controller.inner.lock().unwrap();
+                inner.adapter.lose_ack = true;
+                inner.adapter.native_lock = native;
+                inner.adapter.fail_after_action = fail_capture;
+            }
+            let result = lock(&controller, key).unwrap();
+            assert_eq!(result.receipt.accepted, None);
+            assert_eq!(result.receipt.action_kind, "lock");
+            assert_eq!(result.native_lock, Some(native));
+            assert_eq!(
+                result.effect,
+                if native == LockState::Locked {
+                    ObservedEffect::LockConfirmed
+                } else {
+                    ObservedEffect::Unconfirmed
+                }
+            );
+            assert_eq!(result.after.is_none(), fail_capture);
+            let inner = controller.inner.lock().unwrap();
+            assert_eq!(inner.adapter.actions, 1);
+            assert_eq!(inner.adapter.native_queries, 1);
+        }
+    }
+}
+
+#[test]
+fn native_lock_proof_does_not_bypass_identity_checks() {
+    for after_action in [false, true] {
+        let (controller, key) = controller();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.native_lock = LockState::Locked;
+            if after_action {
+                inner.adapter.mismatch_after_action = true;
+            } else {
+                inner.adapter.wda = HardwareId::new("fixture-phone-b").unwrap();
+            }
+        }
+        assert_eq!(
+            lock(&controller, key).err(),
+            Some(ControllerError::DeviceMismatch)
+        );
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(inner.adapter.actions, usize::from(after_action));
+        assert_eq!(inner.adapter.native_queries, usize::from(after_action));
+        assert!(inner.last.is_none());
+    }
+}
+
+#[test]
+fn non_lock_transport_error_still_fails_without_a_native_query() {
+    let (controller, key) = controller();
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    controller.inner.lock().unwrap().adapter.lose_ack = true;
+    let result = controller.act(
+        "agent",
+        lease,
+        ActionRequest {
+            device: key,
+            expected_revision: None,
+            action: Action::Home,
+        },
+    );
+    assert_eq!(result.err(), Some(ControllerError::Adapter));
+    let inner = controller.inner.lock().unwrap();
+    assert_eq!(inner.adapter.actions, 1);
+    assert_eq!(inner.adapter.native_queries, 0);
+    assert!(inner.last.is_none());
 }

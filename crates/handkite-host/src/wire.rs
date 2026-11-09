@@ -1,7 +1,7 @@
 use base64::Engine;
 use handkite_core::controller::{Controller, DeviceAdapter, LeaseId};
 use handkite_core::protocol::{
-    ActionRequest, DeviceKey, DeviceState, ImageFormat, Observation, ObservationWindow,
+    ActionRequest, DeviceKey, DeviceState, ImageFormat, LockState, Observation, ObservationWindow,
     ObservedEffect, Revision, TransportReceipt,
 };
 use serde::{Deserialize, Serialize};
@@ -41,6 +41,7 @@ pub enum Reply {
     Acted {
         receipt: TransportReceipt,
         after: Option<WireObservation>,
+        native_lock: Option<LockState>,
         effect: ObservedEffect,
     },
     Error {
@@ -107,6 +108,7 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
                 .map(|result| Reply::Acted {
                     receipt: result.receipt,
                     after: result.after.map(Into::into),
+                    native_lock: result.native_lock,
                     effect: result.effect,
                 })
         }
@@ -158,5 +160,67 @@ mod tests {
         };
         let value = serde_json::to_value(WireObservation::from(observation)).unwrap();
         assert_eq!(value["screenshot_base64"], "AQID");
+    }
+
+    #[test]
+    fn action_reply_keeps_delivery_and_native_lock_proof_separate() {
+        for (accepted, native_lock, effect, expected_effect, expected_lock) in [
+            (
+                None,
+                Some(LockState::Locked),
+                ObservedEffect::LockConfirmed,
+                "lock_confirmed",
+                serde_json::json!("locked"),
+            ),
+            (
+                Some(true),
+                Some(LockState::Uncertain),
+                ObservedEffect::Unconfirmed,
+                "unconfirmed",
+                serde_json::json!("uncertain"),
+            ),
+            (
+                Some(true),
+                Some(LockState::Unlocked),
+                ObservedEffect::Unconfirmed,
+                "unconfirmed",
+                serde_json::json!("unlocked"),
+            ),
+            (
+                Some(true),
+                None,
+                ObservedEffect::Changed,
+                "changed",
+                serde_json::Value::Null,
+            ),
+            (
+                Some(false),
+                None,
+                ObservedEffect::Unconfirmed,
+                "unconfirmed",
+                serde_json::Value::Null,
+            ),
+        ] {
+            let reply = Reply::Acted {
+                receipt: TransportReceipt {
+                    accepted,
+                    action_kind: if native_lock.is_some() {
+                        "lock"
+                    } else {
+                        "home"
+                    }
+                    .into(),
+                },
+                after: None,
+                native_lock,
+                effect,
+            };
+            let value = serde_json::to_value(reply).unwrap();
+            assert_eq!(value["type"], "acted");
+            assert_eq!(value["receipt"]["accepted"], serde_json::json!(accepted));
+            assert_eq!(value["native_lock"], expected_lock);
+            assert_eq!(value["effect"], expected_effect);
+            assert!(value["after"].is_null());
+        }
     }
 }

@@ -22,6 +22,10 @@ pub trait DeviceAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
     fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError>;
+    /// Query only the pinned device, without sending input or retrying the action.
+    fn native_lock_state(&mut self) -> LockState {
+        LockState::Uncertain
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -162,12 +166,24 @@ impl<A: DeviceAdapter> Controller<A> {
         }
         inner.last = Some(fresh);
 
+        let is_lock = matches!(&request.action, Action::Lock);
         let receipt = match inner.adapter.execute(&request.action) {
             Ok(receipt) => receipt,
+            // An error can follow delivery. Keep checking the postcondition without replay.
+            Err(_) if is_lock => TransportReceipt {
+                accepted: None,
+                action_kind: request.action.kind().into(),
+            },
             Err(_) => {
                 inner.last = None;
                 return Err(ControllerError::Adapter);
             }
+        };
+        let native_lock = is_lock.then(|| inner.adapter.native_lock_state());
+        let lock_effect = if native_lock == Some(LockState::Locked) {
+            ObservedEffect::LockConfirmed
+        } else {
+            ObservedEffect::Unconfirmed
         };
         let observed = self.capture(&mut inner, &request.device);
         match observed {
@@ -176,7 +192,9 @@ impl<A: DeviceAdapter> Controller<A> {
                     .last
                     .as_ref()
                     .is_some_and(|before| !same_view(before, &after));
-                let effect = if receipt.accepted && changed {
+                let effect = if is_lock {
+                    lock_effect
+                } else if receipt.accepted == Some(true) && changed {
                     ObservedEffect::Changed
                 } else {
                     ObservedEffect::Unconfirmed
@@ -185,6 +203,7 @@ impl<A: DeviceAdapter> Controller<A> {
                 Ok(ActionResult {
                     receipt,
                     after: Some(after),
+                    native_lock,
                     effect,
                 })
             }
@@ -197,7 +216,8 @@ impl<A: DeviceAdapter> Controller<A> {
                 Ok(ActionResult {
                     receipt,
                     after: None,
-                    effect: ObservedEffect::Unconfirmed,
+                    native_lock,
+                    effect: lock_effect,
                 })
             }
         }

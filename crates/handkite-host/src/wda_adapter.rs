@@ -1,3 +1,4 @@
+use crate::native_lock;
 use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
 use crate::wda_http::HttpResponse;
@@ -104,6 +105,10 @@ impl DeviceAdapter for WdaAdapter {
     fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
         self.runtime
             .block_on(self.actions.execute(&UsbWda::new(self.usb.clone()), action))
+    }
+
+    fn native_lock_state(&mut self) -> LockState {
+        native_lock::query(&self.expected).state
     }
 }
 

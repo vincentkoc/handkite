@@ -188,7 +188,8 @@ pub struct ActionRequest {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TransportReceipt {
-    pub accepted: bool,
+    /// None means the transport outcome is unknown, not that delivery failed.
+    pub accepted: Option<bool>,
     pub action_kind: String,
 }
 
@@ -196,6 +197,8 @@ pub struct TransportReceipt {
 pub struct ActionResult {
     pub receipt: TransportReceipt,
     pub after: Option<Observation>,
+    /// Present only for lock actions; Uncertain means native proof was unavailable.
+    pub native_lock: Option<LockState>,
     pub effect: ObservedEffect,
 }
 
@@ -203,6 +206,8 @@ pub struct ActionResult {
 #[serde(rename_all = "snake_case")]
 pub enum ObservedEffect {
     Changed,
+    /// Native state is locked after the request; this does not prove a transition.
+    LockConfirmed,
     Unconfirmed,
 }
 
