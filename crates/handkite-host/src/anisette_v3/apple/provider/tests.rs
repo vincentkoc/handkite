@@ -111,6 +111,23 @@ async fn approved_lookup_precedes_one_use_start_and_finish() {
 }
 
 #[tokio::test]
+async fn start_and_finish_close_keep_alive_connections_without_pooling() {
+    let (client, server) = TlsFixture::new("provision.example.test", true, false)
+        .keep_alive(vec![
+            start_response(),
+            finish_response("X-Apple-I-MD-RINFO: 17106176\r\n"),
+        ])
+        .await;
+    let mut provider = provider(client);
+    provider.start().await.unwrap();
+    provider.finish("Yg==").await.unwrap();
+    let requests = server.await.unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with(b"POST /start HTTP/1.1\r\n"));
+    assert!(requests[1].starts_with(b"POST /finish HTTP/1.1\r\n"));
+}
+
+#[tokio::test]
 async fn empty_production_policy_and_unapproved_lookup_fail_before_provisioning() {
     assert_eq!(
         AppleProvisioningProvider::discover(context()).await.err(),

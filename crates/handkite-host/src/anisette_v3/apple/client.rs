@@ -135,6 +135,8 @@ fn builder(roots: RootCertStore) -> Result<reqwest::ClientBuilder, &'static str>
         .http1_max_headers(MAX_HEADER_COUNT)
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
+        // Hyper can retry cancelled requests on reused sockets independently of reqwest.
+        .pool_max_idle_per_host(0)
         .no_proxy()
         .no_gzip()
         .no_brotli()

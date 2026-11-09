@@ -94,6 +94,31 @@ impl TlsFixture {
         responses: Vec<Vec<u8>>,
         stall: bool,
     ) -> (AppleClient, JoinHandle<Vec<Vec<u8>>>) {
+        self.serve_mode(responses, stall, false).await
+    }
+
+    pub(in crate::anisette_v3::apple) async fn keep_alive(
+        self,
+        responses: Vec<Vec<u8>>,
+    ) -> (AppleClient, JoinHandle<Vec<Vec<u8>>>) {
+        let responses = responses
+            .into_iter()
+            .map(|response| {
+                String::from_utf8(response)
+                    .unwrap()
+                    .replace("Connection: close\r\n", "Connection: keep-alive\r\n")
+                    .into_bytes()
+            })
+            .collect();
+        self.serve_mode(responses, false, true).await
+    }
+
+    async fn serve_mode(
+        self,
+        responses: Vec<Vec<u8>>,
+        stall: bool,
+        keep_alive: bool,
+    ) -> (AppleClient, JoinHandle<Vec<Vec<u8>>>) {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -150,7 +175,15 @@ impl TlsFixture {
                         assert_eq!(stream.read(&mut chunk).await.unwrap_or(0), 0);
                     } else {
                         let _ = stream.write_all(&response).await;
-                        let _ = stream.shutdown().await;
+                        if keep_alive {
+                            assert_eq!(
+                                stream.read(&mut chunk).await.unwrap_or(0),
+                                0,
+                                "client must close the connection without reusing it"
+                            );
+                        } else {
+                            let _ = stream.shutdown().await;
+                        }
                     }
                 }
                 assert!(
