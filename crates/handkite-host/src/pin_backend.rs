@@ -17,6 +17,7 @@ pub struct NativePasscodeBackend {
     actions: WdaActions,
     last_view: Option<ParsedPasscodeView>,
     last_diagnostics: Option<PinDiagnostics>,
+    supervised_visibility_fallback: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -27,11 +28,23 @@ pub struct PinDiagnostics {
     pub field_accepted: bool,
     pub keys_seen: usize,
     pub keys_eligible: usize,
+    pub keys_visible: usize,
+    pub keys_enabled: usize,
+    pub field_visible: bool,
+    pub field_enabled: bool,
     pub layout_valid: bool,
+    pub visibility_fallback: bool,
 }
 
 impl NativePasscodeBackend {
     pub fn new(expected: HardwareId) -> Result<Self, BackendError> {
+        Self::new_with_supervised_visibility_fallback(expected, false)
+    }
+
+    pub fn new_with_supervised_visibility_fallback(
+        expected: HardwareId,
+        supervised_visibility_fallback: bool,
+    ) -> Result<Self, BackendError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -43,6 +56,7 @@ impl NativePasscodeBackend {
             actions: WdaActions::default(),
             last_view: None,
             last_diagnostics: None,
+            supervised_visibility_fallback,
         })
     }
 
@@ -125,7 +139,12 @@ impl PasscodeBackend for NativePasscodeBackend {
             field_accepted: parsed.secure_field_value.is_some(),
             keys_seen: parsed.digit_keys_seen,
             keys_eligible: parsed.digit_keys_eligible,
+            keys_visible: parsed.digit_keys_visible,
+            keys_enabled: parsed.digit_keys_enabled,
+            field_visible: parsed.field_visible,
+            field_enabled: parsed.field_enabled,
             layout_valid: parsed.layout_valid,
+            visibility_fallback: parsed.visibility_fallback,
         });
         if started.elapsed() > Duration::from_secs(5) {
             self.last_view = None;
@@ -136,14 +155,19 @@ impl PasscodeBackend for NativePasscodeBackend {
             Some(false) => LockState::Unlocked,
             None => LockState::Uncertain,
         };
+        let fallback_blocked = parsed.visibility_fallback && !self.supervised_visibility_fallback;
         let screen = PasscodeScreen {
             connected_usb: self.expected.clone(),
             wda_target: self.expected.clone(),
             native_lock: native.state,
             visible_lock: parsed.visible_lock,
             wda_lock,
-            keypad_ready: parsed.keypad.is_some() && parsed.secure_field_value.is_some(),
-            secure_field_value: parsed.secure_field_value.clone(),
+            keypad_ready: !fallback_blocked
+                && parsed.keypad.is_some()
+                && parsed.secure_field_value.is_some(),
+            secure_field_value: (!fallback_blocked)
+                .then(|| parsed.secure_field_value.clone())
+                .flatten(),
             before_first_unlock: native.unlocked_since_boot != Some(true),
             trust_prompt: parsed.has_alert,
         };
@@ -152,6 +176,14 @@ impl PasscodeBackend for NativePasscodeBackend {
     }
 
     fn show_keypad(&mut self) -> Result<(), BackendError> {
+        if self.supervised_visibility_fallback {
+            return self
+                .last_view
+                .as_ref()
+                .filter(|view| view.visibility_fallback && view.keypad.is_some())
+                .map(|_| ())
+                .ok_or(BackendError::Unavailable);
+        }
         if self
             .last_view
             .as_ref()
@@ -196,6 +228,9 @@ impl PasscodeBackend for NativePasscodeBackend {
     }
 
     fn delete_digit(&mut self) -> Result<(), BackendError> {
+        if self.supervised_visibility_fallback {
+            return Err(BackendError::Unavailable);
+        }
         let at = self
             .last_view
             .as_ref()

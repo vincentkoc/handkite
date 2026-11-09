@@ -14,8 +14,15 @@ pub struct ParsedPasscodeView {
     pub has_alert: bool,
     pub digit_keys_seen: usize,
     pub digit_keys_eligible: usize,
+    pub digit_keys_visible: usize,
+    pub digit_keys_explicitly_hidden: usize,
+    pub digit_keys_enabled: usize,
     pub field_seen: bool,
+    pub field_visible: bool,
+    pub field_explicitly_hidden: bool,
+    pub field_enabled: bool,
     pub layout_valid: bool,
+    pub visibility_fallback: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -167,12 +174,19 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     let mut seen_digit = [false; 10];
     let mut field = None;
     let mut field_seen = false;
+    let mut field_visible = false;
+    let mut field_explicitly_hidden = false;
+    let mut field_enabled = false;
     let mut buttons = Vec::new();
     let mut lock_marker = false;
+    let mut passcode_view_marker = false;
     let mut screen_size = None;
     let mut foreground_app = None;
     let mut home_icons = 0_usize;
     let mut has_alert = false;
+    let mut digit_keys_visible = 0_usize;
+    let mut digit_keys_explicitly_hidden = 0_usize;
+    let mut digit_keys_enabled = 0_usize;
     loop {
         match reader.read_event().map_err(|_| ParseError)? {
             Event::Start(element) | Event::Empty(element) => {
@@ -195,13 +209,20 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
                 }) {
                     lock_marker = true;
                 }
+                if node.kind == "XCUIElementTypeOther"
+                    && node.name.as_deref() == Some("passcode-view")
+                {
+                    passcode_view_marker = true;
+                }
                 if node.kind == "XCUIElementTypeSecureTextField" {
                     if field_seen {
                         return Err(ParseError);
                     }
                     field_seen = true;
-                    if node.visible == Some(true)
-                        && node.enabled == Some(true)
+                    field_visible = node.visible == Some(true);
+                    field_explicitly_hidden = node.visible == Some(false);
+                    field_enabled = node.enabled == Some(true);
+                    if node.enabled == Some(true)
                         && node.rect.is_some_and(|rect| {
                             screen_size.is_some_and(|screen| rect.inside(screen))
                         })
@@ -216,7 +237,15 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
                                 return Err(ParseError);
                             }
                             seen_digit[digit] = true;
-                            if node.visible == Some(true) && node.enabled == Some(true) {
+                            if node.visible == Some(true) {
+                                digit_keys_visible += 1;
+                            } else if node.visible == Some(false) {
+                                digit_keys_explicitly_hidden += 1;
+                            }
+                            if node.enabled == Some(true) {
+                                digit_keys_enabled += 1;
+                            }
+                            if node.enabled == Some(true) {
                                 if let (Some(point), Some(rect)) = (node.point, node.rect) {
                                     keys[digit] = Some((point, rect));
                                 }
@@ -238,6 +267,15 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     }
     let digit_keys_seen = seen_digit.into_iter().filter(|seen| *seen).count();
     let digit_keys_eligible = keys.iter().filter(|key| key.is_some()).count();
+    let visibility_fallback = passcode_view_marker
+        && !has_alert
+        && field_seen
+        && field_explicitly_hidden
+        && field_enabled
+        && digit_keys_seen == 10
+        && digit_keys_explicitly_hidden == 10
+        && digit_keys_enabled == 10;
+    let visibility_admitted = (field_visible && digit_keys_visible == 10) || visibility_fallback;
     let key_rects = keys
         .into_iter()
         .collect::<Option<Vec<_>>>()
@@ -246,6 +284,7 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     let layout_valid = key_rects.is_some();
     let keypad = key_rects
         .as_ref()
+        .filter(|_| visibility_admitted && field.is_some())
         .map(|keys: &[(Point, Rect); 10]| keys.map(|key| key.0));
     let delete_key = keypad.as_ref().and_then(|keys: &[Point; 10]| {
         let candidates: Vec<_> = buttons
@@ -273,14 +312,21 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
             LockState::Uncertain
         },
         screen_size,
-        secure_field_value: field,
+        secure_field_value: visibility_admitted.then_some(field).flatten(),
         keypad,
         delete_key,
         has_alert,
         digit_keys_seen,
         digit_keys_eligible,
+        digit_keys_visible,
+        digit_keys_explicitly_hidden,
+        digit_keys_enabled,
         field_seen,
+        field_visible,
+        field_explicitly_hidden,
+        field_enabled,
         layout_valid,
+        visibility_fallback,
     })
 }
 
@@ -382,5 +428,34 @@ mod tests {
             "XCUIElementTypeSecureTextField visible=\"false\"",
         );
         assert!(parse(&hidden_field).unwrap().secure_field_value.is_none());
+    }
+
+    #[test]
+    fn admits_only_explicit_systematic_false_visibility() {
+        let all_false = fixture().replace("visible=\"true\"", "visible=\"false\"");
+        let parsed = parse(&all_false).unwrap();
+        assert!(parsed.visibility_fallback);
+        assert!(parsed.keypad.is_some());
+        assert_eq!(parsed.digit_keys_explicitly_hidden, 10);
+        assert!(parsed.field_explicitly_hidden);
+
+        let missing = all_false.replacen("visible=\"false\"", "", 1);
+        assert!(!parse(&missing).unwrap().visibility_fallback);
+        let mixed = all_false.replacen("visible=\"false\"", "visible=\"true\"", 1);
+        assert!(!parse(&mixed).unwrap().visibility_fallback);
+        let disabled = all_false.replacen("enabled=\"true\"", "enabled=\"false\"", 1);
+        assert!(!parse(&disabled).unwrap().visibility_fallback);
+        let no_marker = all_false.replace("name=\"passcode-view\"", "name=\"other\"");
+        assert!(!parse(&no_marker).unwrap().visibility_fallback);
+        let alert = all_false.replace(
+            "</XCUIElementTypeApplication>",
+            "<XCUIElementTypeAlert/></XCUIElementTypeApplication>",
+        );
+        assert!(!parse(&alert).unwrap().visibility_fallback);
+        let offscreen = all_false.replace(
+            "name=\"1\" visible=\"false\" enabled=\"true\" x=\"40\"",
+            "name=\"1\" visible=\"false\" enabled=\"true\" x=\"1040\"",
+        );
+        assert!(parse(&offscreen).unwrap().keypad.is_none());
     }
 }

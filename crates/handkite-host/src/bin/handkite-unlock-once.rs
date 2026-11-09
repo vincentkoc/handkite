@@ -14,8 +14,13 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    if args.len() != 5 || args[1] != "--config" || args[3] != "--state-dir" {
-        return Err("usage: handkite-unlock-once --config FILE --state-dir DIRECTORY".into());
+    let supervised_visibility_fallback =
+        args.len() == 6 && args[5] == "--supervised-visibility-fallback";
+    if !(args.len() == 5 || supervised_visibility_fallback)
+        || args[1] != "--config"
+        || args[3] != "--state-dir"
+    {
+        return Err("usage: handkite-unlock-once --config FILE --state-dir DIRECTORY [--supervised-visibility-fallback]".into());
     }
     let binding = host_config::load(Path::new(&args[2])).map_err(str::to_owned)?;
     let mut gate = FileAttemptGate::new(Path::new(&args[4]).join("UNLOCK-DISABLED"))
@@ -27,8 +32,11 @@ fn run() -> Result<(), String> {
         return Err("PIN attempts disabled; owner inspection required".into());
     }
     let code = pin_input::read_once(std::io::stdin().lock()).map_err(str::to_owned)?;
-    let mut backend = NativePasscodeBackend::new(binding.usb_id.clone())
-        .map_err(|_| "cannot initialize passcode backend")?;
+    let mut backend = NativePasscodeBackend::new_with_supervised_visibility_fallback(
+        binding.usb_id.clone(),
+        supervised_visibility_fallback,
+    )
+    .map_err(|_| "cannot initialize passcode backend")?;
     let outcome = unlock_once(
         &mut backend,
         &mut gate,
