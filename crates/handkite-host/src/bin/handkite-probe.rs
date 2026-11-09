@@ -49,6 +49,8 @@ fn main() {
         }
         "pin-shape" => pin_shape(expected),
         "show-keypad" => show_keypad(expected),
+        "pin-diagnostic" => pin_diagnostic(expected, false),
+        "pin-preflight" => pin_diagnostic(expected, true),
         _ => Err("unknown probe command".into()),
     };
     if let Err(error) = result {
@@ -217,12 +219,16 @@ fn show_keypad(expected: HardwareId) -> Result<(), String> {
     if let Err(error) = backend.show_keypad() {
         if let Some(diag) = backend.diagnostics() {
             println!(
-                "pin_diagnostic snapshot_ms={} screen_size={} field_seen={} field_accepted={} keys_seen={} keys_eligible={} layout_valid={}",
+                "pin_diagnostic snapshot_ms={} screen_size={} field_seen={} field_visible={} field_enabled={} field_accepted={} keys_seen={} keys_visible={} keys_enabled={} keys_eligible={} layout_valid={}",
                 diag.snapshot_ms,
                 diag.screen_size,
                 diag.field_seen,
+                diag.field_visible,
+                diag.field_enabled,
                 diag.field_accepted,
                 diag.keys_seen,
+                diag.keys_visible,
+                diag.keys_enabled,
                 diag.keys_eligible,
                 diag.layout_valid
             );
@@ -246,6 +252,52 @@ fn show_keypad(expected: HardwareId) -> Result<(), String> {
         || after.trust_prompt
     {
         return Err("passcode keypad unconfirmed".into());
+    }
+    Ok(())
+}
+
+fn pin_diagnostic(expected: HardwareId, supervised: bool) -> Result<(), String> {
+    let mut backend =
+        NativePasscodeBackend::new_with_supervised_visibility_fallback(expected, supervised)
+            .map_err(|_| "cannot initialize passcode backend")?;
+    let state = backend
+        .snapshot()
+        .map_err(|error| format!("snapshot={error:?}"))?;
+    let diag = backend.diagnostics().ok_or("diagnostic unavailable")?;
+    println!(
+        "native_lock={:?} visible_lock={:?} snapshot_ms={} field_seen={} field_visible={} field_enabled={} field_accepted={} keys_seen={} keys_visible={} keys_enabled={} keys_eligible={} layout_valid={} visibility_fallback={} keypad_ready={}",
+        state.native_lock,
+        state.visible_lock,
+        diag.snapshot_ms,
+        diag.field_seen,
+        diag.field_visible,
+        diag.field_enabled,
+        diag.field_accepted,
+        diag.keys_seen,
+        diag.keys_visible,
+        diag.keys_enabled,
+        diag.keys_eligible,
+        diag.layout_valid,
+        diag.visibility_fallback,
+        state.keypad_ready,
+    );
+    if supervised {
+        let progress = state
+            .secure_field_value
+            .as_deref()
+            .and_then(|value| handkite_core::passcode::PasscodeProgress::parse(value, 6).ok())
+            .ok_or("six-digit progress unavailable")?;
+        if state.native_lock != LockState::Locked
+            || state.visible_lock != LockState::Locked
+            || state.wda_lock != LockState::Locked
+            || !state.keypad_ready
+            || state.before_first_unlock
+            || state.trust_prompt
+            || progress.entered != 0
+        {
+            return Err("supervised PIN preflight failed".into());
+        }
+        println!("pin_preflight=ready progress=0/6");
     }
     Ok(())
 }
