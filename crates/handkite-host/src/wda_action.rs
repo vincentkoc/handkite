@@ -54,6 +54,28 @@ impl WdaActions {
         Self::execute_on(wda, action, session).await
     }
 
+    /// A coordinate tap through WDA's dedicated endpoint. Qualify on harmless UI
+    /// before selecting it for passcode entry.
+    pub async fn tap_existing(
+        &self,
+        wda: &UsbWda,
+        at: Point,
+    ) -> Result<TransportReceipt, AdapterError> {
+        let session = self.session.as_deref().ok_or(AdapterError)?;
+        let body = coordinate_tap_payload(at)?;
+        let path = format!("/session/{session}/wda/tap/0");
+        let body = serde_json::to_vec(&body).map_err(|_| AdapterError)?;
+        let response = wda
+            .request("POST", &path, &body, Duration::from_secs(30))
+            .await
+            .map_err(|_| AdapterError)?;
+        response_ok(response)?;
+        Ok(TransportReceipt {
+            accepted: true,
+            action_kind: "tap".into(),
+        })
+    }
+
     pub async fn wake_hid_existing(&self, wda: &UsbWda) -> Result<(), AdapterError> {
         let session = self.session.as_deref().ok_or(AdapterError)?;
         let path = format!("/session/{session}/wda/performIoHidEvent");
@@ -135,6 +157,12 @@ fn point_valid(point: Point) -> bool {
         && (0.0..=10_000.0).contains(&point.y)
 }
 
+fn coordinate_tap_payload(at: Point) -> Result<Value, AdapterError> {
+    point_valid(at)
+        .then(|| json!({"x": at.x, "y": at.y}))
+        .ok_or(AdapterError)
+}
+
 fn touch_action(steps: Vec<Value>) -> Value {
     json!({"actions": [{"type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"}, "actions": steps}]})
 }
@@ -203,6 +231,17 @@ mod tests {
 
     #[test]
     fn invalid_coordinates_never_reach_wda() {
+        assert_eq!(
+            coordinate_tap_payload(Point { x: 120.0, y: 240.0 }).unwrap(),
+            json!({"x": 120.0, "y": 240.0})
+        );
+        assert!(
+            coordinate_tap_payload(Point {
+                x: f64::NAN,
+                y: 0.0
+            })
+            .is_err()
+        );
         assert!(
             payload(&Action::Tap {
                 at: Point {
