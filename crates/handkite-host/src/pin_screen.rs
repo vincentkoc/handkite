@@ -97,8 +97,20 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
             b"y" => y = decoded.parse::<f64>().ok(),
             b"width" => width = decoded.parse::<f64>().ok(),
             b"height" => height = decoded.parse::<f64>().ok(),
-            b"visible" => visible = Some(decoded == "true"),
-            b"enabled" => enabled = Some(decoded == "true"),
+            b"visible" => {
+                visible = match decoded.as_ref() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }
+            }
+            b"enabled" => {
+                enabled = match decoded.as_ref() {
+                    "true" => Some(true),
+                    "false" => Some(false),
+                    _ => None,
+                }
+            }
             _ => {}
         }
     }
@@ -441,6 +453,8 @@ mod tests {
 
         let missing = all_false.replacen("visible=\"false\"", "", 1);
         assert!(!parse(&missing).unwrap().visibility_fallback);
+        let malformed = all_false.replacen("visible=\"false\"", "visible=\"unknown\"", 1);
+        assert!(!parse(&malformed).unwrap().visibility_fallback);
         let mixed = all_false.replacen("visible=\"false\"", "visible=\"true\"", 1);
         assert!(!parse(&mixed).unwrap().visibility_fallback);
         let disabled = all_false.replacen("enabled=\"true\"", "enabled=\"false\"", 1);
