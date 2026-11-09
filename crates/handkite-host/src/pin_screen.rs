@@ -7,6 +7,7 @@ const ALIGN_TOLERANCE: f64 = 12.0;
 
 pub struct ParsedPasscodeView {
     pub visible_lock: LockState,
+    pub screen_size: Option<(f64, f64)>,
     pub secure_field_value: Option<String>,
     pub keypad: Option<[Point; 10]>,
     pub delete_key: Option<Point>,
@@ -19,7 +20,9 @@ struct Node {
     kind: String,
     name: Option<String>,
     value: Option<String>,
+    bundle_id: Option<String>,
     point: Option<Point>,
+    size: Option<(f64, f64)>,
 }
 
 fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseError> {
@@ -28,6 +31,7 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
         .to_owned();
     let mut name = None;
     let mut value = None;
+    let mut bundle_id = None;
     let mut x = None;
     let mut y = None;
     let mut width = None;
@@ -40,6 +44,7 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
         match attribute.key.as_ref() {
             b"name" => name = Some(decoded.into_owned()),
             b"value" => value = Some(decoded.into_owned()),
+            b"bundleId" => bundle_id = Some(decoded.into_owned()),
             b"x" => x = decoded.parse::<f64>().ok(),
             b"y" => y = decoded.parse::<f64>().ok(),
             b"width" => width = decoded.parse::<f64>().ok(),
@@ -62,11 +67,21 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
         }
         _ => None,
     };
+    let size = match (width, height) {
+        (Some(width), Some(height))
+            if width.is_finite() && height.is_finite() && width > 0.0 && height > 0.0 =>
+        {
+            Some((width, height))
+        }
+        _ => None,
+    };
     Ok(Node {
         kind,
         name,
         value,
+        bundle_id,
         point,
+        size,
     })
 }
 
@@ -103,10 +118,20 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     let mut field_seen = false;
     let mut buttons = Vec::new();
     let mut lock_marker = false;
+    let mut screen_size = None;
+    let mut foreground_app = None;
+    let mut home_icons = 0_usize;
     loop {
         match reader.read_event().map_err(|_| ParseError)? {
             Event::Start(element) | Event::Empty(element) => {
                 let node = node(&reader, &element)?;
+                if node.kind == "XCUIElementTypeApplication" && screen_size.is_none() {
+                    screen_size = node.size;
+                    foreground_app = node.bundle_id.clone();
+                }
+                if node.kind == "XCUIElementTypeIcon" {
+                    home_icons += 1;
+                }
                 if node.name.as_deref().is_some_and(|name| {
                     matches!(
                         name,
@@ -153,9 +178,16 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     Ok(ParsedPasscodeView {
         visible_lock: if lock_marker || field.is_some() {
             LockState::Locked
+        } else if foreground_app
+            .as_deref()
+            .is_some_and(|app| app != "com.apple.springboard")
+            || home_icons > 0
+        {
+            LockState::Unlocked
         } else {
             LockState::Uncertain
         },
+        screen_size,
         secure_field_value: field,
         keypad,
         delete_key,
@@ -189,6 +221,28 @@ mod tests {
         assert_eq!(parsed.secure_field_value.as_deref(), Some("0 of 6 digits"));
         assert!(parsed.keypad.is_some());
         assert!(parsed.delete_key.is_some());
+    }
+
+    #[test]
+    fn app_or_home_icons_confirm_visible_unlock() {
+        assert_eq!(
+            parse("<XCUIElementTypeApplication bundleId=\"com.apple.mobiletimer\"/>")
+                .unwrap()
+                .visible_lock,
+            LockState::Unlocked
+        );
+        assert_eq!(
+            parse("<XCUIElementTypeApplication bundleId=\"com.apple.springboard\"><XCUIElementTypeIcon/></XCUIElementTypeApplication>")
+                .unwrap()
+                .visible_lock,
+            LockState::Unlocked
+        );
+        assert_eq!(
+            parse("<XCUIElementTypeApplication bundleId=\"com.apple.springboard\"/>")
+                .unwrap()
+                .visible_lock,
+            LockState::Uncertain
+        );
     }
 
     #[test]
