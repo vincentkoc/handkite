@@ -51,7 +51,14 @@ where
             Ok(value) => value,
             Err(_) => continue,
         };
-        if let Some(response) = process(&request, device, &mut exchange) {
+        let response = if request["method"] == "tools/call" && !valid_tool_frame(&line) {
+            request
+                .get("id")
+                .map(|id| error(id.clone(), -32602, "invalid tool call"))
+        } else {
+            process(&request, device, &mut exchange)
+        };
+        if let Some(response) = response {
             let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
             if bytes.len() > MAX_RESPONSE {
                 return Err(io::Error::new(
@@ -129,6 +136,52 @@ struct ToolCall {
     name: String,
     #[serde(default = "empty_arguments")]
     arguments: Value,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RevisionArguments {
+    #[serde(rename = "expected_revision")]
+    _revision: handkite_core::protocol::Revision,
+}
+
+// Validate the raw frame as well: decoding to Value alone discards duplicate keys.
+fn valid_tool_frame(bytes: &[u8]) -> bool {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Envelope<'a> {
+        #[serde(rename = "jsonrpc")]
+        _jsonrpc: String,
+        #[serde(rename = "id")]
+        _id: Value,
+        #[serde(rename = "method")]
+        _method: String,
+        #[serde(borrow)]
+        params: Arguments<'a>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Arguments<'a> {
+        name: String,
+        #[serde(borrow)]
+        arguments: Option<&'a serde_json::value::RawValue>,
+    }
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Empty {}
+
+    let Ok(envelope) = serde_json::from_slice::<Envelope<'_>>(bytes) else {
+        return false;
+    };
+    let arguments = envelope.params.arguments.map_or("{}", |raw| raw.get());
+    if matches!(
+        envelope.params.name.as_str(),
+        "handkite_home" | "handkite_launch_clock"
+    ) {
+        serde_json::from_str::<RevisionArguments>(arguments).is_ok()
+    } else {
+        serde_json::from_str::<Empty>(arguments).is_ok()
+    }
 }
 
 fn empty_arguments() -> Value {
@@ -305,6 +358,28 @@ mod tests {
                 process(&request, &device, &mut exchange).unwrap()["error"]["code"],
                 -32600
             );
+        }
+    }
+    #[test]
+    fn duplicate_fields_are_rejected_before_socket_dispatch() {
+        for input in [
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_home","arguments":{"expected_revision":1,"expected_revision":2}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_status","name":"handkite_acquire_control","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"id":2,"method":"tools/call","params":{"name":"handkite_acquire_control","arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_acquire_control","arguments":{},"arguments":{}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_home","arguments":{"expected_revision":18446744073709551616}}}"#,
+            r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"handkite_home","arguments":{"expected_revision":1.0}}}"#,
+        ] {
+            let mut output = Vec::new();
+            serve(
+                Cursor::new(format!("{input}\n")),
+                &mut output,
+                &DeviceKey::new("phone").unwrap(),
+                |_| panic!("duplicate field reached socket"),
+            )
+            .unwrap();
+            let reply: Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(reply["error"]["code"], -32602);
         }
     }
 }
