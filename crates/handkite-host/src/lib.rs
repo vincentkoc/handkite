@@ -2,6 +2,7 @@
 
 pub mod file_gate;
 pub mod host_config;
+pub mod local_socket;
 pub mod usb;
 pub mod wda_action;
 pub mod wda_adapter;
