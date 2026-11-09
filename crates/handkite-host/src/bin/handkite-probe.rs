@@ -18,6 +18,8 @@ use std::time::Duration;
 mod clock_attrs;
 #[path = "probe/lock_ui_attrs.rs"]
 mod lock_ui_attrs;
+#[path = "probe/normal_lock_attrs.rs"]
+mod normal_lock_attrs;
 #[path = "probe/reveal_keypad.rs"]
 mod reveal_keypad;
 #[path = "probe/touch_trial.rs"]
@@ -25,6 +27,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "normal-lock-attrs") {
+        if let Err(error) = normal_lock_attrs::command(&args[1..]) {
+            eprintln!("normal_lock_attrs={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "reveal-keypad") {
         if let Err(error) = reveal_keypad::command(&args[1..]) {
             eprintln!("reveal_keypad={error}");

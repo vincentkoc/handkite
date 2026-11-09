@@ -155,6 +155,22 @@ fn wda_locked(device: &mut impl ReadDevice) -> Result<(), Refusal> {
 }
 
 fn inspect(device: &mut impl ReadDevice) -> Result<Summary, Refusal> {
+    inspect_with(device, parse)
+}
+
+pub(super) fn with_locked_xml<T>(
+    expected: HardwareId,
+    parse: impl FnOnce(&str) -> Result<T, ()>,
+) -> Result<T, &'static str> {
+    let mut live = Live::new(expected).map_err(Refusal::message)?;
+    inspect_with(&mut live, |xml| parse(xml).map_err(|_| Refusal::Capture))
+        .map_err(Refusal::message)
+}
+
+fn inspect_with<T>(
+    device: &mut impl ReadDevice,
+    parse: impl FnOnce(&str) -> Result<T, Refusal>,
+) -> Result<T, Refusal> {
     device.identity()?;
     native_locked(device.native())?;
     let before = session(device)?;

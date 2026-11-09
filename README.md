@@ -181,6 +181,12 @@ control flow only; live touch delivery and PIN entry remain unqualified.
 
 ## PIN stop gate
 
+`handkite-probe normal-lock-attrs --config PRIVATE_FILE` is a read-only aid for
+diagnosing a normal-lock-screen refusal. It reports only fixed Application and
+proud-lock categories, prohibited-element presence, and geometry validity after
+the existing pinned-device/session and lock checks. It sends no input and
+prints or saves no screenshot/XML. Its output does not relax the reveal guard.
+
 `handkite-probe reveal-keypad --config PRIVATE_FILE` is a separate one-shot
 diagnostic that sends USB keyboard Return only after two distinct fresh captures
 whose accessibility trees identify a normal lock screen. Both require the pinned
