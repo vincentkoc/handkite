@@ -6,6 +6,7 @@ pub mod local_client;
 pub mod local_socket;
 pub mod native_lock;
 pub mod pin_backend;
+pub mod pin_input;
 pub mod pin_screen;
 pub mod usb;
 pub mod wda_action;
