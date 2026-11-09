@@ -14,7 +14,18 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+#[path = "probe/touch_trial.rs"]
+mod touch_trial;
+
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "touch-trial") {
+        if let Err(error) = touch_trial::command(&args[1..]) {
+            eprintln!("touch_trial={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let expected = match std::env::var("HANDKITE_DEVICE_UDID")
         .ok()
         .and_then(|value| HardwareId::new(value).ok())

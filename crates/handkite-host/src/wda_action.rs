@@ -35,6 +35,10 @@ pub struct WdaActions {
 }
 
 impl WdaActions {
+    pub fn prepared_session_matches(&self, expected: &str) -> bool {
+        self.session.as_deref() == Some(expected)
+    }
+
     pub async fn prepare_existing(&mut self, wda: &UsbWda) -> Result<(), AdapterError> {
         self.validate_existing(wda).await
     }
@@ -89,6 +93,14 @@ impl WdaActions {
         at: Point,
     ) -> Result<TransportReceipt, AdapterError> {
         let session = self.session.as_deref().ok_or(AdapterError)?;
+        Self::tap_on(wda, session, at).await
+    }
+
+    async fn tap_on(
+        wda: &impl WdaRequest,
+        session: &str,
+        at: Point,
+    ) -> Result<TransportReceipt, AdapterError> {
         let body = coordinate_tap_payload(at)?;
         let path = format!("/session/{session}/wda/tap/0");
         let body = serde_json::to_vec(&body).map_err(|_| AdapterError)?;
@@ -224,11 +236,11 @@ mod tests {
         response: Result<HttpResponse, WdaError>,
     }
 
-    struct Script(RefCell<VecDeque<Step>>);
+    struct Script(RefCell<VecDeque<Step>>, Option<Value>);
 
     impl Script {
         fn new(steps: Vec<Step>) -> Self {
-            Self(RefCell::new(steps.into()))
+            Self(RefCell::new(steps.into()), None)
         }
 
         fn done(&self) {
@@ -255,7 +267,7 @@ mod tests {
             } else {
                 assert_eq!(
                     serde_json::from_slice::<Value>(body).unwrap(),
-                    json!({"name": "home"})
+                    self.1.clone().unwrap_or_else(|| json!({"name": "home"}))
                 );
             }
             step.response
@@ -469,5 +481,43 @@ mod tests {
             })
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn touch_transports_send_exactly_one_post_even_when_acknowledgment_is_lost() {
+        let point = Point { x: 250.0, y: 740.0 };
+        let w3c = json!({"actions": [{"type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"}, "actions": [
+            {"type": "pointerMove", "duration": 0, "x": 250.0, "y": 740.0},
+            {"type": "pointerDown", "button": 0},
+            {"type": "pause", "duration": 80},
+            {"type": "pointerUp", "button": 0}
+        ]}]});
+        for coordinate in [false, true] {
+            for lost in [false, true] {
+                let path = if coordinate {
+                    "/session/fixture-session/wda/tap/0"
+                } else {
+                    "/session/fixture-session/actions"
+                };
+                let mut step = response("POST", path, 200, json!({"value": null}));
+                if lost {
+                    step.response = Err(WdaError::AfterSent);
+                }
+                let mut wda = Script::new(vec![step]);
+                wda.1 = Some(if coordinate {
+                    json!({"x": 250.0, "y": 740.0})
+                } else {
+                    w3c.clone()
+                });
+                let result = if coordinate {
+                    WdaActions::tap_on(&wda, "fixture-session", point).await
+                } else {
+                    WdaActions::execute_on(&wda, &Action::Tap { at: point }, "fixture-session")
+                        .await
+                };
+                assert_eq!(result.is_err(), lost);
+                wda.done();
+            }
+        }
     }
 }

@@ -129,6 +129,47 @@ remain external inputs; this path pin does not qualify them.
 
 `handkite-doctor --config /path/to/config.json` checks the pinned USB device, WDA status, the existing WDA session, and native lock state. It reports only readiness flags and lock state as JSON; it does not create a WDA session or send device input. Exit code 0 means the locked or unlocked phone can be observed. It does not mean app actions or PIN entry are qualified.
 
+## One-shot Clock touch diagnostic
+
+An explicitly supervised trial can run
+`handkite-probe touch-trial --config /path/to/config.json --transport w3c`
+or select `coordinate` instead. This command sends input when its preconditions
+pass. The explicit regular mode-0600 config pins the USB identity through
+`host_config::load`; this diagnostic does not use the ambient device environment
+variable or establish protected service-config custody.
+
+Manually leave the unlocked phone in the English Clock app with World Clock
+selected. The probe requires ready WDA, a validated unchanged existing session,
+matching pinned USB identity, native and WDA unlocked state, and two fresh
+screenshot/tree captures with stable Stopwatch tab geometry. Its separate
+attribute-rich tree retains `visible`, `enabled`, and `selected`; ordinary
+controller observations keep their existing projection. Capture windows must
+be at most ten seconds, and the paired evidence must be at most two seconds old
+after the final identity, session, and native checks. Missing attributes, alerts,
+secure fields, lock markers, ambiguous geometry, or an already selected Stopwatch
+tab refuse input.
+
+The capture also carries an absolute monotonic expiry into the selected input
+transport. Discovery and connection time consume that budget. Expiry is checked
+immediately before each socket write poll; an expired connection sends no POST
+bytes. Expiry after a partial write leaves delivery unknown and never retries.
+
+The selected transport sends one tap at the tab's accessibility-coordinate
+center. One post-action paired capture must show Stopwatch selected, World Clock
+unselected, and visible enabled Start content, with the same device/session and
+unlocked state. This uses accessibility evidence alongside the screenshot; it
+does not perform image recognition. A receipt alone is insufficient. Output is
+limited to fixed status words and the selected transport: exit 0 confirms the
+observed result, while exit 1 reports invalid arguments/config, refusal before
+input, or an unknown result after dispatch. Lost acknowledgment remains unknown
+even if the postcheck succeeds. No screen content, identifiers, or captures are
+printed or retained.
+
+There is no automatic retry, transport fallback, app launch, session creation,
+PIN input, stop-marker change, or service installation. A separate invocation
+requires fresh operator judgment. Offline fixtures qualify this command's
+control flow only; live touch delivery and PIN entry remain unqualified.
+
 ## PIN stop gate
 
 `handkite-unlock-once --config /path/to/config.json [--supervised-visibility-fallback]` accepts only the fixed device key `iphone`. Its stop marker is `Library/Application Support/Handkite/state/iphone/UNLOCK-DISABLED` under the effective user's OS account home, resolved with `getpwuid_r`, independent of `HOME` and the working directory. There is no `--state-dir` override.

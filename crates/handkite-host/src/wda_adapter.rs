@@ -9,9 +9,10 @@ use handkite_core::protocol::{
     Action, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, ScreenImage,
     TransportReceipt,
 };
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=visible,accessible,focused,enabled,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
+const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 
 pub struct WdaAdapter {
     expected: HardwareId,
@@ -37,12 +38,13 @@ impl WdaAdapter {
     async fn capture(
         usb: &PinnedUsb,
         expected: &HardwareId,
-    ) -> Result<RawObservation, AdapterError> {
+        source_path: &str,
+    ) -> Result<(RawObservation, Instant), AdapterError> {
         let started_unix_ms = unix_ms()?;
         let wda = UsbWda::new(usb.clone());
         let (image, source, app, reported_lock) = tokio::join!(
             wda.request("GET", "/screenshot", b"", Duration::from_secs(20)),
-            wda.request("GET", SCREEN_SOURCE, b"", Duration::from_secs(20)),
+            wda.request("GET", source_path, b"", Duration::from_secs(20)),
             wda.request("GET", "/wda/activeAppInfo", b"", Duration::from_secs(10)),
             wda.request("GET", "/wda/locked", b"", Duration::from_secs(10)),
         );
@@ -68,7 +70,8 @@ impl WdaAdapter {
             .ok_or(AdapterError)?
             .to_owned();
         let lock = classify_lock(&app, &tree, reported_lock.as_bool());
-        Ok(RawObservation {
+        let finished = Instant::now();
+        let observation = RawObservation {
             connected_usb: expected.clone(),
             wda_target: expected.clone(),
             window: ObservationWindow {
@@ -85,7 +88,16 @@ impl WdaAdapter {
                 format: ImageFormat::Png,
                 bytes: screenshot,
             },
-        })
+        };
+        Ok((observation, finished))
+    }
+
+    /// Diagnostic capture retaining visibility, enabled and selected attributes.
+    /// The monotonic completion anchor bounds later diagnostic input freshness.
+    /// Ordinary controller observations continue to use the smaller projection.
+    pub fn observe_with_attributes(&mut self) -> Result<(RawObservation, Instant), AdapterError> {
+        self.runtime
+            .block_on(Self::capture(&self.usb, &self.expected, ATTRIBUTE_SOURCE))
     }
 }
 
@@ -99,7 +111,8 @@ impl DeviceAdapter for WdaAdapter {
 
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
         self.runtime
-            .block_on(Self::capture(&self.usb, &self.expected))
+            .block_on(Self::capture(&self.usb, &self.expected, SCREEN_SOURCE))
+            .map(|(observation, _)| observation)
     }
 
     fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
