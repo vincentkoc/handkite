@@ -13,6 +13,7 @@ pub mod pin_backend;
 pub mod pin_input;
 pub mod pin_screen;
 pub mod release_manifest;
+pub mod release_signer;
 pub mod service_layout;
 pub mod service_lock;
 pub mod unlock_state;
