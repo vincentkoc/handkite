@@ -2,6 +2,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+pub mod apple;
 mod tls;
 mod transport;
 pub use tls::AnisetteIdentity;
