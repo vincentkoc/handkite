@@ -1,4 +1,6 @@
 use super::*;
+use std::cell::RefCell;
+use std::rc::Rc;
 
 const CORRECT: [u8; 6] = [1, 2, 3, 4, 5, 6];
 
@@ -7,6 +9,8 @@ struct MemoryGate {
     disabled: bool,
     marks: usize,
     clears: usize,
+    fail_mark: bool,
+    events: Rc<RefCell<Vec<&'static str>>>,
 }
 
 impl AttemptGate for MemoryGate {
@@ -15,16 +19,31 @@ impl AttemptGate for MemoryGate {
     }
 
     fn mark_uncertain(&mut self) -> Result<(), GateError> {
+        if self.fail_mark {
+            return Err(GateError);
+        }
         self.disabled = true;
         self.marks += 1;
+        self.events.borrow_mut().push("mark");
         Ok(())
     }
 
     fn clear(&mut self) -> Result<(), GateError> {
         self.disabled = false;
         self.clears += 1;
+        self.events.borrow_mut().push("clear");
         Ok(())
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DeleteEffect {
+    Normal,
+    DisconnectAfter,
+    Unknown,
+    Failed,
+    Doubled,
+    Delayed,
 }
 
 struct FakePhone {
@@ -45,8 +64,12 @@ struct FakePhone {
     double_at: Option<usize>,
     disconnect_at: Option<usize>,
     early_unlock_at: Option<usize>,
+    delete_effect: DeleteEffect,
+    field_value: Option<&'static str>,
+    deletes: usize,
     presses: usize,
     failed_attempts: usize,
+    events: Rc<RefCell<Vec<&'static str>>>,
 }
 
 impl FakePhone {
@@ -70,8 +93,12 @@ impl FakePhone {
             double_at: None,
             disconnect_at: None,
             early_unlock_at: None,
+            delete_effect: DeleteEffect::Normal,
+            field_value: None,
+            deletes: 0,
             presses: 0,
             failed_attempts: 0,
+            events: Rc::default(),
         }
     }
 
@@ -102,7 +129,9 @@ impl PasscodeBackend for FakePhone {
         };
         let count = self.input.len();
         let secure_field_value = (self.keypad && self.locked).then(|| {
-            if self.entered_first {
+            if let Some(value) = self.field_value {
+                value.to_owned()
+            } else if self.entered_first {
                 format!("{count} of 6 digits")
             } else {
                 format!("6-digit passcode, {count} entered")
@@ -136,6 +165,7 @@ impl PasscodeBackend for FakePhone {
 
     fn press_digit(&mut self, digit: u8) -> Result<(), BackendError> {
         self.presses += 1;
+        self.events.borrow_mut().push("press");
         if self.drop_at == Some(self.presses) {
             return Ok(());
         }
@@ -157,8 +187,24 @@ impl PasscodeBackend for FakePhone {
     }
 
     fn delete_digit(&mut self) -> Result<(), BackendError> {
-        self.input.pop();
-        Ok(())
+        self.deletes += 1;
+        self.events.borrow_mut().push("delete");
+        match self.delete_effect {
+            DeleteEffect::Failed => Err(BackendError::Unavailable),
+            DeleteEffect::Delayed => Ok(()),
+            effect => {
+                self.input.pop();
+                match effect {
+                    DeleteEffect::Unknown => return Err(BackendError::Unavailable),
+                    DeleteEffect::DisconnectAfter => self.disconnected = true,
+                    DeleteEffect::Doubled => {
+                        self.input.pop();
+                    }
+                    _ => {}
+                }
+                Ok(())
+            }
+        }
     }
 }
 
@@ -182,6 +228,7 @@ fn run(
     code: &str,
 ) -> Result<UnlockOutcome, UnlockError> {
     let (binding, key, policy) = fixture();
+    phone.events = Rc::clone(&gate.events);
     unlock_once(
         phone,
         gate,
@@ -298,7 +345,116 @@ fn residual_input_is_cleared_before_the_first_new_digit() {
         run(&mut phone, &mut gate, "123456"),
         Ok(UnlockOutcome::CodeSubmitted)
     );
+    assert_eq!(phone.deletes, 2);
     assert_eq!(phone.presses, 6);
+    assert_eq!(phone.failed_attempts, 0);
+    assert!(!phone.locked);
+    assert!(!gate.disabled);
+    assert_eq!((gate.marks, gate.clears), (1, 1));
+    assert_eq!(
+        *gate.events.borrow(),
+        [
+            "mark", "delete", "delete", "press", "press", "press", "press", "press", "press",
+            "clear"
+        ]
+    );
+}
+
+#[test]
+fn residual_delete_faults_keep_the_gate_disabled_without_submitting_or_retrying() {
+    for (effect, expected, remaining) in [
+        (
+            DeleteEffect::DisconnectAfter,
+            UnlockError::Backend(BackendError::Disconnected),
+            1,
+        ),
+        (
+            DeleteEffect::Unknown,
+            UnlockError::Backend(BackendError::Unavailable),
+            1,
+        ),
+        (
+            DeleteEffect::Failed,
+            UnlockError::Backend(BackendError::Unavailable),
+            2,
+        ),
+        (DeleteEffect::Doubled, UnlockError::ResidualInput, 0),
+        (DeleteEffect::Delayed, UnlockError::ResidualInput, 2),
+    ] {
+        let mut phone = FakePhone::new();
+        phone.input = vec![9, 9];
+        phone.delete_effect = effect;
+        let mut gate = MemoryGate::default();
+        assert_eq!(run(&mut phone, &mut gate, "123456"), Err(expected));
+        assert_eq!(phone.input.len(), remaining, "{effect:?}");
+        assert_eq!(
+            (phone.deletes, phone.presses, phone.failed_attempts),
+            (1, 0, 0)
+        );
+        assert!(gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (1, 0));
+        assert_eq!(*gate.events.borrow(), ["mark", "delete"]);
+
+        if matches!(effect, DeleteEffect::Delayed) {
+            phone.input.pop();
+        }
+        phone.disconnected = false;
+        phone.delete_effect = DeleteEffect::Normal;
+        assert_eq!(
+            run(&mut phone, &mut gate, "123456"),
+            Err(UnlockError::Disabled)
+        );
+        assert_eq!(
+            (phone.deletes, phone.presses, phone.failed_attempts),
+            (1, 0, 0)
+        );
+        assert!(gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (1, 0));
+        assert_eq!(*gate.events.borrow(), ["mark", "delete"]);
+    }
+}
+
+#[test]
+fn marker_persistence_failure_prevents_delete_and_digit_input() {
+    for residual in [vec![], vec![9, 9]] {
+        let mut phone = FakePhone::new();
+        phone.input = residual.clone();
+        let mut gate = MemoryGate {
+            fail_mark: true,
+            ..MemoryGate::default()
+        };
+        assert_eq!(run(&mut phone, &mut gate, "123456"), Err(UnlockError::Gate));
+        assert_eq!(phone.input, residual);
+        assert_eq!(
+            (phone.deletes, phone.presses, phone.failed_attempts),
+            (0, 0, 0)
+        );
+        assert!(!gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (0, 0));
+        assert!(gate.events.borrow().is_empty());
+    }
+}
+
+#[test]
+fn unreadable_or_wrong_length_progress_does_not_mark_or_modify_the_field() {
+    for (value, expected) in [
+        ("unreadable", UnlockError::UnreadableProgress),
+        (
+            "4-digit passcode, 2 entered",
+            UnlockError::LengthMismatch { observed_total: 4 },
+        ),
+    ] {
+        let mut phone = FakePhone::new();
+        phone.input = vec![9, 9];
+        phone.field_value = Some(value);
+        let mut gate = MemoryGate::default();
+        assert_eq!(run(&mut phone, &mut gate, "123456"), Err(expected));
+        assert_eq!(phone.input, [9, 9]);
+        assert_eq!((phone.deletes, phone.presses), (0, 0));
+        assert!(!gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (0, 0));
+        assert!(gate.events.borrow().is_empty());
+    }
 }
 
 #[test]
@@ -356,6 +512,9 @@ fn ambiguous_screen_and_second_phone_block_before_input() {
         Err(UnlockError::ManualRequired)
     );
     assert_eq!(phone.presses, 0);
+    assert_eq!(phone.deletes, 0);
+    assert!(!gate.disabled);
+    assert_eq!((gate.marks, gate.clears), (0, 0));
 
     phone.ambiguous = false;
     phone.usb = HardwareId::new("fixture-phone-b").unwrap();
@@ -364,6 +523,9 @@ fn ambiguous_screen_and_second_phone_block_before_input() {
         Err(UnlockError::DeviceMismatch)
     );
     assert_eq!(phone.presses, 0);
+    assert_eq!(phone.deletes, 0);
+    assert!(!gate.disabled);
+    assert_eq!((gate.marks, gate.clears), (0, 0));
 }
 
 #[test]
@@ -378,7 +540,9 @@ fn first_unlock_and_trust_prompts_require_a_person() {
             Err(UnlockError::ManualRequired)
         );
         assert_eq!(phone.presses, 0);
+        assert_eq!(phone.deletes, 0);
         assert!(!gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (0, 0));
     }
 }
 
@@ -406,4 +570,7 @@ fn stale_wda_flag_does_not_enter_a_code_on_an_unlocked_phone() {
         Ok(UnlockOutcome::AlreadyUnlocked)
     );
     assert_eq!(phone.presses, 0);
+    assert_eq!(phone.deletes, 0);
+    assert!(!gate.disabled);
+    assert_eq!((gate.marks, gate.clears), (0, 0));
 }

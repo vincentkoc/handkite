@@ -204,7 +204,7 @@ enum FinalState {
     Incomplete,
 }
 
-/// Submit one supplied code at most once. A possible submission leaves the gate disabled.
+/// Submit one supplied code at most once. Uncertain field input leaves the gate disabled.
 pub fn unlock_once<B: PasscodeBackend, G: AttemptGate>(
     backend: &mut B,
     gate: &mut G,
@@ -233,6 +233,7 @@ pub fn unlock_once<B: PasscodeBackend, G: AttemptGate>(
         return Err(UnlockError::NoKeypad);
     }
     let mut field = progress(&screen, code.len())?.ok_or(UnlockError::UnreadableProgress)?;
+    gate.mark_uncertain()?;
     while field.entered > 0 {
         backend.delete_digit()?;
         match wait_for_count(
@@ -248,7 +249,6 @@ pub fn unlock_once<B: PasscodeBackend, G: AttemptGate>(
         }
     }
 
-    gate.mark_uncertain()?;
     for index in 0..code.len() as usize {
         backend.press_digit(code.digit(index))?;
         let before = index as u32;
