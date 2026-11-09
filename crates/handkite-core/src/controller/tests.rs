@@ -121,6 +121,39 @@ fn controller() -> (Controller<FakeAdapter>, DeviceKey) {
 }
 
 #[test]
+fn lease_token_is_opaque_and_a_guess_cannot_take_control() {
+    let (controller, key) = controller();
+    let first = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    let token = serde_json::to_value(first).unwrap();
+    assert_eq!(token.as_str().unwrap().len(), 32);
+    assert!(!format!("{first:?}").contains(token.as_str().unwrap()));
+
+    let guess = LeaseId::try_from("00000000000000000000000000000001".to_owned()).unwrap();
+    let request = ActionRequest {
+        device: key,
+        expected_revision: None,
+        action: Action::Home,
+    };
+    assert_eq!(
+        controller.act("agent", guess, request).err(),
+        Some(ControllerError::InvalidLease)
+    );
+    assert_eq!(
+        controller.release("agent", guess),
+        Err(ControllerError::InvalidLease)
+    );
+    assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+
+    controller.release("agent", first).unwrap();
+    let second = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    assert_ne!(first, second);
+}
+
+#[test]
 fn lease_rejects_a_competing_owner_and_a_stale_revision() {
     let (controller, key) = controller();
     let owner = "agent-a";

@@ -139,6 +139,23 @@ mod tests {
     }
 
     #[test]
+    fn wire_requires_a_canonical_opaque_lease_token() {
+        for lease in [
+            "1",
+            "\"1\"",
+            "\"0000000000000000000000000000000G\"",
+            "\"0000000000000000000000000000000A\"",
+        ] {
+            let request =
+                format!("{{\"method\":\"release\",\"owner\":\"agent\",\"lease\":{lease}}}");
+            assert!(serde_json::from_str::<Request>(&request).is_err());
+        }
+        let request =
+            r#"{"method":"release","owner":"agent","lease":"0123456789abcdef0123456789abcdef"}"#;
+        assert!(serde_json::from_str::<Request>(request).is_ok());
+    }
+
+    #[test]
     fn screenshot_is_base64_not_a_byte_array() {
         let observation = Observation {
             device: DeviceKey::new("phone").unwrap(),

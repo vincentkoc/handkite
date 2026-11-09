@@ -28,14 +28,44 @@ pub trait DeviceAdapter {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(transparent)]
-pub struct LeaseId(u64);
+#[derive(Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct LeaseId(u128);
+
+impl std::fmt::Debug for LeaseId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("LeaseId([redacted])")
+    }
+}
+
+impl TryFrom<String> for LeaseId {
+    type Error = &'static str;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        if value.len() != 32
+            || !value
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+        {
+            return Err("invalid lease token");
+        }
+        u128::from_str_radix(&value, 16)
+            .map(Self)
+            .map_err(|_| "invalid lease token")
+    }
+}
+
+impl From<LeaseId> for String {
+    fn from(value: LeaseId) -> Self {
+        format!("{:032x}", value.0)
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerError {
     Busy,
     InvalidLease,
+    Randomness,
     DeviceMismatch,
     StaleRevision,
     LockedAction,
@@ -57,7 +87,6 @@ struct Inner<A> {
     last: Option<Observation>,
     revision: Revision,
     lease: Option<Lease>,
-    next_lease: u64,
 }
 
 /// Serializes all device access. Authentication of the caller precedes this controller.
@@ -79,7 +108,6 @@ impl<A: DeviceAdapter> Controller<A> {
                 last: None,
                 revision: Revision(0),
                 lease: None,
-                next_lease: 0,
             }),
         }
     }
@@ -96,11 +124,9 @@ impl<A: DeviceAdapter> Controller<A> {
         {
             return Err(ControllerError::Busy);
         }
-        inner.next_lease = inner
-            .next_lease
-            .checked_add(1)
-            .ok_or(ControllerError::InvalidLease)?;
-        let id = LeaseId(inner.next_lease);
+        let mut token = [0_u8; 16];
+        getrandom::fill(&mut token).map_err(|_| ControllerError::Randomness)?;
+        let id = LeaseId(u128::from_be_bytes(token));
         inner.lease = Some(Lease {
             id,
             owner,
