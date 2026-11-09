@@ -1,6 +1,7 @@
 use crate::protocol::{
     Action, ActionRequest, ActionResult, DeviceBinding, DeviceKey, DeviceState, HardwareId,
-    Observation, ObservationWindow, ObservedEffect, Revision, ScreenImage, TransportReceipt,
+    LockState, Observation, ObservationWindow, ObservedEffect, Revision, ScreenImage,
+    TransportReceipt,
 };
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,6 +33,7 @@ pub enum ControllerError {
     InvalidLease,
     DeviceMismatch,
     StaleRevision,
+    LockedAction,
     StaleObservation,
     InvalidObservationWindow,
     RevisionExhausted,
@@ -143,6 +145,22 @@ impl<A: DeviceAdapter> Controller<A> {
             .verify(&request.device, &usb, &wda)
             .map_err(|_| ControllerError::DeviceMismatch)?;
 
+        let fresh = self.capture(&mut inner, &request.device)?;
+        if request.expected_revision.is_some()
+            && inner
+                .last
+                .as_ref()
+                .is_some_and(|last| !same_view(last, &fresh))
+        {
+            inner.last = Some(fresh);
+            return Err(ControllerError::StaleRevision);
+        }
+        if !matches!(&request.action, Action::Home) && fresh.state.lock != LockState::Unlocked {
+            inner.last = Some(fresh);
+            return Err(ControllerError::LockedAction);
+        }
+        inner.last = Some(fresh);
+
         let receipt = match inner.adapter.execute(&request.action) {
             Ok(receipt) => receipt,
             Err(_) => {
@@ -153,11 +171,10 @@ impl<A: DeviceAdapter> Controller<A> {
         let observed = self.capture(&mut inner, &request.device);
         match observed {
             Ok(after) => {
-                let changed = inner.last.as_ref().is_some_and(|before| {
-                    before.state != after.state
-                        || before.accessibility_tree != after.accessibility_tree
-                        || before.screenshot != after.screenshot
-                });
+                let changed = inner
+                    .last
+                    .as_ref()
+                    .is_some_and(|before| !same_view(before, &after));
                 let effect = if receipt.accepted && changed {
                     ObservedEffect::Changed
                 } else {
@@ -238,6 +255,12 @@ impl<A: DeviceAdapter> Controller<A> {
             screenshot: raw.screenshot,
         })
     }
+}
+
+fn same_view(before: &Observation, after: &Observation) -> bool {
+    before.state == after.state
+        && before.accessibility_tree == after.accessibility_tree
+        && before.screenshot == after.screenshot
 }
 
 #[cfg(test)]

@@ -7,6 +7,8 @@ struct FakeAdapter {
     app: String,
     stale_capture: bool,
     fail_capture: bool,
+    fail_after_action: bool,
+    locked: bool,
     actions: usize,
 }
 
@@ -19,6 +21,8 @@ impl FakeAdapter {
             app: "com.example.notes".into(),
             stale_capture: false,
             fail_capture: false,
+            fail_after_action: false,
+            locked: false,
             actions: 0,
         }
     }
@@ -50,7 +54,11 @@ impl DeviceAdapter for FakeAdapter {
                 finished_unix_ms: finished,
             },
             state: DeviceState {
-                lock: LockState::Unlocked,
+                lock: if self.locked {
+                    LockState::Locked
+                } else {
+                    LockState::Unlocked
+                },
                 wda_ready: true,
                 foreground_app: Some(self.app.clone()),
             },
@@ -64,6 +72,9 @@ impl DeviceAdapter for FakeAdapter {
 
     fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
         self.actions += 1;
+        if self.fail_after_action {
+            self.fail_capture = true;
+        }
         if matches!(action, Action::Home) {
             self.app = "com.apple.springboard".into();
         }
@@ -106,7 +117,7 @@ fn lease_rejects_a_competing_owner_and_a_stale_revision() {
     };
     let result = controller.act(owner, lease, request).unwrap();
     assert_eq!(result.effect, ObservedEffect::Changed);
-    assert_eq!(result.after.as_ref().unwrap().revision, Revision(2));
+    assert_eq!(result.after.as_ref().unwrap().revision, Revision(3));
     assert_eq!(result.receipt.action_kind, "home");
 
     let stale = ActionRequest {
@@ -154,7 +165,7 @@ fn missing_after_capture_is_not_reported_as_a_confirmed_effect() {
         .acquire("agent".into(), Duration::from_secs(30))
         .unwrap();
     let before = controller.observe(&key).unwrap();
-    controller.inner.lock().unwrap().adapter.fail_capture = true;
+    controller.inner.lock().unwrap().adapter.fail_after_action = true;
     let request = ActionRequest {
         device: key.clone(),
         expected_revision: Some(before.revision),
@@ -183,4 +194,40 @@ fn old_screen_capture_is_rejected() {
         controller.observe(&key).err(),
         Some(ControllerError::StaleObservation)
     );
+}
+
+#[test]
+fn changed_screen_or_lock_state_blocks_input_before_transport() {
+    let (controller, key) = controller();
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    let before = controller.observe(&key).unwrap();
+    controller.inner.lock().unwrap().adapter.app = "com.example.other".into();
+    let request = ActionRequest {
+        device: key.clone(),
+        expected_revision: Some(before.revision),
+        action: Action::Tap {
+            at: Point { x: 20.0, y: 30.0 },
+        },
+    };
+    assert_eq!(
+        controller.act("agent", lease, request).err(),
+        Some(ControllerError::StaleRevision)
+    );
+    assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+
+    controller.inner.lock().unwrap().adapter.locked = true;
+    let request = ActionRequest {
+        device: key,
+        expected_revision: None,
+        action: Action::Text {
+            value: "fixture".into(),
+        },
+    };
+    assert_eq!(
+        controller.act("agent", lease, request).err(),
+        Some(ControllerError::LockedAction)
+    );
+    assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
 }
