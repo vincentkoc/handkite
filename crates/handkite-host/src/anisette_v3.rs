@@ -2,6 +2,11 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
+mod tls;
+mod transport;
+pub use tls::AnisetteIdentity;
+pub use transport::{AnisetteClient, ClientInfo};
+
 pub const ROUTING_INFO_HEADER: &str = "X-Apple-I-MD-RINFO";
 const MAX_SERVER_MESSAGE_BYTES: usize = 4 * 1024 * 1024 + 4096;
 const MAX_CPIM_BYTES: usize = 64 * 1024;
@@ -102,6 +107,7 @@ struct StateEnvelope {
 
 pub struct MacosProvisionedState {
     bytes: Vec<u8>,
+    identifier: [u8; 16],
 }
 
 impl MacosProvisionedState {
@@ -129,7 +135,7 @@ impl MacosProvisionedState {
             bytes.zeroize();
             return Err(error);
         }
-        Ok(Self { bytes })
+        Ok(Self { bytes, identifier })
     }
 
     pub fn as_bytes(&self) -> &[u8] {
