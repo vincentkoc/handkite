@@ -193,6 +193,13 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = Some(fresh);
 
         let is_lock = matches!(&request.action, Action::Lock);
+        if inner
+            .lease
+            .as_ref()
+            .is_none_or(|lease| lease.expires_at <= Instant::now())
+        {
+            return Err(ControllerError::InvalidLease);
+        }
         let receipt = match inner.adapter.execute(&request.action) {
             Ok(receipt) => receipt,
             // An error can follow delivery. Keep checking the postcondition without replay.

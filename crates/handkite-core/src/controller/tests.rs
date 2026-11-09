@@ -14,6 +14,7 @@ struct FakeAdapter {
     actions: usize,
     native_lock: LockState,
     native_queries: usize,
+    capture_wait_until: Option<Instant>,
 }
 
 impl FakeAdapter {
@@ -32,6 +33,7 @@ impl FakeAdapter {
             actions: 0,
             native_lock: LockState::Uncertain,
             native_queries: 0,
+            capture_wait_until: None,
         }
     }
 }
@@ -42,6 +44,9 @@ impl DeviceAdapter for FakeAdapter {
     }
 
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
+        if let Some(deadline) = self.capture_wait_until.take() {
+            std::thread::sleep(deadline.saturating_duration_since(Instant::now()));
+        }
         if self.fail_capture {
             return Err(AdapterError);
         }
@@ -151,6 +156,40 @@ fn lease_token_is_opaque_and_a_guess_cannot_take_control() {
         .acquire("agent".into(), Duration::from_secs(30))
         .unwrap();
     assert_ne!(first, second);
+}
+
+#[test]
+fn lease_expiring_during_capture_cannot_dispatch_input() {
+    let (controller, key) = controller();
+    let lease = controller
+        .acquire("agent".into(), Duration::from_millis(250))
+        .unwrap();
+    {
+        let mut inner = controller.inner.lock().unwrap();
+        inner.adapter.capture_wait_until = Some(inner.lease.as_ref().unwrap().expires_at);
+    }
+    let request = || ActionRequest {
+        device: key.clone(),
+        expected_revision: None,
+        action: Action::Home,
+    };
+    assert_eq!(
+        controller.act("agent", lease, request()).err(),
+        Some(ControllerError::InvalidLease)
+    );
+    {
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(inner.adapter.actions, 0);
+        assert!(inner.adapter.capture_wait_until.is_none());
+        assert_eq!(inner.last.as_ref().unwrap().revision, Revision(1));
+    }
+
+    let valid_lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    let result = controller.act("agent", valid_lease, request()).unwrap();
+    assert_eq!(result.effect, ObservedEffect::Changed);
+    assert_eq!(controller.inner.lock().unwrap().adapter.actions, 1);
 }
 
 #[test]
