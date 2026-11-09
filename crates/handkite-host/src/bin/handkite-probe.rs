@@ -1,6 +1,6 @@
 use handkite_core::controller::Controller;
 use handkite_core::protocol::{
-    Action, ActionRequest, DeviceBinding, DeviceKey, HardwareId, LockState, ObservedEffect,
+    Action, ActionRequest, DeviceBinding, DeviceKey, HardwareId, LockState, Observation,
 };
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_adapter::WdaAdapter;
@@ -30,6 +30,7 @@ fn main() {
         }
         "observe" => observe(expected),
         "demo" => demo(expected),
+        "home" => home(expected),
         _ => Err("unknown probe command".into()),
     };
     if let Err(error) = result {
@@ -120,11 +121,11 @@ fn demo(expected: HardwareId) -> Result<(), String> {
             },
         )
         .map_err(|error| format!("{error:?}"))?;
-    let after_settings = settings.after.ok_or("Settings effect unobserved")?;
-    if !settings.receipt.accepted
-        || settings.effect != ObservedEffect::Changed
-        || after_settings.state.foreground_app.as_deref() != Some("com.apple.Preferences")
-    {
+    if !settings.receipt.accepted {
+        return Err("Settings request unaccepted".into());
+    }
+    let after_settings = settle_foreground(&controller, &key, "com.apple.Preferences")?;
+    if after_settings.state.foreground_app.as_deref() != Some("com.apple.Preferences") {
         return Err("Settings effect unconfirmed".into());
     }
     println!("settings_receipt=true settings_observed=true");
@@ -133,19 +134,14 @@ fn demo(expected: HardwareId) -> Result<(), String> {
             owner,
             lease,
             ActionRequest {
-                device: key,
+                device: key.clone(),
                 expected_revision: Some(after_settings.revision),
                 action: Action::Home,
             },
         )
         .map_err(|error| format!("{error:?}"))?;
     let home_observed = home.receipt.accepted
-        && home.effect == ObservedEffect::Changed
-        && home
-            .after
-            .as_ref()
-            .and_then(|after| after.state.foreground_app.as_deref())
-            == Some("com.apple.springboard");
+        && settle_foreground(&controller, &key, "com.apple.springboard").is_ok();
     controller
         .release(owner, lease)
         .map_err(|error| format!("{error:?}"))?;
@@ -157,4 +153,57 @@ fn demo(expected: HardwareId) -> Result<(), String> {
         return Err("Home effect unconfirmed".into());
     }
     Ok(())
+}
+
+fn home(expected: HardwareId) -> Result<(), String> {
+    let (controller, key) = controller(expected)?;
+    let before = controller
+        .observe(&key)
+        .map_err(|error| format!("{error:?}"))?;
+    if before.state.lock != LockState::Unlocked
+        || before.state.foreground_app.as_deref() != Some("com.apple.Preferences")
+    {
+        return Err("Home trial requires unlocked Settings in foreground".into());
+    }
+    let owner = "local-home-trial";
+    let lease = controller
+        .acquire(owner.into(), Duration::from_secs(30))
+        .map_err(|error| format!("{error:?}"))?;
+    let result = controller
+        .act(
+            owner,
+            lease,
+            ActionRequest {
+                device: key.clone(),
+                expected_revision: Some(before.revision),
+                action: Action::Home,
+            },
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    if !result.receipt.accepted {
+        return Err("Home request unaccepted".into());
+    }
+    settle_foreground(&controller, &key, "com.apple.springboard")?;
+    controller
+        .release(owner, lease)
+        .map_err(|error| format!("{error:?}"))?;
+    println!("home_receipt=true home_observed=true");
+    Ok(())
+}
+
+fn settle_foreground(
+    controller: &Controller<WdaAdapter>,
+    key: &DeviceKey,
+    expected: &str,
+) -> Result<Observation, String> {
+    for _ in 0..12 {
+        let observed = controller
+            .observe(key)
+            .map_err(|error| format!("{error:?}"))?;
+        if observed.state.foreground_app.as_deref() == Some(expected) {
+            return Ok(observed);
+        }
+        std::thread::sleep(Duration::from_millis(150));
+    }
+    Err("foreground effect unconfirmed within bounded settle".into())
 }
