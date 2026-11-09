@@ -105,7 +105,7 @@ fn run(device: &mut impl Device, expected: &HardwareId) -> Result<(), Error> {
         return Err(Error::Refused(Refusal::Geometry));
     }
     let input_started = device.now();
-    if input_started >= before.fresh_until || input_started >= current.fresh_until {
+    if input_started >= current.fresh_until {
         return Err(Error::Refused(Refusal::Freshness));
     }
     let receipt = device.reveal(&current.session, current.fresh_until);
@@ -478,7 +478,7 @@ impl Device for Live {
 mod tests {
     use super::*;
     use handkite_core::protocol::{DeviceState, ImageFormat, ObservationWindow, ScreenImage};
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
     const NORMAL: &str = r#"<AppiumAUT><XCUIElementTypeApplication name="SpringBoard" width="400" height="800"><XCUIElementTypeOther name="proud-lock" visible="true"/></XCUIElementTypeApplication></AppiumAUT>"#;
@@ -544,7 +544,8 @@ mod tests {
         posts: Vec<(String, Instant)>,
         receipt: Result<(), ()>,
         now: Instant,
-        override_now: Option<Instant>,
+        now_calls: Cell<usize>,
+        override_now: Option<(usize, Instant)>,
     }
 
     impl Fake {
@@ -560,6 +561,7 @@ mod tests {
                 posts: Vec::new(),
                 receipt: Ok(()),
                 now,
+                now_calls: Cell::new(0),
                 override_now: None,
             }
         }
@@ -575,7 +577,11 @@ mod tests {
             result
         }
         fn now(&self) -> Instant {
-            self.override_now.unwrap_or(self.now)
+            let call = self.now_calls.get() + 1;
+            self.now_calls.set(call);
+            self.override_now
+                .filter(|(index, _)| *index == call)
+                .map_or(self.now, |(_, now)| now)
         }
         fn reveal(&mut self, session: &str, fresh_until: Instant) -> Result<(), ()> {
             assert!(self.posts.is_empty(), "input replayed");
@@ -702,7 +708,7 @@ mod tests {
         }
         for elapsed in [BUDGET, BUDGET + Duration::from_nanos(1)] {
             let mut fake = Fake::new();
-            fake.override_now = Some(fake.now + elapsed);
+            fake.override_now = Some((1, fake.now + elapsed));
             assert_eq!(
                 run(&mut fake, &id()),
                 Err(Error::Refused(Refusal::Freshness))
@@ -723,7 +729,6 @@ mod tests {
         for (offset, reason) in [
             (Duration::ZERO, Refusal::Freshness),
             (Duration::from_millis(99), Refusal::Freshness),
-            (BUDGET, Refusal::Freshness),
         ] {
             let mut fake = Fake::new();
             let started = fake.captures[0].as_ref().unwrap().started;
@@ -761,6 +766,35 @@ mod tests {
         assert_eq!(run(&mut fake, &id()), Ok(()));
         assert_eq!(fake.posts, [("fixture-session".into(), expiry)]);
         assert_eq!(fake.captures_called, 3);
+    }
+
+    #[test]
+    fn only_the_second_capture_deadline_controls_dispatch() {
+        let mut fake = Fake::new();
+        let started = fake.captures[0].as_ref().unwrap().started;
+        let mut second = snapshot(started + BUDGET - Duration::from_secs(1), false);
+        second.finished = started + BUDGET + Duration::from_millis(100);
+        let expiry = second.fresh_until;
+        fake.captures[1] = Ok(second);
+        fake.captures[2] = Ok(snapshot(started + BUDGET + Duration::from_secs(1), true));
+        assert_eq!(run(&mut fake, &id()), Ok(()));
+        assert_eq!(fake.posts, [("fixture-session".into(), expiry)]);
+        assert_eq!(fake.captures_called, 3);
+
+        // Expire the second capture either at validation or immediately before dispatch.
+        for now_call in [2, 3] {
+            for lateness in [Duration::ZERO, Duration::from_nanos(1)] {
+                let mut fake = Fake::new();
+                let expiry = fake.captures[1].as_ref().unwrap().fresh_until;
+                fake.override_now = Some((now_call, expiry + lateness));
+                assert_eq!(
+                    run(&mut fake, &id()),
+                    Err(Error::Refused(Refusal::Freshness))
+                );
+                assert!(fake.posts.is_empty());
+                assert_eq!(fake.captures_called, 2);
+            }
+        }
     }
 
     #[test]
