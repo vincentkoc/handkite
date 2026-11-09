@@ -107,6 +107,13 @@ async fn pin_attrs(wda: &UsbWda) -> Result<(), String> {
         serde_json::from_slice(&response.body).map_err(|_| "invalid WDA JSON")?;
     let xml = json["value"].as_str().ok_or("missing source")?;
     println!(
+        "marker_flags passcode_view={} proud_lock={} call_to_action={} enter_passcode={}",
+        xml.contains("passcode-view"),
+        xml.contains("proud-lock"),
+        xml.contains("call-to-action-label"),
+        xml.contains("Enter Passcode")
+    );
+    println!(
         "pin_source_status={} visible_attr={} enabled_attr={} secure_field={} digit_key={} elapsed_ms={}",
         response.status,
         xml.contains(" visible=\""),
@@ -119,24 +126,45 @@ async fn pin_attrs(wda: &UsbWda) -> Result<(), String> {
     loop {
         match reader.read_event().map_err(|_| "invalid source XML")? {
             quick_xml::events::Event::Start(element) | quick_xml::events::Event::Empty(element) => {
-                if element.name().as_ref() != b"XCUIElementTypeKey" {
-                    continue;
-                }
+                let kind = element.name().as_ref().to_vec();
                 let mut attrs = std::collections::BTreeMap::new();
+                let mut enter_passcode_attribute = None;
                 for attr in element.attributes() {
                     let attr = attr.map_err(|_| "invalid source attribute")?;
+                    let value = attr
+                        .decode_and_unescape_value(reader.decoder())
+                        .map_err(|_| "invalid source attribute")?;
+                    if value == "Enter Passcode" {
+                        enter_passcode_attribute =
+                            Some(String::from_utf8_lossy(attr.key.as_ref()).into_owned());
+                    }
                     if matches!(
                         attr.key.as_ref(),
                         b"name" | b"x" | b"y" | b"width" | b"height"
                     ) {
-                        let value = attr
-                            .decode_and_unescape_value(reader.decoder())
-                            .map_err(|_| "invalid source attribute")?;
                         attrs.insert(
                             String::from_utf8_lossy(attr.key.as_ref()).into_owned(),
                             value.into_owned(),
                         );
                     }
+                }
+                if attrs
+                    .get("name")
+                    .is_some_and(|name| name == "passcode-view")
+                {
+                    println!("passcode_marker_kind={}", String::from_utf8_lossy(&kind));
+                }
+                if attrs.get("name").is_some_and(|name| name == "proud-lock") {
+                    println!("proud_lock_kind={}", String::from_utf8_lossy(&kind));
+                }
+                if let Some(attribute) = enter_passcode_attribute {
+                    println!(
+                        "enter_passcode_kind={} attribute={attribute}",
+                        String::from_utf8_lossy(&kind)
+                    );
+                }
+                if kind != b"XCUIElementTypeKey" {
+                    continue;
                 }
                 if attrs
                     .get("name")
