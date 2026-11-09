@@ -40,6 +40,8 @@ struct FakePhone {
     trust: bool,
     disconnected: bool,
     drop_at: Option<usize>,
+    delay_at: Option<usize>,
+    pending_digit: Option<u8>,
     double_at: Option<usize>,
     disconnect_at: Option<usize>,
     early_unlock_at: Option<usize>,
@@ -63,6 +65,8 @@ impl FakePhone {
             trust: false,
             disconnected: false,
             drop_at: None,
+            delay_at: None,
+            pending_digit: None,
             double_at: None,
             disconnect_at: None,
             early_unlock_at: None,
@@ -133,6 +137,10 @@ impl PasscodeBackend for FakePhone {
     fn press_digit(&mut self, digit: u8) -> Result<(), BackendError> {
         self.presses += 1;
         if self.drop_at == Some(self.presses) {
+            return Ok(());
+        }
+        if self.delay_at == Some(self.presses) {
+            self.pending_digit = Some(digit);
             return Ok(());
         }
         self.accept(digit);
@@ -236,7 +244,14 @@ fn dropped_and_doubled_digits_stop_before_a_submission() {
         ));
         assert_eq!(phone.failed_attempts, 0);
         assert!(phone.presses < 6);
-        assert!(!gate.disabled);
+        assert!(gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (1, 0));
+        let presses = phone.presses;
+        assert_eq!(
+            run(&mut phone, &mut gate, "123456"),
+            Err(UnlockError::Disabled)
+        );
+        assert_eq!(phone.presses, presses);
     }
 }
 
@@ -264,7 +279,13 @@ fn a_dropped_final_digit_is_incomplete() {
         Err(UnlockError::Incomplete { digit: 6 })
     );
     assert_eq!(phone.failed_attempts, 0);
-    assert!(!gate.disabled);
+    assert!(gate.disabled);
+    assert_eq!((gate.marks, gate.clears), (1, 0));
+    assert_eq!(
+        run(&mut phone, &mut gate, "123456"),
+        Err(UnlockError::Disabled)
+    );
+    assert_eq!(phone.presses, 6);
 }
 
 #[test]
@@ -290,6 +311,39 @@ fn early_unlock_never_counts_as_full_code_submission() {
         Err(UnlockError::UnlockedBeforeLastDigit)
     );
     assert_eq!(phone.presses, 2);
+    assert!(gate.disabled);
+    assert_eq!((gate.marks, gate.clears), (1, 0));
+    phone.locked = true;
+    phone.keypad = false;
+    phone.input.clear();
+    assert_eq!(
+        run(&mut phone, &mut gate, "123456"),
+        Err(UnlockError::Disabled)
+    );
+    assert_eq!(phone.presses, 2);
+}
+
+#[test]
+fn delayed_digit_cannot_reopen_a_second_attempt() {
+    for delayed_at in [3, 6] {
+        let mut phone = FakePhone::new();
+        phone.delay_at = Some(delayed_at);
+        let mut gate = MemoryGate::default();
+        assert!(matches!(
+            run(&mut phone, &mut gate, "123456"),
+            Err(UnlockError::Incomplete { .. })
+        ));
+        assert_eq!(phone.presses, delayed_at);
+        let pending = phone.pending_digit.take().unwrap();
+        phone.accept(pending);
+        assert!(gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (1, 0));
+        assert_eq!(
+            run(&mut phone, &mut gate, "123456"),
+            Err(UnlockError::Disabled)
+        );
+        assert_eq!(phone.presses, delayed_at);
+    }
 }
 
 #[test]

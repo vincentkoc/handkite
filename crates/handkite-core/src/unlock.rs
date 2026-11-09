@@ -259,7 +259,6 @@ pub fn unlock_once<B: PasscodeBackend, G: AttemptGate>(
                     return Ok(UnlockOutcome::CodeSubmitted);
                 }
                 FinalState::Incomplete => {
-                    gate.clear()?;
                     return Err(UnlockError::Incomplete {
                         digit: index as u32 + 1,
                     });
@@ -269,13 +268,11 @@ pub fn unlock_once<B: PasscodeBackend, G: AttemptGate>(
         match wait_for_count(backend, binding, requested, code.len(), before, policy)? {
             Step::Count(next) if next == before + 1 => {}
             Step::Count(next) if next >= before && next < code.len() => {
-                gate.clear()?;
                 return Err(UnlockError::Incomplete {
                     digit: index as u32 + 1,
                 });
             }
             Step::Unlocked => {
-                gate.clear()?;
                 return Err(UnlockError::UnlockedBeforeLastDigit);
             }
             _ => return Err(UnlockError::WrongOrUncertain),
