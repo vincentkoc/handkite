@@ -14,6 +14,56 @@ const CLOCK: &str = "com.apple.mobiletimer";
 const MAX_CAPTURE_MS: u64 = 10_000;
 const MAX_AGE_MS: u64 = 2_000;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RefusalReason {
+    NativeLocked,
+    NativeLockUnproven,
+    WdaLocked,
+    WdaLockUnproven,
+    ForegroundNotClock,
+    SessionUnproven,
+    IdentityUnproven,
+    FreshnessUnproven,
+    CaptureFailed,
+    WorldClockAttributes,
+    StopwatchAttributes,
+    GeometryMismatch,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrialError {
+    Refused(RefusalReason),
+    Unknown,
+}
+
+impl TrialError {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Refused(RefusalReason::NativeLocked) => "refused reason=native_locked",
+            Self::Refused(RefusalReason::NativeLockUnproven) => {
+                "refused reason=native_lock_unproven"
+            }
+            Self::Refused(RefusalReason::WdaLocked) => "refused reason=wda_locked",
+            Self::Refused(RefusalReason::WdaLockUnproven) => "refused reason=wda_lock_unproven",
+            Self::Refused(RefusalReason::ForegroundNotClock) => {
+                "refused reason=foreground_not_clock"
+            }
+            Self::Refused(RefusalReason::SessionUnproven) => "refused reason=session_unproven",
+            Self::Refused(RefusalReason::IdentityUnproven) => "refused reason=identity_unproven",
+            Self::Refused(RefusalReason::FreshnessUnproven) => "refused reason=freshness_unproven",
+            Self::Refused(RefusalReason::CaptureFailed) => "refused reason=capture_failed",
+            Self::Refused(RefusalReason::WorldClockAttributes) => {
+                "refused reason=world_clock_attributes"
+            }
+            Self::Refused(RefusalReason::StopwatchAttributes) => {
+                "refused reason=stopwatch_attributes"
+            }
+            Self::Refused(RefusalReason::GeometryMismatch) => "refused reason=geometry_mismatch",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Transport {
     W3c,
@@ -42,11 +92,9 @@ pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
         _ => return Err("invalid_arguments"),
     };
     let binding = host_config::load(Path::new(config)).map_err(|_| "configuration_invalid")?;
-    let mut live = Live::new(binding.usb_id.clone()).map_err(|_| "refused")?;
-    run(&mut live, &binding.usb_id, transport).map_err(|error| match error {
-        TrialError::Refused => "refused",
-        TrialError::Unknown => "unknown",
-    })?;
+    let mut live = Live::new(binding.usb_id.clone())
+        .map_err(|reason| TrialError::Refused(reason).message())?;
+    run(&mut live, &binding.usb_id, transport).map_err(TrialError::message)?;
     println!("touch_trial=confirmed transport={}", transport.name());
     Ok(())
 }
@@ -59,15 +107,9 @@ struct Snapshot {
 }
 
 trait TrialDevice {
-    fn capture(&mut self) -> Result<Snapshot, ()>;
+    fn capture(&mut self) -> Result<Snapshot, RefusalReason>;
     fn now_ms(&self) -> Result<u64, ()>;
     fn tap(&mut self, transport: Transport, at: Point, fresh_until: Instant) -> Result<(), ()>;
-}
-
-#[derive(Debug, PartialEq)]
-enum TrialError {
-    Refused,
-    Unknown,
 }
 
 fn run(
@@ -75,20 +117,24 @@ fn run(
     expected: &HardwareId,
     transport: Transport,
 ) -> Result<(), TrialError> {
-    let before = device.capture().map_err(|_| TrialError::Refused)?;
-    let first =
-        validate(&before, expected, device.now_ms(), false).map_err(|_| TrialError::Refused)?;
+    let before = device.capture().map_err(TrialError::Refused)?;
+    let first = validate(&before, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
     // Reobserve every precondition; only stable accessibility geometry authorizes input.
-    let current = device.capture().map_err(|_| TrialError::Refused)?;
+    let current = device.capture().map_err(TrialError::Refused)?;
     let second =
-        validate(&current, expected, device.now_ms(), false).map_err(|_| TrialError::Refused)?;
-    if current.session != before.session
-        || current.observation.window.started_unix_ms < before.observation.window.finished_unix_ms
-        || first != second
-    {
-        return Err(TrialError::Refused);
+        validate(&current, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
+    if current.session != before.session {
+        return Err(TrialError::Refused(RefusalReason::SessionUnproven));
     }
-    let input_started = device.now_ms().map_err(|_| TrialError::Refused)?;
+    if current.observation.window.started_unix_ms < before.observation.window.finished_unix_ms {
+        return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
+    }
+    if first != second {
+        return Err(TrialError::Refused(RefusalReason::GeometryMismatch));
+    }
+    let input_started = device
+        .now_ms()
+        .map_err(|_| TrialError::Refused(RefusalReason::FreshnessUnproven))?;
     let receipt = device.tap(transport, second.center(), current.fresh_until);
     // Even unknown delivery receives one read-only postcheck, never another input.
     let after = device.capture().map_err(|_| TrialError::Unknown)?;
@@ -107,40 +153,83 @@ fn validate(
     expected: &HardwareId,
     now: Result<u64, ()>,
     after: bool,
-) -> Result<Rect, ()> {
+) -> Result<Rect, RefusalReason> {
     let raw = &snapshot.observation;
-    if Instant::now() >= snapshot.fresh_until
-        || raw.connected_usb != *expected
-        || raw.wda_target != *expected
-        || !valid_session(&snapshot.session)
-        || snapshot.native != LockState::Unlocked
-        || raw.state.lock != LockState::Unlocked
-        || !raw.state.wda_ready
-        || raw.state.foreground_app.as_deref() != Some(CLOCK)
-        || raw.window.duration_ms().map_err(|_| ())? > MAX_CAPTURE_MS
-        || now?.checked_sub(raw.window.finished_unix_ms).ok_or(())? > MAX_AGE_MS
+    if Instant::now() >= snapshot.fresh_until {
+        return Err(RefusalReason::FreshnessUnproven);
+    }
+    if raw.connected_usb != *expected || raw.wda_target != *expected {
+        return Err(RefusalReason::IdentityUnproven);
+    }
+    if !valid_session(&snapshot.session) {
+        return Err(RefusalReason::SessionUnproven);
+    }
+    require_native_unlocked(snapshot.native)?;
+    match raw.state.lock {
+        LockState::Locked => return Err(RefusalReason::WdaLocked),
+        LockState::Uncertain => return Err(RefusalReason::WdaLockUnproven),
+        LockState::Unlocked => {}
+    }
+    if !raw.state.wda_ready {
+        return Err(RefusalReason::SessionUnproven);
+    }
+    if raw.state.foreground_app.as_deref() != Some(CLOCK) {
+        return Err(RefusalReason::ForegroundNotClock);
+    }
+    if raw
+        .window
+        .duration_ms()
+        .map_err(|_| RefusalReason::FreshnessUnproven)?
+        > MAX_CAPTURE_MS
+        || now
+            .map_err(|_| RefusalReason::FreshnessUnproven)?
+            .checked_sub(raw.window.finished_unix_ms)
+            .ok_or(RefusalReason::FreshnessUnproven)?
+            > MAX_AGE_MS
     {
-        return Err(());
+        return Err(RefusalReason::FreshnessUnproven);
     }
     let png = &raw.screenshot.bytes;
     if png.len() < 24 || !png.starts_with(b"\x89PNG\r\n\x1a\n") || &png[12..16] != b"IHDR" {
-        return Err(());
+        return Err(RefusalReason::CaptureFailed);
     }
-    let width = u32::from_be_bytes(png[16..20].try_into().map_err(|_| ())?);
-    let height = u32::from_be_bytes(png[20..24].try_into().map_err(|_| ())?);
+    let width = u32::from_be_bytes(
+        png[16..20]
+            .try_into()
+            .map_err(|_| RefusalReason::CaptureFailed)?,
+    );
+    let height = u32::from_be_bytes(
+        png[20..24]
+            .try_into()
+            .map_err(|_| RefusalReason::CaptureFailed)?,
+    );
     let evidence = parse(&raw.accessibility_tree)?;
     // Coordinates come from accessibility points; image pixels only check screen shape.
     if width == 0
         || height == 0
         || (f64::from(width) / f64::from(height) - evidence.screen.w / evidence.screen.h).abs()
             > 0.02
-        || evidence.stopwatch.selected != Some(after)
-        || evidence.world.selected != Some(!after)
-        || (after && !evidence.start_visible)
     {
-        return Err(());
+        return Err(RefusalReason::GeometryMismatch);
+    }
+    if evidence.stopwatch.selected != Some(after) {
+        return Err(RefusalReason::StopwatchAttributes);
+    }
+    if evidence.world.selected != Some(!after) {
+        return Err(RefusalReason::WorldClockAttributes);
+    }
+    if after && !evidence.start_visible {
+        return Err(RefusalReason::StopwatchAttributes);
     }
     Ok(evidence.stopwatch.rect)
+}
+
+fn require_native_unlocked(state: LockState) -> Result<(), RefusalReason> {
+    match state {
+        LockState::Locked => Err(RefusalReason::NativeLocked),
+        LockState::Uncertain => Err(RefusalReason::NativeLockUnproven),
+        LockState::Unlocked => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -227,9 +316,9 @@ struct Evidence {
     start_visible: bool,
 }
 
-fn parse(xml: &str) -> Result<Evidence, ()> {
+fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
     if xml.is_empty() || xml.len() > 2 * 1024 * 1024 {
-        return Err(());
+        return Err(RefusalReason::CaptureFailed);
     }
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut stack = Vec::new();
@@ -240,28 +329,33 @@ fn parse(xml: &str) -> Result<Evidence, ()> {
     let mut start_visible = false;
     let mut start_seen = false;
     loop {
-        let event = reader.read_event().map_err(|_| ())?;
+        let event = reader
+            .read_event()
+            .map_err(|_| RefusalReason::CaptureFailed)?;
         let is_start = matches!(&event, Event::Start(_));
         match event {
             Event::Start(ref node) | Event::Empty(ref node) => {
-                let kind = String::from_utf8(node.name().as_ref().to_vec()).map_err(|_| ())?;
-                if stack.len() > 128
-                    || matches!(
-                        kind.as_str(),
-                        "XCUIElementTypeAlert"
-                            | "XCUIElementTypeSheet"
-                            | "XCUIElementTypeSecureTextField"
-                    )
-                {
-                    return Err(());
+                let kind = String::from_utf8(node.name().as_ref().to_vec())
+                    .map_err(|_| RefusalReason::CaptureFailed)?;
+                if stack.len() > 128 {
+                    return Err(RefusalReason::CaptureFailed);
+                }
+                if matches!(
+                    kind.as_str(),
+                    "XCUIElementTypeAlert"
+                        | "XCUIElementTypeSheet"
+                        | "XCUIElementTypeSecureTextField"
+                ) {
+                    return Err(RefusalReason::WdaLockUnproven);
                 }
                 let mut attrs = BTreeMap::new();
                 for attr in node.attributes() {
-                    let attr = attr.map_err(|_| ())?;
-                    let key = String::from_utf8(attr.key.as_ref().to_vec()).map_err(|_| ())?;
+                    let attr = attr.map_err(|_| RefusalReason::CaptureFailed)?;
+                    let key = String::from_utf8(attr.key.as_ref().to_vec())
+                        .map_err(|_| RefusalReason::CaptureFailed)?;
                     let value = attr
                         .decode_and_unescape_value(reader.decoder())
-                        .map_err(|_| ())?;
+                        .map_err(|_| RefusalReason::CaptureFailed)?;
                     if [
                         "proud-lock",
                         "passcode-view",
@@ -271,87 +365,93 @@ fn parse(xml: &str) -> Result<Evidence, ()> {
                     .iter()
                     .any(|marker| value.contains(marker))
                     {
-                        return Err(());
+                        return Err(RefusalReason::WdaLocked);
                     }
                     attrs.insert(key, value.into_owned());
                 }
                 if kind == "XCUIElementTypeApplication" {
                     if screen.is_some() {
-                        return Err(());
+                        return Err(RefusalReason::GeometryMismatch);
                     }
-                    let rect = Rect::read(&attrs)?;
+                    let rect = Rect::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?;
                     if rect.x != 0.0 || rect.y != 0.0 {
-                        return Err(());
+                        return Err(RefusalReason::GeometryMismatch);
                     }
                     screen = Some(rect);
                 }
                 if kind == "XCUIElementTypeTabBar" {
                     if tabbar.is_some() || !stack.iter().any(|s| s == "XCUIElementTypeApplication")
                     {
-                        return Err(());
+                        return Err(RefusalReason::GeometryMismatch);
                     }
-                    tabbar = Some(Rect::read(&attrs)?);
+                    tabbar = Some(Rect::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?);
                 }
                 let name = attrs.get("name").map(String::as_str);
                 if matches!(name, Some("Stopwatch" | "World Clock"))
                     && kind == "XCUIElementTypeButton"
                 {
                     if !stack.iter().any(|s| s == "XCUIElementTypeTabBar") {
-                        return Err(());
+                        return Err(RefusalReason::GeometryMismatch);
                     }
-                    let slot = if name == Some("Stopwatch") {
-                        &mut stopwatch
+                    let (slot, reason) = if name == Some("Stopwatch") {
+                        (&mut stopwatch, RefusalReason::StopwatchAttributes)
                     } else {
-                        &mut world
+                        (&mut world, RefusalReason::WorldClockAttributes)
                     };
                     if slot.is_some() {
-                        return Err(());
+                        return Err(reason);
                     }
-                    *slot = Some(Tab::read(&attrs)?);
+                    *slot = Some(Tab::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?);
                 }
                 if name == Some("Start")
                     && kind == "XCUIElementTypeButton"
                     && !stack.iter().any(|s| s == "XCUIElementTypeTabBar")
                 {
                     if start_seen || !stack.iter().any(|s| s == "XCUIElementTypeApplication") {
-                        return Err(());
+                        return Err(RefusalReason::StopwatchAttributes);
                     }
                     start_seen = true;
-                    let button = Tab::read(&attrs)?;
+                    let button = Tab::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?;
                     start_visible = button.visible == Some(true)
                         && button.enabled == Some(true)
-                        && screen.ok_or(())?.contains(button.rect);
+                        && screen
+                            .ok_or(RefusalReason::GeometryMismatch)?
+                            .contains(button.rect);
                 }
                 if is_start {
                     stack.push(kind);
                 }
             }
             Event::End(_) => {
-                stack.pop().ok_or(())?;
+                stack.pop().ok_or(RefusalReason::CaptureFailed)?;
             }
             Event::Eof => break,
-            Event::DocType(_) => return Err(()),
+            Event::DocType(_) => return Err(RefusalReason::CaptureFailed),
             _ => {}
         }
     }
     if !stack.is_empty() {
-        return Err(());
+        return Err(RefusalReason::CaptureFailed);
     }
     let evidence = Evidence {
-        screen: screen.ok_or(())?,
-        stopwatch: stopwatch.ok_or(())?,
-        world: world.ok_or(())?,
+        screen: screen.ok_or(RefusalReason::GeometryMismatch)?,
+        stopwatch: stopwatch.ok_or(RefusalReason::StopwatchAttributes)?,
+        world: world.ok_or(RefusalReason::WorldClockAttributes)?,
         start_visible,
     };
-    let bar = tabbar.ok_or(())?;
-    if !evidence.stopwatch.eligible()
-        || !evidence.world.eligible()
-        || !evidence.screen.contains(bar)
+    let bar = tabbar.ok_or(RefusalReason::GeometryMismatch)?;
+    if !evidence.stopwatch.eligible() {
+        return Err(RefusalReason::StopwatchAttributes);
+    }
+    if !evidence.world.eligible() {
+        return Err(RefusalReason::WorldClockAttributes);
+    }
+    if !evidence.screen.contains(bar)
         || !bar.contains(evidence.stopwatch.rect)
         || !bar.contains(evidence.world.rect)
         || evidence.stopwatch.rect.overlaps(evidence.world.rect)
     {
-        return Err(());
+        return Err(RefusalReason::GeometryMismatch);
     }
     Ok(evidence)
 }
@@ -365,37 +465,38 @@ struct Live {
 }
 
 impl Live {
-    fn new(expected: HardwareId) -> Result<Self, ()> {
+    fn new(expected: HardwareId) -> Result<Self, RefusalReason> {
         Ok(Self {
-            adapter: WdaAdapter::new(expected.clone()).map_err(|_| ())?,
+            adapter: WdaAdapter::new(expected.clone()).map_err(|_| RefusalReason::CaptureFailed)?,
             wda: UsbWda::new(PinnedUsb::new(expected.clone())),
             expected,
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .map_err(|_| ())?,
+                .map_err(|_| RefusalReason::CaptureFailed)?,
             actions: WdaActions::default(),
         })
     }
 
-    fn status(&self) -> Result<String, ()> {
+    fn status(&self) -> Result<String, RefusalReason> {
         let response = self
             .runtime
             .block_on(
                 self.wda
                     .request("GET", "/status", b"", Duration::from_secs(10)),
             )
-            .map_err(|_| ())?;
-        let json: serde_json::Value = serde_json::from_slice(&response.body).map_err(|_| ())?;
+            .map_err(|_| RefusalReason::SessionUnproven)?;
+        let json: serde_json::Value =
+            serde_json::from_slice(&response.body).map_err(|_| RefusalReason::SessionUnproven)?;
         let session = json["sessionId"]
             .as_str()
             .filter(|id| valid_session(id))
-            .ok_or(())?;
+            .ok_or(RefusalReason::SessionUnproven)?;
         if response.status != 200
             || json["value"]["ready"] != true
             || json["value"].get("error").is_some()
         {
-            return Err(());
+            return Err(RefusalReason::SessionUnproven);
         }
         Ok(session.to_owned())
     }
@@ -406,26 +507,32 @@ fn valid_session(id: &str) -> bool {
 }
 
 impl TrialDevice for Live {
-    fn capture(&mut self) -> Result<Snapshot, ()> {
-        let started = self.now_ms()?;
-        self.adapter.identities().map_err(|_| ())?;
+    fn capture(&mut self) -> Result<Snapshot, RefusalReason> {
+        let started = self
+            .now_ms()
+            .map_err(|_| RefusalReason::FreshnessUnproven)?;
+        self.adapter
+            .identities()
+            .map_err(|_| RefusalReason::IdentityUnproven)?;
         let session = self.status()?;
-        if native_lock::query(&self.expected).state != LockState::Unlocked {
-            return Err(());
-        }
-        let (mut observation, captured_at) =
-            self.adapter.observe_with_attributes().map_err(|_| ())?;
+        require_native_unlocked(native_lock::query(&self.expected).state)?;
+        let (mut observation, captured_at) = self
+            .adapter
+            .observe_with_attributes()
+            .map_err(|_| RefusalReason::CaptureFailed)?;
         let fresh_until = captured_at
             .checked_add(Duration::from_millis(MAX_AGE_MS))
-            .ok_or(())?;
+            .ok_or(RefusalReason::FreshnessUnproven)?;
         self.runtime
             .block_on(self.actions.prepare_existing(&self.wda))
-            .map_err(|_| ())?;
+            .map_err(|_| RefusalReason::SessionUnproven)?;
         if !self.actions.prepared_session_matches(&session) || self.status()? != session {
-            return Err(());
+            return Err(RefusalReason::SessionUnproven);
         }
         let native = native_lock::query(&self.expected).state;
-        self.adapter.identities().map_err(|_| ())?;
+        self.adapter
+            .identities()
+            .map_err(|_| RefusalReason::IdentityUnproven)?;
         // Include all identity/session/native checks in the bounded capture window.
         observation.window.started_unix_ms = started;
         Ok(Snapshot {
@@ -465,6 +572,59 @@ mod tests {
     use super::*;
     use handkite_core::protocol::{DeviceState, ImageFormat, ObservationWindow, ScreenImage};
     use std::collections::VecDeque;
+
+    type RefusalMutation = (RefusalReason, fn(&mut Snapshot));
+
+    const REFUSAL_OUTPUTS: &[(RefusalReason, &str)] = &[
+        (
+            RefusalReason::NativeLocked,
+            "touch_trial=refused reason=native_locked",
+        ),
+        (
+            RefusalReason::NativeLockUnproven,
+            "touch_trial=refused reason=native_lock_unproven",
+        ),
+        (
+            RefusalReason::WdaLocked,
+            "touch_trial=refused reason=wda_locked",
+        ),
+        (
+            RefusalReason::WdaLockUnproven,
+            "touch_trial=refused reason=wda_lock_unproven",
+        ),
+        (
+            RefusalReason::ForegroundNotClock,
+            "touch_trial=refused reason=foreground_not_clock",
+        ),
+        (
+            RefusalReason::SessionUnproven,
+            "touch_trial=refused reason=session_unproven",
+        ),
+        (
+            RefusalReason::IdentityUnproven,
+            "touch_trial=refused reason=identity_unproven",
+        ),
+        (
+            RefusalReason::FreshnessUnproven,
+            "touch_trial=refused reason=freshness_unproven",
+        ),
+        (
+            RefusalReason::CaptureFailed,
+            "touch_trial=refused reason=capture_failed",
+        ),
+        (
+            RefusalReason::WorldClockAttributes,
+            "touch_trial=refused reason=world_clock_attributes",
+        ),
+        (
+            RefusalReason::StopwatchAttributes,
+            "touch_trial=refused reason=stopwatch_attributes",
+        ),
+        (
+            RefusalReason::GeometryMismatch,
+            "touch_trial=refused reason=geometry_mismatch",
+        ),
+    ];
 
     fn tree(after: bool) -> String {
         format!(
@@ -509,7 +669,7 @@ mod tests {
     }
 
     struct Fixture {
-        captures: VecDeque<Result<Snapshot, ()>>,
+        captures: VecDeque<Result<Snapshot, RefusalReason>>,
         taps: Vec<(Transport, Point, Instant)>,
         receipt: Result<(), ()>,
         now: u64,
@@ -537,7 +697,7 @@ mod tests {
     }
 
     impl TrialDevice for Fixture {
-        fn capture(&mut self) -> Result<Snapshot, ()> {
+        fn capture(&mut self) -> Result<Snapshot, RefusalReason> {
             let snapshot = self
                 .captures
                 .pop_front()
@@ -574,84 +734,153 @@ mod tests {
 
     #[test]
     fn both_preflight_captures_reject_stale_mismatched_locked_and_unready_evidence() {
-        let mutations: &[fn(&mut Snapshot)] = &[
-            |s| s.fresh_until = Instant::now(),
-            |s| s.observation.connected_usb = HardwareId::new("other-device").unwrap(),
-            |s| s.observation.wda_target = HardwareId::new("other-device").unwrap(),
-            |s| s.native = LockState::Locked,
-            |s| s.native = LockState::Uncertain,
-            |s| s.observation.state.lock = LockState::Locked,
-            |s| s.observation.state.lock = LockState::Uncertain,
-            |s| s.observation.state.wda_ready = false,
-            |s| s.observation.state.foreground_app = Some("com.apple.springboard".into()),
-            |s| s.session = "../invalid".into(),
-            |s| s.observation.window.finished_unix_ms = 0,
-            |s| s.observation.window.finished_unix_ms = 20_000,
-            |s| s.observation.screenshot.bytes.clear(),
-            |s| s.observation.accessibility_tree = tree(true),
+        use RefusalReason::*;
+        let mutations: &[RefusalMutation] = &[
+            (FreshnessUnproven, |s| s.fresh_until = Instant::now()),
+            (IdentityUnproven, |s| {
+                s.observation.connected_usb = HardwareId::new("other-device").unwrap()
+            }),
+            (IdentityUnproven, |s| {
+                s.observation.wda_target = HardwareId::new("other-device").unwrap()
+            }),
+            (NativeLocked, |s| s.native = LockState::Locked),
+            (NativeLockUnproven, |s| s.native = LockState::Uncertain),
+            (WdaLocked, |s| s.observation.state.lock = LockState::Locked),
+            (WdaLockUnproven, |s| {
+                s.observation.state.lock = LockState::Uncertain
+            }),
+            (SessionUnproven, |s| s.observation.state.wda_ready = false),
+            (ForegroundNotClock, |s| {
+                s.observation.state.foreground_app = Some("com.apple.springboard".into())
+            }),
+            (SessionUnproven, |s| s.session = "../invalid".into()),
+            (FreshnessUnproven, |s| {
+                s.observation.window.finished_unix_ms = 0
+            }),
+            (FreshnessUnproven, |s| {
+                s.observation.window.finished_unix_ms = 20_000
+            }),
+            (CaptureFailed, |s| s.observation.screenshot.bytes.clear()),
+            (StopwatchAttributes, |s| {
+                s.observation.accessibility_tree = tree(true)
+            }),
+            (WorldClockAttributes, |s| {
+                s.observation.accessibility_tree =
+                    tree(false).replace("selected=\"true\"", "selected=\"false\"")
+            }),
+            (GeometryMismatch, |s| {
+                s.observation.accessibility_tree = tree(false).replace("x=\"200\"", "x=\"NaN\"")
+            }),
         ];
-        for position in 0..2 {
-            for mutate in mutations {
-                let mut fixture = Fixture::new();
-                mutate(fixture.captures[position].as_mut().unwrap());
-                assert_eq!(fixture.run(Transport::W3c), Err(TrialError::Refused));
-                assert!(fixture.taps.is_empty());
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for position in 0..2 {
+                for (reason, mutate) in mutations {
+                    let mut fixture = Fixture::new();
+                    mutate(fixture.captures[position].as_mut().unwrap());
+                    assert_eq!(fixture.run(transport), Err(TrialError::Refused(*reason)));
+                    assert!(fixture.taps.is_empty());
+                }
             }
         }
         let mut fixture = Fixture::new();
         fixture.age = 4000;
-        assert_eq!(fixture.run(Transport::Coordinate), Err(TrialError::Refused));
+        assert_eq!(
+            fixture.run(Transport::Coordinate),
+            Err(TrialError::Refused(FreshnessUnproven))
+        );
         assert!(fixture.taps.is_empty());
     }
 
     #[test]
     fn revalidation_refuses_changed_session_geometry_or_reused_capture() {
-        let mutations: &[fn(&mut Snapshot)] = &[
-            |s| s.session = "replacement-session".into(),
-            |s| s.observation.accessibility_tree = tree(false).replace("x=\"200\"", "x=\"210\""),
-            |s| s.observation.window.started_unix_ms = 100,
+        let mutations: &[RefusalMutation] = &[
+            (RefusalReason::SessionUnproven, |s| {
+                s.session = "replacement-session".into()
+            }),
+            (RefusalReason::GeometryMismatch, |s| {
+                s.observation.accessibility_tree = tree(false).replace("x=\"200\"", "x=\"210\"")
+            }),
+            (RefusalReason::FreshnessUnproven, |s| {
+                s.observation.window.started_unix_ms = 100
+            }),
         ];
-        for mutate in mutations {
-            let mut fixture = Fixture::new();
-            mutate(fixture.captures[1].as_mut().unwrap());
-            assert_eq!(fixture.run(Transport::W3c), Err(TrialError::Refused));
-            assert!(fixture.taps.is_empty());
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for (reason, mutate) in mutations {
+                let mut fixture = Fixture::new();
+                mutate(fixture.captures[1].as_mut().unwrap());
+                assert_eq!(fixture.run(transport), Err(TrialError::Refused(*reason)));
+                assert!(fixture.taps.is_empty());
+            }
         }
     }
 
     #[test]
     fn ambiguous_hidden_disabled_missing_attributes_and_unsafe_trees_refuse_input() {
         let original = tree(false);
+        use RefusalReason::*;
         let duplicate = r#"<XCUIElementTypeButton name="Stopwatch" visible="true" enabled="true" selected="false" x="200" y="700" width="100" height="80"/>"#;
         let cases = [
-            original.replace(
-                "</XCUIElementTypeTabBar>",
-                &format!("{duplicate}</XCUIElementTypeTabBar>"),
+            (
+                StopwatchAttributes,
+                original.replace(
+                    "</XCUIElementTypeTabBar>",
+                    &format!("{duplicate}</XCUIElementTypeTabBar>"),
+                ),
             ),
-            original.replace("visible=\"true\"", "visible=\"false\""),
-            original.replace("enabled=\"true\"", "enabled=\"false\""),
-            original.replace(" selected=\"false\"", ""),
-            original.replace(" visible=\"true\"", ""),
-            original.replace(" enabled=\"true\"", ""),
-            original.replace("x=\"200\"", "x=\"NaN\""),
-            original.replace("x=\"200\"", "x=\"399\""),
-            original.replace("</AppiumAUT>", "<XCUIElementTypeAlert/></AppiumAUT>"),
-            original.replace(
-                "</AppiumAUT>",
-                "<XCUIElementTypeSecureTextField/></AppiumAUT>",
+            (
+                StopwatchAttributes,
+                original.replace("visible=\"true\"", "visible=\"false\""),
             ),
-            original.replace("</AppiumAUT>", "<node name=\"proud-lock\"/></AppiumAUT>"),
-            original.replace("</AppiumAUT>", ""),
+            (
+                StopwatchAttributes,
+                original.replace("enabled=\"true\"", "enabled=\"false\""),
+            ),
+            (
+                StopwatchAttributes,
+                original.replace(" selected=\"false\"", ""),
+            ),
+            (
+                StopwatchAttributes,
+                original.replace(" visible=\"true\"", ""),
+            ),
+            (
+                StopwatchAttributes,
+                original.replace(" enabled=\"true\"", ""),
+            ),
+            (
+                WorldClockAttributes,
+                original.replace("name=\"World Clock\"", "name=\"Other\""),
+            ),
+            (GeometryMismatch, original.replace("x=\"200\"", "x=\"NaN\"")),
+            (GeometryMismatch, original.replace("x=\"200\"", "x=\"399\"")),
+            (
+                WdaLockUnproven,
+                original.replace("</AppiumAUT>", "<XCUIElementTypeAlert/></AppiumAUT>"),
+            ),
+            (
+                WdaLockUnproven,
+                original.replace(
+                    "</AppiumAUT>",
+                    "<XCUIElementTypeSecureTextField/></AppiumAUT>",
+                ),
+            ),
+            (
+                WdaLocked,
+                original.replace("</AppiumAUT>", "<node name=\"proud-lock\"/></AppiumAUT>"),
+            ),
+            (CaptureFailed, original.replace("</AppiumAUT>", "")),
         ];
-        for xml in cases {
-            let mut fixture = Fixture::new();
-            fixture.captures[1]
-                .as_mut()
-                .unwrap()
-                .observation
-                .accessibility_tree = xml;
-            assert_eq!(fixture.run(Transport::Coordinate), Err(TrialError::Refused));
-            assert!(fixture.taps.is_empty());
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for (reason, xml) in &cases {
+                let mut fixture = Fixture::new();
+                fixture.captures[1]
+                    .as_mut()
+                    .unwrap()
+                    .observation
+                    .accessibility_tree = xml.clone();
+                assert_eq!(fixture.run(transport), Err(TrialError::Refused(*reason)));
+                assert!(fixture.taps.is_empty());
+            }
         }
     }
 
@@ -668,15 +897,17 @@ mod tests {
             |s| s.observation.connected_usb = HardwareId::new("other-device").unwrap(),
             |s| s.observation.window.started_unix_ms = 100,
         ];
-        for mutate in mutations {
-            let mut fixture = Fixture::new();
-            mutate(fixture.captures[2].as_mut().unwrap());
-            assert_eq!(fixture.run(Transport::W3c), Err(TrialError::Unknown));
-            assert_eq!(fixture.taps.len(), 1);
-            assert!(fixture.captures.is_empty());
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for mutate in mutations {
+                let mut fixture = Fixture::new();
+                mutate(fixture.captures[2].as_mut().unwrap());
+                assert_eq!(fixture.run(transport), Err(TrialError::Unknown));
+                assert_eq!(fixture.taps.len(), 1);
+                assert!(fixture.captures.is_empty());
+            }
         }
         let mut fixture = Fixture::new();
-        fixture.captures[2] = Err(());
+        fixture.captures[2] = Err(RefusalReason::CaptureFailed);
         assert_eq!(fixture.run(Transport::Coordinate), Err(TrialError::Unknown));
         assert_eq!(fixture.taps.len(), 1);
     }
@@ -690,6 +921,76 @@ mod tests {
             assert_eq!(fixture.taps.len(), 1);
             assert!(fixture.captures.is_empty());
         }
+    }
+
+    #[test]
+    fn capture_failures_have_fixed_output_and_never_report_refusal_after_input() {
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for &(reason, output) in REFUSAL_OUTPUTS {
+                for position in 0..3 {
+                    let mut fixture = Fixture::new();
+                    fixture.captures[position] = Err(reason);
+                    let error = fixture.run(transport).unwrap_err();
+                    if position < 2 {
+                        assert_eq!(error, TrialError::Refused(reason));
+                        assert_eq!(format!("touch_trial={}", error.message()), output);
+                        assert!(fixture.taps.is_empty());
+                    } else {
+                        assert_eq!(error, TrialError::Unknown);
+                        assert_eq!(
+                            format!("touch_trial={}", error.message()),
+                            "touch_trial=unknown"
+                        );
+                        assert_eq!(fixture.taps.len(), 1);
+                    }
+                    assert_eq!(fixture.captures.len(), 2 - position);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn first_failed_guard_keeps_its_original_precedence() {
+        use RefusalReason::*;
+        let expected = HardwareId::new("fixture-device").unwrap();
+        let mut sample = snapshot(false, 100);
+        sample.fresh_until = Instant::now();
+        sample.observation.connected_usb = HardwareId::new("other-device").unwrap();
+        sample.session.clear();
+        sample.native = LockState::Locked;
+        sample.observation.state.lock = LockState::Locked;
+        sample.observation.state.wda_ready = false;
+        sample.observation.state.foreground_app = None;
+        sample.observation.window.finished_unix_ms = 0;
+        let repairs: &[RefusalMutation] = &[
+            (FreshnessUnproven, |s| {
+                s.fresh_until = Instant::now() + Duration::from_millis(MAX_AGE_MS)
+            }),
+            (IdentityUnproven, |s| {
+                s.observation.connected_usb = HardwareId::new("fixture-device").unwrap()
+            }),
+            (SessionUnproven, |s| s.session = "fixture-session".into()),
+            (NativeLocked, |s| s.native = LockState::Unlocked),
+            (WdaLocked, |s| {
+                s.observation.state.lock = LockState::Unlocked
+            }),
+            (SessionUnproven, |s| s.observation.state.wda_ready = true),
+            (ForegroundNotClock, |s| {
+                s.observation.state.foreground_app = Some(CLOCK.into())
+            }),
+            (FreshnessUnproven, |s| {
+                s.observation.window.finished_unix_ms = 101
+            }),
+        ];
+        for (reason, repair) in repairs {
+            assert_eq!(validate(&sample, &expected, Err(()), false), Err(*reason));
+            repair(&mut sample);
+        }
+        assert_eq!(
+            validate(&sample, &expected, Err(()), false),
+            Err(FreshnessUnproven)
+        );
+        assert!(validate(&sample, &expected, Ok(1000), false).is_ok());
     }
 
     #[test]
