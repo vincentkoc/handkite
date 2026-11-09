@@ -5,6 +5,7 @@ use handkite_core::protocol::{
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_transport::UsbWda;
+use handkite_host::{native_lock, pin_screen};
 use std::time::Duration;
 
 fn main() {
@@ -31,6 +32,15 @@ fn main() {
         "observe" => observe(expected),
         "demo" => demo(expected),
         "home" => home(expected),
+        "native-lock" => {
+            let result = native_lock::query(&expected);
+            println!(
+                "native_lock={:?} unlocked_since_boot={:?}",
+                result.state, result.unlocked_since_boot
+            );
+            Ok(())
+        }
+        "pin-shape" => pin_shape(expected),
         _ => Err("unknown probe command".into()),
     };
     if let Err(error) = result {
@@ -92,6 +102,23 @@ fn controller(expected: HardwareId) -> Result<(Controller<WdaAdapter>, DeviceKey
         5000,
     );
     Ok((controller, key))
+}
+
+fn pin_shape(expected: HardwareId) -> Result<(), String> {
+    let (controller, key) = controller(expected)?;
+    let observation = controller
+        .observe(&key)
+        .map_err(|error| format!("{error:?}"))?;
+    let parsed = pin_screen::parse(&observation.accessibility_tree)
+        .map_err(|_| "cannot parse passcode screen")?;
+    println!(
+        "visible_lock={:?} secure_field={} keypad={} delete_key={}",
+        parsed.visible_lock,
+        parsed.secure_field_value.is_some(),
+        parsed.keypad.is_some(),
+        parsed.delete_key.is_some()
+    );
+    Ok(())
 }
 
 fn demo(expected: HardwareId) -> Result<(), String> {
