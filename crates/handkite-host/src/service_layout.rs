@@ -32,6 +32,11 @@ impl ServiceLayout {
         self.root().join("releases")
     }
 
+    /// Fixed path for the future release-selection protocol; no pointer is created.
+    pub fn current_release_executable(&self) -> PathBuf {
+        self.releases_directory().join("current/handkited")
+    }
+
     pub fn runtime_directory(&self) -> PathBuf {
         self.root().join("runtime")
     }
@@ -109,6 +114,10 @@ pub(crate) mod tests {
     use std::os::unix::fs::symlink;
     use std::process::Command;
 
+    pub(crate) fn layout_at(home: impl Into<PathBuf>) -> ServiceLayout {
+        ServiceLayout { home: home.into() }
+    }
+
     pub(crate) fn fixture() -> (tempfile::TempDir, ServiceLayout) {
         fixture_with(tempfile::tempdir().unwrap())
     }
@@ -156,6 +165,10 @@ pub(crate) mod tests {
             assert_eq!(layout.root(), root);
             assert_eq!(layout.config_file(), root.join("config/host.json"));
             assert_eq!(layout.releases_directory(), root.join("releases"));
+            assert_eq!(
+                layout.current_release_executable(),
+                root.join("releases/current/handkited")
+            );
             assert_eq!(layout.runtime_directory(), root.join("runtime"));
             assert_eq!(layout.socket(), root.join("runtime/handkite.sock"));
             assert_eq!(layout.process_lock(), root.join("runtime/handkite.lock"));

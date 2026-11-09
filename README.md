@@ -64,10 +64,16 @@ The library's `ServiceLayout::current_account()` derives fixed paths from the ef
 | --- | --- |
 | Host configuration | `config/host.json` |
 | Versioned signed releases | `releases/` |
+| Selected daemon executable | `releases/current/handkited` |
 | Private runtime socket | `runtime/handkite.sock` |
 | Process ownership lock | `runtime/handkite.lock` |
 | Durable state | `state/` |
 | Staged launchd descriptor | `launchd/com.handkite.host.plist` |
+
+The pure `launchd_descriptor::render` helper emits the intended supervised
+descriptor for this fixed selection path. It writes or loads nothing; current
+release selection and activation remain unimplemented. See the descriptor
+contract and activation preconditions in [Mac release inputs](RELEASE.md).
 
 `validate_existing_directories()` requires every listed parent directory to exist. The home, Library, Application Support, Handkite root, and state directory must belong to the effective user and reject group/other write access. Config, releases, runtime, and launchd directories must additionally be mode 0700. Ancestors above the home must belong to root or that user and reject group/other writes. Symlinks and non-directory components fail closed. This metadata preflight is a point-in-time check; a future installer must use anchored directory descriptors to prevent path replacement races and validate each file separately.
 
