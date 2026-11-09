@@ -1,6 +1,6 @@
-//! Pure release inventory parsing. This does not verify artifacts or signer trust.
+//! Pure release inventory encoding and parsing, without artifact or signer proof.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const TARGET: &str = "aarch64-apple-darwin";
@@ -46,7 +46,13 @@ impl ArtifactName {
     }
 }
 
-#[derive(Debug, Deserialize)]
+impl Serialize for ArtifactName {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.filename())
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseArtifact {
     pub name: ArtifactName,
@@ -56,7 +62,20 @@ pub struct ReleaseArtifact {
     pub code_identifier: String,
 }
 
-#[derive(Debug, Deserialize)]
+impl ReleaseArtifact {
+    /// Record caller-supplied final signed-byte metadata. The manifest constructor
+    /// validates this record; no executable bytes or signatures are checked here.
+    pub fn new(name: ArtifactName, size: u64, sha256: String) -> Self {
+        Self {
+            name,
+            size,
+            sha256,
+            code_identifier: name.code_identifier().into(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RustIdentity {
     /// Exact stable toolchain version, without a host suffix or channel alias.
@@ -64,7 +83,7 @@ pub struct RustIdentity {
     pub compiler_commit: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SdkIdentity {
     pub version: String,
@@ -103,11 +122,27 @@ impl ReleaseManifest {
         if raw.schema_version != SCHEMA_VERSION || raw.target != TARGET {
             return Err("unsupported release schema or target");
         }
+        Self::new(
+            raw.source_sha,
+            raw.rust.0,
+            raw.sdk.0,
+            raw.artifacts.map(|item| item.0),
+        )
+    }
+
+    /// Construct a v1 inventory using the same validation as the JSON parser.
+    /// The caller supplies build identities and final signed-byte metadata.
+    pub fn new(
+        source_sha: String,
+        rust: RustIdentity,
+        sdk: SdkIdentity,
+        artifacts: [ReleaseArtifact; 3],
+    ) -> Result<Self, &'static str> {
         let value = Self {
-            source_sha: raw.source_sha,
-            rust: raw.rust.0,
-            sdk: raw.sdk.0,
-            artifacts: raw.artifacts.map(|item| item.0),
+            source_sha,
+            rust,
+            sdk,
+            artifacts,
         };
         if !lower_hex(&value.source_sha, 40)
             || !version(&value.rust.toolchain, 3, 3)
@@ -143,6 +178,45 @@ impl ReleaseManifest {
             }
         }
         Ok(value)
+    }
+
+    /// Compact UTF-8 JSON with fixed field order, no trailing newline, and
+    /// artifacts ordered as daemon, CLI, MCP. This is Handkite v1's encoding.
+    pub fn canonical_json(&self) -> Result<Vec<u8>, &'static str> {
+        #[derive(Serialize)]
+        struct Output<'a> {
+            schema_version: u32,
+            source_sha: &'a str,
+            target: &'a str,
+            rust: &'a RustIdentity,
+            sdk: &'a SdkIdentity,
+            artifacts: [&'a ReleaseArtifact; 3],
+        }
+
+        let mut artifacts = self.artifacts.each_ref();
+        artifacts.sort_unstable_by_key(|artifact| match artifact.name {
+            ArtifactName::Daemon => 0,
+            ArtifactName::Cli => 1,
+            ArtifactName::Mcp => 2,
+        });
+        serde_json::to_vec(&Output {
+            schema_version: SCHEMA_VERSION,
+            source_sha: &self.source_sha,
+            target: TARGET,
+            rust: &self.rust,
+            sdk: &self.sdk,
+            artifacts,
+        })
+        .map_err(|_| "cannot encode release manifest")
+    }
+
+    /// SHA-256 of `canonical_json()`, for an independently pinned receipt.
+    /// This is not the digest of the original bytes supplied to `parse`.
+    pub fn canonical_sha256(&self) -> Result<[u8; 32], &'static str> {
+        let digest = ring::digest::digest(&ring::digest::SHA256, &self.canonical_json()?);
+        let mut bytes = [0; 32];
+        bytes.copy_from_slice(digest.as_ref());
+        Ok(bytes)
     }
 
     pub fn source_sha(&self) -> &str {

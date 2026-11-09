@@ -37,6 +37,130 @@ fn parse(value: &Value) -> Result<ReleaseManifest, &'static str> {
     ReleaseManifest::parse(&serde_json::to_vec(value).unwrap())
 }
 
+fn construct(value: &Value) -> Result<ReleaseManifest, &'static str> {
+    let raw: ManifestJson = serde_json::from_value(value.clone()).unwrap();
+    ReleaseManifest::new(
+        raw.source_sha,
+        raw.rust.0,
+        raw.sdk.0,
+        raw.artifacts.map(|record| record.0),
+    )
+}
+
+#[test]
+fn construction_round_trips_with_fixed_identifiers() {
+    let parsed = ReleaseManifest::parse(FIXTURE.as_bytes()).unwrap();
+    let artifacts = parsed
+        .artifacts
+        .map(|record| ReleaseArtifact::new(record.name, record.size, record.sha256));
+    let manifest =
+        ReleaseManifest::new(parsed.source_sha, parsed.rust, parsed.sdk, artifacts).unwrap();
+    let bytes = manifest.canonical_json().unwrap();
+    assert_eq!(
+        bytes,
+        FIXTURE.split_whitespace().collect::<String>().as_bytes()
+    );
+    assert!(bytes.len() <= MAX_MANIFEST_BYTES);
+    let reparsed = ReleaseManifest::parse(&bytes).unwrap();
+    assert_eq!(reparsed.canonical_json().unwrap(), bytes);
+    assert_eq!(reparsed.canonical_sha256(), manifest.canonical_sha256());
+    let digest_hex: String = manifest
+        .canonical_sha256()
+        .unwrap()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest_hex,
+        "81656db26a02d367018ad3a66fdc4f676677bad2c4f632c3365de346625e890f"
+    );
+}
+
+#[test]
+fn canonical_encoding_is_independent_of_input_order_and_whitespace() {
+    let expected = ReleaseManifest::parse(FIXTURE.as_bytes()).unwrap();
+    for order in [
+        [0, 1, 2],
+        [0, 2, 1],
+        [1, 0, 2],
+        [1, 2, 0],
+        [2, 0, 1],
+        [2, 1, 0],
+    ] {
+        let mut value = fixture();
+        let original = value["artifacts"].clone();
+        value["artifacts"] = json!(order.map(|i| original[i].clone()));
+        let constructed = construct(&value).unwrap();
+        let parsed = parse(&value).unwrap();
+        for manifest in [constructed, parsed] {
+            assert_eq!(manifest.canonical_json(), expected.canonical_json());
+            assert_eq!(manifest.canonical_sha256(), expected.canonical_sha256());
+        }
+    }
+}
+
+#[test]
+fn construction_rejects_invalid_identities_and_records() {
+    for (pointer, invalid) in [
+        ("/source_sha", json!("a".repeat(39))),
+        ("/rust/toolchain", json!("stable")),
+        ("/rust/compiler_commit", json!("A".repeat(40))),
+        ("/sdk/version", json!("26.02")),
+        ("/sdk/build", json!("25C58\n")),
+        ("/artifacts/0/size", json!(0)),
+        ("/artifacts/0/size", json!(MAX_ARTIFACT_BYTES + 1)),
+        ("/artifacts/0/sha256", json!("g".repeat(64))),
+        ("/artifacts/0/code_identifier", json!("com.handkite.other")),
+    ] {
+        let mut value = fixture();
+        *value.pointer_mut(pointer).unwrap() = invalid;
+        assert_eq!(construct(&value).unwrap_err(), parse(&value).unwrap_err());
+    }
+    let mut value = fixture();
+    value["artifacts"][1] = value["artifacts"][0].clone();
+    assert_eq!(construct(&value).unwrap_err(), parse(&value).unwrap_err());
+}
+
+#[test]
+fn canonical_digest_covers_each_variable_field() {
+    let expected = construct(&fixture()).unwrap().canonical_sha256().unwrap();
+    for (pointer, changed) in [
+        ("/source_sha", json!("a".repeat(40))),
+        ("/rust/toolchain", json!("1.95.1")),
+        ("/rust/compiler_commit", json!("b".repeat(40))),
+        ("/sdk/version", json!("26.3")),
+        ("/sdk/build", json!("25C59")),
+        ("/artifacts/0/size", json!(2)),
+        ("/artifacts/1/size", json!(1025)),
+        ("/artifacts/2/size", json!(MAX_ARTIFACT_BYTES - 1)),
+        ("/artifacts/0/sha256", json!("a".repeat(64))),
+        ("/artifacts/1/sha256", json!("b".repeat(64))),
+        ("/artifacts/2/sha256", json!("c".repeat(64))),
+    ] {
+        let mut value = fixture();
+        *value.pointer_mut(pointer).unwrap() = changed;
+        assert_ne!(
+            construct(&value).unwrap().canonical_sha256().unwrap(),
+            expected,
+            "{pointer}"
+        );
+    }
+    // Names and code identifiers are fixed pairs; rebinding metadata must change
+    // the digest, while merely reordering complete records must not.
+    for pair in [[0, 1], [0, 2], [1, 2]] {
+        let mut value = fixture();
+        for field in ["name", "code_identifier"] {
+            let first = value["artifacts"][pair[0]][field].clone();
+            value["artifacts"][pair[0]][field] = value["artifacts"][pair[1]][field].clone();
+            value["artifacts"][pair[1]][field] = first;
+        }
+        assert_ne!(
+            construct(&value).unwrap().canonical_sha256().unwrap(),
+            expected
+        );
+    }
+}
+
 #[test]
 fn accepts_inventory_and_boundary_sizes_in_any_order() {
     let manifest = ReleaseManifest::parse(FIXTURE.as_bytes()).unwrap();
