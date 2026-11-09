@@ -1,4 +1,4 @@
-//! Read-only validation of the fixed service configuration for a future installer.
+//! Protected reading of the fixed service configuration for startup and installation.
 
 use crate::service_layout::ServiceLayout;
 use handkite_core::protocol::DeviceBinding;
@@ -6,13 +6,28 @@ use handkite_core::protocol::DeviceBinding;
 /// Validate existing config bytes against an independently supplied device binding.
 ///
 /// This neither observes a device nor grants installation authority. It creates
-/// or repairs nothing and does not change daemon loading. Success is bounded by
+/// or repairs nothing. Success is bounded by
 /// the checks performed: same-account races and replacement/restoration between
 /// observations remain possible, including changes after this function returns.
 pub fn verify(layout: &ServiceLayout, expected: &DeviceBinding) -> Result<(), &'static str> {
+    read_protected(layout, Some(expected)).map(|_| ())
+}
+
+/// Load the configured binding after protected reading and final path revalidation.
+///
+/// The binding comes from the fixed config, without comparison to an independent
+/// expected device. This neither observes a device nor grants installer authority.
+pub fn load_protected(layout: &ServiceLayout) -> Result<DeviceBinding, &'static str> {
+    read_protected(layout, None)
+}
+
+fn read_protected(
+    layout: &ServiceLayout,
+    expected: Option<&DeviceBinding>,
+) -> Result<DeviceBinding, &'static str> {
     #[cfg(target_os = "macos")]
     {
-        macos::verify(
+        macos::read(
             layout,
             expected,
             #[cfg(test)]
@@ -152,11 +167,11 @@ mod macos {
         Ok(metadata.into())
     }
 
-    pub(super) fn verify(
+    pub(super) fn read(
         layout: &ServiceLayout,
-        expected: &DeviceBinding,
+        expected: Option<&DeviceBinding>,
         #[cfg(test)] after_read: Option<&mut dyn FnMut()>,
-    ) -> Result<(), &'static str> {
+    ) -> Result<DeviceBinding, &'static str> {
         // Keep lower-level release helper errors inside this config boundary.
         let check = || {
             let mut held = AnchoredConfig::open(layout)?;
@@ -174,10 +189,13 @@ mod macos {
             }
             held.revalidate()?;
             let binding = parse(&bytes)?;
-            if binding.key != expected.key || binding.usb_id != expected.usb_id {
-                return Err(UNSAFE);
+            if let Some(expected) = expected {
+                if binding.key != expected.key || binding.usb_id != expected.usb_id {
+                    return Err(UNSAFE);
+                }
             }
-            held.revalidate()
+            held.revalidate()?;
+            Ok(binding)
         };
         check().map_err(|_| UNSAFE)
     }

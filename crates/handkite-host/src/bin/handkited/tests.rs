@@ -224,3 +224,43 @@ fn alternate_config_or_socket_directory_is_rejected_before_device_access() {
     }
     assert_eq!(fs::read_dir(scratch.path()).unwrap().count(), 0);
 }
+
+#[test]
+fn protected_config_failure_stops_before_socket_or_device_startup() {
+    let layout = ServiceLayout::current_account().unwrap();
+    let error = load_before_serving(
+        &layout,
+        |resolved| {
+            assert_eq!(resolved, &layout);
+            Err("unsafe or changed service configuration")
+        },
+        |_| panic!("config failure must not bind a socket or initialize a device"),
+    )
+    .unwrap_err();
+    assert_eq!(error, "unsafe or changed service configuration");
+}
+
+#[test]
+fn startup_continues_once_with_the_loaded_binding() {
+    let layout = ServiceLayout::current_account().unwrap();
+    let calls = std::cell::RefCell::new(Vec::new());
+    let result = load_before_serving(
+        &layout,
+        |resolved| {
+            calls.borrow_mut().push("load");
+            assert_eq!(resolved, &layout);
+            Ok(DeviceBinding {
+                key: handkite_core::protocol::DeviceKey::new("phone").unwrap(),
+                usb_id: HardwareId::new("fixture-usb").unwrap(),
+            })
+        },
+        |binding| {
+            calls.borrow_mut().push("serve");
+            assert_eq!(binding.key.as_str(), "phone");
+            assert_eq!(binding.usb_id.as_str(), "fixture-usb");
+            Err("fixture continuation".into())
+        },
+    );
+    assert_eq!(result, Err("fixture continuation".into()));
+    assert_eq!(*calls.borrow(), ["load", "serve"]);
+}

@@ -1,9 +1,9 @@
 use handkite_core::controller::Controller;
-use handkite_core::protocol::HardwareId;
+use handkite_core::protocol::{DeviceBinding, HardwareId};
 use handkite_host::service_layout::ServiceLayout;
 use handkite_host::service_lock::ServiceLock;
 use handkite_host::wda_adapter::WdaAdapter;
-use handkite_host::{device_health, host_config, local_socket};
+use handkite_host::{device_health, host_config, install_config, local_socket};
 use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
@@ -60,20 +60,30 @@ fn run(
 
 fn serve(layout: ServiceLayout) -> Result<(), String> {
     let owner = ServiceLock::acquire(layout).map_err(|_| "cannot acquire service ownership")?;
-    let binding = host_config::load(&owner.layout().config_file()).map_err(str::to_owned)?;
-    let listener =
-        local_socket::bind_service(&owner).map_err(|_| "cannot bind protected socket")?;
-    let key = binding.key.clone();
-    let adapter = WdaAdapter::new(binding.usb_id.clone())
-        .map_err(|_| "cannot initialize pinned WDA adapter")?;
-    let controller = Controller::new(binding, adapter, 5000, 5000);
-    controller
-        .observe(&key)
-        .map_err(|_| "pinned device is not ready")?;
-    eprintln!("handkited ready");
-    listener
-        .serve(&controller)
-        .map_err(|_| "local socket failed".into())
+    load_before_serving(owner.layout(), install_config::load_protected, |binding| {
+        let listener =
+            local_socket::bind_service(&owner).map_err(|_| "cannot bind protected socket")?;
+        let key = binding.key.clone();
+        let adapter = WdaAdapter::new(binding.usb_id.clone())
+            .map_err(|_| "cannot initialize pinned WDA adapter")?;
+        let controller = Controller::new(binding, adapter, 5000, 5000);
+        controller
+            .observe(&key)
+            .map_err(|_| "pinned device is not ready")?;
+        eprintln!("handkited ready");
+        listener
+            .serve(&controller)
+            .map_err(|_| "local socket failed".into())
+    })
+}
+
+fn load_before_serving(
+    layout: &ServiceLayout,
+    load: impl FnOnce(&ServiceLayout) -> Result<DeviceBinding, &'static str>,
+    serve: impl FnOnce(DeviceBinding) -> Result<(), String>,
+) -> Result<(), String> {
+    let binding = load(layout).map_err(str::to_owned)?;
+    serve(binding)
 }
 
 #[cfg(test)]
