@@ -212,13 +212,25 @@ fn validate(
     {
         return Err(RefusalReason::GeometryMismatch);
     }
-    if evidence.stopwatch.selected != Some(after) {
+    let explicit_selected = evidence.stopwatch.selected_present || evidence.world.selected_present;
+    if !evidence
+        .stopwatch
+        .selection_matches(after, explicit_selected)
+    {
         return Err(RefusalReason::StopwatchAttributes);
     }
-    if evidence.world.selected != Some(!after) {
+    if !evidence.world.selection_matches(!after, explicit_selected) {
         return Err(RefusalReason::WorldClockAttributes);
     }
-    if after && !evidence.start_visible {
+    if evidence.world_clock_navigation != u8::from(!after) {
+        return Err(RefusalReason::WorldClockAttributes);
+    }
+    let start_matches = if after {
+        evidence.start_ready
+    } else {
+        evidence.start_hidden_or_absent
+    };
+    if !start_matches {
         return Err(RefusalReason::StopwatchAttributes);
     }
     Ok(evidence.stopwatch.rect)
@@ -282,11 +294,20 @@ impl Rect {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+enum TabValue {
+    Absent,
+    Active,
+    Other,
+}
+
 struct Tab {
     rect: Rect,
     visible: Option<bool>,
     enabled: Option<bool>,
     selected: Option<bool>,
+    selected_present: bool,
+    value: TabValue,
 }
 
 impl Tab {
@@ -301,11 +322,36 @@ impl Tab {
             visible: flag("visible"),
             enabled: flag("enabled"),
             selected: flag("selected"),
+            selected_present: attrs.contains_key("selected"),
+            value: match attrs.get("value").map(String::as_str) {
+                None => TabValue::Absent,
+                Some("1") => TabValue::Active,
+                _ => TabValue::Other,
+            },
         })
     }
 
     fn eligible(&self) -> bool {
-        self.visible == Some(true) && self.enabled == Some(true) && self.selected.is_some()
+        self.visible == Some(true) && self.enabled == Some(true)
+    }
+
+    fn selection_matches(&self, active: bool, explicit_selected: bool) -> bool {
+        if explicit_selected {
+            self.selected == Some(active)
+                && match self.value {
+                    TabValue::Absent => true,
+                    TabValue::Active => active,
+                    TabValue::Other => false,
+                }
+        } else {
+            !self.selected_present
+                && self.value
+                    == if active {
+                        TabValue::Active
+                    } else {
+                        TabValue::Absent
+                    }
+        }
     }
 }
 
@@ -313,7 +359,9 @@ struct Evidence {
     screen: Rect,
     stopwatch: Tab,
     world: Tab,
-    start_visible: bool,
+    world_clock_navigation: u8,
+    start_hidden_or_absent: bool,
+    start_ready: bool,
 }
 
 fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
@@ -326,7 +374,9 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
     let mut tabbar = None;
     let mut stopwatch = None;
     let mut world = None;
-    let mut start_visible = false;
+    let mut world_clock_navigation = 0u8;
+    let mut start_hidden_or_absent = true;
+    let mut start_ready = false;
     let mut start_seen = false;
     loop {
         let event = reader
@@ -387,6 +437,18 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
                     tabbar = Some(Rect::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?);
                 }
                 let name = attrs.get("name").map(String::as_str);
+                let label = attrs.get("label").map(String::as_str);
+                if kind == "XCUIElementTypeNavigationBar"
+                    && (name == Some("World Clock") || label == Some("World Clock"))
+                    && attrs.get("visible").map(String::as_str) == Some("true")
+                {
+                    if !stack.iter().any(|s| s == "XCUIElementTypeApplication") {
+                        return Err(RefusalReason::WorldClockAttributes);
+                    }
+                    if !stack.iter().any(|s| s == "XCUIElementTypeTabBar") {
+                        world_clock_navigation = world_clock_navigation.saturating_add(1);
+                    }
+                }
                 if matches!(name, Some("Stopwatch" | "World Clock"))
                     && kind == "XCUIElementTypeButton"
                 {
@@ -403,7 +465,7 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
                     }
                     *slot = Some(Tab::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?);
                 }
-                if name == Some("Start")
+                if (name == Some("Start") || label == Some("Start"))
                     && kind == "XCUIElementTypeButton"
                     && !stack.iter().any(|s| s == "XCUIElementTypeTabBar")
                 {
@@ -412,7 +474,8 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
                     }
                     start_seen = true;
                     let button = Tab::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?;
-                    start_visible = button.visible == Some(true)
+                    start_hidden_or_absent = button.visible == Some(false);
+                    start_ready = button.visible == Some(true)
                         && button.enabled == Some(true)
                         && screen
                             .ok_or(RefusalReason::GeometryMismatch)?
@@ -437,7 +500,9 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
         screen: screen.ok_or(RefusalReason::GeometryMismatch)?,
         stopwatch: stopwatch.ok_or(RefusalReason::StopwatchAttributes)?,
         world: world.ok_or(RefusalReason::WorldClockAttributes)?,
-        start_visible,
+        world_clock_navigation,
+        start_hidden_or_absent,
+        start_ready,
     };
     let bar = tabbar.ok_or(RefusalReason::GeometryMismatch)?;
     if !evidence.stopwatch.eligible() {
@@ -629,14 +694,24 @@ mod tests {
     fn tree(after: bool) -> String {
         format!(
             r#"<AppiumAUT><XCUIElementTypeApplication name="Clock" x="0" y="0" width="400" height="800">
+          <XCUIElementTypeNavigationBar name="World Clock" visible="{before}"/>
           <XCUIElementTypeButton name="Start" visible="{after}" enabled="true" x="300" y="500" width="60" height="60"/>
           <XCUIElementTypeTabBar x="0" y="700" width="400" height="100">
-            <XCUIElementTypeButton name="World Clock" visible="true" enabled="true" selected="{}" x="0" y="700" width="100" height="80"/>
+            <XCUIElementTypeButton name="World Clock" visible="true" enabled="true" selected="{before}" x="0" y="700" width="100" height="80"/>
             <XCUIElementTypeButton name="Stopwatch" visible="true" enabled="true" selected="{after}" x="200" y="700" width="100" height="80"/>
           </XCUIElementTypeTabBar>
         </XCUIElementTypeApplication></AppiumAUT>"#,
-            !after
+            before = !after
         )
+    }
+
+    const WORLD_NAV: &str = r#"<XCUIElementTypeNavigationBar name="World Clock" visible="true"/>"#;
+    const HIDDEN_START: &str = r#"<XCUIElementTypeButton name="Start" visible="false" enabled="true" x="300" y="500" width="60" height="60"/>"#;
+    const READY_START: &str = r#"<XCUIElementTypeButton name="Start" visible="true" enabled="true" x="300" y="500" width="60" height="60"/>"#;
+
+    fn value_schema(xml: &str) -> String {
+        xml.replace(" selected=\"true\"", " value=\"1\"")
+            .replace(" selected=\"false\"", "")
     }
 
     fn snapshot(after: bool, tick: u64) -> Snapshot {
@@ -729,6 +804,200 @@ mod tests {
                 [(transport, Point { x: 250.0, y: 740.0 }, expires)]
             );
             assert!(fixture.captures.is_empty());
+        }
+    }
+
+    #[test]
+    fn both_coherent_schemas_require_the_reciprocal_content_transition() {
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for schema in 0..3 {
+                for start_absent in [false, true] {
+                    let mut fixture = Fixture::new();
+                    for (index, capture) in fixture.captures.iter_mut().enumerate() {
+                        let xml = &mut capture.as_mut().unwrap().observation.accessibility_tree;
+                        if schema == 1 {
+                            *xml = value_schema(xml);
+                        }
+                        if schema == 2 {
+                            *xml =
+                                xml.replace("selected=\"true\"", "selected=\"true\" value=\"1\"");
+                        }
+                        if start_absent && index < 2 {
+                            *xml = xml.replace(HIDDEN_START, "");
+                        }
+                        *xml = xml
+                            .replace(
+                                "NavigationBar name=\"World Clock\"",
+                                "NavigationBar label=\"World Clock\"",
+                            )
+                            .replace("Button name=\"Start\"", "Button label=\"Start\"");
+                    }
+                    assert_eq!(fixture.run(transport), Ok(()));
+                    assert_eq!(fixture.taps.len(), 1);
+                    assert!(fixture.captures.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_conflicting_or_unrecognized_selection_evidence_refuses_both_transports() {
+        let explicit = tree(false);
+        let values = value_schema(&explicit);
+        let inactive = "name=\"Stopwatch\" visible=\"true\" enabled=\"true\"";
+        let cases = [
+            explicit.replace("selected=\"true\"", "selected=\"false\""),
+            explicit.replace("selected=\"false\"", "selected=\"true\""),
+            explicit.replace("selected=\"false\"", "selected=\"invalid\""),
+            explicit.replace(" selected=\"false\"", ""),
+            explicit.replace(" selected=\"true\"", ""),
+            explicit.replace("selected=\"false\"", "selected=\"false\" value=\"1\""),
+            explicit.replace("selected=\"true\"", "selected=\"true\" value=\"other\""),
+            values.replace(" value=\"1\"", ""),
+            values.replace(inactive, &format!("{inactive} value=\"1\"")),
+            values.replace(inactive, &format!("{inactive} value=\"0\"")),
+            values.replace(inactive, &format!("{inactive} selected=\"false\"")),
+            values.replace("value=\"1\"", "selected=\"true\" value=\"1\""),
+            values.replace("value=\"1\"", "selected=\"invalid\" value=\"1\""),
+            values.replace("value=\"1\"", "value=\"0\""),
+            values.replace("value=\"1\"", "value=\"true\""),
+            values.replace("value=\"1\"", "value=\"false\""),
+            values.replace("value=\"1\"", "value=\" 1\""),
+            values.replace("value=\"1\"", "value=\"\""),
+        ];
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for position in 0..2 {
+                for xml in &cases {
+                    let mut fixture = Fixture::new();
+                    fixture.captures[position]
+                        .as_mut()
+                        .unwrap()
+                        .observation
+                        .accessibility_tree = xml.clone();
+                    assert!(matches!(
+                        fixture.run(transport),
+                        Err(TrialError::Refused(_))
+                    ));
+                    assert!(fixture.taps.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn before_content_rejects_other_clock_tabs_overlays_and_ambiguous_markers() {
+        let before = tree(false);
+        let cases = [
+            before.replace(WORLD_NAV, &WORLD_NAV.replace("World Clock", "Alarm")),
+            before.replace(WORLD_NAV, &WORLD_NAV.replace("World Clock", "Timers")),
+            before.replace(WORLD_NAV, ""),
+            before.replace(WORLD_NAV, &WORLD_NAV.replace("true", "false")),
+            before.replace(WORLD_NAV, &WORLD_NAV.replace("NavigationBar", "StaticText")),
+            before.replace(WORLD_NAV, &WORLD_NAV.repeat(2)),
+            before
+                .replace(WORLD_NAV, "")
+                .replace("</AppiumAUT>", &format!("{WORLD_NAV}</AppiumAUT>")),
+            before.replace(WORLD_NAV, "").replace(
+                "</XCUIElementTypeTabBar>",
+                &format!("{WORLD_NAV}</XCUIElementTypeTabBar>"),
+            ),
+            before.replace(HIDDEN_START, READY_START),
+            before.replace(
+                HIDDEN_START,
+                &READY_START.replace("enabled=\"true\"", "enabled=\"false\""),
+            ),
+            before.replace(
+                HIDDEN_START,
+                &HIDDEN_START.replace(" visible=\"false\"", ""),
+            ),
+            before.replace(HIDDEN_START, &HIDDEN_START.repeat(2)),
+            before.replace(
+                "</XCUIElementTypeApplication>",
+                "<XCUIElementTypeAlert/></XCUIElementTypeApplication>",
+            ),
+            before.replace(
+                "</XCUIElementTypeApplication>",
+                "<XCUIElementTypeSheet/></XCUIElementTypeApplication>",
+            ),
+            before.replace(
+                "</XCUIElementTypeApplication>",
+                "<XCUIElementTypeSecureTextField/></XCUIElementTypeApplication>",
+            ),
+        ];
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for values in [false, true] {
+                for xml in &cases {
+                    let mut fixture = Fixture::new();
+                    fixture.captures[1]
+                        .as_mut()
+                        .unwrap()
+                        .observation
+                        .accessibility_tree = if values {
+                        value_schema(xml)
+                    } else {
+                        xml.clone()
+                    };
+                    assert!(matches!(
+                        fixture.run(transport),
+                        Err(TrialError::Refused(_))
+                    ));
+                    assert!(fixture.taps.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_after_content_or_schema_is_unknown_after_exactly_one_tap() {
+        let after = tree(true);
+        let cases = [
+            after.replace(&WORLD_NAV.replace("true", "false"), WORLD_NAV),
+            after.replace(READY_START, ""),
+            after.replace(READY_START, HIDDEN_START),
+            after.replace(
+                READY_START,
+                &READY_START.replace("enabled=\"true\"", "enabled=\"false\""),
+            ),
+            after.replace(READY_START, &READY_START.repeat(2)),
+            after
+                .replace(READY_START, "")
+                .replace("</AppiumAUT>", &format!("{READY_START}</AppiumAUT>")),
+            after.replace(READY_START, "").replace(
+                "</XCUIElementTypeTabBar>",
+                &format!("{READY_START}</XCUIElementTypeTabBar>"),
+            ),
+            after.replace(
+                "</XCUIElementTypeApplication>",
+                "<XCUIElementTypeAlert/></XCUIElementTypeApplication>",
+            ),
+            after.replace("selected=\"false\"", "selected=\"true\""),
+            after.replace(" selected=\"true\"", ""),
+        ];
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for values in [false, true] {
+                for xml in &cases {
+                    let mut fixture = Fixture::new();
+                    if values {
+                        for capture in &mut fixture.captures {
+                            let source =
+                                &mut capture.as_mut().unwrap().observation.accessibility_tree;
+                            *source = value_schema(source);
+                        }
+                    }
+                    fixture.captures[2]
+                        .as_mut()
+                        .unwrap()
+                        .observation
+                        .accessibility_tree = if values {
+                        value_schema(xml)
+                    } else {
+                        xml.clone()
+                    };
+                    assert_eq!(fixture.run(transport), Err(TrialError::Unknown));
+                    assert_eq!(fixture.taps.len(), 1);
+                    assert!(fixture.captures.is_empty());
+                }
+            }
         }
     }
 

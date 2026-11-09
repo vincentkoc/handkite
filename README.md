@@ -145,9 +145,17 @@ screenshot/tree captures with stable Stopwatch tab geometry. Its separate
 attribute-rich tree retains `visible`, `enabled`, and `selected`; ordinary
 controller observations keep their existing projection. Capture windows must
 be at most ten seconds, and the paired evidence must be at most two seconds old
-after the final identity, session, and native checks. Missing attributes, alerts,
+after the final identity, session, and native checks. Missing visibility/enabled
+attributes, incoherent selection evidence, alerts,
 secure fields, lock markers, ambiguous geometry, or an already selected Stopwatch
 tab refuse input.
+
+Selection requires reciprocal explicit `selected` booleans on both tabs, or
+both `selected` attributes absent with exact `value="1"` on the active tab and
+no value on the inactive tab. Explicit booleans can have an absent value or a
+corroborating active `1`; inactive values and every other value are refused.
+Before input, exactly one visible World Clock NavigationBar must be inside the
+Application and outside TabBar, and Start must be absent or explicitly hidden.
 
 The capture also carries an absolute monotonic expiry into the selected input
 transport. Discovery and connection time consume that budget. Expiry is checked
@@ -156,7 +164,8 @@ bytes. Expiry after a partial write leaves delivery unknown and never retries.
 
 The selected transport sends one tap at the tab's accessibility-coordinate
 center. One post-action paired capture must show Stopwatch selected, World Clock
-unselected, and visible enabled Start content, with the same device/session and
+unselected, no visible World Clock NavigationBar, and exactly one visible enabled
+Start button inside the Application and outside TabBar, with the same device/session and
 unlocked state. This uses accessibility evidence alongside the screenshot; it
 does not perform image recognition. A receipt alone is insufficient. Output is
 limited to fixed status words and the selected transport: exit 0 confirms the
