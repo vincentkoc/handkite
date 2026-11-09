@@ -23,7 +23,7 @@ fn main() {
     };
     let command = std::env::args().nth(1).unwrap_or_else(|| "status".into());
     let result = match command.as_str() {
-        "status" | "sessions" | "pin-attrs" => {
+        "status" | "sessions" | "pin-attrs" | "active-session" => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -32,6 +32,7 @@ fn main() {
             match command.as_str() {
                 "status" => runtime.block_on(status(&wda)),
                 "sessions" => runtime.block_on(sessions(&wda)),
+                "active-session" => runtime.block_on(active_session(&wda)),
                 _ => runtime.block_on(pin_attrs(&wda)),
             }
         }
@@ -95,6 +96,7 @@ async fn sessions(wda: &UsbWda) -> Result<(), String> {
 }
 
 async fn pin_attrs(wda: &UsbWda) -> Result<(), String> {
+    let started = std::time::Instant::now();
     let response = wda
         .request("GET", "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame", b"", Duration::from_secs(10))
         .await
@@ -103,13 +105,41 @@ async fn pin_attrs(wda: &UsbWda) -> Result<(), String> {
         serde_json::from_slice(&response.body).map_err(|_| "invalid WDA JSON")?;
     let xml = json["value"].as_str().ok_or("missing source")?;
     println!(
-        "pin_source_status={} visible_attr={} enabled_attr={} secure_field={} digit_key={}",
+        "pin_source_status={} visible_attr={} enabled_attr={} secure_field={} digit_key={} elapsed_ms={}",
         response.status,
         xml.contains(" visible=\""),
         xml.contains(" enabled=\""),
         xml.contains("XCUIElementTypeSecureTextField"),
-        xml.contains("XCUIElementTypeKey")
+        xml.contains("XCUIElementTypeKey"),
+        started.elapsed().as_millis()
     );
+    Ok(())
+}
+
+async fn active_session(wda: &UsbWda) -> Result<(), String> {
+    let response = wda
+        .request("GET", "/status", b"", Duration::from_secs(8))
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|_| "invalid WDA JSON")?;
+    let id = json["sessionId"].as_str().filter(|id| {
+        !id.is_empty()
+            && id.len() <= 128
+            && id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    });
+    let Some(id) = id else {
+        println!("active_session=false validated=false");
+        return Ok(());
+    };
+    let path = format!("/session/{id}");
+    let validation = wda
+        .request("GET", &path, b"", Duration::from_secs(8))
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    println!("active_session=true validated={}", validation.status == 200);
     Ok(())
 }
 
