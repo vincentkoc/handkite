@@ -220,6 +220,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            WdaActions::default()
+                .tap_existing(&wda, Point { x: 100.0, y: 200.0 })
+                .await
+                .is_err()
+        );
     }
 
     #[test]
