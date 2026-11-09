@@ -1,11 +1,33 @@
 use crate::wda_http::HttpResponse;
-use crate::wda_transport::UsbWda;
+use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::AdapterError;
 use handkite_core::protocol::{Action, Point, TransportReceipt};
 use serde_json::{Value, json};
 use std::time::Duration;
 
 const LOCK_SHORTCUT: &str = "shortcuts://run-shortcut?name=OpenClaw%20Lock%20Screen";
+
+pub(crate) trait WdaRequest {
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        deadline: Duration,
+    ) -> Result<HttpResponse, WdaError>;
+}
+
+impl WdaRequest for UsbWda {
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        deadline: Duration,
+    ) -> Result<HttpResponse, WdaError> {
+        UsbWda::request(self, method, path, body, deadline).await
+    }
+}
 
 #[derive(Default)]
 pub struct WdaActions {
@@ -14,6 +36,10 @@ pub struct WdaActions {
 
 impl WdaActions {
     pub async fn prepare_existing(&mut self, wda: &UsbWda) -> Result<(), AdapterError> {
+        self.validate_existing(wda).await
+    }
+
+    async fn validate_existing(&mut self, wda: &impl WdaRequest) -> Result<(), AdapterError> {
         let response = wda
             .request("GET", "/status", b"", Duration::from_secs(10))
             .await
@@ -23,8 +49,8 @@ impl WdaActions {
         if !valid_session_id(id) {
             return Err(AdapterError);
         }
-        if let Some(current) = &self.session {
-            return (current == id).then_some(()).ok_or(AdapterError);
+        if self.session.as_ref().is_some_and(|current| current != id) {
+            return Err(AdapterError);
         }
         let path = format!("/session/{id}");
         let validation = wda
@@ -36,13 +62,14 @@ impl WdaActions {
         Ok(())
     }
 
-    pub async fn execute(
+    pub(crate) async fn execute_with_existing_session(
         &mut self,
-        wda: &UsbWda,
+        wda: &impl WdaRequest,
         action: &Action,
     ) -> Result<TransportReceipt, AdapterError> {
-        let session = self.session_id(wda).await?;
-        Self::execute_on(wda, action, &session).await
+        self.validate_existing(wda).await?;
+        let session = self.session.as_deref().ok_or(AdapterError)?;
+        Self::execute_on(wda, action, session).await
     }
 
     pub async fn execute_existing(
@@ -90,7 +117,7 @@ impl WdaActions {
     }
 
     async fn execute_on(
-        wda: &UsbWda,
+        wda: &impl WdaRequest,
         action: &Action,
         session: &str,
     ) -> Result<TransportReceipt, AdapterError> {
@@ -106,28 +133,6 @@ impl WdaActions {
             accepted: Some(true),
             action_kind: action.kind().into(),
         })
-    }
-
-    async fn session_id(&mut self, wda: &UsbWda) -> Result<String, AdapterError> {
-        if let Some(session) = &self.session {
-            return Ok(session.clone());
-        }
-        let body = serde_json::to_vec(&json!({"capabilities": {"alwaysMatch": {}}}))
-            .map_err(|_| AdapterError)?;
-        let response = wda
-            .request("POST", "/session", &body, Duration::from_secs(30))
-            .await
-            .map_err(|_| AdapterError)?;
-        let json = response_ok(response)?;
-        let id = json["sessionId"]
-            .as_str()
-            .or_else(|| json["value"]["sessionId"].as_str())
-            .ok_or(AdapterError)?;
-        if !valid_session_id(id) {
-            return Err(AdapterError);
-        }
-        self.session = Some(id.into());
-        Ok(id.into())
     }
 }
 
@@ -210,6 +215,205 @@ mod tests {
     use super::*;
     use crate::usb::PinnedUsb;
     use handkite_core::protocol::HardwareId;
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+
+    struct Step {
+        method: &'static str,
+        path: &'static str,
+        response: Result<HttpResponse, WdaError>,
+    }
+
+    struct Script(RefCell<VecDeque<Step>>);
+
+    impl Script {
+        fn new(steps: Vec<Step>) -> Self {
+            Self(RefCell::new(steps.into()))
+        }
+
+        fn done(&self) {
+            assert!(self.0.borrow().is_empty(), "unconsumed WDA requests");
+        }
+    }
+
+    impl WdaRequest for Script {
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            body: &[u8],
+            _deadline: Duration,
+        ) -> Result<HttpResponse, WdaError> {
+            let step = self
+                .0
+                .borrow_mut()
+                .pop_front()
+                .expect("unexpected WDA request");
+            assert_eq!((method, path), (step.method, step.path));
+            if method == "GET" {
+                assert!(body.is_empty());
+            } else {
+                assert_eq!(
+                    serde_json::from_slice::<Value>(body).unwrap(),
+                    json!({"name": "home"})
+                );
+            }
+            step.response
+        }
+    }
+
+    fn response(method: &'static str, path: &'static str, status: u16, body: Value) -> Step {
+        Step {
+            method,
+            path,
+            response: Ok(HttpResponse {
+                status,
+                body: serde_json::to_vec(&body).unwrap(),
+            }),
+        }
+    }
+
+    fn status(id: Value) -> Step {
+        response("GET", "/status", 200, json!({"sessionId": id, "value": {}}))
+    }
+
+    fn valid_action() -> Vec<Step> {
+        vec![
+            status(json!("fixture-session")),
+            response("GET", "/session/fixture-session", 200, json!({"value": {}})),
+            response(
+                "POST",
+                "/session/fixture-session/wda/pressButton",
+                200,
+                json!({"value": null}),
+            ),
+        ]
+    }
+
+    #[tokio::test]
+    async fn daemon_adopts_and_revalidates_the_existing_session_before_each_action() {
+        let mut steps = valid_action();
+        steps.extend(valid_action());
+        let wda = Script::new(steps);
+        let mut actions = WdaActions::default();
+        for _ in 0..2 {
+            let receipt = actions
+                .execute_with_existing_session(&wda, &Action::Home)
+                .await
+                .unwrap();
+            assert_eq!(receipt.accepted, Some(true));
+            assert_eq!(receipt.action_kind, "home");
+            assert_eq!(actions.session.as_deref(), Some("fixture-session"));
+        }
+        wda.done();
+    }
+
+    #[tokio::test]
+    async fn daemon_rejects_absent_invalid_or_stale_sessions_before_input() {
+        let cases = vec![
+            vec![status(Value::Null)],
+            vec![status(json!(""))],
+            vec![status(json!("../invalid"))],
+            vec![response("GET", "/status", 503, json!({"value": {}}))],
+            vec![
+                status(json!("fixture-session")),
+                response(
+                    "GET",
+                    "/session/fixture-session",
+                    404,
+                    json!({"value": {"error": "invalid session id"}}),
+                ),
+            ],
+            vec![
+                status(json!("fixture-session")),
+                response(
+                    "GET",
+                    "/session/fixture-session",
+                    200,
+                    json!({"value": {"error": "invalid session id"}}),
+                ),
+            ],
+            vec![Step {
+                method: "GET",
+                path: "/status",
+                response: Err(WdaError::NotConnected),
+            }],
+        ];
+        for steps in cases {
+            let wda = Script::new(steps);
+            let mut actions = WdaActions::default();
+            assert!(
+                actions
+                    .execute_with_existing_session(&wda, &Action::Home)
+                    .await
+                    .is_err()
+            );
+            assert!(actions.session.is_none());
+            wda.done();
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_never_replaces_a_missing_changed_or_stale_pinned_session() {
+        let cases = vec![
+            vec![status(Value::Null)],
+            vec![status(json!("replacement-session"))],
+            vec![
+                status(json!("fixture-session")),
+                response(
+                    "GET",
+                    "/session/fixture-session",
+                    404,
+                    json!({"value": {"error": "invalid session id"}}),
+                ),
+            ],
+            vec![
+                status(json!("fixture-session")),
+                Step {
+                    method: "GET",
+                    path: "/session/fixture-session",
+                    response: Err(WdaError::AfterSent),
+                },
+            ],
+        ];
+        for failure in cases {
+            let mut steps = valid_action();
+            steps.extend(failure);
+            steps.push(status(json!("replacement-session")));
+            let wda = Script::new(steps);
+            let mut actions = WdaActions::default();
+            actions
+                .execute_with_existing_session(&wda, &Action::Home)
+                .await
+                .unwrap();
+            for _ in 0..2 {
+                assert!(
+                    actions
+                        .execute_with_existing_session(&wda, &Action::Home)
+                        .await
+                        .is_err()
+                );
+                assert_eq!(actions.session.as_deref(), Some("fixture-session"));
+            }
+            wda.done();
+        }
+    }
+
+    #[tokio::test]
+    async fn daemon_does_not_retry_input_or_renew_after_lost_acknowledgment() {
+        let mut steps = valid_action();
+        steps.last_mut().unwrap().response = Err(WdaError::AfterSent);
+        let wda = Script::new(steps);
+        let mut actions = WdaActions::default();
+        assert!(
+            actions
+                .execute_with_existing_session(&wda, &Action::Home)
+                .await
+                .is_err()
+        );
+        assert_eq!(actions.session.as_deref(), Some("fixture-session"));
+        wda.done();
+    }
 
     #[tokio::test]
     async fn pin_action_refuses_to_create_a_session() {

@@ -103,8 +103,10 @@ impl DeviceAdapter for WdaAdapter {
     }
 
     fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
-        self.runtime
-            .block_on(self.actions.execute(&UsbWda::new(self.usb.clone()), action))
+        self.runtime.block_on(
+            self.actions
+                .execute_with_existing_session(&UsbWda::new(self.usb.clone()), action),
+        )
     }
 
     fn native_lock_state(&mut self) -> LockState {
