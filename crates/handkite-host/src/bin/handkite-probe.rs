@@ -23,13 +23,17 @@ fn main() {
     };
     let command = std::env::args().nth(1).unwrap_or_else(|| "status".into());
     let result = match command.as_str() {
-        "status" => {
+        "status" | "sessions" | "pin-attrs" => {
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .expect("Tokio runtime");
             let wda = UsbWda::new(PinnedUsb::new(expected));
-            runtime.block_on(status(&wda))
+            match command.as_str() {
+                "status" => runtime.block_on(status(&wda)),
+                "sessions" => runtime.block_on(sessions(&wda)),
+                _ => runtime.block_on(pin_attrs(&wda)),
+            }
         }
         "observe" => observe(expected),
         "demo" => demo(expected),
@@ -64,6 +68,49 @@ async fn status(wda: &UsbWda) -> Result<(), String> {
     (response.status == 200 && ready)
         .then_some(())
         .ok_or_else(|| "WDA is not ready".into())
+}
+
+async fn sessions(wda: &UsbWda) -> Result<(), String> {
+    let response = wda
+        .request("GET", "/sessions", b"", Duration::from_secs(8))
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let value: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|_| "invalid WDA JSON")?;
+    let sessions = value["value"].as_array();
+    let valid_ids = sessions.is_some_and(|sessions| {
+        sessions.iter().all(|session| {
+            session["id"]
+                .as_str()
+                .or_else(|| session["sessionId"].as_str())
+                .is_some()
+        })
+    });
+    println!(
+        "sessions_status={} count={} valid_ids={valid_ids}",
+        response.status,
+        sessions.map_or(0, Vec::len)
+    );
+    Ok(())
+}
+
+async fn pin_attrs(wda: &UsbWda) -> Result<(), String> {
+    let response = wda
+        .request("GET", "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame", b"", Duration::from_secs(10))
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+    let json: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|_| "invalid WDA JSON")?;
+    let xml = json["value"].as_str().ok_or("missing source")?;
+    println!(
+        "pin_source_status={} visible_attr={} enabled_attr={} secure_field={} digit_key={}",
+        response.status,
+        xml.contains(" visible=\""),
+        xml.contains(" enabled=\""),
+        xml.contains("XCUIElementTypeSecureTextField"),
+        xml.contains("XCUIElementTypeKey")
+    );
+    Ok(())
 }
 
 fn observe(expected: HardwareId) -> Result<(), String> {
