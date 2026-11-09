@@ -1,0 +1,200 @@
+use super::*;
+use device_health::DeviceHealth;
+use handkite_core::protocol::LockState;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use tempfile::NamedTempFile;
+
+fn config(contents: &[u8]) -> NamedTempFile {
+    let mut file = NamedTempFile::new().unwrap();
+    file.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))
+        .unwrap();
+    file.write_all(contents).unwrap();
+    file
+}
+
+fn valid_config() -> NamedTempFile {
+    config(br#"{"device_key":"phone","usb_id":"fixture-usb"}"#)
+}
+
+fn check_args(file: &Path) -> Vec<OsString> {
+    vec!["--check".into(), "--config".into(), file.into()]
+}
+
+fn ready() -> DeviceHealth {
+    DeviceHealth {
+        usb_connected: true,
+        wda_http: true,
+        wda_ready: true,
+        existing_session_valid: true,
+        native_lock: LockState::Locked,
+        unlocked_since_boot: Some(true),
+    }
+}
+
+#[test]
+fn check_reports_only_health_and_never_serves() {
+    let config = valid_config();
+    for lock in [LockState::Locked, LockState::Unlocked] {
+        for unlocked_since_boot in [None, Some(false), Some(true)] {
+            let health = DeviceHealth {
+                native_lock: lock,
+                unlocked_since_boot,
+                ..ready()
+            };
+            let mut output = Vec::new();
+            let code = run(
+                &check_args(config.path()),
+                |id| {
+                    assert_eq!(id.as_str(), "fixture-usb");
+                    health
+                },
+                |_, _| panic!("check must not initialize or serve the daemon"),
+                &mut output,
+            )
+            .unwrap();
+            assert_eq!(code, 0);
+            let json: serde_json::Value = serde_json::from_slice(&output).unwrap();
+            assert_eq!(json, serde_json::to_value(health).unwrap());
+            assert_eq!(json.as_object().unwrap().len(), 6);
+            assert!(output.len() < 200);
+            assert!(!String::from_utf8(output).unwrap().contains("fixture-usb"));
+        }
+    }
+}
+
+#[test]
+fn every_readiness_failure_returns_one_without_serving() {
+    let config = valid_config();
+    for health in [
+        DeviceHealth {
+            usb_connected: false,
+            ..ready()
+        },
+        DeviceHealth {
+            wda_http: false,
+            ..ready()
+        },
+        DeviceHealth {
+            wda_ready: false,
+            ..ready()
+        },
+        DeviceHealth {
+            existing_session_valid: false,
+            ..ready()
+        },
+        DeviceHealth {
+            native_lock: LockState::Uncertain,
+            ..ready()
+        },
+    ] {
+        let mut output = Vec::new();
+        assert_eq!(
+            run(
+                &check_args(config.path()),
+                |_| health,
+                |_, _| panic!("failed check must not serve"),
+                &mut output,
+            )
+            .unwrap(),
+            1,
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&output).unwrap(),
+            serde_json::to_value(health).unwrap(),
+        );
+    }
+}
+
+fn rejected_before_device_access(args: &[OsString]) -> String {
+    let mut output = Vec::new();
+    let error = run(
+        args,
+        |_| panic!("invalid input must not inspect a device"),
+        |_, _| panic!("invalid input must not serve"),
+        &mut output,
+    )
+    .unwrap_err();
+    assert!(output.is_empty());
+    error
+}
+
+#[test]
+fn invalid_config_is_rejected_before_device_access() {
+    for contents in [
+        b"invalid".as_slice(),
+        br#"{"device_key":"../phone","usb_id":"fixture-usb"}"#,
+        br#"{"device_key":"phone","usb_id":""}"#,
+        br#"{"device_key":"phone","usb_id":"fixture-usb","extra":true}"#,
+    ] {
+        let config = config(contents);
+        let error = rejected_before_device_access(&check_args(config.path()));
+        assert!(!error.contains("fixture-usb"));
+    }
+    let config = valid_config();
+    fs::set_permissions(config.path(), fs::Permissions::from_mode(0o644)).unwrap();
+    rejected_before_device_access(&check_args(config.path()));
+    let path = config.path().to_owned();
+    config.close().unwrap();
+    rejected_before_device_access(&check_args(&path));
+}
+
+#[test]
+fn only_exact_command_forms_are_accepted() {
+    let config = valid_config();
+    let path = config.path().as_os_str().to_owned();
+    for args in [
+        vec![],
+        vec!["--check".into()],
+        vec!["--check".into(), "--config".into()],
+        vec!["--config".into(), path.clone(), "--check".into()],
+        vec![
+            "--check".into(),
+            "--config".into(),
+            path.clone(),
+            "--check".into(),
+        ],
+        vec![
+            "--check".into(),
+            "--config".into(),
+            path.clone(),
+            "--socket-dir".into(),
+            "/unused".into(),
+        ],
+        vec![
+            "--config".into(),
+            path,
+            "--socket-dir".into(),
+            "/unused".into(),
+            "--unknown".into(),
+        ],
+    ] {
+        assert_eq!(rejected_before_device_access(&args), USAGE);
+    }
+}
+
+#[test]
+fn normal_daemon_mode_uses_only_the_serve_path() {
+    let config = valid_config();
+    let mut output = Vec::new();
+    let code = run(
+        &[
+            "--config".into(),
+            config.path().into(),
+            "--socket-dir".into(),
+            "/unused".into(),
+        ],
+        |_| panic!("normal daemon startup does not run a separate preflight"),
+        |binding, directory| {
+            assert_eq!(binding.key.as_str(), "phone");
+            assert_eq!(binding.usb_id.as_str(), "fixture-usb");
+            assert_eq!(directory, Path::new("/unused"));
+            Ok(())
+        },
+        &mut output,
+    )
+    .unwrap();
+    assert_eq!(code, 0);
+    assert!(output.is_empty());
+}
