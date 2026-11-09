@@ -1,0 +1,20 @@
+anisette.example.invalid {
+    tls {
+        client_auth {
+            mode require_and_verify
+            trust_pool file /etc/handkite/anisette-client-ca.pem
+        }
+    }
+
+    log {
+        output discard
+    }
+
+    @v3 path /v3/client_info /v3/get_headers /v3/provisioning_session
+    handle @v3 {
+        reverse_proxy 127.0.0.1:6969
+    }
+    handle {
+        respond 404
+    }
+}
