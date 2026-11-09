@@ -110,7 +110,15 @@ pub(crate) mod tests {
     use std::process::Command;
 
     pub(crate) fn fixture() -> (tempfile::TempDir, ServiceLayout) {
-        let scratch = tempfile::tempdir().unwrap();
+        fixture_with(tempfile::tempdir().unwrap())
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn fixture_in(parent: &Path) -> (tempfile::TempDir, ServiceLayout) {
+        fixture_with(tempfile::tempdir_in(parent).unwrap())
+    }
+
+    fn fixture_with(scratch: tempfile::TempDir) -> (tempfile::TempDir, ServiceLayout) {
         let layout = ServiceLayout {
             home: fs::canonicalize(scratch.path()).unwrap().join("account"),
         };

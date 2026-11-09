@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
-const MAX_CONFIG_BYTES: u64 = 4096;
+pub(super) const MAX_CONFIG_BYTES: u64 = 4096;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -32,11 +32,15 @@ pub fn load(path: &Path) -> Result<DeviceBinding, &'static str> {
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| "configuration unreadable")?;
+    parse(&bytes)
+}
+
+pub(super) fn parse(bytes: &[u8]) -> Result<DeviceBinding, &'static str> {
     if bytes.len() as u64 > MAX_CONFIG_BYTES {
         return Err("configuration exceeds 4 KiB");
     }
     let config: ConfigFile =
-        serde_json::from_slice(&bytes).map_err(|_| "configuration is invalid")?;
+        serde_json::from_slice(bytes).map_err(|_| "configuration is invalid")?;
     let usb_id = HardwareId::new(config.usb_id).map_err(|_| "device identity is invalid")?;
     Ok(DeviceBinding {
         key: config.device_key,

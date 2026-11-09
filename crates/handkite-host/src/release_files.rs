@@ -130,7 +130,7 @@ impl AnchoredRelease {
     }
 }
 
-fn directory_matches(current: &Fingerprint, held: &Fingerprint, private: bool) -> bool {
+pub(super) fn directory_matches(current: &Fingerprint, held: &Fingerprint, private: bool) -> bool {
     if private {
         return current == held;
     }
@@ -145,7 +145,7 @@ fn directory_matches(current: &Fingerprint, held: &Fingerprint, private: bool) -
     ) == (held.device, held.inode, held.uid, held.gid, held.mode)
 }
 
-fn components(path: &Path) -> Result<Vec<CString>, &'static str> {
+pub(super) fn components(path: &Path) -> Result<Vec<CString>, &'static str> {
     let bytes = path.as_os_str().as_bytes();
     if !bytes.starts_with(b"/") || bytes.len() > 4096 {
         return Err(UNSAFE);
@@ -165,7 +165,7 @@ fn components(path: &Path) -> Result<Vec<CString>, &'static str> {
     Ok(parts)
 }
 
-fn open_at(parent: RawFd, name: &CStr, directory: bool) -> Result<File, &'static str> {
+pub(super) fn open_at(parent: RawFd, name: &CStr, directory: bool) -> Result<File, &'static str> {
     let flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
     let fd = unsafe {
         libc::openat(
@@ -190,7 +190,11 @@ fn directory(file: File, uid: u32, private: bool) -> Result<Directory, &'static 
     })
 }
 
-fn directory_metadata(file: &File, uid: u32, private: bool) -> Result<Fingerprint, &'static str> {
+pub(super) fn directory_metadata(
+    file: &File,
+    uid: u32,
+    private: bool,
+) -> Result<Fingerprint, &'static str> {
     let meta = file.metadata().map_err(|_| UNSAFE)?;
     if !meta.is_dir()
         || (meta.uid() != uid && (private || meta.uid() != 0))
@@ -285,7 +289,7 @@ unsafe extern "C" {
     fn acl_free(acl: *mut c_void) -> libc::c_int;
 }
 
-fn check_acl(fd: RawFd, require_empty: bool) -> Result<(), &'static str> {
+pub(super) fn check_acl(fd: RawFd, require_empty: bool) -> Result<(), &'static str> {
     // Query presence explicitly: acl_get_fd_np uses NULL/ENOENT both for absent
     // ACL metadata and failures, so it cannot by itself prove safe absence.
     let security = unsafe { filesec_init() };
