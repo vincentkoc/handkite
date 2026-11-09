@@ -4,6 +4,7 @@ pub mod file_gate;
 pub mod host_config;
 pub mod local_client;
 pub mod local_socket;
+pub mod mcp;
 pub mod native_lock;
 pub mod pin_backend;
 pub mod pin_input;
