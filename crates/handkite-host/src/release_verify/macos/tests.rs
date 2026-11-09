@@ -1,7 +1,8 @@
 use super::*;
 use crate::release_files::tests::{Fixture, chmod};
 use crate::release_manifest::{
-    ArtifactName, MAX_ARTIFACT_BYTES, ReleaseArtifact, RustIdentity, SdkIdentity,
+    ArtifactName, MAX_ARTIFACT_BYTES, MAX_MANIFEST_BYTES, ReleaseArtifact, RustIdentity,
+    SdkIdentity,
 };
 use std::fs;
 use std::os::unix::fs::symlink;
@@ -127,6 +128,92 @@ fn rejects_trust_inputs_before_path_or_checker_access() {
         Err("release manifest is not canonical")
     );
     assert!(!missing.exists());
+}
+
+#[test]
+fn trust_validation_preserves_bounds_and_first_error_when_inputs_conflict() {
+    let fixture = Fixture::new();
+    let bytes = manifest(&fixture);
+    let mut spaced = bytes.clone();
+    spaced.push(b'\n');
+    let cases = [
+        (
+            vec![b' '; MAX_MANIFEST_BYTES + 1],
+            [0; 32],
+            "release manifest exceeds 16 KiB",
+        ),
+        (b"{}".to_vec(), [0; 32], "invalid release manifest JSON"),
+        (
+            spaced.clone(),
+            hash(&bytes),
+            "release manifest pin mismatch",
+        ),
+        (
+            spaced.clone(),
+            hash(&spaced),
+            "release manifest is not canonical",
+        ),
+        (
+            bytes.clone(),
+            hash(&bytes),
+            "invalid signer certificate SHA1",
+        ),
+    ];
+    let missing = fixture.scratch.path().join("missing");
+    for (bytes, pin, expected) in cases {
+        assert_eq!(
+            ValidatedTrust::new(&bytes, &pin, "bad").err(),
+            Some(expected)
+        );
+        assert_eq!(
+            verify(
+                &missing,
+                &bytes,
+                &pin,
+                "bad",
+                Some(&mut |_, _| panic!("checker must not run"))
+            ),
+            Err(expected)
+        );
+    }
+    assert!(!missing.exists());
+}
+
+#[test]
+fn held_verification_reuses_trust_but_rechecks_files_and_exact_signer_policy() {
+    let fixture = Fixture::new();
+    let bytes = manifest(&fixture);
+    let trust = ValidatedTrust::new(&bytes, &hash(&bytes), CERTIFICATE).unwrap();
+    assert_eq!(trust.manifest().canonical_json().unwrap(), bytes);
+    let mut held = AnchoredRelease::open(&fixture.stage).unwrap();
+    for _ in 0..2 {
+        let mut checked = Vec::new();
+        verify_held(
+            &mut held,
+            &trust,
+            Some(&mut |name, path| {
+                assert_eq!(path, fixture.file(name));
+                checked.push(name);
+                Ok(())
+            }),
+        )
+        .unwrap();
+        assert_eq!(checked, NAMES);
+    }
+    // No injected checker: this route also rejects the unsigned fixture files.
+    assert!(verify_held(&mut held, &trust, None).is_err());
+    overwrite(
+        &fixture.file(ArtifactName::Daemon),
+        b"modified executable data",
+    );
+    assert_eq!(
+        verify_held(
+            &mut held,
+            &trust,
+            Some(&mut |_, _| panic!("checker must not run"))
+        ),
+        Err("release artifact bytes mismatch")
+    );
 }
 
 #[test]

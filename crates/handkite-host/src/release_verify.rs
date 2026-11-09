@@ -40,7 +40,7 @@ pub fn verify(
 }
 
 #[cfg(target_os = "macos")]
-mod macos {
+pub(crate) mod macos {
     use super::*;
     use crate::release_files::{AnchoredRelease, ArtifactFile, NAMES};
     use crate::release_manifest::{ReleaseArtifact, ReleaseManifest};
@@ -51,31 +51,69 @@ mod macos {
     type TestCheck<'a> =
         &'a mut dyn FnMut(crate::release_manifest::ArtifactName, &Path) -> Result<(), &'static str>;
 
+    /// Bounded caller trust inputs, not evidence about any release files.
+    pub(crate) struct ValidatedTrust {
+        manifest: ReleaseManifest,
+        policies: [SignerPolicy; 3],
+    }
+
+    impl ValidatedTrust {
+        pub(crate) fn new(
+            manifest_bytes: &[u8],
+            expected_manifest_sha256: &[u8; 32],
+            certificate_sha1: &str,
+        ) -> Result<Self, &'static str> {
+            // Parse and validate both independent trust inputs before any path access.
+            let manifest = ReleaseManifest::parse(manifest_bytes)?;
+            if ring::digest::digest(&ring::digest::SHA256, manifest_bytes).as_ref()
+                != expected_manifest_sha256
+            {
+                return Err("release manifest pin mismatch");
+            }
+            if manifest.canonical_json()? != manifest_bytes {
+                return Err("release manifest is not canonical");
+            }
+            let policies = NAMES.map(|name| SignerPolicy::new(certificate_sha1, name));
+            let [daemon, cli, mcp] = policies;
+            Ok(Self {
+                manifest,
+                policies: [daemon?, cli?, mcp?],
+            })
+        }
+
+        pub(crate) fn manifest(&self) -> &ReleaseManifest {
+            &self.manifest
+        }
+    }
+
     pub(super) fn verify(
         stage: &Path,
         manifest_bytes: &[u8],
         expected_manifest_sha256: &[u8; 32],
         certificate_sha1: &str,
+        #[cfg(test)] check: Option<TestCheck<'_>>,
+    ) -> Result<(), &'static str> {
+        let trust =
+            ValidatedTrust::new(manifest_bytes, expected_manifest_sha256, certificate_sha1)?;
+        let mut held = AnchoredRelease::open(stage)?;
+        verify_held(
+            &mut held,
+            &trust,
+            #[cfg(test)]
+            check,
+        )
+    }
+
+    /// Check the already-held files under the same fixed policy as the public route.
+    /// Success remains a bounded observation, never an acceptance token.
+    pub(crate) fn verify_held(
+        held: &mut AnchoredRelease,
+        trust: &ValidatedTrust,
         #[cfg(test)] mut check: Option<TestCheck<'_>>,
     ) -> Result<(), &'static str> {
-        // Parse and validate both independent trust inputs before any path access.
-        let manifest = ReleaseManifest::parse(manifest_bytes)?;
-        if ring::digest::digest(&ring::digest::SHA256, manifest_bytes).as_ref()
-            != expected_manifest_sha256
-        {
-            return Err("release manifest pin mismatch");
-        }
-        if manifest.canonical_json()? != manifest_bytes {
-            return Err("release manifest is not canonical");
-        }
-        let policies = NAMES.map(|name| SignerPolicy::new(certificate_sha1, name));
-        let [daemon, cli, mcp] = policies;
-        let policies = [daemon?, cli?, mcp?];
-
-        let mut held = AnchoredRelease::open(stage)?;
-        hash_all(&mut held, &manifest)?;
+        hash_all(held, trust.manifest())?;
         held.revalidate()?;
-        for (name, policy) in NAMES.into_iter().zip(policies) {
+        for (name, policy) in NAMES.into_iter().zip(&trust.policies) {
             held.revalidate()?;
             let path = held.path(name);
             #[cfg(test)]
@@ -90,7 +128,7 @@ mod macos {
         }
         // An early binary may change during a later signature check. Rehash ALL
         // three held descriptors after the final tool call, then check paths again.
-        hash_all(&mut held, &manifest)?;
+        hash_all(held, trust.manifest())?;
         held.revalidate()
     }
 
