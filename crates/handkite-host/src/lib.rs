@@ -9,6 +9,7 @@ pub mod host_config;
 pub mod install_config;
 pub mod install_plan;
 pub mod launchd_descriptor;
+pub mod launchd_observation;
 pub mod local_client;
 pub mod local_socket;
 pub mod mcp;
