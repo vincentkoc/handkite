@@ -1,4 +1,5 @@
 use handkite_core::protocol::DeviceKey;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
@@ -70,7 +71,14 @@ where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
     let id = request.get("id")?.clone();
-    if request.get("jsonrpc") != Some(&json!("2.0")) {
+    if request.get("jsonrpc") != Some(&json!("2.0"))
+        || !(id.is_string() || id.is_i64() || id.is_u64())
+        || request.as_object().is_none_or(|fields| {
+            fields
+                .keys()
+                .any(|key| !matches!(key.as_str(), "jsonrpc" | "id" | "method" | "params"))
+        })
+    {
         return Some(error(id, -32600, "invalid JSON-RPC request"));
     }
     let result = match request.get("method").and_then(Value::as_str) {
@@ -93,19 +101,19 @@ where
             }
         ]}),
         Some("tools/call") => {
-            let params = request.get("params");
-            let name = params
-                .and_then(|value| value.get("name"))
-                .and_then(Value::as_str);
-            let arguments = params.and_then(|value| value.get("arguments"));
-            if !arguments
-                .is_none_or(|value| value.as_object().is_some_and(serde_json::Map::is_empty))
+            let Ok(params) = serde_json::from_value::<ToolCall>(request["params"].clone()) else {
+                return Some(error(id, -32602, "invalid tool call"));
+            };
+            if !params
+                .arguments
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
             {
                 return Some(error(id, -32602, "tool arguments must be empty"));
             }
-            match name {
-                Some("handkite_status" | "handkite_observe") => {
-                    tool_result(name.unwrap_or_default(), device, exchange)
+            match params.name.as_str() {
+                "handkite_status" | "handkite_observe" => {
+                    tool_result(&params.name, device, exchange)
                 }
                 _ => return Some(error(id, -32602, "unknown tool")),
             }
@@ -113,6 +121,18 @@ where
         _ => return Some(error(id, -32601, "method not found")),
     };
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolCall {
+    name: String,
+    #[serde(default = "empty_arguments")]
+    arguments: Value,
+}
+
+fn empty_arguments() -> Value {
+    json!({})
 }
 
 fn tool_result<F>(name: &str, device: &DeviceKey, exchange: &mut F) -> Value
@@ -242,5 +262,49 @@ mod tests {
         );
         assert_eq!(replies[0]["error"]["code"], -32602);
         assert_eq!(replies[1]["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn forged_envelopes_and_arguments_never_reach_the_socket() {
+        let device = DeviceKey::new("phone").unwrap();
+        let mut exchange = |_: &[u8]| panic!("invalid input reached the socket");
+        let valid = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "handkite_status", "arguments": {}}});
+        for arguments in [
+            Value::Null,
+            json!([]),
+            json!(1),
+            json!({"device": "other"}),
+            json!({"owner": "other"}),
+            json!({"lease": "forged"}),
+            json!({"socket": "/other"}),
+        ] {
+            let mut request = valid.clone();
+            request["params"]["arguments"] = arguments;
+            assert_eq!(
+                process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+                -32602
+            );
+        }
+        let mut request = valid.clone();
+        request["params"]["device"] = json!("other");
+        assert_eq!(
+            process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+            -32602
+        );
+        let mut request = valid.clone();
+        request["socket"] = json!("/other");
+        assert_eq!(
+            process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+            -32600
+        );
+        for id in [Value::Null, json!({}), json!(true), json!(1.5)] {
+            let mut request = valid.clone();
+            request["id"] = id;
+            assert_eq!(
+                process(&request, &device, &mut exchange).unwrap()["error"]["code"],
+                -32600
+            );
+        }
     }
 }
