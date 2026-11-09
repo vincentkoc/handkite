@@ -6,6 +6,7 @@ use crate::wda_adapter::SCREEN_SOURCE;
 use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::protocol::{Action, HardwareId, LockState, Point};
 use handkite_core::unlock::{BackendError, PasscodeBackend, PasscodeScreen};
+use std::thread;
 use std::time::Duration;
 
 pub struct NativePasscodeBackend {
@@ -71,7 +72,7 @@ fn keypad_swipe(size: (f64, f64)) -> Result<Action, BackendError> {
     Ok(Action::Swipe {
         from: Point {
             x: width / 2.0,
-            y: height * 0.90,
+            y: height - 8.0,
         },
         to: Point {
             x: width / 2.0,
@@ -124,6 +125,7 @@ impl PasscodeBackend for NativePasscodeBackend {
             return Ok(());
         }
         self.request_action(&Action::Home)?;
+        thread::sleep(Duration::from_millis(300));
         let screen = self.snapshot()?;
         if screen.keypad_ready {
             return Ok(());
@@ -133,7 +135,14 @@ impl PasscodeBackend for NativePasscodeBackend {
             .as_ref()
             .and_then(|view| view.screen_size)
             .ok_or(BackendError::Unavailable)?;
-        self.request_action(&keypad_swipe(size)?)
+        self.request_action(&keypad_swipe(size)?)?;
+        for _ in 0..8 {
+            thread::sleep(Duration::from_millis(150));
+            if self.snapshot()?.keypad_ready {
+                return Ok(());
+            }
+        }
+        Err(BackendError::Unavailable)
     }
 
     fn press_digit(&mut self, digit: u8) -> Result<(), BackendError> {
@@ -172,6 +181,7 @@ mod tests {
             panic!("expected swipe");
         };
         assert_eq!(from.x, 196.5);
+        assert_eq!(from.y, 844.0);
         assert!(from.y > to.y);
         assert_eq!(duration_ms, 300);
         assert!(keypad_swipe((0.0, 852.0)).is_err());
