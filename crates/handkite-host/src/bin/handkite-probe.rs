@@ -1,5 +1,7 @@
 use handkite_core::controller::Controller;
-use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
+use handkite_core::protocol::{
+    Action, ActionRequest, DeviceBinding, DeviceKey, HardwareId, LockState, ObservedEffect,
+};
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_transport::UsbWda;
@@ -27,6 +29,7 @@ fn main() {
             runtime.block_on(status(&wda))
         }
         "observe" => observe(expected),
+        "demo" => demo(expected),
         _ => Err("unknown probe command".into()),
     };
     if let Err(error) = result {
@@ -50,17 +53,7 @@ async fn status(wda: &UsbWda) -> Result<(), String> {
 }
 
 fn observe(expected: HardwareId) -> Result<(), String> {
-    let key = DeviceKey::new("iphone-15-pro").map_err(|error| error.to_string())?;
-    let adapter = WdaAdapter::new(expected.clone()).map_err(|_| "cannot initialize WDA reader")?;
-    let controller = Controller::new(
-        DeviceBinding {
-            key: key.clone(),
-            usb_id: expected,
-        },
-        adapter,
-        5000,
-        5000,
-    );
+    let (controller, key) = controller(expected)?;
     let observation = controller
         .observe(&key)
         .map_err(|error| format!("{error:?}"))?;
@@ -82,5 +75,86 @@ fn observe(expected: HardwareId) -> Result<(), String> {
             .duration_ms()
             .map_err(|_| "invalid window")?
     );
+    Ok(())
+}
+
+fn controller(expected: HardwareId) -> Result<(Controller<WdaAdapter>, DeviceKey), String> {
+    let key = DeviceKey::new("iphone-15-pro").map_err(|error| error.to_string())?;
+    let adapter = WdaAdapter::new(expected.clone()).map_err(|_| "cannot initialize WDA adapter")?;
+    let controller = Controller::new(
+        DeviceBinding {
+            key: key.clone(),
+            usb_id: expected,
+        },
+        adapter,
+        5000,
+        5000,
+    );
+    Ok((controller, key))
+}
+
+fn demo(expected: HardwareId) -> Result<(), String> {
+    let (controller, key) = controller(expected)?;
+    let before = controller
+        .observe(&key)
+        .map_err(|error| format!("{error:?}"))?;
+    if before.state.lock != LockState::Unlocked
+        || before.state.foreground_app.as_deref() != Some("com.apple.mobiletimer")
+    {
+        return Err("demo requires unlocked Clock in foreground".into());
+    }
+    let owner = "local-demo";
+    let lease = controller
+        .acquire(owner.into(), Duration::from_secs(60))
+        .map_err(|error| format!("{error:?}"))?;
+    let settings = controller
+        .act(
+            owner,
+            lease,
+            ActionRequest {
+                device: key.clone(),
+                expected_revision: Some(before.revision),
+                action: Action::LaunchApp {
+                    bundle_id: "com.apple.Preferences".into(),
+                },
+            },
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    let after_settings = settings.after.ok_or("Settings effect unobserved")?;
+    if !settings.receipt.accepted
+        || settings.effect != ObservedEffect::Changed
+        || after_settings.state.foreground_app.as_deref() != Some("com.apple.Preferences")
+    {
+        return Err("Settings effect unconfirmed".into());
+    }
+    println!("settings_receipt=true settings_observed=true");
+    let home = controller
+        .act(
+            owner,
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(after_settings.revision),
+                action: Action::Home,
+            },
+        )
+        .map_err(|error| format!("{error:?}"))?;
+    let home_observed = home.receipt.accepted
+        && home.effect == ObservedEffect::Changed
+        && home
+            .after
+            .as_ref()
+            .and_then(|after| after.state.foreground_app.as_deref())
+            == Some("com.apple.springboard");
+    controller
+        .release(owner, lease)
+        .map_err(|error| format!("{error:?}"))?;
+    println!(
+        "home_receipt={} home_observed={home_observed}",
+        home.receipt.accepted
+    );
+    if !home_observed {
+        return Err("Home effect unconfirmed".into());
+    }
     Ok(())
 }
