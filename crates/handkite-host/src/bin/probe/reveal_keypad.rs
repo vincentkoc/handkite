@@ -30,9 +30,19 @@ enum Refusal {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum UnknownReason {
+    ReceiptUnproven,
+    PostcaptureFailed,
+    PostFreshnessUnproven,
+    PostconditionUnproven,
+    SessionChanged,
+    PostOrderUnproven,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Error {
     Refused(Refusal),
-    Unknown,
+    Unknown(UnknownReason),
 }
 
 impl Error {
@@ -47,7 +57,16 @@ impl Error {
             Self::Refused(Refusal::Geometry) => "refused reason=geometry_unproven",
             Self::Refused(Refusal::Freshness) => "refused reason=freshness_unproven",
             Self::Refused(Refusal::Capture) => "refused reason=capture_failed",
-            Self::Unknown => "unknown",
+            Self::Unknown(UnknownReason::ReceiptUnproven) => "unknown reason=receipt_unproven",
+            Self::Unknown(UnknownReason::PostcaptureFailed) => "unknown reason=postcapture_failed",
+            Self::Unknown(UnknownReason::PostFreshnessUnproven) => {
+                "unknown reason=post_freshness_unproven"
+            }
+            Self::Unknown(UnknownReason::PostconditionUnproven) => {
+                "unknown reason=postcondition_unproven"
+            }
+            Self::Unknown(UnknownReason::SessionChanged) => "unknown reason=session_changed",
+            Self::Unknown(UnknownReason::PostOrderUnproven) => "unknown reason=post_order_unproven",
         }
     }
 }
@@ -110,10 +129,23 @@ fn run(device: &mut impl Device, expected: &HardwareId) -> Result<(), Error> {
     }
     let receipt = device.reveal(&current.session, current.fresh_until);
     // Once dispatch is entered, all failures are unknown. Observe once, never replay.
-    let after = device.capture().map_err(|_| Error::Unknown)?;
-    validate(&after, expected, device.now(), true).map_err(|_| Error::Unknown)?;
-    if receipt.is_err() || after.session != current.session || after.started < input_started {
-        return Err(Error::Unknown);
+    let captured = device.capture();
+    if receipt.is_err() {
+        return Err(Error::Unknown(UnknownReason::ReceiptUnproven));
+    }
+    let after = captured.map_err(|_| Error::Unknown(UnknownReason::PostcaptureFailed))?;
+    validate(&after, expected, device.now(), true).map_err(|reason| {
+        Error::Unknown(if reason == Refusal::Freshness {
+            UnknownReason::PostFreshnessUnproven
+        } else {
+            UnknownReason::PostconditionUnproven
+        })
+    })?;
+    if after.session != current.session {
+        return Err(Error::Unknown(UnknownReason::SessionChanged));
+    }
+    if after.started < input_started {
+        return Err(Error::Unknown(UnknownReason::PostOrderUnproven));
     }
     Ok(())
 }
@@ -861,40 +893,79 @@ mod tests {
     #[test]
     fn every_post_dispatch_failure_is_unknown_with_no_retry() {
         type Change = fn(&mut Snapshot);
-        for change in [
-            (|s: &mut Snapshot| s.raw.accessibility_tree = NORMAL.into()) as Change,
-            |s| s.raw.accessibility_tree = keypad().replace("0 of 6 digits", "1 of 6 digits"),
-            |s| s.raw.accessibility_tree = keypad().replace("0 of 6 digits", "0 of 4 digits"),
-            |s| s.raw.accessibility_tree = keypad().replace("name=\"1\"", "name=\"missing\""),
-            |s| {
+        for (reason, change) in [
+            (
+                UnknownReason::PostconditionUnproven,
+                (|s: &mut Snapshot| s.raw.accessibility_tree = NORMAL.into()) as Change,
+            ),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.raw.accessibility_tree = keypad().replace("0 of 6 digits", "1 of 6 digits")
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.raw.accessibility_tree = keypad().replace("0 of 6 digits", "0 of 4 digits")
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.raw.accessibility_tree = keypad().replace("name=\"1\"", "name=\"missing\"")
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
                 s.raw.accessibility_tree =
                     keypad().replace("</AppiumAUT>", "<XCUIElementTypeAlert/></AppiumAUT>")
-            },
-            |s| s.native.state = LockState::Unlocked,
-            |s| s.native.unlocked_since_boot = None,
-            |s| s.wda_locked = Some(false),
-            |s| s.raw.wda_target = HardwareId::new("other").unwrap(),
-            |s| s.session = "replacement".into(),
-            |s| {
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.native.state = LockState::Unlocked
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.native.unlocked_since_boot = None
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.wda_locked = Some(false)
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.raw.wda_target = HardwareId::new("other").unwrap()
+            }),
+            (UnknownReason::SessionChanged, |s| {
+                s.session = "replacement".into()
+            }),
+            (UnknownReason::PostOrderUnproven, |s| {
                 s.started -= Duration::from_secs(2);
                 s.fresh_until = s.started + BUDGET;
-            },
-            |s| s.fresh_until = s.finished,
-            |s| s.raw.screenshot.bytes.clear(),
+            }),
+            (UnknownReason::PostFreshnessUnproven, |s| {
+                s.fresh_until = s.finished
+            }),
+            (UnknownReason::PostconditionUnproven, |s| {
+                s.raw.screenshot.bytes.clear()
+            }),
         ] {
             let mut fake = Fake::new();
             change(fake.captures[2].as_mut().unwrap());
-            assert_eq!(run(&mut fake, &id()), Err(Error::Unknown));
+            assert_eq!(run(&mut fake, &id()), Err(Error::Unknown(reason)));
             assert_eq!(fake.posts.len(), 1);
             assert_eq!(fake.captures_called, 3);
         }
-        for capture_failure in [false, true] {
+        let mut fake = Fake::new();
+        fake.captures[2] = Err(Refusal::Capture);
+        assert_eq!(
+            run(&mut fake, &id()),
+            Err(Error::Unknown(UnknownReason::PostcaptureFailed))
+        );
+        assert_eq!((fake.posts.len(), fake.captures_called), (1, 3));
+    }
+
+    #[test]
+    fn receipt_failure_has_priority_after_one_postcapture_attempt() {
+        for (capture_failure, wrong_screen) in [(false, false), (true, false), (false, true)] {
             let mut fake = Fake::new();
             fake.receipt = Err(());
             if capture_failure {
                 fake.captures[2] = Err(Refusal::Capture);
+            } else if wrong_screen {
+                fake.captures[2].as_mut().unwrap().raw.accessibility_tree = NORMAL.into();
             }
-            assert_eq!(run(&mut fake, &id()), Err(Error::Unknown));
+            assert_eq!(
+                run(&mut fake, &id()),
+                Err(Error::Unknown(UnknownReason::ReceiptUnproven))
+            );
             assert_eq!(fake.posts.len(), 1);
             assert_eq!(fake.captures_called, 3);
         }
@@ -958,7 +1029,7 @@ mod tests {
                 if receipt.is_ok() {
                     Ok(())
                 } else {
-                    Err(Error::Unknown)
+                    Err(Error::Unknown(UnknownReason::ReceiptUnproven))
                 }
             );
             assert_eq!((fake.posts.len(), fake.captures_called), (1, 3));
@@ -1002,6 +1073,24 @@ mod tests {
                 format!("reveal_keypad=refused reason={token}")
             );
         }
-        assert_eq!(Error::Unknown.message(), "unknown");
+        for (reason, token) in [
+            (UnknownReason::ReceiptUnproven, "receipt_unproven"),
+            (UnknownReason::PostcaptureFailed, "postcapture_failed"),
+            (
+                UnknownReason::PostFreshnessUnproven,
+                "post_freshness_unproven",
+            ),
+            (
+                UnknownReason::PostconditionUnproven,
+                "postcondition_unproven",
+            ),
+            (UnknownReason::SessionChanged, "session_changed"),
+            (UnknownReason::PostOrderUnproven, "post_order_unproven"),
+        ] {
+            assert_eq!(
+                format!("reveal_keypad={}", Error::Unknown(reason).message()),
+                format!("reveal_keypad=unknown reason={token}")
+            );
+        }
     }
 }

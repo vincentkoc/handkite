@@ -200,7 +200,7 @@ The unique in-app proud-lock marker must carry an explicit visibility boolean,
 true or false, which must agree across both captures; missing or invalid evidence
 refuses input.
 It sends one fixed HID event, then checks once for a valid empty six-digit
-keypad while still locked. Output is fixed `confirmed`, `unknown`, or refusal
+keypad while still locked. Output is fixed `confirmed`, `unknown reason=<fixed>`, or refusal
 categories. It has no retry, swipe, PIN read, or stop-marker access. This command
 sends input; its offline fixtures do not qualify live delivery.
 
