@@ -63,6 +63,7 @@ impl Rect {
 struct Node {
     kind: String,
     name: Option<String>,
+    label: Option<String>,
     value: Option<String>,
     bundle_id: Option<String>,
     point: Option<Point>,
@@ -77,6 +78,7 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
         .map_err(|_| ParseError)?
         .to_owned();
     let mut name = None;
+    let mut label = None;
     let mut value = None;
     let mut bundle_id = None;
     let mut x = None;
@@ -92,6 +94,7 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
             .map_err(|_| ParseError)?;
         match attribute.key.as_ref() {
             b"name" => name = Some(decoded.into_owned()),
+            b"label" => label = Some(decoded.into_owned()),
             b"value" => value = Some(decoded.into_owned()),
             b"bundleId" => bundle_id = Some(decoded.into_owned()),
             b"x" => x = decoded.parse::<f64>().ok(),
@@ -144,6 +147,7 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
     Ok(Node {
         kind,
         name,
+        label,
         value,
         bundle_id,
         point,
@@ -193,6 +197,8 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     let mut buttons = Vec::new();
     let mut lock_marker = false;
     let mut passcode_view_marker = false;
+    let mut proud_lock_marker = false;
+    let mut passcode_heading_marker = false;
     let mut screen_size = None;
     let mut foreground_app = None;
     let mut home_icons = 0_usize;
@@ -226,6 +232,15 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
                     && node.name.as_deref() == Some("passcode-view")
                 {
                     passcode_view_marker = true;
+                }
+                if node.kind == "XCUIElementTypeOther" && node.name.as_deref() == Some("proud-lock")
+                {
+                    proud_lock_marker = true;
+                }
+                if node.kind == "XCUIElementTypeStaticText"
+                    && node.label.as_deref() == Some("Enter Passcode")
+                {
+                    passcode_heading_marker = true;
                 }
                 if node.kind == "XCUIElementTypeSecureTextField" {
                     if field_seen {
@@ -280,7 +295,8 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     }
     let digit_keys_seen = seen_digit.into_iter().filter(|seen| *seen).count();
     let digit_keys_eligible = keys.iter().filter(|key| key.is_some()).count();
-    let visibility_fallback = passcode_view_marker
+    let visibility_fallback = (passcode_view_marker
+        || (proud_lock_marker && passcode_heading_marker))
         && !has_alert
         && field_seen
         && field_explicitly_hidden
@@ -484,5 +500,26 @@ mod tests {
             "name=\"1\" visible=\"false\" enabled=\"true\" x=\"1040\"",
         );
         assert!(parse(&offscreen).unwrap().keypad.is_none());
+    }
+
+    #[test]
+    fn current_ios_lock_markers_require_both_elements() {
+        let source = fixture()
+            .replace("visible=\"true\"", "visible=\"false\"")
+            .replace(
+                "<XCUIElementTypeOther name=\"passcode-view\"/>",
+                "<XCUIElementTypeOther name=\"proud-lock\"/><XCUIElementTypeStaticText label=\"Enter Passcode\"/>",
+            );
+        assert!(parse(&source).unwrap().visibility_fallback);
+        assert!(
+            !parse(&source.replace("name=\"proud-lock\"", "name=\"other\""))
+                .unwrap()
+                .visibility_fallback
+        );
+        assert!(
+            !parse(&source.replace("label=\"Enter Passcode\"", "label=\"Other\""))
+                .unwrap()
+                .visibility_fallback
+        );
     }
 }
