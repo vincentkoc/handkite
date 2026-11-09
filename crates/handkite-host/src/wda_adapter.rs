@@ -1,4 +1,5 @@
 use crate::usb::PinnedUsb;
+use crate::wda_action::WdaActions;
 use crate::wda_http::HttpResponse;
 use crate::wda_transport::UsbWda;
 use base64::Engine;
@@ -15,6 +16,7 @@ pub struct WdaAdapter {
     expected: HardwareId,
     usb: PinnedUsb,
     runtime: tokio::runtime::Runtime,
+    actions: WdaActions,
 }
 
 impl WdaAdapter {
@@ -27,6 +29,7 @@ impl WdaAdapter {
             usb: PinnedUsb::new(expected.clone()),
             expected,
             runtime,
+            actions: WdaActions::default(),
         })
     }
 
@@ -98,8 +101,9 @@ impl DeviceAdapter for WdaAdapter {
             .block_on(Self::capture(&self.usb, &self.expected))
     }
 
-    fn execute(&mut self, _action: &Action) -> Result<TransportReceipt, AdapterError> {
-        Err(AdapterError)
+    fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
+        self.runtime
+            .block_on(self.actions.execute(&UsbWda::new(self.usb.clone()), action))
     }
 }
 
