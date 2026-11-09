@@ -8,6 +8,7 @@ pub mod file_gate;
 pub mod host_config;
 pub mod install_config;
 pub mod install_plan;
+pub mod installer_lock;
 pub mod launchd_descriptor;
 pub mod launchd_observation;
 pub mod local_client;
