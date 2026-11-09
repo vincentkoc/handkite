@@ -10,7 +10,7 @@ use handkite_core::protocol::{
 };
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=visible,accessible,focused,enabled,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
+pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=visible,accessible,focused,enabled,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 
 pub struct WdaAdapter {
     expected: HardwareId,

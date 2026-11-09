@@ -11,6 +11,7 @@ pub struct ParsedPasscodeView {
     pub secure_field_value: Option<String>,
     pub keypad: Option<[Point; 10]>,
     pub delete_key: Option<Point>,
+    pub has_alert: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -121,6 +122,7 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
     let mut screen_size = None;
     let mut foreground_app = None;
     let mut home_icons = 0_usize;
+    let mut has_alert = false;
     loop {
         match reader.read_event().map_err(|_| ParseError)? {
             Event::Start(element) | Event::Empty(element) => {
@@ -131,6 +133,9 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
                 }
                 if node.kind == "XCUIElementTypeIcon" {
                     home_icons += 1;
+                }
+                if node.kind == "XCUIElementTypeAlert" {
+                    has_alert = true;
                 }
                 if node.name.as_deref().is_some_and(|name| {
                     matches!(
@@ -191,6 +196,7 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
         secure_field_value: field,
         keypad,
         delete_key,
+        has_alert,
     })
 }
 
@@ -242,6 +248,17 @@ mod tests {
                 .unwrap()
                 .visible_lock,
             LockState::Uncertain
+        );
+    }
+
+    #[test]
+    fn an_alert_requires_manual_inspection() {
+        assert!(
+            parse(
+                "<XCUIElementTypeApplication><XCUIElementTypeAlert/></XCUIElementTypeApplication>"
+            )
+            .unwrap()
+            .has_alert
         );
     }
 
