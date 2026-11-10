@@ -35,6 +35,8 @@ pub fn render(layout: &ServiceLayout) -> Result<String, &'static str> {
   <true/>
   <key>KeepAlive</key>
   <true/>
+  <key>ExitTimeOut</key>
+  <integer>180</integer>
   <key>EnableGlobbing</key>
   <false/>
 </dict>
@@ -126,6 +128,7 @@ mod tests {
                 "ProcessType": "Background",
                 "RunAtLoad": true,
                 "KeepAlive": true,
+                "ExitTimeOut": 180,
                 "EnableGlobbing": false
             })
         );
@@ -163,7 +166,7 @@ mod tests {
                     layout.runtime_directory()
                 ])
             );
-            assert_eq!(parsed.as_object().unwrap().len(), 7);
+            assert_eq!(parsed.as_object().unwrap().len(), 8);
         }
     }
 
