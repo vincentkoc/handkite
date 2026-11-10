@@ -24,6 +24,7 @@ pub struct NativePasscodeBackend {
     last_view: Option<PreparedPinView>,
     last_diagnostics: Option<PinDiagnostics>,
     supervised_visibility_fallback: bool,
+    session_bound: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -63,7 +64,25 @@ impl NativePasscodeBackend {
             last_view: None,
             last_diagnostics: None,
             supervised_visibility_fallback,
+            session_bound: false,
         })
+    }
+
+    /// Opt-in backend for a settings transaction; every input revalidates its session.
+    pub fn new_for_session(
+        expected: HardwareId,
+        supervised_visibility_fallback: bool,
+        session: &str,
+    ) -> Result<Self, BackendError> {
+        let actions =
+            WdaActions::bound_to_existing(session).map_err(|_| BackendError::Unavailable)?;
+        let mut backend = Self::new_with_supervised_visibility_fallback(
+            expected,
+            supervised_visibility_fallback,
+        )?;
+        backend.actions = actions;
+        backend.session_bound = true;
+        Ok(backend)
     }
 
     pub fn diagnostics(&self) -> Option<PinDiagnostics> {
@@ -75,7 +94,16 @@ impl NativePasscodeBackend {
             let wda = UsbWda::new(backend.usb.clone()).with_write_deadline(fresh_until);
             backend
                 .runtime
-                .block_on(backend.actions.execute_existing(&wda, action))
+                .block_on(async {
+                    if backend.session_bound {
+                        backend
+                            .actions
+                            .execute_with_existing_session(&wda, action)
+                            .await
+                    } else {
+                        backend.actions.execute_existing(&wda, action).await
+                    }
+                })
                 .map(|_| ())
                 .map_err(|_| BackendError::Unavailable)
         })
@@ -173,6 +201,11 @@ impl NativePasscodeBackend {
         });
         let source = response_value(source.map_err(wda_error)?)?;
         let reported_lock = response_value(reported_lock.map_err(wda_error)?)?;
+        if self.session_bound {
+            self.runtime
+                .block_on(self.actions.prepare_existing(&wda))
+                .map_err(|_| BackendError::Unavailable)?;
+        }
         let xml = source.as_str().ok_or(BackendError::Unavailable)?;
         let parsed = pin_screen::parse(xml).map_err(|_| BackendError::Unavailable)?;
         let native = native_lock::query(&self.expected);
@@ -238,11 +271,19 @@ impl PasscodeBackend for NativePasscodeBackend {
         {
             return Ok(());
         }
-        self.last_view = None;
+        let prepared = self.last_view.take();
         let wda = UsbWda::new(self.usb.clone());
-        self.runtime
-            .block_on(self.actions.wake_hid_existing(&wda))
-            .map_err(|_| BackendError::Unavailable)?;
+        if self.session_bound {
+            let deadline = prepared.ok_or(BackendError::Unavailable)?.fresh_until;
+            let wda = wda.with_write_deadline(deadline);
+            self.runtime
+                .block_on(self.actions.wake_with_existing_session(&wda))
+                .map_err(|_| BackendError::Unavailable)?;
+        } else {
+            self.runtime
+                .block_on(self.actions.wake_hid_existing(&wda))
+                .map_err(|_| BackendError::Unavailable)?;
+        }
         thread::sleep(Duration::from_millis(300));
         let screen = self.snapshot()?;
         if screen.keypad_ready {

@@ -151,6 +151,11 @@ async fn active_session(wda: &impl WdaRequest) -> Result<String, SettingsError> 
     Ok(session)
 }
 
+/// Validate the active existing session for an explicit transaction. Do not log its ID.
+pub async fn validated_active_session(wda: &UsbWda) -> Result<String, SettingsError> {
+    active_session(wda).await
+}
+
 /// Run one action only after the temporary settings are acknowledged and verified.
 /// Restore the original two numeric values after every attempted set, even when
 /// that set or the action fails. No request or action is retried.
@@ -158,7 +163,7 @@ async fn active_session(wda: &impl WdaRequest) -> Result<String, SettingsError> 
 /// The caller must provide exclusive session ownership and await completion:
 /// dropping this future cannot perform asynchronous restoration. Readback checks
 /// detect observed conflicts, but WDA offers no atomic compare-and-set or lease.
-/// This helper creates no session and is not used by the PIN backend.
+/// This helper creates no session; callers own their input policy and stop gate.
 pub async fn with_temporary_idle_settings<T, E, F, Fut>(
     wda: &UsbWda,
     session: &str,

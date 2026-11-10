@@ -244,6 +244,15 @@ not qualify a Cancel tap or PIN entry.
 
 The home and each state ancestor must already exist, be owned by that user, and have no group or other write access. Symlinks are rejected, and the final `iphone` directory must be mode 0700. Unlock never creates or migrates these directories. An existing marker blocks execution before PIN input or backend initialization; it requires owner inspection, and this command cannot clear an earlier attempt's marker. The failed supervised trial remains blocked, and Handkite PIN entry is still unqualified.
 
+The explicit `--temporary-idle-settings` variant temporarily uses idle settings
+`1.0` and `0.2`, then verifies restoration of the original values. It requires
+externally proven exclusive WDA ownership for the complete invocation. Its marker
+check precedes stdin and settings mutation. Every backend input revalidates the
+transaction session; a completed code submission can clear its own marker only
+after verified restoration. Failure never clears a marked gate or retries input.
+Do not cancel the bracket. This variant is offline-tested only and does not
+qualify live PIN entry; omitting the flag preserves the default unlock path.
+
 ## Anisette
 
 The [deployment bundle](deploy/anisette/README.md) pins a separate V3 sidecar behind a loopback listener and a TLS client-authenticated proxy. It is staged only. The final domain, host, client certificate, provisioning flow, and signing result must be verified before use.

@@ -5,6 +5,9 @@ use handkite_host::pin_input;
 use handkite_host::unlock_state;
 use std::path::Path;
 
+#[path = "unlock/idle.rs"]
+mod idle;
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("handkite-unlock-once: {error}");
@@ -14,11 +17,10 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let supervised_visibility_fallback =
-        args.len() == 4 && args[3] == "--supervised-visibility-fallback";
-    if !(args.len() == 3 || supervised_visibility_fallback) || args[1] != "--config" {
+    let (supervised_visibility_fallback, temporary_idle_settings) = flags(&args)?;
+    if args[1] != "--config" {
         return Err(
-            "usage: handkite-unlock-once --config FILE [--supervised-visibility-fallback]".into(),
+            "usage: handkite-unlock-once --config FILE [--supervised-visibility-fallback] [--temporary-idle-settings]".into(),
         );
     }
     let binding = host_config::load(Path::new(&args[2])).map_err(str::to_owned)?;
@@ -32,6 +34,9 @@ fn run() -> Result<(), String> {
         .map_err(|_| "cannot read PIN stop marker")?
     {
         return Err("PIN attempts disabled; owner inspection required".into());
+    }
+    if temporary_idle_settings {
+        return idle::run(binding, gate, supervised_visibility_fallback).map_err(str::to_owned);
     }
     let code = pin_input::read_once(std::io::stdin().lock()).map_err(str::to_owned)?;
     let mut backend = NativePasscodeBackend::new_with_supervised_visibility_fallback(
@@ -56,4 +61,39 @@ fn run() -> Result<(), String> {
         }
     );
     Ok(())
+}
+
+fn flags(args: &[String]) -> Result<(bool, bool), String> {
+    if args.len() < 3 {
+        return Err("invalid_arguments".into());
+    }
+    let mut supervised = false;
+    let mut temporary = false;
+    for arg in &args[3..] {
+        match arg.as_str() {
+            "--supervised-visibility-fallback" if !supervised => supervised = true,
+            "--temporary-idle-settings" if !temporary => temporary = true,
+            _ => return Err("invalid_arguments".into()),
+        }
+    }
+    Ok((supervised, temporary))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn temporary_settings_are_explicit_and_duplicate_flags_refuse() {
+        let base = vec!["unlock".into(), "--config".into(), "private".into()];
+        assert_eq!(flags(&base), Ok((false, false)));
+        let mut args = base;
+        args.push("--temporary-idle-settings".into());
+        assert_eq!(flags(&args), Ok((false, true)));
+        args.push("--supervised-visibility-fallback".into());
+        assert_eq!(flags(&args), Ok((true, true)));
+        args.push("--temporary-idle-settings".into());
+        assert!(flags(&args).is_err());
+        assert!(flags(&[]).is_err());
+    }
 }

@@ -35,6 +35,15 @@ pub struct WdaActions {
 }
 
 impl WdaActions {
+    pub(crate) fn bound_to_existing(session: &str) -> Result<Self, AdapterError> {
+        if !valid_session_id(session) {
+            return Err(AdapterError);
+        }
+        Ok(Self {
+            session: Some(session.to_owned()),
+        })
+    }
+
     pub fn prepared_session_matches(&self, expected: &str) -> bool {
         self.session.as_deref() == Some(expected)
     }
@@ -117,6 +126,18 @@ impl WdaActions {
 
     pub async fn wake_hid_existing(&self, wda: &UsbWda) -> Result<(), AdapterError> {
         let session = self.session.as_deref().ok_or(AdapterError)?;
+        Self::wake_on(wda, session).await
+    }
+
+    pub(crate) async fn wake_with_existing_session(
+        &mut self,
+        wda: &impl WdaRequest,
+    ) -> Result<(), AdapterError> {
+        self.validate_existing(wda).await?;
+        Self::wake_on(wda, self.session.as_deref().ok_or(AdapterError)?).await
+    }
+
+    async fn wake_on(wda: &impl WdaRequest, session: &str) -> Result<(), AdapterError> {
         let path = format!("/session/{session}/wda/performIoHidEvent");
         let body = serde_json::to_vec(&json!({"page": 0x0c, "usage": 0x223, "duration": 0.05}))
             .map_err(|_| AdapterError)?;
@@ -300,6 +321,59 @@ mod tests {
                 json!({"value": null}),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn transaction_bound_inputs_refuse_a_different_valid_session_before_any_post() {
+        for action in [
+            Action::Tap {
+                at: Point { x: 80.0, y: 340.0 },
+            },
+            Action::Tap {
+                at: Point { x: 280.0, y: 640.0 },
+            },
+            Action::Swipe {
+                from: Point { x: 200.0, y: 790.0 },
+                to: Point { x: 200.0, y: 360.0 },
+                duration_ms: 300,
+            },
+        ] {
+            let wda = Script::new(vec![status(json!("different-valid-session"))]);
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert!(
+                actions
+                    .execute_with_existing_session(&wda, &action)
+                    .await
+                    .is_err()
+            );
+            wda.done();
+        }
+        let wda = Script::new(vec![status(json!("different-valid-session"))]);
+        let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+        assert!(actions.wake_with_existing_session(&wda).await.is_err());
+        wda.done();
+        assert!(WdaActions::bound_to_existing("../invalid").is_err());
+    }
+
+    #[tokio::test]
+    async fn bound_input_revalidates_after_a_previous_success_without_retry() {
+        let mut steps = valid_action();
+        steps.push(status(json!("replacement-session")));
+        let wda = Script::new(steps);
+        let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+        assert!(
+            actions
+                .execute_with_existing_session(&wda, &Action::Home)
+                .await
+                .is_ok()
+        );
+        assert!(
+            actions
+                .execute_with_existing_session(&wda, &Action::Home)
+                .await
+                .is_err()
+        );
+        wda.done();
     }
 
     #[tokio::test]
