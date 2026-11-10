@@ -1,4 +1,21 @@
 //! Bounded intent syntax, retained selection transactions, and reconciliation.
+//!
+//! Parsing and read-only inspection remain public:
+//!
+//! ```
+//! use handkite_host::selection_intent::{Intent, inspect};
+//! ```
+//!
+//! Mutation stays crate-private until production admission verifies stopped
+//! controllers and independently pinned connected-device agreement.
+//!
+//! ```compile_fail,E0603
+//! use handkite_host::selection_intent::prepare;
+//! ```
+//!
+//! ```compile_fail,E0603
+//! use handkite_host::selection_intent::commit;
+//! ```
 
 use crate::current_selection::{encode_target, parse_target};
 use crate::install_config::RetainedConfig;
@@ -269,7 +286,9 @@ impl PreparedSelection<'_, '_> {
 /// Config and release handles must retain this exact lock. Config agreement is
 /// not a device observation or authority to select or activate a release.
 /// All errors preserve residues, with no retry, rollback, adoption, or cleanup.
-pub fn prepare<'held, 'lock>(
+// No production caller exists until stopped-controller and device admission is implemented.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
     config: &'held mut RetainedConfig<'lock>,
     operation: Operation,
@@ -359,7 +378,9 @@ impl CommittedSelection<'_, '_> {
 /// Consume the prepared capability with its original paths, trust, config and lock.
 /// Attempt at most one rename. Every failure consumes preparation and preserves files.
 /// No retry, rollback, journal removal, activation, or replacement evidence is accepted.
-pub fn commit<'held, 'lock>(
+// No production caller exists until stopped-controller and device admission is implemented.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn commit<'held, 'lock>(
     prepared: PreparedSelection<'held, 'lock>,
 ) -> Result<CommittedSelection<'held, 'lock>, CommitFailure> {
     #[cfg(target_os = "macos")]
