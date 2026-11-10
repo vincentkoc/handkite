@@ -121,7 +121,7 @@ impl ClientInfo {
         &self.user_agent
     }
 
-    pub(super) fn parse(body: &[u8]) -> Result<Self, &'static str> {
+    pub(crate) fn parse(body: &[u8]) -> Result<Self, &'static str> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Fields {

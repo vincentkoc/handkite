@@ -146,6 +146,10 @@ impl MacosProvisionedState {
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+
+    pub(crate) fn identifier(&self) -> &[u8; 16] {
+        &self.identifier
+    }
 }
 
 impl Drop for MacosProvisionedState {

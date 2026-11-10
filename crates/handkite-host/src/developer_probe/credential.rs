@@ -44,7 +44,7 @@ impl DeveloperCredential {
         Self::parse(&bytes)
     }
 
-    fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
+    pub(super) fn parse(bytes: &[u8]) -> Result<Self, &'static str> {
         let mut lines = bytes.split(|byte| *byte == b'\n');
         let (Some(adsid), Some(token), Some(b""), None) =
             (lines.next(), lines.next(), lines.next(), lines.next())
