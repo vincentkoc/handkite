@@ -71,9 +71,17 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
     match mode {
         DaemonMode::Borrowed => {
             load_before_serving(owner.layout(), install_config::load_protected, |binding| {
-                let adapter = WdaAdapter::new(binding.usb_id.clone())
-                    .map_err(|_| "cannot initialize pinned WDA adapter")?;
-                serve_adapter(&owner, binding, adapter)
+                bind_before_start(
+                    || {
+                        local_socket::bind_service(&owner)
+                            .map_err(|_| "cannot bind protected socket".into())
+                    },
+                    |listener| {
+                        let adapter = WdaAdapter::new(binding.usb_id.clone())
+                            .map_err(|_| "cannot initialize pinned WDA adapter")?;
+                        serve_adapter(binding, adapter, listener)
+                    },
+                )
             })
         }
         DaemonMode::Owned => {
@@ -83,24 +91,38 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
                 .wda_runner_bundle_id()
                 .ok_or("owned WDA requires a protected runner ID")?;
             let binding = config.binding().clone();
-            let adapter = WdaAdapter::new_owned(binding.usb_id.clone(), runner_id)
-                .map_err(|_| "cannot start owned WDA runner and session")?;
-            serve_adapter(&owner, binding, adapter)
+            bind_before_start(
+                || {
+                    local_socket::bind_service(&owner)
+                        .map_err(|_| "cannot bind protected socket".into())
+                },
+                |listener| {
+                    let adapter = WdaAdapter::new_owned(binding.usb_id.clone(), runner_id)
+                        .map_err(|_| "cannot start owned WDA runner and session")?;
+                    serve_adapter(binding, adapter, listener)
+                },
+            )
         }
     }
 }
 
+fn bind_before_start<T>(
+    bind: impl FnOnce() -> Result<T, String>,
+    start: impl FnOnce(T) -> Result<(), String>,
+) -> Result<(), String> {
+    start(bind()?)
+}
+
 fn serve_adapter(
-    owner: &ServiceLock,
     binding: DeviceBinding,
     adapter: WdaAdapter,
+    listener: local_socket::ServiceListener<'_>,
 ) -> Result<(), String> {
     let key = binding.key.clone();
     let controller = Controller::new(binding, adapter, 5000, 5000);
     controller
         .observe(&key)
         .map_err(|_| "pinned device is not ready")?;
-    let listener = local_socket::bind_service(owner).map_err(|_| "cannot bind protected socket")?;
     eprintln!("handkited ready");
     listener
         .serve(&controller)

@@ -291,3 +291,17 @@ fn startup_continues_once_with_the_loaded_binding() {
     assert_eq!(result, Err("fixture continuation".into()));
     assert_eq!(*calls.borrow(), ["load", "serve"]);
 }
+
+#[test]
+fn socket_refusal_prevents_device_startup() {
+    let mut calls = Vec::new();
+    let result = bind_before_start(
+        || {
+            calls.push("bind");
+            Err::<(), _>("unsafe socket".into())
+        },
+        |_| panic!("device startup must not run after socket refusal"),
+    );
+    assert_eq!(result, Err("unsafe socket".into()));
+    assert_eq!(calls, ["bind"]);
+}
