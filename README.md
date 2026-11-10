@@ -82,6 +82,10 @@ handle Drop abort the owned host task; `abort_and_join` also observes completion
 Callers must retain the handle inside an active Tokio runtime and establish
 exclusive device/WDA ownership before calling it.
 
+The [independent WDA build and verification tools](tools/wda/README.md) prepare
+an Xcode-signed iOS runner from a pinned Appium source revision. Their offline
+tests do not qualify a real build, install, or launch.
+
 Owned daemon mode now uses this module, then creates a fresh exact session.
 On adapter Drop it attempts one bounded, identity-checked session DELETE before
 aborting the host task. Acknowledgement does not prove endpoint ownership or
