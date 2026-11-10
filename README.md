@@ -163,7 +163,8 @@ binding under the exact lock and calls the bounded device observation once.
 It reports only `device_agreement=pass` (exit 0) or
 `device_agreement=reject stage=<fixed-stage>` (exit 1), including argument and
 setup failures. The stage is a fixed category, never an upstream error or
-device value; stderr stays empty.
+device value. A `lockdown_query` rejection appends a fixed `substage` for the
+failed write, length, body read, decode, or reply validation; stderr stays empty.
 No alternate config, root, socket, or device arguments are accepted.
 
 Lock acquisition can create the fixed `runtime/handkite.lock` file in an existing

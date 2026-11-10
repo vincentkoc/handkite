@@ -80,6 +80,14 @@ fn observe_service() -> Result<(), FailureStage> {
 fn report(outcome: Outcome, output: &mut impl Write) -> u8 {
     let (code, result) = match outcome {
         Outcome::Pass => (0, output.write_all(b"device_agreement=pass\n")),
+        Outcome::Reject(FailureStage::Observation(ObservationFailure::LockdownQuery(query))) => (
+            1,
+            writeln!(
+                output,
+                "device_agreement=reject stage=lockdown_query substage={}",
+                query.substage()
+            ),
+        ),
         Outcome::Reject(stage) => (
             1,
             writeln!(output, "device_agreement=reject stage={}", stage.label()),
@@ -170,7 +178,6 @@ mod tests {
                 FailureStage::Observation(LockdownConnect),
                 "lockdown_connect",
             ),
-            (FailureStage::Observation(LockdownQuery), "lockdown_query"),
             (
                 FailureStage::Observation(Identity),
                 "lockdown_identity_agreement",
@@ -193,6 +200,41 @@ mod tests {
             assert_eq!(
                 output,
                 format!("device_agreement=reject stage={label}\n").as_bytes()
+            );
+        }
+    }
+
+    #[test]
+    fn query_failures_append_only_a_fixed_substage_without_retry() {
+        use handkite_host::device_agreement::LockdownQueryFailure::*;
+        for (query, label) in [
+            (RequestWrite, "request_write"),
+            (ResponseLength, "response_length"),
+            (ResponseRead, "response_read"),
+            (PlistDecode, "plist_decode"),
+            (ReplyValidation, "reply_validation"),
+        ] {
+            let mut calls = 0;
+            let failure = ObservationFailure::LockdownQuery(query);
+            assert_eq!(failure.stage(), "lockdown_query");
+            let outcome = run(args(&["--service"]), || {
+                calls += 1;
+                Err(FailureStage::Observation(failure))
+            });
+            assert_eq!(calls, 1);
+            let mut output = Vec::new();
+            assert_eq!(report(outcome, &mut output), 1);
+            assert_eq!(
+                output,
+                format!("device_agreement=reject stage=lockdown_query substage={label}\n")
+                    .as_bytes()
+            );
+            assert_eq!(
+                report(
+                    Outcome::Reject(FailureStage::Observation(failure)),
+                    &mut io::Cursor::new([0; 0])
+                ),
+                1
             );
         }
     }

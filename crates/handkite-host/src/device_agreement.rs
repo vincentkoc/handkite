@@ -17,7 +17,7 @@ pub enum ObservationFailure {
     UsbBefore,
     Route,
     LockdownConnect,
-    LockdownQuery,
+    LockdownQuery(LockdownQueryFailure),
     Identity,
     UsbAfter,
     ConfigAfter,
@@ -32,11 +32,33 @@ impl ObservationFailure {
             Self::UsbBefore => "usb_inventory_before",
             Self::Route => "usb_route_agreement",
             Self::LockdownConnect => "lockdown_connect",
-            Self::LockdownQuery => "lockdown_query",
+            Self::LockdownQuery(_) => "lockdown_query",
             Self::Identity => "lockdown_identity_agreement",
             Self::UsbAfter => "usb_inventory_after",
             Self::ConfigAfter => "config_revalidate_after",
             Self::Deadline => "observation_deadline",
+        }
+    }
+}
+
+/// Fixed query boundaries only; no socket, parser, or peer data is retained.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LockdownQueryFailure {
+    RequestWrite,
+    ResponseLength,
+    ResponseRead,
+    PlistDecode,
+    ReplyValidation,
+}
+
+impl LockdownQueryFailure {
+    pub fn substage(self) -> &'static str {
+        match self {
+            Self::RequestWrite => "request_write",
+            Self::ResponseLength => "response_length",
+            Self::ResponseRead => "response_read",
+            Self::PlistDecode => "plist_decode",
+            Self::ReplyValidation => "reply_validation",
         }
     }
 }
@@ -155,7 +177,7 @@ trait Transport {
 #[derive(Clone, Copy)]
 enum LockdownFailure {
     Connect,
-    Query,
+    Query(LockdownQueryFailure),
 }
 
 #[cfg(target_os = "macos")]
@@ -180,7 +202,7 @@ impl Transport for FixedUsb {
             .map_err(|_| LockdownFailure::Connect)?;
         lockdown::unique_id(&mut socket)
             .await
-            .map_err(|_| LockdownFailure::Query)
+            .map_err(LockdownFailure::Query)
     }
 }
 
@@ -209,7 +231,7 @@ async fn observe_route(
         check_deadline(deadline)?;
         let reported = reported.map_err(|failure| match failure {
             LockdownFailure::Connect => ObservationFailure::LockdownConnect,
-            LockdownFailure::Query => ObservationFailure::LockdownQuery,
+            LockdownFailure::Query(query) => ObservationFailure::LockdownQuery(query),
         })?;
         if reported != route.udid() || reported != expected.as_str() {
             return Err(ObservationFailure::Identity);
@@ -239,7 +261,7 @@ fn check_deadline(deadline: tokio::time::Instant) -> Result<(), ObservationFailu
 
 #[cfg(any(target_os = "macos", test))]
 mod lockdown {
-    use super::UNAVAILABLE;
+    use super::LockdownQueryFailure;
     use crate::usb::plist_wire;
     use serde::Deserialize;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -257,30 +279,40 @@ mod lockdown {
 
     pub(super) async fn unique_id(
         socket: &mut (impl AsyncRead + AsyncWrite + Unpin),
-    ) -> Result<String, &'static str> {
+    ) -> Result<String, LockdownQueryFailure> {
         let mut request = plist::Dictionary::new();
         request.insert("Label".into(), "handkite".into());
         request.insert("Request".into(), "GetValue".into());
         request.insert("Key".into(), "UniqueDeviceID".into());
-        let body = plist_wire::encode(request).map_err(|_| UNAVAILABLE)?;
+        let body = plist_wire::encode(request).map_err(|_| LockdownQueryFailure::RequestWrite)?;
         socket
             .write_all(&(body.len() as u32).to_be_bytes())
             .await
-            .map_err(|_| UNAVAILABLE)?;
-        socket.write_all(&body).await.map_err(|_| UNAVAILABLE)?;
-        socket.flush().await.map_err(|_| UNAVAILABLE)?;
-        let length = socket.read_u32().await.map_err(|_| UNAVAILABLE)? as usize;
+            .map_err(|_| LockdownQueryFailure::RequestWrite)?;
+        socket
+            .write_all(&body)
+            .await
+            .map_err(|_| LockdownQueryFailure::RequestWrite)?;
+        socket
+            .flush()
+            .await
+            .map_err(|_| LockdownQueryFailure::RequestWrite)?;
+        let length = socket
+            .read_u32()
+            .await
+            .map_err(|_| LockdownQueryFailure::ResponseLength)? as usize;
         if length == 0 || length > MAX_REPLY_BYTES {
-            return Err(UNAVAILABLE);
+            return Err(LockdownQueryFailure::ResponseLength);
         }
         let mut body = vec![0; length];
         socket
             .read_exact(&mut body)
             .await
-            .map_err(|_| UNAVAILABLE)?;
-        let reply: Reply = plist_wire::decode(&body, MAX_REPLY_BYTES).map_err(|_| UNAVAILABLE)?;
+            .map_err(|_| LockdownQueryFailure::ResponseRead)?;
+        let reply: Reply = plist_wire::decode(&body, MAX_REPLY_BYTES)
+            .map_err(|_| LockdownQueryFailure::PlistDecode)?;
         if reply.request != "GetValue" || reply.value.is_empty() {
-            return Err(UNAVAILABLE);
+            return Err(LockdownQueryFailure::ReplyValidation);
         }
         Ok(reply.value)
     }

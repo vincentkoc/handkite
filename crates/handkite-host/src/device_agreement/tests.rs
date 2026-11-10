@@ -191,8 +191,8 @@ async fn missing_ambiguous_mismatching_and_replaced_routes_or_replies_fail() {
                 ObservationFailure::Identity
             }
             4 => {
-                transport.reply = Err(LockdownFailure::Query);
-                ObservationFailure::LockdownQuery
+                transport.reply = Err(LockdownFailure::Query(LockdownQueryFailure::PlistDecode));
+                ObservationFailure::LockdownQuery(LockdownQueryFailure::PlistDecode)
             }
             5 => {
                 transport.routes[1] = Err("private fixture transport detail");
@@ -272,6 +272,43 @@ async fn config_and_lock_drift_before_or_during_observation_fail() {
             );
             assert_eq!(transport.events.borrow().is_empty(), !during);
         }
+    }
+}
+
+#[tokio::test]
+async fn query_substages_preserve_generic_reobservation_errors_and_poisoning() {
+    for query in [
+        LockdownQueryFailure::RequestWrite,
+        LockdownQueryFailure::ResponseLength,
+        LockdownQueryFailure::ResponseRead,
+        LockdownQueryFailure::PlistDecode,
+        LockdownQueryFailure::ReplyValidation,
+    ] {
+        let (_scratch, layout) = fixture();
+        let owner = InstallerLock::acquire(&layout).unwrap();
+        let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+        let before = protected(&layout);
+        let mut transport = Fake::good();
+        transport.reply = Err(LockdownFailure::Query(query));
+        assert_eq!(
+            DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
+                .await
+                .err(),
+            Some(ObservationFailure::LockdownQuery(query)),
+        );
+        assert_eq!(&*transport.events.borrow(), &["enumerate", "GetValue"]);
+        let mut agreement = DeviceAgreement::observe_with(&owner, &mut config, &mut Fake::good())
+            .await
+            .unwrap();
+        let mut transport = Fake::good();
+        transport.reply = Err(LockdownFailure::Query(query));
+        assert_eq!(agreement.reobserve_with(transport).await, Err(UNAVAILABLE));
+        assert_eq!(
+            agreement.reobserve_with(Fake::good()).await,
+            Err(UNAVAILABLE)
+        );
+        drop(agreement);
+        unchanged(before);
     }
 }
 
@@ -394,7 +431,7 @@ async fn shared_deadline_takes_precedence_over_each_transport_error() {
         transport.delay_step = Some(step);
         match step {
             1 => transport.routes[0] = Err("private fixture transport detail"),
-            2 => transport.reply = Err(LockdownFailure::Query),
+            2 => transport.reply = Err(LockdownFailure::Query(LockdownQueryFailure::PlistDecode)),
             _ => transport.routes[1] = Err("private fixture transport detail"),
         }
         assert_eq!(
