@@ -209,6 +209,10 @@ impl Pending {
             .revalidate(&current, c"attempt.json", self.anchor.uid)
     }
 
+    pub(super) fn revalidate_pending(&self) -> Result<(), &'static str> {
+        self.revalidate(&[b"attempt.json"])
+    }
+
     pub(super) fn persist(self, state: &MacosProvisionedState) -> Result<(), &'static str> {
         if state.identifier != *self.identifier {
             return Err(INVALID);

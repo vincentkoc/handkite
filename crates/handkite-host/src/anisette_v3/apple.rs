@@ -15,7 +15,9 @@ mod provider;
 pub(super) use context::{AppleProvisioningContext, ProvisioningIdentifier};
 pub(super) use provider::AppleProvisioningProvider;
 #[cfg(test)]
-pub(crate) use provider::tests::{fixture_empty_policy, fixture_provider, fixture_provider_for};
+pub(crate) use provider::tests::{
+    fixture_empty_policy, fixture_lookup_only, fixture_provider, fixture_provider_for,
+};
 
 const MAX_LOOKUP_BYTES: usize = 64 * 1024;
 const MAX_URL_BYTES: usize = 4096;

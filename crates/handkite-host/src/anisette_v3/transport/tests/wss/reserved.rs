@@ -1,6 +1,7 @@
 use super::*;
 use crate::anisette_v3::state::tests::{fixture, is_reserved, load};
 use std::fs;
+use std::os::unix::fs::PermissionsExt;
 
 const INFO: &[u8] = br#"{"client_info":"reserved client","user_agent":"reserved/1"}"#;
 
@@ -17,6 +18,8 @@ fn info_response(body: &[u8]) -> Vec<u8> {
 impl TlsFixture {
     async fn client_info_then_wss<F, Fut>(
         self,
+        before_info_reply: impl FnOnce() + Send + 'static,
+        expect_wss: bool,
         handler: F,
     ) -> (AnisetteClient, tokio::task::JoinHandle<()>)
     where
@@ -51,8 +54,17 @@ impl TlsFixture {
                     }
                 }
                 assert!(request.starts_with(b"GET /v3/client_info HTTP/1.1\r\n"));
+                before_info_reply();
                 stream.write_all(&info_response(INFO)).await.unwrap();
                 stream.shutdown().await.unwrap();
+                if !expect_wss {
+                    assert!(
+                        timeout(Duration::from_millis(50), listener.accept())
+                            .await
+                            .is_err()
+                    );
+                    return;
+                }
                 let (tcp, _) = listener.accept().await.unwrap();
                 let tls = TlsAcceptor::from(self.server).accept(tcp).await.unwrap();
                 let socket = tokio_tungstenite::accept_hdr_async(tls, check_upgrade)
@@ -107,15 +119,19 @@ async fn reserved_flow_fetches_one_info_and_binds_apple_wss_attempt_and_ready() 
     let identifier = *pending.identifier();
     let server_layout = layout.clone();
     let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
-        .client_info_then_wss(move |mut socket| async move {
-            finish_for(&mut socket, identifier).await;
-            send_success(&mut socket, identifier).await;
-            assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
-            assert_eq!(
-                load(&server_layout).unwrap().as_bytes(),
-                state(identifier).as_bytes()
-            );
-        })
+        .client_info_then_wss(
+            || {},
+            true,
+            move |mut socket| async move {
+                finish_for(&mut socket, identifier).await;
+                send_success(&mut socket, identifier).await;
+                assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+                assert_eq!(
+                    load(&server_layout).unwrap().as_bytes(),
+                    state(identifier).as_bytes()
+                );
+            },
+        )
         .await;
     let mut apple_server = None;
     let value = client
@@ -321,4 +337,189 @@ async fn persistence_failure_never_polls_close_or_overwrites_residue() {
     assert_eq!(fs::read(stage).unwrap(), b"existing");
     assert!(is_reserved(&layout));
     assert!(load(&layout).is_err());
+}
+
+fn change_attempt(layout: &crate::service_layout::ServiceLayout) {
+    fs::set_permissions(
+        layout.anisette_state_directory().join("attempt.json"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+}
+
+#[tokio::test]
+async fn changed_custody_rejects_before_client_info_connection() {
+    let (_scratch, layout, pending) = fixture();
+    change_attempt(&layout);
+    let tls = TlsFixture::new("anisette.example.invalid", true, true);
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let client = AnisetteClient {
+        http: http_builder(&tls.client)
+            .resolve("anisette.example.invalid", address)
+            .build()
+            .unwrap(),
+        tls: tls.client.config,
+        test_port: Some(address.port()),
+    };
+    assert!(
+        client
+            .provision_apple_with_discovery(pending, |_| async {
+                panic!("changed custody cannot reach discovery")
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        timeout(Duration::from_millis(50), listener.accept())
+            .await
+            .is_err()
+    );
+    assert!(is_reserved(&layout));
+}
+
+#[tokio::test]
+async fn custody_changed_during_client_info_blocks_apple_discovery() {
+    let (_scratch, layout, pending) = fixture();
+    let mutate = layout.clone();
+    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        .client_info_then_wss(
+            move || change_attempt(&mutate),
+            false,
+            |_| async { panic!("changed custody cannot reach WSS") },
+        )
+        .await;
+    assert!(
+        client
+            .provision_apple_with_discovery(pending, |_| async {
+                panic!("changed custody cannot reach discovery")
+            })
+            .await
+            .is_err()
+    );
+    server.await.unwrap();
+    assert!(is_reserved(&layout));
+}
+
+#[tokio::test]
+async fn custody_changed_during_discovery_blocks_wss() {
+    let (_scratch, layout, pending) = fixture();
+    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        .http(info_response(INFO))
+        .await;
+    let mut apple_server = None;
+    assert!(matches!(
+        client
+            .provision_apple_with_discovery(pending, |context| async {
+                let (provider, server) =
+                    crate::anisette_v3::apple::fixture_lookup_only(context).await;
+                apple_server = Some(server);
+                change_attempt(&layout);
+                Ok(provider)
+            })
+            .await,
+        Err("Anisette state is unsafe, incomplete or changed")
+    ));
+    assert_eq!(apple_server.unwrap().await.unwrap().len(), 1);
+    assert!(!server.await.unwrap().is_empty());
+    assert!(is_reserved(&layout));
+}
+
+struct MutatingProvider {
+    inner: FixtureProvider,
+    layout: crate::service_layout::ServiceLayout,
+    finish: bool,
+}
+
+impl ProvisioningDataProvider for MutatingProvider {
+    async fn start(&mut self) -> Result<StartProvisioningData, ProvisioningDataError> {
+        let data = self.inner.start().await?;
+        if !self.finish {
+            change_attempt(&self.layout);
+        }
+        Ok(data)
+    }
+
+    async fn finish(&mut self, cpim: &str) -> Result<EndProvisioningData, ProvisioningDataError> {
+        let data = self.inner.finish(cpim).await?;
+        if self.finish {
+            change_attempt(&self.layout);
+        }
+        Ok(data)
+    }
+}
+
+#[tokio::test]
+async fn custody_changed_during_provider_await_blocks_reply() {
+    for finish in [false, true] {
+        let (_scratch, layout, pending) = fixture();
+        let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+            .wss(move |mut socket| async move {
+                challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
+                if finish {
+                    challenge(
+                        &mut socket,
+                        serde_json::json!({"result":"GiveStartProvisioningData"}),
+                    )
+                    .await;
+                }
+                let message = if finish {
+                    serde_json::json!({"result":"GiveEndProvisioningData","cpim":"Yg=="})
+                } else {
+                    serde_json::json!({"result":"GiveStartProvisioningData"})
+                };
+                socket
+                    .send(Message::Text(message.to_string().into()))
+                    .await
+                    .unwrap();
+                assert!(!matches!(socket.next().await, Some(Ok(Message::Text(_)))));
+            })
+            .await;
+        let mut provider = MutatingProvider {
+            inner: FixtureProvider::default(),
+            layout: layout.clone(),
+            finish,
+        };
+        assert!(
+            client
+                .provision_reserved(pending, &mut provider)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            (provider.inner.starts, provider.inner.finishes),
+            (1, usize::from(finish))
+        );
+        assert!(is_reserved(&layout));
+        assert!(load(&layout).is_err());
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn custody_changed_before_challenge_blocks_identifier_reply() {
+    let (_scratch, layout, pending) = fixture();
+    let mutate = layout.clone();
+    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        .wss(move |mut socket| async move {
+            change_attempt(&mutate);
+            socket
+                .send(Message::Text(r#"{"result":"GiveIdentifier"}"#.into()))
+                .await
+                .unwrap();
+            assert!(!matches!(socket.next().await, Some(Ok(Message::Text(_)))));
+        })
+        .await;
+    let mut provider = FixtureProvider::default();
+    assert!(
+        client
+            .provision_reserved(pending, &mut provider)
+            .await
+            .is_err()
+    );
+    assert_eq!((provider.starts, provider.finishes), (0, 0));
+    assert!(is_reserved(&layout));
+    server.await.unwrap();
 }

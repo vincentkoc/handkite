@@ -47,6 +47,17 @@ impl PendingProvisioning {
         unreachable!("reservation is unavailable on this platform")
     }
 
+    pub(super) fn revalidate(&self) -> Result<(), &'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.revalidate_pending()
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err("Anisette state custody requires macOS")
+        }
+    }
+
     /// Synchronous through durable publication and final path revalidation.
     pub(super) fn persist(self, state: &MacosProvisionedState) -> Result<(), &'static str> {
         #[cfg(target_os = "macos")]

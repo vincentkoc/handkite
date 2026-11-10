@@ -52,18 +52,31 @@ pub(crate) async fn fixture_provider() -> (AppleProvisioningProvider, JoinHandle
 pub(crate) async fn fixture_provider_for(
     context: AppleProvisioningContext,
 ) -> (AppleProvisioningProvider, JoinHandle<Vec<Vec<u8>>>) {
+    fixture_provider_with(context, true).await
+}
+
+pub(crate) async fn fixture_lookup_only(
+    context: AppleProvisioningContext,
+) -> (AppleProvisioningProvider, JoinHandle<Vec<Vec<u8>>>) {
+    fixture_provider_with(context, false).await
+}
+
+async fn fixture_provider_with(
+    context: AppleProvisioningContext,
+    complete: bool,
+) -> (AppleProvisioningProvider, JoinHandle<Vec<Vec<u8>>>) {
+    let mut replies = vec![response(
+        "Set-Cookie: synthetic=value; Secure\r\n",
+        &lookup(START, FINISH),
+    )];
+    if complete {
+        replies.push(start_response());
+        replies.push(finish_response(
+            "<key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>",
+        ));
+    }
     let (client, server) = TlsFixture::new("provision.example.test", true, false)
-        .serve(
-            vec![
-                response(
-                    "Set-Cookie: synthetic=value; Secure\r\n",
-                    &lookup(START, FINISH),
-                ),
-                start_response(),
-                finish_response("<key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>"),
-            ],
-            false,
-        )
+        .serve(replies, false)
         .await;
     let provider = AppleProvisioningProvider::discover_with(
         client,

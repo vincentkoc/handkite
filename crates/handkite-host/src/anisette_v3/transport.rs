@@ -75,6 +75,38 @@ pub trait ProvisioningDataProvider {
 
 type Socket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
+// Only tests may run a conversation without the durable capability.
+#[cfg_attr(
+    all(test, target_os = "macos"),
+    expect(
+        clippy::large_enum_variant,
+        reason = "the empty synthetic variant exists only in tests"
+    )
+)]
+enum Reservation {
+    Durable(super::state::PendingProvisioning),
+    #[cfg(test)]
+    Synthetic,
+}
+
+impl Reservation {
+    fn revalidate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::Durable(pending) => pending.revalidate(),
+            #[cfg(test)]
+            Self::Synthetic => Ok(()),
+        }
+    }
+
+    fn persist(self, state: &MacosProvisionedState) -> Result<(), &'static str> {
+        match self {
+            Self::Durable(pending) => pending.persist(state),
+            #[cfg(test)]
+            Self::Synthetic => Ok(()),
+        }
+    }
+}
+
 pub struct ClientInfo {
     client_info: String,
     user_agent: String,
@@ -188,12 +220,15 @@ impl AnisetteClient {
         D: FnOnce(super::apple::AppleProvisioningContext) -> F,
         F: Future<Output = Result<super::apple::AppleProvisioningProvider, &'static str>>,
     {
+        pending.revalidate()?;
         let info = self.client_info().await?;
+        pending.revalidate()?;
         let context = super::apple::AppleProvisioningContext::new(
             super::apple::ProvisioningIdentifier::new(*pending.identifier()),
             info,
         );
         let mut provider = discover(context).await?;
+        pending.revalidate()?;
         if provider.identifier().as_bytes() != pending.identifier() {
             return Err("Anisette provisioning identifier mismatch");
         }
@@ -210,7 +245,7 @@ impl AnisetteClient {
             identifier,
             provider,
             Instant::now() + CONVERSATION_TIMEOUT,
-            move |state| pending.persist(state),
+            Reservation::Durable(pending),
         )
         .await
     }
@@ -233,7 +268,7 @@ impl AnisetteClient {
         provider: &mut P,
         deadline: Instant,
     ) -> Result<MacosProvisionedState, &'static str> {
-        self.provision_conversation(identifier, provider, deadline, |_| Ok(()))
+        self.provision_conversation(identifier, provider, deadline, Reservation::Synthetic)
             .await
     }
 
@@ -242,8 +277,9 @@ impl AnisetteClient {
         identifier: [u8; 16],
         provider: &mut P,
         conversation_deadline: Instant,
-        persist: impl FnOnce(&MacosProvisionedState) -> Result<(), &'static str>,
+        reservation: Reservation,
     ) -> Result<MacosProvisionedState, &'static str> {
+        reservation.revalidate()?;
         let mut socket = timeout_at(conversation_deadline, self.connect())
             .await
             .map_err(|_| "Anisette provisioning conversation timed out")??;
@@ -252,6 +288,7 @@ impl AnisetteClient {
             let read_deadline = (Instant::now() + STAGE_TIMEOUT).min(conversation_deadline);
             let message = receive(&mut socket, read_deadline).await?;
             let deadline = (Instant::now() + STAGE_TIMEOUT).min(conversation_deadline);
+            reservation.revalidate()?;
             match conversation.accept(&message)? {
                 ProvisioningEvent::GiveIdentifier => {
                     #[derive(Serialize)]
@@ -272,6 +309,7 @@ impl AnisetteClient {
                         .await
                         .map_err(|_| "Anisette provisioning stage timed out")?
                         .map_err(|_| "Anisette provisioning data unavailable")?;
+                    reservation.revalidate()?;
                     #[derive(Serialize)]
                     struct Start<'a> {
                         spim: &'a str,
@@ -284,6 +322,7 @@ impl AnisetteClient {
                         .await
                         .map_err(|_| "Anisette provisioning stage timed out")?
                         .map_err(|_| "Anisette provisioning data unavailable")?;
+                    reservation.revalidate()?;
                     send(
                         &mut socket,
                         &FinishProvisioning::new(&data.ptm, &data.tk, data.routing_info),
@@ -293,12 +332,16 @@ impl AnisetteClient {
                 }
                 ProvisioningEvent::ProvisioningSuccess { adi_pb } => {
                     let state = MacosProvisionedState::parse(adi_pb, identifier)?;
-                    return persist_before_close(state, persist, async {
-                        timeout_at(deadline, socket.close(None))
-                            .await
-                            .map_err(|_| "Anisette provisioning stage timed out")?
-                            .map_err(|_| "Anisette provisioning close failed")
-                    })
+                    return persist_before_close(
+                        state,
+                        move |state| reservation.persist(state),
+                        async {
+                            timeout_at(deadline, socket.close(None))
+                                .await
+                                .map_err(|_| "Anisette provisioning stage timed out")?
+                                .map_err(|_| "Anisette provisioning close failed")
+                        },
+                    )
                     .await;
                 }
             }
