@@ -34,6 +34,17 @@ def fixture(directory: str) -> tuple[Path, Path, Path]:
 
 
 class VerifyTests(unittest.TestCase):
+    def test_entitlement_allowances_are_bounded(self):
+        self.assertTrue(verify.allowed_claim("ABCDE12345.com.example.Runner", "ABCDE12345.*"))
+        self.assertFalse(verify.allowed_claim("OTHER12345.com.example.Runner", "ABCDE12345.*"))
+        self.assertFalse(verify.allowed_claim("ABCDE12345.*", "ABCDE12345.*"))
+        self.assertTrue(verify.allowed_claim(["ABCDE12345.runner"], ["ABCDE12345.*"]))
+        self.assertFalse(verify.allowed_claim(["ABCDE12345.runner", "OTHER12345.runner"], ["ABCDE12345.*"]))
+        with self.assertRaisesRegex(ValueError, "entitlement_allowance_unsupported"):
+            verify.allowed_claim("ABCDE12345.runner", "ABCDE12345.r*er")
+        with self.assertRaisesRegex(ValueError, "entitlement_allowance_unsupported"):
+            verify.allowed_claim({"nested": True}, {"nested": True})
+
     def test_udid_accepts_legacy_and_modern_forms_only(self):
         self.assertIsNotNone(verify.UDID.fullmatch(UDID))
         self.assertIsNotNone(verify.UDID.fullmatch(MODERN_UDID))
@@ -70,9 +81,17 @@ class VerifyTests(unittest.TestCase):
             cert = b"synthetic-cert"
             digest = hashlib.sha1(cert).hexdigest()
             entitlements = {
+                "application-identifier": f"{TEAM}.*",
+                "com.apple.developer.team-identifier": TEAM,
+                "get-task-allow": True,
+                "keychain-access-groups": [f"{TEAM}.*"],
+                "com.apple.developer.extra-profile-allowance": True,
+            }
+            signed = {
                 "application-identifier": f"{TEAM}.{RUNNER}",
                 "com.apple.developer.team-identifier": TEAM,
                 "get-task-allow": True,
+                "keychain-access-groups": [f"{TEAM}.{RUNNER}"],
             }
             fields = {
                 "TeamIdentifier": [TEAM],
@@ -83,7 +102,7 @@ class VerifyTests(unittest.TestCase):
             }
 
             def command(arguments):
-                return plistlib.dumps(fields if arguments[0] == "/usr/bin/security" else entitlements)
+                return plistlib.dumps(fields if arguments[0] == "/usr/bin/security" else signed)
 
             with mock.patch.object(verify, "tool", side_effect=command):
                 verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
@@ -93,6 +112,19 @@ class VerifyTests(unittest.TestCase):
                 fields["ProvisionedDevices"] = [MODERN_UDID]
                 fields["ExpirationDate"] = datetime.now(timezone.utc) - timedelta(days=1)
                 with self.assertRaisesRegex(ValueError, "profile_expired"):
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                fields["ExpirationDate"] = datetime.now(timezone.utc) + timedelta(days=1)
+                signed["keychain-access-groups"] = [f"{TEAM}.unrelated"]
+                entitlements["keychain-access-groups"] = [f"{TEAM}.{RUNNER}"]
+                with self.assertRaisesRegex(ValueError, "entitlements_mismatch"):
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                signed["keychain-access-groups"] = [f"{TEAM}.{RUNNER}"]
+                signed["com.apple.developer.unlisted"] = True
+                with self.assertRaisesRegex(ValueError, "entitlements_mismatch"):
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                del signed["com.apple.developer.unlisted"]
+                signed["application-identifier"] = f"{TEAM}.wrong"
+                with self.assertRaisesRegex(ValueError, "signed_entitlement_identity_mismatch"):
                     verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
 
     def test_runner_identity_rejects_before_any_signature_check(self):

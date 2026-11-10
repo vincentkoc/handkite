@@ -102,6 +102,27 @@ def leaf_sha1(app: Path) -> str:
         return hashlib.sha1(leaf.read_bytes()).hexdigest()
 
 
+def allowed_claim(claim: object, allowance: object) -> bool:
+    if isinstance(allowance, str):
+        if not isinstance(claim, str) or "*" in claim:
+            return False
+        if "*" not in allowance:
+            return claim == allowance
+        if allowance.count("*") != 1 or not allowance.endswith(".*"):
+            raise ValueError("entitlement_allowance_unsupported")
+        prefix = allowance[:-1]
+        return claim.startswith(prefix) and len(claim) > len(prefix)
+    if isinstance(allowance, bool):
+        return type(claim) is bool and claim == allowance
+    if isinstance(allowance, int):
+        return type(claim) is int and claim == allowance
+    if isinstance(allowance, list):
+        if not all(isinstance(item, str) for item in allowance) or not isinstance(claim, list):
+            raise ValueError("entitlement_allowance_unsupported")
+        return all(isinstance(item, str) and any(allowed_claim(item, option) for option in allowance) for item in claim)
+    raise ValueError("entitlement_allowance_unsupported")
+
+
 def profile(app: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -> None:
     embedded = app / "embedded.mobileprovision"
     if embedded.stat().st_size > MAX_PROFILE_BYTES:
@@ -122,7 +143,7 @@ def profile(app: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -> 
     if (
         fields.get("TeamIdentifier") != [team]
         or udid not in fields.get("ProvisionedDevices", [])
-        or entitlements.get("application-identifier") != f"{team}.{runner_id}"
+        or not allowed_claim(f"{team}.{runner_id}", entitlements.get("application-identifier"))
         or entitlements.get("com.apple.developer.team-identifier") != team
         or entitlements.get("get-task-allow") is not True
         or not isinstance(certs, list)
@@ -134,7 +155,13 @@ def profile(app: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -> 
         actual = plistlib.loads(signed)
     except (ValueError, plistlib.InvalidFileException) as error:
         raise ValueError("entitlements_invalid") from error
-    if not isinstance(actual, dict) or any(actual.get(key) != value for key, value in entitlements.items()):
+    if not isinstance(actual, dict) or (
+        actual.get("application-identifier") != f"{team}.{runner_id}"
+        or actual.get("com.apple.developer.team-identifier") != team
+        or actual.get("get-task-allow") is not True
+    ):
+        raise ValueError("signed_entitlement_identity_mismatch")
+    if any(key not in entitlements or not allowed_claim(value, entitlements[key]) for key, value in actual.items()):
         raise ValueError("entitlements_mismatch")
 
 
