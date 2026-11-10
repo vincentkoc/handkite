@@ -523,6 +523,17 @@ first digit or qualify live PIN entry; default behavior remains unchanged.
 
 ## Anisette
 
+`handkite-developer-probe --cert PRIVATE_CERT --key PRIVATE_KEY < PRIVATE_TOKEN_FILE`
+is an explicit read-only compatibility probe. The input is a service-owned,
+mode-0600 regular single-link file with two LF-terminated lines: numeric ADSID
+and Xcode GS token. The program uses the fixed ready Anisette identity to fetch
+fresh headers, then makes one bounded HTTPS team-listing request to an
+undocumented Apple developer endpoint. It prints only a fixed status and never
+stores tokens or team data. This endpoint and flow have loopback tests only;
+success would establish request compatibility, not signing, profile creation,
+or a signed runner. The request must not be run before the final sidecar and
+credential custody are qualified.
+
 The [deployment bundle](deploy/anisette/README.md) pins a separate V3 sidecar behind a loopback listener and a TLS client-authenticated proxy. It is staged only. The final domain, host, client certificate, provisioning flow, and signing result must be verified before use.
 
 The host library provides a fixed-origin V3 client for HTTPS client information and signing headers, plus a WSS provisioning conversation. Both transports use one explicit rustls configuration with public WebPKI roots, client-certificate authentication, and HTTP/1.1. There are no endpoint overrides, environment proxies, redirects, automatic retries, or provider fallbacks.
