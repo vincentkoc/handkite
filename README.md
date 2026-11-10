@@ -324,6 +324,20 @@ the pinned device's WDA port as a point-in-time vacancy observation. A listening
 endpoint or uncertain connection refuses startup. Vacancy does not prevent a
 different controller from restarting or prove the new endpoint's ownership.
 
+After cleanup, the owned Clock route emits nine fixed-field timing receipts to
+stderr before its unchanged terminal status. Monotonic `elapsed_us` covers runner
+startup, the session/settings transaction, both preflights, tap, the sole
+postcheck, exact-session close, runner join (including the final ownership
+check), and total invocation work. The transaction includes session creation,
+settings, the Clock trial, and restoration; its time overlaps the four Clock
+steps and must not be added to them. Total excludes receipt formatting/output.
+Skipped steps have no duration. Lost worker receipts are `unavailable`; a capture
+after an uncertain tap receipt is `observed_unvalidated`, never proof of the
+Clock transition. Fixed failure reasons contain no device/session identifiers,
+paths, screen content, coordinates, or credentials. `complete` describes only
+that step; confirmation still requires the existing final checks. No latency or
+live reliability claim follows from the offline fixtures.
+
 ## One-shot Clock touch diagnostic
 
 An explicitly supervised trial can run

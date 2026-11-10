@@ -8,7 +8,7 @@ use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_http::HttpResponse;
 use handkite_host::wda_runner::OwnedWdaRunner;
 use handkite_host::wda_session::{
-    SessionClose, close_owned_session, with_owned_session_idle_settings_receipt,
+    OwnedSessionError, SessionClose, close_owned_session, with_owned_session_idle_settings_receipt,
 };
 use handkite_host::wda_settings::{
     IdleAction, IdleSettingsOutcome, Restoration, with_temporary_idle_settings,
@@ -17,6 +17,7 @@ use handkite_host::wda_transport::UsbWda;
 use handkite_host::{host_config, install_config, native_lock};
 use quick_xml::events::Event;
 use std::collections::BTreeMap;
+use std::fmt::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -112,6 +113,147 @@ impl Transport {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ReceiptFailure {
+    Trial(TrialError),
+    Session(OwnedSessionError),
+    RunnerUnavailable,
+    SettingsUnproven,
+    RestorationUnproven,
+    SessionCloseRefused,
+    SessionCloseUnproven,
+    RunnerExited,
+    RunnerJoinUnproven,
+    ServiceOwnership,
+    TerminalError,
+}
+
+impl ReceiptFailure {
+    fn name(self) -> &'static str {
+        let message = match self {
+            Self::Trial(error) => error.message(),
+            Self::Session(error) => error.message(),
+            Self::RunnerUnavailable => return "runner_unavailable",
+            Self::SettingsUnproven => return "settings_unproven",
+            Self::RestorationUnproven => return "restoration_unproven",
+            Self::SessionCloseRefused => return "session_close_refused",
+            Self::SessionCloseUnproven => return "session_close_unproven",
+            Self::RunnerExited => return "runner_exited",
+            Self::RunnerJoinUnproven => return "runner_join_unproven",
+            Self::ServiceOwnership => return "service_ownership",
+            Self::TerminalError => return "terminal_error",
+        };
+        message
+            .split_once("reason=")
+            .map_or("unproven", |(_, reason)| reason)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum StepOutcome {
+    #[default]
+    Skipped,
+    Complete,
+    Failed(ReceiptFailure),
+    ObservedUnvalidated,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct StepReceipt {
+    elapsed: Option<Duration>,
+    outcome: StepOutcome,
+}
+
+impl StepReceipt {
+    fn finish(&mut self, started: Instant, outcome: StepOutcome) {
+        self.elapsed = Some(started.elapsed());
+        self.outcome = outcome;
+    }
+
+    fn measure<T>(
+        &mut self,
+        work: impl FnOnce() -> Result<T, TrialError>,
+    ) -> Result<T, TrialError> {
+        let started = Instant::now();
+        let result = work();
+        self.finish(
+            started,
+            match &result {
+                Ok(_) => StepOutcome::Complete,
+                Err(error) => StepOutcome::Failed(ReceiptFailure::Trial(*error)),
+            },
+        );
+        result
+    }
+}
+
+#[derive(Default)]
+struct ClockReceipts {
+    preflight_1: StepReceipt,
+    preflight_2: StepReceipt,
+    tap: StepReceipt,
+    postcheck: StepReceipt,
+}
+
+impl ClockReceipts {
+    fn unavailable() -> Self {
+        let lost = StepReceipt {
+            elapsed: None,
+            outcome: StepOutcome::Unavailable,
+        };
+        Self {
+            preflight_1: lost,
+            preflight_2: lost,
+            tap: lost,
+            postcheck: lost,
+        }
+    }
+}
+
+#[derive(Default)]
+struct OwnedReceipts {
+    runner_startup: StepReceipt,
+    session_settings_transaction: StepReceipt,
+    clock: ClockReceipts,
+    session_close: StepReceipt,
+    runner_join: StepReceipt,
+    total: StepReceipt,
+}
+
+impl OwnedReceipts {
+    fn render(&self) -> String {
+        let mut output = String::new();
+        for (step, receipt) in [
+            ("runner_startup", &self.runner_startup),
+            (
+                "session_settings_transaction",
+                &self.session_settings_transaction,
+            ),
+            ("preflight_1", &self.clock.preflight_1),
+            ("preflight_2", &self.clock.preflight_2),
+            ("tap", &self.clock.tap),
+            ("postcheck", &self.clock.postcheck),
+            ("session_close", &self.session_close),
+            ("runner_join", &self.runner_join),
+            ("total", &self.total),
+        ] {
+            let (outcome, reason) = match receipt.outcome {
+                StepOutcome::Skipped => ("skipped", "none"),
+                StepOutcome::Complete => ("complete", "none"),
+                StepOutcome::Failed(reason) => ("failed", reason.name()),
+                StepOutcome::ObservedUnvalidated => ("observed_unvalidated", "receipt_unproven"),
+                StepOutcome::Unavailable => ("unavailable", "worker_unproven"),
+            };
+            let elapsed = receipt
+                .elapsed
+                .map_or_else(|| "none".into(), |elapsed| elapsed.as_micros().to_string());
+            writeln!(output, "touch_trial_owned_step={step} elapsed_us={elapsed} outcome={outcome} reason={reason}").expect("string formatting");
+        }
+        output
+    }
+}
+
 pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
     let (expected, transport) = options(args)?;
     let mut live =
@@ -147,6 +289,27 @@ pub(super) fn idle_command(args: &[String]) -> Result<(), &'static str> {
 }
 
 pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
+    let started = Instant::now();
+    let mut receipts = OwnedReceipts::default();
+    let result = owned_trial(args, &mut receipts);
+    receipts.total.finish(
+        started,
+        match result {
+            Ok(_) => StepOutcome::Complete,
+            Err(_) => StepOutcome::Failed(ReceiptFailure::TerminalError),
+        },
+    );
+    // No formatting or output while the trial or its cleanup is in progress.
+    eprint!("{}", receipts.render());
+    let transport = result?;
+    println!(
+        "touch_trial_owned_session=confirmed transport={}",
+        transport.name()
+    );
+    Ok(())
+}
+
+fn owned_trial(args: &[String], receipts: &mut OwnedReceipts) -> Result<Transport, &'static str> {
     let (path, transport) = option_syntax(args)?;
     let layout = ServiceLayout::current_account().map_err(|_| "refused reason=service_layout")?;
     if path != layout.config_file() {
@@ -170,9 +333,17 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
         .map_err(|_| "refused reason=runner_unavailable")?;
     let result = runtime.block_on(async {
         let usb = PinnedUsb::new(expected.clone());
-        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120))
-            .await
-            .map_err(|_| "refused reason=runner_unavailable")?;
+        let started = Instant::now();
+        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120)).await;
+        receipts.runner_startup.finish(
+            started,
+            if runner.is_ok() {
+                StepOutcome::Complete
+            } else {
+                StepOutcome::Failed(ReceiptFailure::RunnerUnavailable)
+            },
+        );
+        let runner = runner.map_err(|_| "refused reason=runner_unavailable")?;
         let liveness = runner.liveness();
         let wda = UsbWda::new(usb);
         let admit = || {
@@ -182,6 +353,7 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
                 Ok(())
             }
         };
+        let clock_receipts = &mut receipts.clock;
         let action = |worker_session: String| {
             let worker_owner = Arc::clone(&owner);
             let worker_liveness = liveness.clone();
@@ -189,53 +361,109 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
                 if worker_liveness.is_finished() || worker_owner.validate_current().is_err() {
                     return Err(TrialError::Refused(RefusalReason::SessionUnproven));
                 }
-                blocking_trial(move || {
-                    let input_owner = Arc::clone(&worker_owner);
-                    let input_liveness = worker_liveness.clone();
-                    let input_admission: Arc<dyn Fn() -> bool + Send + Sync> =
-                        Arc::new(move || {
-                            !input_liveness.is_finished() && input_owner.validate_current().is_ok()
-                        });
-                    let mut live =
-                        Live::new_with_admission(expected.clone(), Some(input_admission))
-                            .map_err(TrialError::Refused)?;
-                    let owns = || {
-                        !worker_liveness.is_finished() && worker_owner.validate_current().is_ok()
-                    };
-                    let mut bound = SessionBound {
-                        device: &mut live,
-                        session: &worker_session,
-                        admission: Some(&owns),
-                    };
-                    run(&mut bound, &expected, transport)
+                let worker = blocking_trial(move || {
+                    let mut clock = ClockReceipts::default();
+                    let result = (|| {
+                        let input_owner = Arc::clone(&worker_owner);
+                        let input_liveness = worker_liveness.clone();
+                        let input_admission: Arc<dyn Fn() -> bool + Send + Sync> =
+                            Arc::new(move || {
+                                !input_liveness.is_finished()
+                                    && input_owner.validate_current().is_ok()
+                            });
+                        let mut live =
+                            Live::new_with_admission(expected.clone(), Some(input_admission))
+                                .map_err(TrialError::Refused)?;
+                        let owns = || {
+                            !worker_liveness.is_finished()
+                                && worker_owner.validate_current().is_ok()
+                        };
+                        let mut bound = SessionBound {
+                            device: &mut live,
+                            session: &worker_session,
+                            admission: Some(&owns),
+                        };
+                        run_recorded(&mut bound, &expected, transport, &mut clock)
+                    })();
+                    Ok((result, clock))
                 })
-                .await
+                .await;
+                match worker {
+                    Ok((result, clock)) => {
+                        *clock_receipts = clock;
+                        result
+                    }
+                    Err(error) => {
+                        // A lost worker cannot establish which steps it attempted.
+                        *clock_receipts = ClockReceipts::unavailable();
+                        Err(error)
+                    }
+                }
             }
         };
+        let started = Instant::now();
         let transaction = with_owned_session_idle_settings_receipt(&wda, admit, action).await;
+        receipts.session_settings_transaction.finish(
+            started,
+            match &transaction {
+                Ok((_, outcome)) => transaction_receipt(outcome),
+                Err(error) => StepOutcome::Failed(ReceiptFailure::Session(*error)),
+            },
+        );
         let (trial, close) = match transaction {
             Ok((session, outcome)) => {
                 let trial = idle_result(outcome);
-                (trial, Some(close_owned_session(&wda, &session).await))
+                let started = Instant::now();
+                let close = close_owned_session(&wda, &session).await;
+                receipts.session_close.finish(
+                    started,
+                    match close {
+                        SessionClose::Acknowledged => StepOutcome::Complete,
+                        SessionClose::Refused => {
+                            StepOutcome::Failed(ReceiptFailure::SessionCloseRefused)
+                        }
+                        SessionClose::Unknown => {
+                            StepOutcome::Failed(ReceiptFailure::SessionCloseUnproven)
+                        }
+                    },
+                );
+                (trial, Some(close))
             }
             Err(error) => (Err(error.message()), None),
         };
         let alive = !runner.is_finished();
+        let started = Instant::now();
         let stopped = runner.abort_and_join().await;
-        owned_result(
-            trial,
-            close,
-            alive,
-            stopped.is_ok(),
-            owner.validate_current().is_ok(),
-        )
+        let service_owned = owner.validate_current().is_ok();
+        receipts.runner_join.finish(
+            started,
+            if stopped.is_err() {
+                StepOutcome::Failed(ReceiptFailure::RunnerJoinUnproven)
+            } else if !alive {
+                StepOutcome::Failed(ReceiptFailure::RunnerExited)
+            } else if !service_owned {
+                StepOutcome::Failed(ReceiptFailure::ServiceOwnership)
+            } else {
+                StepOutcome::Complete
+            },
+        );
+        owned_result(trial, close, alive, stopped.is_ok(), service_owned)
     });
     result?;
-    println!(
-        "touch_trial_owned_session=confirmed transport={}",
-        transport.name()
-    );
-    Ok(())
+    Ok(transport)
+}
+
+fn transaction_receipt(outcome: &IdleSettingsOutcome<(), TrialError>) -> StepOutcome {
+    match (&outcome.action, outcome.restoration) {
+        (IdleAction::Completed(Ok(())), Restoration::Verified) => StepOutcome::Complete,
+        (IdleAction::Completed(Err(error)), Restoration::Verified) => {
+            StepOutcome::Failed(ReceiptFailure::Trial(*error))
+        }
+        (IdleAction::NotRun(_), Restoration::NotNeeded | Restoration::Verified) => {
+            StepOutcome::Failed(ReceiptFailure::SettingsUnproven)
+        }
+        _ => StepOutcome::Failed(ReceiptFailure::RestorationUnproven),
+    }
 }
 
 fn owned_result(
@@ -295,9 +523,9 @@ fn settings_command(args: &[String]) -> Result<(), &'static str> {
     Ok(())
 }
 
-async fn blocking_trial(
-    work: impl FnOnce() -> Result<(), TrialError> + Send + 'static,
-) -> Result<(), TrialError> {
+async fn blocking_trial<T: Send + 'static>(
+    work: impl FnOnce() -> Result<T, TrialError> + Send + 'static,
+) -> Result<T, TrialError> {
     // Always join before the transaction restores settings; never detach or retry.
     tokio::task::spawn_blocking(work)
         .await
@@ -374,42 +602,88 @@ fn run(
     expected: &HardwareId,
     transport: Transport,
 ) -> Result<(), TrialError> {
-    let before = device.capture().map_err(TrialError::Refused)?;
-    let first = validate(&before, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
+    run_recorded(device, expected, transport, &mut ClockReceipts::default())
+}
+
+fn run_recorded(
+    device: &mut impl TrialDevice,
+    expected: &HardwareId,
+    transport: Transport,
+    receipts: &mut ClockReceipts,
+) -> Result<(), TrialError> {
+    let (before, first) = receipts.preflight_1.measure(|| {
+        let before = device.capture().map_err(TrialError::Refused)?;
+        let first =
+            validate(&before, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
+        Ok((before, first))
+    })?;
     // Reobserve every precondition; only stable accessibility geometry authorizes input.
-    let current = device.capture().map_err(TrialError::Refused)?;
-    let second =
-        validate(&current, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
-    if current.session != before.session {
-        return Err(TrialError::Refused(RefusalReason::SessionUnproven));
-    }
-    if current.observation.window.started_unix_ms < before.observation.window.finished_unix_ms {
-        return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
-    }
-    if first != second {
-        return Err(TrialError::Refused(RefusalReason::GeometryMismatch));
-    }
-    let input_started = device
-        .now_ms()
-        .map_err(|_| TrialError::Refused(RefusalReason::FreshnessUnproven))?;
+    let (current, second, input_started) = receipts.preflight_2.measure(|| {
+        let current = device.capture().map_err(TrialError::Refused)?;
+        let second =
+            validate(&current, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
+        if current.session != before.session {
+            return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+        }
+        if current.observation.window.started_unix_ms < before.observation.window.finished_unix_ms {
+            return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
+        }
+        if first != second {
+            return Err(TrialError::Refused(RefusalReason::GeometryMismatch));
+        }
+        let input_started = device
+            .now_ms()
+            .map_err(|_| TrialError::Refused(RefusalReason::FreshnessUnproven))?;
+        Ok((current, second, input_started))
+    })?;
+    let started = Instant::now();
     let receipt = device.tap(transport, second.center(), current.fresh_until);
+    let receipt_error = receipt.err().map(|error| match error {
+        CoordinateTapError::Http404 => CoordinateUnknown::Http404,
+        CoordinateTapError::ReceiptUnproven => CoordinateUnknown::ReceiptUnproven,
+    });
+    receipts.tap.finish(
+        started,
+        receipt_error.map_or(StepOutcome::Complete, |reason| {
+            StepOutcome::Failed(ReceiptFailure::Trial(TrialError::CoordinateUnknown(reason)))
+        }),
+    );
     // Even unknown delivery receives one read-only postcheck, never another input.
+    let started = Instant::now();
     let after = device.capture();
     // Keep the receipt category even when the sole postcapture also fails.
-    receipt.map_err(|error| {
-        transport.unknown(match error {
-            CoordinateTapError::Http404 => CoordinateUnknown::Http404,
-            CoordinateTapError::ReceiptUnproven => CoordinateUnknown::ReceiptUnproven,
-        })
-    })?;
-    let postcondition = transport.unknown(CoordinateUnknown::PostconditionUnproven);
-    let after = after.map_err(|_| postcondition)?;
-    validate(&after, expected, device.now_ms(), true).map_err(|_| postcondition)?;
-    if after.session != current.session || after.observation.window.started_unix_ms < input_started
-    {
-        return Err(postcondition);
+    if let Some(reason) = receipt_error {
+        receipts.postcheck.finish(
+            started,
+            match after {
+                Ok(_) => StepOutcome::ObservedUnvalidated,
+                Err(reason) => {
+                    StepOutcome::Failed(ReceiptFailure::Trial(TrialError::Refused(reason)))
+                }
+            },
+        );
+        return Err(transport.unknown(reason));
     }
-    Ok(())
+    let postcondition = transport.unknown(CoordinateUnknown::PostconditionUnproven);
+    let result = (|| {
+        let after = after.map_err(TrialError::Refused)?;
+        validate(&after, expected, device.now_ms(), true).map_err(TrialError::Refused)?;
+        if after.session != current.session {
+            return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+        }
+        if after.observation.window.started_unix_ms < input_started {
+            return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
+        }
+        Ok(())
+    })();
+    receipts.postcheck.finish(
+        started,
+        match result {
+            Ok(()) => StepOutcome::Complete,
+            Err(error) => StepOutcome::Failed(ReceiptFailure::Trial(error)),
+        },
+    );
+    result.map_err(|_| postcondition)
 }
 
 fn validate(
@@ -1098,6 +1372,200 @@ mod tests {
         )
     }
 
+    fn recorded(
+        fixture: &mut Fixture,
+        transport: Transport,
+    ) -> (Result<(), TrialError>, ClockReceipts) {
+        let mut receipts = ClockReceipts::default();
+        let result = run_recorded(
+            fixture,
+            &HardwareId::new("fixture-device").unwrap(),
+            transport,
+            &mut receipts,
+        );
+        (result, receipts)
+    }
+
+    #[test]
+    fn recorded_trial_keeps_capture_count_and_marks_only_attempted_steps() {
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for failure in [None, Some(0), Some(1)] {
+                let mut fixture = Fixture::new();
+                if let Some(index) = failure {
+                    fixture.captures[index] = Err(RefusalReason::CaptureFailed);
+                }
+                let (result, receipts) = recorded(&mut fixture, transport);
+                assert_eq!(result.is_ok(), failure.is_none());
+                let steps = [
+                    receipts.preflight_1,
+                    receipts.preflight_2,
+                    receipts.tap,
+                    receipts.postcheck,
+                ];
+                for (index, step) in steps.iter().enumerate() {
+                    if failure == Some(index) {
+                        assert_eq!(
+                            step.outcome,
+                            StepOutcome::Failed(ReceiptFailure::Trial(TrialError::Refused(
+                                RefusalReason::CaptureFailed
+                            )))
+                        );
+                        assert!(step.elapsed.is_some());
+                    } else if failure.is_some_and(|failure| index > failure) {
+                        assert_eq!(step.outcome, StepOutcome::Skipped);
+                        assert!(step.elapsed.is_none());
+                    } else {
+                        assert_eq!(step.outcome, StepOutcome::Complete);
+                        assert!(step.elapsed.is_some());
+                    }
+                }
+                assert_eq!(fixture.taps.len(), usize::from(failure.is_none()));
+                assert_eq!(fixture.captures.len(), failure.map_or(0, |index| 2 - index));
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_receipt_error_does_not_validate_or_hide_the_sole_postcapture() {
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for error in [
+                CoordinateTapError::Http404,
+                CoordinateTapError::ReceiptUnproven,
+            ] {
+                for capture_fails in [false, true] {
+                    let mut fixture = Fixture::new();
+                    fixture.receipt = Err(error);
+                    if capture_fails {
+                        fixture.captures[2] = Err(RefusalReason::CaptureFailed);
+                    } else {
+                        // Deliberately invalid evidence must remain unvalidated after receipt loss.
+                        fixture.captures[2].as_mut().unwrap().native = LockState::Locked;
+                    }
+                    let (result, receipts) = recorded(&mut fixture, transport);
+                    let reason = match error {
+                        CoordinateTapError::Http404 => CoordinateUnknown::Http404,
+                        CoordinateTapError::ReceiptUnproven => CoordinateUnknown::ReceiptUnproven,
+                    };
+                    assert_eq!(result, Err(transport.unknown(reason)));
+                    assert_eq!(
+                        receipts.tap.outcome,
+                        StepOutcome::Failed(ReceiptFailure::Trial(TrialError::CoordinateUnknown(
+                            reason
+                        )))
+                    );
+                    assert_eq!(
+                        receipts.postcheck.outcome,
+                        if capture_fails {
+                            StepOutcome::Failed(ReceiptFailure::Trial(TrialError::Refused(
+                                RefusalReason::CaptureFailed,
+                            )))
+                        } else {
+                            StepOutcome::ObservedUnvalidated
+                        }
+                    );
+                    assert!(receipts.postcheck.elapsed.is_some());
+                    assert_eq!(fixture.taps.len(), 1);
+                    assert!(fixture.captures.is_empty());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn recorded_postcondition_failure_preserves_terminal_category() {
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            let mut fixture = Fixture::new();
+            fixture.captures[2].as_mut().unwrap().native = LockState::Locked;
+            let (result, receipts) = recorded(&mut fixture, transport);
+            assert_eq!(
+                result,
+                Err(transport.unknown(CoordinateUnknown::PostconditionUnproven))
+            );
+            assert_eq!(
+                receipts.postcheck.outcome,
+                StepOutcome::Failed(ReceiptFailure::Trial(TrialError::Refused(
+                    RefusalReason::NativeLocked
+                )))
+            );
+            assert_eq!(fixture.taps.len(), 1);
+            assert!(fixture.captures.is_empty());
+        }
+    }
+
+    #[test]
+    fn aggregate_receipt_preserves_settings_restoration_precedence() {
+        use handkite_host::wda_settings::SettingsError;
+        let failed = Err(TrialError::CoordinateUnknown(CoordinateUnknown::Http404));
+        for action in [
+            IdleAction::Completed(Ok(())),
+            IdleAction::Completed(failed),
+            IdleAction::NotRun(SettingsError::ReadUnproven),
+        ] {
+            let outcome = IdleSettingsOutcome {
+                action,
+                restoration: Restoration::Unproven(SettingsError::WriteUnproven),
+            };
+            assert_eq!(
+                transaction_receipt(&outcome),
+                StepOutcome::Failed(ReceiptFailure::RestorationUnproven)
+            );
+            assert_eq!(idle_result(outcome), Err("unknown"));
+        }
+        let outcome = IdleSettingsOutcome {
+            action: IdleAction::Completed(failed),
+            restoration: Restoration::Verified,
+        };
+        assert_eq!(
+            transaction_receipt(&outcome),
+            StepOutcome::Failed(ReceiptFailure::Trial(failed.unwrap_err()))
+        );
+        assert_eq!(idle_result(outcome), Err("unknown reason=http_404"));
+    }
+
+    #[test]
+    fn receipt_output_has_only_fixed_fields_and_distinguishes_lost_worker_from_skipped() {
+        let mut fixture = Fixture::new();
+        fixture.captures[0].as_mut().unwrap().session = "private-session-value".into();
+        fixture.captures[0]
+            .as_mut()
+            .unwrap()
+            .observation
+            .connected_usb = HardwareId::new("private-device-value").unwrap();
+        let (_, clock) = recorded(&mut fixture, Transport::W3c);
+        let mut report = OwnedReceipts {
+            clock,
+            ..OwnedReceipts::default()
+        };
+        report.clock.preflight_1.elapsed = Some(Duration::from_micros(123));
+        let output = report.render();
+        assert_eq!(output.lines().count(), 9);
+        assert!(output.contains("touch_trial_owned_step=preflight_1 elapsed_us=123 outcome=failed reason=identity_unproven\n"));
+        assert!(
+            output.contains(
+                "touch_trial_owned_step=tap elapsed_us=none outcome=skipped reason=none\n"
+            )
+        );
+        assert!(!output.contains("private-"));
+        assert!(!output.contains("fixture-"));
+        for line in output.lines() {
+            assert_eq!(line.split_ascii_whitespace().count(), 4);
+            assert!(line.bytes().all(|byte| byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || b"_= ".contains(&byte)));
+        }
+        report.clock = ClockReceipts::unavailable();
+        let output = report.render();
+        assert_eq!(
+            output
+                .matches("outcome=unavailable reason=worker_unproven")
+                .count(),
+            4
+        );
+        assert!(output.contains(
+            "touch_trial_owned_step=session_close elapsed_us=none outcome=skipped reason=none\n"
+        ));
+    }
+
     #[test]
     fn idle_trial_binds_both_pre_captures_to_the_settings_session() {
         for transport in [Transport::W3c, Transport::Coordinate] {
@@ -1310,7 +1778,7 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert_eq!(
-            blocking_trial(|| panic!("fixture worker panic")).await,
+            blocking_trial::<()>(|| panic!("fixture worker panic")).await,
             Err(TrialError::Unknown)
         );
     }
