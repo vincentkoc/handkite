@@ -32,6 +32,7 @@ pub mod unlock_state;
 pub mod usb;
 pub mod wda_action;
 pub mod wda_adapter;
+mod wda_bundle;
 pub mod wda_http;
 pub mod wda_runner;
 pub mod wda_session;

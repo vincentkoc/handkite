@@ -51,12 +51,9 @@ async fn public_start_rejects_invalid_inputs_before_device_lookup() {
             Some(RunnerError::InvalidBundleId)
         );
     }
+    assert!(validate_runner_bundle_id(&format!("com.{}.xctrunner", "a".repeat(255))).is_err());
     assert_eq!(
-        validate_bundle_id(&format!("com.{}.xctrunner", "a".repeat(255))),
-        Err(RunnerError::InvalidBundleId)
-    );
-    assert_eq!(
-        validate_bundle_id("com.example.WDA-Runner.xctrunner"),
+        validate_runner_bundle_id("com.example.WDA-Runner.xctrunner"),
         Ok(())
     );
     for timeout in [

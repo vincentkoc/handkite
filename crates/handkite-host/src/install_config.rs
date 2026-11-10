@@ -1,13 +1,15 @@
 //! Protected reading of the fixed service configuration for startup and installation.
 
-use crate::{installer_lock::InstallerLock, service_layout::ServiceLayout};
+use crate::{
+    host_config::HostConfig, installer_lock::InstallerLock, service_layout::ServiceLayout,
+};
 use handkite_core::protocol::DeviceBinding;
 
 /// Retains the original protected config and borrows installer ownership.
 /// Binding agreement is not a device observation or installation authority.
 pub struct RetainedConfig<'lock> {
     _owner: &'lock InstallerLock,
-    binding: DeviceBinding,
+    parsed: HostConfig,
     #[cfg(target_os = "macos")]
     config: macos::ProtectedConfig,
 }
@@ -36,7 +38,13 @@ impl<'lock> RetainedConfig<'lock> {
 
     /// The originally matched config binding, not evidence of a connected device.
     pub fn binding(&self) -> &DeviceBinding {
-        &self.binding
+        self.parsed.binding()
+    }
+
+    /// The originally read runner ID, if present; call `revalidate` before use.
+    /// This is private configuration, not proof of installation or device identity.
+    pub fn wda_runner_bundle_id(&self) -> Option<&str> {
+        self.parsed.wda_runner_bundle_id()
     }
 
     /// Recheck the original bytes, descriptors, metadata, and installer lock.
@@ -72,13 +80,22 @@ pub fn verify(layout: &ServiceLayout, expected: &DeviceBinding) -> Result<(), &'
 /// The binding comes from the fixed config, without comparison to an independent
 /// expected device. This neither observes a device nor grants installer authority.
 pub fn load_protected(layout: &ServiceLayout) -> Result<DeviceBinding, &'static str> {
+    load_protected_config(layout).map(HostConfig::into_binding)
+}
+
+/// Load the binding and optional runner ID through the fixed protected path.
+///
+/// Uses the same anchored descriptors, metadata checks, bounded parser, and final
+/// path revalidation as `load_protected`. The runner ID is private configuration;
+/// this does not verify installation, start WDA, or retain the file after return.
+pub fn load_protected_config(layout: &ServiceLayout) -> Result<HostConfig, &'static str> {
     read_protected(layout, None)
 }
 
 fn read_protected(
     layout: &ServiceLayout,
     expected: Option<&DeviceBinding>,
-) -> Result<DeviceBinding, &'static str> {
+) -> Result<HostConfig, &'static str> {
     #[cfg(target_os = "macos")]
     {
         macos::read(
@@ -240,21 +257,21 @@ mod macos {
         layout: &ServiceLayout,
         expected: Option<&DeviceBinding>,
         #[cfg(test)] after_read: Option<&mut dyn FnMut()>,
-    ) -> Result<DeviceBinding, &'static str> {
+    ) -> Result<HostConfig, &'static str> {
         read_anchored(
             layout,
             expected,
             #[cfg(test)]
             after_read,
         )
-        .map(|(_, binding)| binding)
+        .map(|(_, parsed)| parsed)
     }
 
     fn read_anchored(
         layout: &ServiceLayout,
         expected: Option<&DeviceBinding>,
         #[cfg(test)] after_read: Option<&mut dyn FnMut()>,
-    ) -> Result<(ProtectedConfig, DeviceBinding), &'static str> {
+    ) -> Result<(ProtectedConfig, HostConfig), &'static str> {
         // Keep lower-level release helper errors inside this config boundary.
         let check = || {
             let mut held = AnchoredConfig::open(layout)?;
@@ -267,14 +284,15 @@ mod macos {
                 return Err(UNSAFE);
             }
             held.revalidate()?;
-            let binding = parse(&bytes)?;
+            let parsed = parse(&bytes)?;
+            let binding = parsed.binding();
             if let Some(expected) = expected
                 && (binding.key != expected.key || binding.usb_id != expected.usb_id)
             {
                 return Err(UNSAFE);
             }
             held.revalidate()?;
-            Ok((ProtectedConfig { held, bytes }, binding))
+            Ok((ProtectedConfig { held, bytes }, parsed))
         };
         check().map_err(|_| UNSAFE)
     }
@@ -286,7 +304,7 @@ mod macos {
     ) -> Result<RetainedConfig<'lock>, &'static str> {
         let check = || -> Result<RetainedConfig<'lock>, &'static str> {
             owner.revalidate()?;
-            let (config, binding) = read_anchored(
+            let (config, parsed) = read_anchored(
                 owner.layout(),
                 Some(expected),
                 #[cfg(test)]
@@ -297,7 +315,7 @@ mod macos {
             owner.revalidate()?;
             Ok(RetainedConfig {
                 _owner: owner,
-                binding,
+                parsed,
                 config,
             })
         };
@@ -345,6 +363,10 @@ mod unsupported_tests {
         assert!(InstallerLock::acquire(&layout).is_err());
         assert_eq!(
             load_protected(&layout).err(),
+            Some("protected configuration verification requires macOS")
+        );
+        assert_eq!(
+            load_protected_config(&layout).err(),
             Some("protected configuration verification requires macOS")
         );
         assert_eq!(

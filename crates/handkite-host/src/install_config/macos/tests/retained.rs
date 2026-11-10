@@ -45,6 +45,7 @@ fn retains_original_bytes_parsed_binding_readonly_descriptors_and_lock() {
     assert!(std::ptr::eq(value._owner, &owner));
     assert_eq!(value.binding().key, expected().key);
     assert_eq!(value.binding().usb_id, expected().usb_id);
+    assert_eq!(value.wda_runner_bundle_id(), None);
     assert_eq!(&*value.config.bytes, CONFIG);
     assert_eq!(
         value.config.held.fingerprint,
@@ -59,6 +60,34 @@ fn retains_original_bytes_parsed_binding_readonly_descriptors_and_lock() {
     drop(value);
     unchanged(before);
     assert_eq!(fs::read(layout.config_file()).unwrap(), CONFIG);
+}
+
+#[test]
+fn runner_id_remains_the_original_snapshot_after_config_changes() {
+    let (_scratch, layout) = fixture();
+    fs::write(layout.config_file(), CONFIG_WITH_RUNNER).unwrap();
+    let owner = InstallerLock::acquire(&layout).unwrap();
+    let mut value = RetainedConfig::acquire(&owner, &expected()).unwrap();
+    value.revalidate().unwrap();
+    assert_eq!(
+        value.wda_runner_bundle_id(),
+        Some("com.example.WDA-Runner.xctrunner")
+    );
+    let changed = std::str::from_utf8(CONFIG_WITH_RUNNER)
+        .unwrap()
+        .replace("WDA-Runner", "WDA-Other1");
+    fs::write(layout.config_file(), changed).unwrap();
+    let fresh = super::super::super::load_protected_config(&layout).unwrap();
+    assert_eq!(
+        fresh.wda_runner_bundle_id(),
+        Some("com.example.WDA-Other1.xctrunner")
+    );
+    assert_eq!(value.revalidate(), Err(UNSAFE));
+    assert_eq!(
+        value.wda_runner_bundle_id(),
+        Some("com.example.WDA-Runner.xctrunner")
+    );
+    assert_eq!(&*value.config.bytes, CONFIG_WITH_RUNNER);
 }
 
 #[test]

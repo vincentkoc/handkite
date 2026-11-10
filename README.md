@@ -55,6 +55,17 @@ The returned device binding comes from that protected config; it is not an
 independent observation of the attached device. Same-account changes after the
 read remain possible.
 
+The config also accepts an optional `wda_runner_bundle_id` string. When supplied,
+it must be at most 255 ASCII bytes, contain at least three nonempty dot-separated
+components of letters, digits, or hyphens, and end exactly in `.xctrunner`.
+Omit it for existing read-only service use; `null` and malformed IDs are rejected.
+Keep the actual ID only in the protected host config. The library API
+`install_config::load_protected_config` returns the binding and optional ID
+through the same anchored reader. `RetainedConfig::wda_runner_bundle_id` exposes
+the original retained value; revalidation still requires the exact original
+bytes. Neither API starts WDA or verifies that the runner is installed, and
+daemon startup continues to use an externally ready WDA.
+
 The CLI's `request` subcommand reads one JSON request from stdin and returns the complete JSON response. An `observe` response contains a screenshot and accessibility tree, so keep its raw output inside the protected local boundary. While holding the fixed process lock, the daemon can reclaim an owned mode-0600 socket left by a crash. It first checks endpoint liveness with a nonblocking datagram connect, then rechecks the socket inode, owner, mode, link count, size, and modification/change timestamps before removing it through the anchored runtime directory. Only `ECONNREFUSED` permits reclamation; a live endpoint, symlink, non-socket, unsafe owner/mode, changed metadata, or uncertain probe result stops startup. A datagram probe creates no stream connection and sends no request. This trial service currently requires a ready WDA on the pinned phone. It does not yet own pairing, WDA startup, signing, PIN entry, or remote-agent authentication.
 
 Before each action, the daemon checks the existing WDA session on the pinned USB route and validates its session endpoint. It adopts that session on the first action and rejects absent, invalid, stale, or replacement sessions before sending input. It never creates or renews a WDA session. WDA ownership and session renewal remain external and unqualified; a replaced session requires an explicit daemon restart after owner inspection.

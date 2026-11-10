@@ -5,6 +5,7 @@
 //! the HTTP endpoint belongs to the newly launched process.
 
 use crate::usb::PinnedUsb;
+use crate::wda_bundle::validate_runner_bundle_id;
 use crate::wda_http::HttpResponse;
 use crate::wda_transport::UsbWda;
 use idevice::services::dvt::xctest::{TestConfig, XCUITestService, listener::XCUITestListener};
@@ -55,7 +56,7 @@ impl OwnedWdaRunner {
         runner_bundle_id: &str,
         startup_timeout: Duration,
     ) -> Result<Self, RunnerError> {
-        validate_bundle_id(runner_bundle_id)?;
+        validate_runner_bundle_id(runner_bundle_id).map_err(|_| RunnerError::InvalidBundleId)?;
         let deadline = startup_deadline(startup_timeout)?;
         let (provider, config) = lookup_before_deadline(
             async {
@@ -198,22 +199,6 @@ impl Drop for OwnedWdaRunner {
             task.abort();
         }
     }
-}
-
-fn validate_bundle_id(bundle_id: &str) -> Result<(), RunnerError> {
-    if bundle_id.len() > 255
-        || !bundle_id.ends_with(".xctrunner")
-        || bundle_id.split('.').count() < 3
-        || !bundle_id.split('.').all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-    {
-        return Err(RunnerError::InvalidBundleId);
-    }
-    Ok(())
 }
 
 fn startup_deadline(timeout: Duration) -> Result<Instant, RunnerError> {

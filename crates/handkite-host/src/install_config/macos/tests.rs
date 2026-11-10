@@ -9,6 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 const CONFIG: &[u8] = br#"{"device_key":"phone","usb_id":"test-device"}"#;
+const CONFIG_WITH_RUNNER: &[u8] = br#"{"device_key":"phone","usb_id":"test-device","wda_runner_bundle_id":"com.example.WDA-Runner.xctrunner"}"#;
 
 mod retained;
 
@@ -28,9 +29,14 @@ fn fixture() -> (tempfile::TempDir, ServiceLayout) {
 
 fn check_both(layout: &ServiceLayout) -> Result<(), &'static str> {
     let loaded = super::super::load_protected(layout);
+    let configured = super::super::load_protected_config(layout);
     let verified = super::super::verify(layout, &expected());
     assert_eq!(
         loaded.as_ref().map(|_| ()).map_err(|error| *error),
+        verified
+    );
+    assert_eq!(
+        configured.as_ref().map(|_| ()).map_err(|error| *error),
         verified
     );
     loaded.map(|binding| {
@@ -139,6 +145,28 @@ fn loader_returns_the_configured_binding_without_an_independent_expectation() {
 }
 
 #[test]
+fn protected_loader_exposes_optional_runner_without_changing_binding_only_loaders() {
+    let (_scratch, layout) = fixture();
+    let missing = super::super::load_protected_config(&layout).unwrap();
+    assert_eq!(missing.wda_runner_bundle_id(), None);
+    fs::write(layout.config_file(), CONFIG_WITH_RUNNER).unwrap();
+    let before = Fingerprint::from(fs::metadata(layout.config_file()).unwrap());
+    check_both(&layout).unwrap();
+    let config = super::super::load_protected_config(&layout).unwrap();
+    assert_eq!(config.binding().key, expected().key);
+    assert_eq!(config.binding().usb_id, expected().usb_id);
+    assert_eq!(
+        config.wda_runner_bundle_id(),
+        Some("com.example.WDA-Runner.xctrunner")
+    );
+    let binding = crate::host_config::load(&layout.config_file()).unwrap();
+    assert_eq!(binding.key, expected().key);
+    assert_eq!(binding.usb_id, expected().usb_id);
+    assert_eq!(before, fs::metadata(layout.config_file()).unwrap().into());
+    assert_eq!(fs::read(layout.config_file()).unwrap(), CONFIG_WITH_RUNNER);
+}
+
+#[test]
 fn bounded_shared_parser_rejects_invalid_and_oversized_config() {
     let (_scratch, layout) = fixture();
     for content in [
@@ -149,6 +177,9 @@ fn bounded_shared_parser_rejects_invalid_and_oversized_config() {
         br#"{"device_key":"../phone","usb_id":"test-device"}"#,
         br#"{"device_key":"phone","usb_id":"invalid identity"}"#,
         br#"{"device_key":"phone","usb_id":null}"#,
+        br#"{"device_key":"phone","usb_id":"test-device","wda_runner_bundle_id":null}"#,
+        br#"{"device_key":"phone","usb_id":"test-device","wda_runner_bundle_id":"com.example.Runner"}"#,
+        br#"{"device_key":"phone","usb_id":"test-device","wda_runner_bundle_id":"com.example.xctrunner","wda_runner_bundle_id":"com.example.xctrunner"}"#,
     ] {
         fs::write(layout.config_file(), content).unwrap();
         assert_eq!(check_both(&layout), Err(UNSAFE));
