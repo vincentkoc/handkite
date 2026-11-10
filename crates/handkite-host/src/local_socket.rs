@@ -13,6 +13,8 @@ const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
 const REQUEST_BUDGET: Duration = Duration::from_secs(10);
 const READ_POLL: Duration = Duration::from_millis(100);
+const RESPONSE_BUDGET: Duration = Duration::from_secs(15);
+const WRITE_POLL: Duration = Duration::from_millis(100);
 
 /// The listener cannot outlive the process lock that authorized its creation.
 pub struct ServiceListener<'a> {
@@ -231,15 +233,56 @@ fn handle_checked<A: DeviceAdapter>(
         },
     };
     let bytes = serde_json::to_vec(&reply).map_err(io::Error::other)?;
+    let deadline = Instant::now() + RESPONSE_BUDGET;
     if bytes.len() > MAX_RESPONSE {
-        return write_reply(stream, br#"{"type":"error","code":"ResponseTooLarge"}"#);
+        return write_reply_until(
+            stream,
+            br#"{"type":"error","code":"ResponseTooLarge"}"#,
+            should_stop,
+            deadline,
+        );
     }
-    write_reply(stream, &bytes)
+    write_reply_until(stream, &bytes, should_stop, deadline)
 }
 
-fn write_reply(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
-    stream.write_all(bytes)?;
-    stream.write_all(b"\n")
+fn write_reply_until(
+    stream: &mut UnixStream,
+    bytes: &[u8],
+    should_stop: &impl Fn() -> bool,
+    deadline: Instant,
+) -> io::Result<()> {
+    for chunk in [bytes, b"\n"] {
+        let mut sent = 0;
+        while sent < chunk.len() {
+            if should_stop() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "service stopping",
+                ));
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "response timed out",
+                ));
+            }
+            stream.set_write_timeout(Some(remaining.min(WRITE_POLL)))?;
+            match stream.write(&chunk[sent..]) {
+                Ok(0) => return Err(io::Error::new(io::ErrorKind::WriteZero, "response stalled")),
+                Ok(written) => sent += written,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock
+                            | io::ErrorKind::TimedOut
+                            | io::ErrorKind::Interrupted
+                    ) => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(())
 }
 
 fn read_request_until(
@@ -302,6 +345,59 @@ fn read_request_until(
 mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
+
+    fn constrained_pair() -> (UnixStream, UnixStream) {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let size: libc::c_int = 1024;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&size as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&size) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        (sender, receiver)
+    }
+
+    #[test]
+    fn slow_reader_cannot_extend_response_deadline() {
+        let (mut sender, _receiver) = constrained_pair();
+        let started = Instant::now();
+        let result = write_reply_until(
+            &mut sender,
+            &vec![b'x'; 1024 * 1024],
+            &|| false,
+            started + Duration::from_millis(80),
+        );
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn shutdown_interrupts_a_blocked_response() {
+        let (mut sender, _receiver) = constrained_pair();
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stopped.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = write_reply_until(
+            &mut sender,
+            &vec![b'x'; 1024 * 1024],
+            &|| stopped.load(std::sync::atomic::Ordering::Acquire),
+            started + Duration::from_secs(1),
+        );
+        setter.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
 
     #[test]
     fn idle_listener_stops_without_a_client() {
