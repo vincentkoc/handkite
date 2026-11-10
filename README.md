@@ -155,6 +155,22 @@ See the [input envelope and exit codes](RELEASE.md#release-verification-diagnost
 This diagnostic is excluded from the three-artifact release inventory. Its tests
 do not qualify a real signed stage, installation, or service activation.
 
+## Device agreement diagnostic
+
+`handkite-device-agreement --service` self-loads the binding from the protected
+fixed service config before acquiring the installer lock. It retains that
+binding under the exact lock and calls the bounded device observation once.
+It reports only `device_agreement=pass` (exit 0) or `device_agreement=reject`
+(exit 1), including argument and setup failures; stderr stays empty.
+No alternate config, root, socket, or device arguments are accepted.
+
+Lock acquisition can create the fixed `runtime/handkite.lock` file in an existing
+protected layout. The diagnostic creates no directories and performs no service,
+WDA, pairing, PIN, or stop-marker operation. Success is point-in-time agreement
+with a self-loaded config binding, not an independent device pin or installation
+authority. This binary is excluded from the three-artifact release inventory.
+See the [diagnostic contract](RELEASE.md#device-agreement-diagnostic).
+
 ## MCP bridge
 
 `handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
