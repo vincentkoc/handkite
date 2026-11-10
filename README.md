@@ -226,7 +226,15 @@ receipt, proven postcondition, and verified restoration produce
 `cancel_trial_idle=confirmed`; post-dispatch failures are `unknown`. There is no
 retry or fallback. Refusal sends no tap, but the settings bracket can still run.
 Process termination can prevent restoration. Offline fixtures do not qualify live
-Cancel delivery or PIN entry; this command has not been run live.
+Cancel delivery or PIN entry.
+
+`handkite-probe cancel-geometry --config PRIVATE_FILE --supervised-hidden-cancel`
+is a read-only aid for a Cancel geometry refusal. It reuses the pinned locked
+capture and exact trial parser, printing only a fixed classification. A geometry
+failure is reported at its first observation; `stable` requires two fresh,
+nonoverlapping captures with the same session and geometry. Other guards still
+refuse. It sends no input or settings writes and saves no screenshot or XML.
+The classification does not authorize a tap or relax any trial guard.
 
 `handkite-probe pin-geometry --config PRIVATE_FILE` is read-only. After pinned
 device, unchanged existing session, and native/WDA lock checks, it reports bounded

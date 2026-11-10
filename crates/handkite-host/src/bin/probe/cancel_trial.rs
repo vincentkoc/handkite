@@ -39,7 +39,7 @@ impl Error {
     }
 }
 
-pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
+fn options(args: &[String]) -> Result<(HardwareId, bool), &'static str> {
     let (path, supervised) = match args {
         [flag, path] if flag == "--config" => (path, false),
         [flag, path, supervision]
@@ -52,6 +52,11 @@ pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
     let expected = host_config::load(Path::new(path))
         .map_err(|_| "refused reason=configuration_invalid")?
         .usb_id;
+    Ok((expected, supervised))
+}
+
+pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
+    let (expected, supervised) = options(args)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -79,6 +84,99 @@ pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
     })?;
     println!("cancel_trial_idle=confirmed");
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GeometryClass {
+    ProtectedCountInvalid,
+    OverlapKeyOrField,
+    OverlapOtherControl,
+    CompetitorBoundsInvalid,
+    Stable,
+}
+
+impl GeometryClass {
+    fn line(self) -> &'static str {
+        match self {
+            Self::ProtectedCountInvalid => {
+                "cancel_geometry=observed classification=protected_count_invalid"
+            }
+            Self::OverlapKeyOrField => {
+                "cancel_geometry=observed classification=overlap_key_or_field"
+            }
+            Self::OverlapOtherControl => {
+                "cancel_geometry=observed classification=overlap_other_control"
+            }
+            Self::CompetitorBoundsInvalid => {
+                "cancel_geometry=observed classification=competitor_bounds_invalid"
+            }
+            Self::Stable => "cancel_geometry=observed classification=stable",
+        }
+    }
+}
+
+// This diagnostic interface has no settings, input, or session-creation operation.
+trait ReadOnly {
+    fn capture(&mut self) -> Result<LockedCapture, Error>;
+    fn now(&self) -> Instant;
+}
+
+impl ReadOnly for LockedObserver {
+    fn capture(&mut self) -> Result<LockedCapture, Error> {
+        LockedObserver::capture(self).map_err(|_| Error::Capture)
+    }
+
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+}
+
+pub(super) fn geometry_command(args: &[String]) -> Result<(), &'static str> {
+    let (expected, supervised) = options(args)?;
+    let mut observer =
+        LockedObserver::new(expected.clone()).map_err(|_| Error::Capture.message())?;
+    let class = inspect_geometry(&mut observer, &expected, supervised).map_err(Error::message)?;
+    println!("{}", class.line());
+    Ok(())
+}
+
+fn inspect_geometry(
+    device: &mut impl ReadOnly,
+    expected: &HardwareId,
+    supervised: bool,
+) -> Result<GeometryClass, Error> {
+    let before = device.capture()?;
+    check_capture(&before, expected, &before.session, device.now())?;
+    let first = match parse_cancel(&before, supervised) {
+        Ok(evidence) => evidence,
+        Err(failure) => {
+            return failure
+                .classification
+                .map(Ok)
+                .unwrap_or(Err(failure.refusal));
+        }
+    };
+    let current = device.capture()?;
+    check_capture(&current, expected, &before.session, device.now())?;
+    if current.started < before.finished
+        || current.started <= before.started
+        || current.finished <= before.finished
+    {
+        return Err(Error::Freshness);
+    }
+    let second = match parse_cancel(&current, supervised) {
+        Ok(evidence) => evidence,
+        Err(failure) => {
+            return failure
+                .classification
+                .map(Ok)
+                .unwrap_or(Err(failure.refusal));
+        }
+    };
+    if first != second {
+        return Err(Error::Geometry);
+    }
+    Ok(GeometryClass::Stable)
 }
 
 async fn blocking_trial(
@@ -229,7 +327,46 @@ struct Evidence {
     competing: Vec<Rect>,
 }
 
+struct CancelFailure {
+    refusal: Error,
+    classification: Option<GeometryClass>,
+}
+
+impl From<Error> for CancelFailure {
+    fn from(refusal: Error) -> Self {
+        Self {
+            refusal,
+            classification: None,
+        }
+    }
+}
+
+impl CancelFailure {
+    fn classified(classification: GeometryClass) -> Self {
+        Self {
+            refusal: Error::Geometry,
+            classification: Some(classification),
+        }
+    }
+}
+
 fn cancel(capture: &LockedCapture, supervised: bool) -> Result<Evidence, Error> {
+    parse_cancel(capture, supervised).map_err(|failure| failure.refusal)
+}
+
+fn classify_rectangles(cancel: Rect, protected: &[Rect], competing: &[Rect]) -> GeometryClass {
+    if protected.len() != 11 {
+        GeometryClass::ProtectedCountInvalid
+    } else if protected.iter().any(|rect| cancel.overlaps(*rect)) {
+        GeometryClass::OverlapKeyOrField
+    } else if competing.iter().any(|rect| cancel.overlaps(*rect)) {
+        GeometryClass::OverlapOtherControl
+    } else {
+        GeometryClass::Stable
+    }
+}
+
+fn parse_cancel(capture: &LockedCapture, supervised: bool) -> Result<Evidence, CancelFailure> {
     let xml = &capture.raw.accessibility_tree;
     let png = &capture.raw.screenshot.bytes;
     // Includes bounded strict XML, exact zero-of-six progress, field/key uniqueness,
@@ -275,7 +412,7 @@ fn cancel(capture: &LockedCapture, supervised: bool) -> Result<Evidence, Error> 
                 let inside = kind.as_ref() == b"XCUIElementTypeApplication"
                     || stack.last().copied().unwrap_or(false);
                 if kind.as_ref() == b"XCUIElementTypeTextField" {
-                    return Err(Error::Screen);
+                    return Err(Error::Screen.into());
                 }
                 let is_cancel =
                     name.as_deref() == Some("Cancel") || label.as_deref() == Some("Cancel");
@@ -292,18 +429,20 @@ fn cancel(capture: &LockedCapture, supervised: bool) -> Result<Evidence, Error> 
                                     || (s.len() == 1 && s.as_bytes()[0].is_ascii_digit())
                             })
                     {
-                        return Err(Error::Screen);
+                        return Err(Error::Screen.into());
                     }
                     let visible = visible.ok_or(Error::Screen)?;
                     if !visible && !supervised {
-                        return Err(Error::Supervision);
+                        return Err(Error::Supervision.into());
                     }
                     candidate = Some((Rect::read(rect, screen)?, visible));
                 }
                 // Hidden or disabled competitors still cannot prove a safe hit target.
                 // Missing or malformed bounds fail closed rather than hiding an overlap.
                 if inside && !is_cancel && competing_control(kind.as_ref()) {
-                    competing.push(Rect::read(rect, screen)?);
+                    competing.push(Rect::read(rect, screen).map_err(|_| {
+                        CancelFailure::classified(GeometryClass::CompetitorBoundsInvalid)
+                    })?);
                 }
                 if matches!(
                     kind.as_ref(),
@@ -323,13 +462,9 @@ fn cancel(capture: &LockedCapture, supervised: bool) -> Result<Evidence, Error> 
         }
     }
     let (cancel, visible) = candidate.ok_or(Error::Screen)?;
-    if protected.len() != 11
-        || protected
-            .iter()
-            .chain(&competing)
-            .any(|rect| cancel.overlaps(*rect))
-    {
-        return Err(Error::Geometry);
+    let class = classify_rectangles(cancel, &protected, &competing);
+    if class != GeometryClass::Stable {
+        return Err(CancelFailure::classified(class));
     }
     Ok(Evidence {
         screen,
@@ -555,6 +690,159 @@ mod tests {
             self.taps.push((session.into(), at, fresh_until));
             self.receipt
         }
+    }
+
+    impl ReadOnly for Fake {
+        fn capture(&mut self) -> Result<LockedCapture, Error> {
+            Device::capture(self)
+        }
+        fn now(&self) -> Instant {
+            Device::now(self)
+        }
+    }
+
+    #[test]
+    fn read_only_geometry_reports_the_existing_guard_category_without_input() {
+        let extra = r#"<XCUIElementTypeButton name="private-canary" visible="false" enabled="true" x="280" y="700" width="100" height="40"/>"#;
+        for (xml, class) in [
+            (
+                keypad().replace(CANCEL, &CANCEL.replace("y=\"700\"", "y=\"300\"")),
+                GeometryClass::OverlapKeyOrField,
+            ),
+            (
+                keypad().replace(CANCEL, &CANCEL.replace("y=\"700\"", "y=\"220\"")),
+                GeometryClass::OverlapKeyOrField,
+            ),
+            (
+                keypad().replace(CANCEL, &format!("{CANCEL}{extra}")),
+                GeometryClass::OverlapOtherControl,
+            ),
+            (
+                keypad().replace(
+                    CANCEL,
+                    &format!("{CANCEL}{}", extra.replace("width=\"100\"", "")),
+                ),
+                GeometryClass::CompetitorBoundsInvalid,
+            ),
+        ] {
+            for n in 0..2 {
+                let mut fake = Fake::new();
+                fake.at(n).raw.accessibility_tree = xml.clone();
+                assert_eq!(inspect_geometry(&mut fake, &id(), true), Ok(class));
+                assert_eq!(fake.count, n + 1);
+                assert!(fake.taps.is_empty());
+            }
+        }
+        let mut fake = Fake::new();
+        assert_eq!(
+            inspect_geometry(&mut fake, &id(), true),
+            Ok(GeometryClass::Stable)
+        );
+        assert_eq!(fake.count, 2);
+        assert!(fake.taps.is_empty());
+        // The strict keypad parser already rejects count mismatches. Keep the
+        // downstream defensive classifier tested without weakening that parser.
+        assert_eq!(
+            classify_rectangles(Rect([0.0, 0.0, 1.0, 1.0]), &[], &[]),
+            GeometryClass::ProtectedCountInvalid
+        );
+    }
+
+    #[test]
+    fn read_only_geometry_retains_capture_session_and_stability_guards() {
+        for (change, expected) in [
+            (
+                (|s: &mut LockedCapture| s.session = "changed-session".into())
+                    as fn(&mut LockedCapture),
+                Error::Session,
+            ),
+            (|s| s.finished = s.fresh_until, Error::Freshness),
+            (
+                |s| s.raw.wda_target = HardwareId::new("other").unwrap(),
+                Error::Screen,
+            ),
+            (|s| s.raw.state.lock = LockState::Unlocked, Error::Screen),
+            (
+                |s| s.raw.accessibility_tree = keypad().replace(CANCEL, ""),
+                Error::Screen,
+            ),
+            (
+                |s| {
+                    s.raw.accessibility_tree =
+                        keypad().replace("x=\"280\" y=\"700\"", "x=\"279\" y=\"700\"")
+                },
+                Error::Geometry,
+            ),
+            (
+                |s| {
+                    s.started -= Duration::from_millis(100);
+                    s.fresh_until -= Duration::from_millis(100);
+                },
+                Error::Freshness,
+            ),
+        ] {
+            let mut fake = Fake::new();
+            change(fake.at(1));
+            assert_eq!(inspect_geometry(&mut fake, &id(), true), Err(expected));
+            assert!(fake.taps.is_empty());
+        }
+        let mut fake = Fake::new();
+        fake.captures[0] = Err(Error::Capture);
+        assert_eq!(
+            inspect_geometry(&mut fake, &id(), true),
+            Err(Error::Capture)
+        );
+        let mut fake = Fake::new();
+        fake.at(0).raw.accessibility_tree =
+            keypad().replace("visible=\"true\"", "visible=\"false\"");
+        assert_eq!(
+            inspect_geometry(&mut fake, &id(), false),
+            Err(Error::Supervision)
+        );
+        assert!(fake.taps.is_empty());
+    }
+
+    #[test]
+    fn geometry_classification_output_is_fixed_and_private() {
+        for (class, token) in [
+            (
+                GeometryClass::ProtectedCountInvalid,
+                "protected_count_invalid",
+            ),
+            (GeometryClass::OverlapKeyOrField, "overlap_key_or_field"),
+            (GeometryClass::OverlapOtherControl, "overlap_other_control"),
+            (
+                GeometryClass::CompetitorBoundsInvalid,
+                "competitor_bounds_invalid",
+            ),
+            (GeometryClass::Stable, "stable"),
+        ] {
+            let line = class.line();
+            assert_eq!(
+                line,
+                format!("cancel_geometry=observed classification={token}")
+            );
+            for private in [
+                SESSION,
+                "fixture-phone",
+                "private-canary",
+                "Cancel",
+                "0 of 6 digits",
+                "<",
+                "280",
+                "700",
+            ] {
+                assert!(!line.contains(private));
+            }
+        }
+        assert_eq!(
+            geometry_command(&[]),
+            Err("refused reason=invalid_arguments")
+        );
+        assert_eq!(
+            geometry_command(&["private-canary".into()]),
+            Err("refused reason=invalid_arguments")
+        );
     }
 
     #[test]
