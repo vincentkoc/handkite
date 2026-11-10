@@ -166,8 +166,58 @@ impl AnisetteClient {
         AppleSigningHeaders::parse(200, &body)
     }
 
-    /// One conversation, with no replay after an error, cancellation or timeout.
-    pub async fn provision<P: ProvisioningDataProvider>(
+    /// Consume the durable reservation before fetching client info or contacting Apple.
+    /// Lookup and exact endpoint approval complete before opening the sidecar WSS.
+    pub async fn provision_apple(
+        &self,
+        pending: super::state::PendingProvisioning,
+    ) -> Result<MacosProvisionedState, &'static str> {
+        self.provision_apple_with_discovery(
+            pending,
+            super::apple::AppleProvisioningProvider::discover,
+        )
+        .await
+    }
+
+    async fn provision_apple_with_discovery<D, F>(
+        &self,
+        pending: super::state::PendingProvisioning,
+        discover: D,
+    ) -> Result<MacosProvisionedState, &'static str>
+    where
+        D: FnOnce(super::apple::AppleProvisioningContext) -> F,
+        F: Future<Output = Result<super::apple::AppleProvisioningProvider, &'static str>>,
+    {
+        let info = self.client_info().await?;
+        let context = super::apple::AppleProvisioningContext::new(
+            super::apple::ProvisioningIdentifier::new(*pending.identifier()),
+            info,
+        );
+        let mut provider = discover(context).await?;
+        if provider.identifier().as_bytes() != pending.identifier() {
+            return Err("Anisette provisioning identifier mismatch");
+        }
+        self.provision_reserved(pending, &mut provider).await
+    }
+
+    async fn provision_reserved<P: ProvisioningDataProvider>(
+        &self,
+        pending: super::state::PendingProvisioning,
+        provider: &mut P,
+    ) -> Result<MacosProvisionedState, &'static str> {
+        let identifier = *pending.identifier();
+        self.provision_conversation(
+            identifier,
+            provider,
+            Instant::now() + CONVERSATION_TIMEOUT,
+            move |state| pending.persist(state),
+        )
+        .await
+    }
+
+    // Synthetic transport fixtures have no production reservation bypass.
+    #[cfg(test)]
+    async fn provision<P: ProvisioningDataProvider>(
         &self,
         identifier: [u8; 16],
         provider: &mut P,
@@ -176,31 +226,23 @@ impl AnisetteClient {
             .await
     }
 
-    /// Lookup and exact endpoint approval complete before opening the sidecar WSS.
-    pub async fn provision_apple(
-        &self,
-        context: super::apple::AppleProvisioningContext,
-    ) -> Result<MacosProvisionedState, &'static str> {
-        self.provision_apple_with_discovery(super::apple::AppleProvisioningProvider::discover(
-            context,
-        ))
-        .await
-    }
-
-    async fn provision_apple_with_discovery(
-        &self,
-        discovery: impl Future<Output = Result<super::apple::AppleProvisioningProvider, &'static str>>,
-    ) -> Result<MacosProvisionedState, &'static str> {
-        let mut provider = discovery.await?;
-        self.provision(*provider.identifier().as_bytes(), &mut provider)
-            .await
-    }
-
+    #[cfg(test)]
     async fn provision_until<P: ProvisioningDataProvider>(
         &self,
         identifier: [u8; 16],
         provider: &mut P,
+        deadline: Instant,
+    ) -> Result<MacosProvisionedState, &'static str> {
+        self.provision_conversation(identifier, provider, deadline, |_| Ok(()))
+            .await
+    }
+
+    async fn provision_conversation<P: ProvisioningDataProvider>(
+        &self,
+        identifier: [u8; 16],
+        provider: &mut P,
         conversation_deadline: Instant,
+        persist: impl FnOnce(&MacosProvisionedState) -> Result<(), &'static str>,
     ) -> Result<MacosProvisionedState, &'static str> {
         let mut socket = timeout_at(conversation_deadline, self.connect())
             .await
@@ -251,11 +293,13 @@ impl AnisetteClient {
                 }
                 ProvisioningEvent::ProvisioningSuccess { adi_pb } => {
                     let state = MacosProvisionedState::parse(adi_pb, identifier)?;
-                    timeout_at(deadline, socket.close(None))
-                        .await
-                        .map_err(|_| "Anisette provisioning stage timed out")?
-                        .map_err(|_| "Anisette provisioning close failed")?;
-                    return Ok(state);
+                    return persist_before_close(state, persist, async {
+                        timeout_at(deadline, socket.close(None))
+                            .await
+                            .map_err(|_| "Anisette provisioning stage timed out")?
+                            .map_err(|_| "Anisette provisioning close failed")
+                    })
+                    .await;
                 }
             }
         }
@@ -334,6 +378,17 @@ impl AnisetteClient {
         .await
         .map_err(|_| "Anisette HTTPS request timed out")?
     }
+}
+
+// No suspension point separates validated success from durable publication.
+async fn persist_before_close(
+    state: MacosProvisionedState,
+    persist: impl FnOnce(&MacosProvisionedState) -> Result<(), &'static str>,
+    close: impl Future<Output = Result<(), &'static str>>,
+) -> Result<MacosProvisionedState, &'static str> {
+    persist(&state)?;
+    close.await?;
+    Ok(state)
 }
 
 async fn receive(

@@ -26,18 +26,6 @@ pub struct AppleProvisioningProvider {
 }
 
 impl AppleProvisioningProvider {
-    pub fn new(
-        endpoints: ApprovedEndpoints,
-        context: AppleProvisioningContext,
-    ) -> Result<Self, &'static str> {
-        Ok(Self {
-            client: AppleClient::new()?,
-            endpoints,
-            context,
-            stage: Stage::Fresh,
-        })
-    }
-
     /// Reject an empty policy before any lookup, DNS resolution or WSS connection.
     pub async fn discover(context: AppleProvisioningContext) -> Result<Self, &'static str> {
         let policy = ReviewedEndpointPolicy::production();

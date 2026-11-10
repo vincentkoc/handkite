@@ -12,10 +12,10 @@ mod client;
 mod context;
 mod plist;
 mod provider;
-pub use context::{AppleProvisioningContext, ProvisioningIdentifier};
-pub use provider::AppleProvisioningProvider;
+pub(super) use context::{AppleProvisioningContext, ProvisioningIdentifier};
+pub(super) use provider::AppleProvisioningProvider;
 #[cfg(test)]
-pub(crate) use provider::tests::{fixture_empty_policy, fixture_provider};
+pub(crate) use provider::tests::{fixture_empty_policy, fixture_provider, fixture_provider_for};
 
 const MAX_LOOKUP_BYTES: usize = 64 * 1024;
 const MAX_URL_BYTES: usize = 4096;

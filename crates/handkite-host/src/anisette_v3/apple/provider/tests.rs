@@ -46,6 +46,12 @@ fn lookup(start: &str, finish: &str) -> Vec<u8> {
 }
 
 pub(crate) async fn fixture_provider() -> (AppleProvisioningProvider, JoinHandle<Vec<Vec<u8>>>) {
+    fixture_provider_for(context()).await
+}
+
+pub(crate) async fn fixture_provider_for(
+    context: AppleProvisioningContext,
+) -> (AppleProvisioningProvider, JoinHandle<Vec<Vec<u8>>>) {
     let (client, server) = TlsFixture::new("provision.example.test", true, false)
         .serve(
             vec![
@@ -64,7 +70,7 @@ pub(crate) async fn fixture_provider() -> (AppleProvisioningProvider, JoinHandle
         ReviewedEndpointPolicy {
             pairs: &[(START, FINISH)],
         },
-        context(),
+        context,
     )
     .await
     .unwrap();
