@@ -16,6 +16,12 @@
 //! ```compile_fail,E0603
 //! use handkite_host::selection_intent::commit;
 //! ```
+//!
+//! Retained pending-journal inspection remains an internal recovery prerequisite:
+//!
+//! ```compile_fail,E0603
+//! use handkite_host::selection_intent::inspect_pending;
+//! ```
 
 use crate::current_selection::{encode_target, parse_target};
 use crate::device_agreement::DeviceAgreement;
@@ -235,6 +241,58 @@ pub fn inspect<'held, 'lock>(
 
 /// Fixed sibling journal name under the lock's anchored releases directory.
 pub const PENDING_JOURNAL: &str = ".selection-pending.json";
+
+/// Retains the fixed journal, current snapshot, verified releases, and exact lock.
+/// Journal claims provide no historical commit, cleanup, or installation authority.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct PendingInspection<'held, 'lock> {
+    #[cfg(target_os = "macos")]
+    inner: macos::pending::Pending<'held, 'lock>,
+    #[cfg(not(target_os = "macos"))]
+    _unsupported:
+        std::marker::PhantomData<(&'held mut PublishedRelease<'lock>, &'lock InstallerLock)>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PendingInspection<'_, '_> {
+    /// Recheck the same journal, selection, and real signer evidence without adoption.
+    pub(crate) fn reobserve(&mut self) -> Result<Observation, &'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.reobserve(
+                #[cfg(test)]
+                None,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err("pending selection inspection requires macOS")
+    }
+}
+
+/// Read only the fixed pending journal relative to the anchored releases directory.
+/// Missing, partial, unsafe, or changed evidence refuses without repair or mutation.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn inspect_pending<'held, 'lock>(
+    owner: &'lock InstallerLock,
+    previous: Option<&'held mut PublishedRelease<'lock>>,
+    destination: &'held mut PublishedRelease<'lock>,
+) -> Result<(PendingInspection<'held, 'lock>, Observation), &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::pending::inspect_pending(
+            owner,
+            previous,
+            destination,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (owner, previous, destination);
+        Err("pending selection inspection requires macOS")
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub struct PreparationFailure {

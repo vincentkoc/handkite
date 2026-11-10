@@ -7,6 +7,7 @@ use crate::selection_intent::{PENDING_JOURNAL, PreparationFailure, PreparedSelec
 mod commit;
 mod config;
 mod device_admission;
+mod pending;
 
 const CANDIDATE: &str = ".selection-31313131313131313131313131313131";
 

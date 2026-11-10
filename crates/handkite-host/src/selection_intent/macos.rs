@@ -3,6 +3,7 @@ use crate::current_selection::macos::Snapshot;
 use std::ffi::CStr;
 
 mod journal;
+pub(crate) mod pending;
 pub(crate) mod preparation;
 
 const MISMATCH: &str = "selection intent release or lock mismatch";

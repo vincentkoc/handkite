@@ -52,6 +52,26 @@ pub(super) struct Journal {
 }
 
 impl Journal {
+    pub(super) fn open_existing(parent: &File) -> Result<(Self, Intent), &'static str> {
+        let mut file = open_at(parent.as_raw_fd(), JOURNAL, false)?;
+        let size =
+            usize::try_from(file.metadata().map_err(|_| UNSAFE)?.len()).map_err(|_| UNSAFE)?;
+        let fingerprint = policy(&file, 0o400, size)?;
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(MAX_INTENT_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|_| UNSAFE)?;
+        let intent = Intent::parse(&bytes)?;
+        let value = Self {
+            file,
+            fingerprint,
+            bytes,
+        };
+        value.check(parent)?;
+        Ok((value, intent))
+    }
+
     pub(super) fn retain(
         writer: File,
         parent: &File,
