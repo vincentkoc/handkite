@@ -2,6 +2,9 @@ use crate::native_lock;
 use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
 use crate::wda_http::HttpResponse;
+use crate::wda_runner::OwnedWdaRunner;
+use crate::wda_session::create_owned_session;
+use crate::wda_settings::validate_session;
 use crate::wda_transport::UsbWda;
 use base64::Engine;
 use handkite_core::controller::{AdapterError, DeviceAdapter, RawObservation};
@@ -20,6 +23,8 @@ pub struct WdaAdapter {
     usb: PinnedUsb,
     runtime: tokio::runtime::Runtime,
     actions: WdaActions,
+    owned_runner: Option<OwnedWdaRunner>,
+    owned_session: Option<String>,
 }
 
 impl WdaAdapter {
@@ -33,7 +38,65 @@ impl WdaAdapter {
             expected,
             runtime,
             actions: WdaActions::default(),
+            owned_runner: None,
+            owned_session: None,
         })
+    }
+
+    /// Start one configured XCTest runner and create one exact WDA session.
+    /// The caller must first obtain exclusive device and WDA ownership.
+    /// The multi-thread runtime continues driving XCTest while the socket server is idle.
+    pub fn new_owned(expected: HardwareId, runner_bundle_id: &str) -> Result<Self, AdapterError> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|_| AdapterError)?;
+        let usb = PinnedUsb::new(expected.clone());
+        let runner = runtime
+            .block_on(OwnedWdaRunner::start(
+                usb.clone(),
+                runner_bundle_id,
+                Duration::from_secs(120),
+            ))
+            .map_err(|_| AdapterError)?;
+        let session = runtime
+            .block_on(create_owned_session(&UsbWda::new(usb.clone()), || Ok(())))
+            .map_err(|_| AdapterError)?;
+        let actions = WdaActions::bound_to_existing(&session)?;
+        Ok(Self {
+            expected,
+            usb,
+            runtime,
+            actions,
+            owned_runner: Some(runner),
+            owned_session: Some(session),
+        })
+    }
+
+    fn validate_owned(&self) -> Result<(), AdapterError> {
+        let Some(session) = &self.owned_session else {
+            return Ok(());
+        };
+        if self
+            .owned_runner
+            .as_ref()
+            .is_none_or(OwnedWdaRunner::is_finished)
+            || !self.actions.prepared_session_matches(session)
+        {
+            return Err(AdapterError);
+        }
+        self.runtime
+            .block_on(validate_session(&UsbWda::new(self.usb.clone()), session))
+            .map_err(|_| AdapterError)?;
+        if self
+            .owned_runner
+            .as_ref()
+            .is_none_or(OwnedWdaRunner::is_finished)
+        {
+            return Err(AdapterError);
+        }
+        Ok(())
     }
 
     async fn capture(
@@ -112,6 +175,7 @@ impl WdaAdapter {
 
 impl DeviceAdapter for WdaAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
+        self.validate_owned()?;
         self.runtime
             .block_on(self.usb.provider())
             .map_err(|_| AdapterError)?;
@@ -119,20 +183,35 @@ impl DeviceAdapter for WdaAdapter {
     }
 
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
-        self.runtime
+        self.validate_owned()?;
+        let observation = self
+            .runtime
             .block_on(Self::capture(&self.usb, &self.expected, SCREEN_SOURCE))
-            .map(|(observation, _)| observation)
+            .map(|(observation, _)| observation)?;
+        self.validate_owned()?;
+        Ok(observation)
     }
 
     fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
-        self.runtime.block_on(
+        self.validate_owned()?;
+        let receipt = self.runtime.block_on(
             self.actions
                 .execute_with_existing_session(&UsbWda::new(self.usb.clone()), action),
-        )
+        )?;
+        self.validate_owned()?;
+        Ok(receipt)
     }
 
     fn native_lock_state(&mut self) -> LockState {
         native_lock::query(&self.expected).state
+    }
+}
+
+impl Drop for WdaAdapter {
+    fn drop(&mut self) {
+        if let Some(runner) = self.owned_runner.take() {
+            let _ = self.runtime.block_on(runner.abort_and_join());
+        }
     }
 }
 
