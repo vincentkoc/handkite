@@ -189,7 +189,7 @@ impl NativePasscodeBackend {
     fn wake_hidden_with(
         &mut self,
         now: Instant,
-        wake: impl FnOnce(&mut Self, Instant, (f64, f64)) -> Result<(), BackendError>,
+        wake: impl FnOnce(&mut Self, Instant) -> Result<(), BackendError>,
         settle: impl FnOnce(Duration),
         snapshot: impl FnOnce(&mut Self) -> Result<PasscodeScreen, BackendError>,
     ) -> Result<(), BackendError> {
@@ -202,8 +202,7 @@ impl NativePasscodeBackend {
         {
             return Err(BackendError::Unavailable);
         }
-        let size = prepared.view.screen_size.ok_or(BackendError::Unavailable)?;
-        wake(self, prepared.fresh_until, size)?;
+        wake(self, prepared.fresh_until)?;
         settle(SUPERVISED_WAKE_SETTLE);
         // The core samples again before marking the gate. Keep the same zero-progress
         // requirement through that snapshot, until the first digit dispatch begins.
@@ -472,22 +471,12 @@ impl PasscodeBackend for NativePasscodeBackend {
             }
             return self.wake_hidden_with(
                 Instant::now(),
-                |backend, fresh_until, size| {
+                |backend, fresh_until| {
                     let wda = UsbWda::new(backend.usb.clone()).with_write_deadline(fresh_until);
                     backend
                         .runtime
                         .block_on(backend.actions.wake_with_existing_session(&wda))
-                        .map_err(|_| BackendError::Unavailable)?;
-                    thread::sleep(Duration::from_millis(1000));
-                    backend
-                        .runtime
-                        .block_on(
-                            backend
-                                .actions
-                                .execute_with_existing_session(&wda, &keypad_swipe(size)?),
-                        )
-                        .map_err(|_| BackendError::Unavailable)?;
-                    Ok(())
+                        .map_err(|_| BackendError::Unavailable)
                 },
                 thread::sleep,
                 Self::snapshot,
@@ -1028,10 +1017,9 @@ mod tests {
         assert_eq!(
             backend.wake_hidden_with(
                 start + Duration::from_millis(100),
-                |backend, deadline, size| {
+                |backend, deadline| {
                     assert!(backend.last_view.is_none());
                     assert_eq!(deadline, start + PIN_VIEW_BUDGET);
-                    assert_eq!(size, (400.0, 800.0));
                     wakes += 1;
                     Ok(())
                 },
@@ -1087,7 +1075,7 @@ mod tests {
             assert_eq!(
                 backend.wake_hidden_with(
                     start,
-                    |_, _, _| panic!("no wake"),
+                    |_, _| panic!("no wake"),
                     |_| panic!("no settle"),
                     |_| panic!("no capture")
                 ),
@@ -1104,7 +1092,7 @@ mod tests {
             assert_eq!(
                 backend.wake_hidden_with(
                     start + elapsed,
-                    |_, _, _| panic!("expired view"),
+                    |_, _| panic!("expired view"),
                     |_| panic!("no settle"),
                     |_| panic!("no capture")
                 ),
@@ -1122,7 +1110,7 @@ mod tests {
             assert_eq!(
                 backend.wake_hidden_with(
                     start,
-                    |_, _, _| panic!("unbound path"),
+                    |_, _| panic!("unbound path"),
                     |_| panic!("no settle"),
                     |_| panic!("no capture")
                 ),
@@ -1142,7 +1130,7 @@ mod tests {
         assert_eq!(
             backend.wake_hidden_with(
                 start,
-                |_, _, _| {
+                |_, _| {
                     wakes += 1;
                     Err(BackendError::Unavailable)
                 },
@@ -1156,7 +1144,7 @@ mod tests {
         assert_eq!(
             backend.wake_hidden_with(
                 start,
-                |_, _, _| panic!("no replay"),
+                |_, _| panic!("no replay"),
                 |_| panic!("no settle"),
                 |_| panic!("no capture")
             ),
@@ -1192,7 +1180,7 @@ mod tests {
                 let wakes = &mut self.wakes;
                 self.backend.wake_hidden_with(
                     self.start,
-                    |_, _, _| {
+                    |_, _| {
                         *wakes += 1;
                         Ok(())
                     },
