@@ -282,14 +282,17 @@ an unproven restoration or worker join reports unknown. There is no retry or
 fallback. This command is offline-tested only; live use is not yet qualified.
 The default `touch-trial` command does not change idle settings.
 
-`handkite-probe touch-trial-owned-session --config PRIVATE_FILE --transport coordinate`
-(or `w3c`) is the explicit no-PIN qualification route for a newly owned session.
-It first proves the unlocked World Clock starting state, then uses the same
-creation and settings helper as the opt-in unlock route below. It repeats the
-guarded Clock trial on that exact new session and requires verified restoration.
+`handkite-probe touch-trial-owned-session --config SERVICE_CONFIG --transport w3c`
+(or `coordinate`) is the explicit no-PIN qualification route. The config path
+must be the fixed protected service config, with a configured runner ID. The
+probe acquires Handkite's service lock, starts one XCTest runner, creates one
+session, and checks the unlocked World Clock starting state twice on that exact
+session before one tap. It requires a confirmed Clock transition and verified
+idle-settings restoration, then attempts one bounded close of that session and
+joins the runner. Uncertain cleanup is reported as unknown, without replay.
 It never reads a PIN or touches the stop marker. This route is offline-tested;
-live use is blocked until the baseline daemon that owns the WDA runner is
-quiesced through a reviewed handoff with exclusive ownership for the whole call.
+live use still requires a reviewed exclusive handoff from any other WDA owner,
+because Handkite's service lock does not exclude an external controller.
 
 ## One-shot Clock touch diagnostic
 

@@ -1,18 +1,24 @@
 use handkite_core::controller::{DeviceAdapter, RawObservation};
 use handkite_core::protocol::{Action, HardwareId, LockState, Point};
+use handkite_host::service_layout::ServiceLayout;
+use handkite_host::service_lock::ServiceLock;
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_action::{CoordinateTapError, WdaActions};
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_http::HttpResponse;
-use handkite_host::wda_session::with_owned_session_idle_settings;
+use handkite_host::wda_runner::OwnedWdaRunner;
+use handkite_host::wda_session::{
+    SessionClose, close_owned_session, with_owned_session_idle_settings_receipt,
+};
 use handkite_host::wda_settings::{
     IdleAction, IdleSettingsOutcome, Restoration, with_temporary_idle_settings,
 };
 use handkite_host::wda_transport::UsbWda;
-use handkite_host::{host_config, native_lock};
+use handkite_host::{host_config, install_config, native_lock};
 use quick_xml::events::Event;
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const CLOCK: &str = "com.apple.mobiletimer";
@@ -116,6 +122,12 @@ pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
 }
 
 fn options(args: &[String]) -> Result<(HardwareId, Transport), &'static str> {
+    let (config, transport) = option_syntax(args)?;
+    let binding = host_config::load(config).map_err(|_| "configuration_invalid")?;
+    Ok((binding.usb_id, transport))
+}
+
+fn option_syntax(args: &[String]) -> Result<(&Path, Transport), &'static str> {
     let [config_flag, config, transport_flag, transport] = args else {
         return Err("invalid_arguments");
     };
@@ -127,31 +139,106 @@ fn options(args: &[String]) -> Result<(HardwareId, Transport), &'static str> {
         "coordinate" => Transport::Coordinate,
         _ => return Err("invalid_arguments"),
     };
-    let binding = host_config::load(Path::new(config)).map_err(|_| "configuration_invalid")?;
-    Ok((binding.usb_id, transport))
+    Ok((Path::new(config), transport))
 }
 
 pub(super) fn idle_command(args: &[String]) -> Result<(), &'static str> {
-    settings_command(args, false)
+    settings_command(args)
 }
 
 pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
-    settings_command(args, true)
+    let (path, transport) = option_syntax(args)?;
+    let layout = ServiceLayout::current_account().map_err(|_| "refused reason=service_layout")?;
+    if path != layout.config_file() {
+        return Err("refused reason=protected_config_required");
+    }
+    let owner =
+        Arc::new(ServiceLock::acquire(layout).map_err(|_| "refused reason=service_ownership")?);
+    let config = install_config::load_protected_config(owner.layout())
+        .map_err(|_| "refused reason=protected_config_unavailable")?;
+    let runner_id = config
+        .wda_runner_bundle_id()
+        .ok_or("refused reason=runner_unconfigured")?;
+    let expected = config.binding().usb_id.clone();
+    owner
+        .validate_current()
+        .map_err(|_| "refused reason=service_ownership")?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .map_err(|_| "refused reason=runner_unavailable")?;
+    let result = runtime.block_on(async {
+        let usb = PinnedUsb::new(expected.clone());
+        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120))
+            .await
+            .map_err(|_| "refused reason=runner_unavailable")?;
+        let wda = UsbWda::new(usb);
+        let admit = || {
+            if runner.is_finished() || owner.validate_current().is_err() {
+                Err(())
+            } else {
+                Ok(())
+            }
+        };
+        let action = |worker_session: String| {
+            let worker_owner = Arc::clone(&owner);
+            let runner_ref = &runner;
+            async move {
+                if runner_ref.is_finished() || worker_owner.validate_current().is_err() {
+                    return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+                }
+                blocking_trial(move || {
+                    let mut live = Live::new(expected.clone()).map_err(TrialError::Refused)?;
+                    let owns = || worker_owner.validate_current().is_ok();
+                    let mut bound = SessionBound {
+                        device: &mut live,
+                        session: &worker_session,
+                        admission: Some(&owns),
+                    };
+                    run(&mut bound, &expected, transport)
+                })
+                .await
+            }
+        };
+        let transaction = with_owned_session_idle_settings_receipt(&wda, admit, action).await;
+        let (trial, close) = match transaction {
+            Ok((session, outcome)) => {
+                let trial = idle_result(outcome);
+                (trial, Some(close_owned_session(&wda, &session).await))
+            }
+            Err(error) => (Err(error.message()), None),
+        };
+        let alive = !runner.is_finished();
+        let stopped = runner.abort_and_join().await;
+        owned_result(trial, close, alive, stopped.is_ok())
+    });
+    result?;
+    println!(
+        "touch_trial_owned_session=confirmed transport={}",
+        transport.name()
+    );
+    Ok(())
 }
 
-fn settings_command(args: &[String], owned: bool) -> Result<(), &'static str> {
-    let (expected, transport) = options(args)?;
-    if owned {
-        // Refuse session creation unless the harmless Clock starting state is
-        // already proven. The trial captures it twice again on the new session.
-        let mut preflight =
-            Live::new(expected.clone()).map_err(|reason| TrialError::Refused(reason).message())?;
-        let snapshot = preflight
-            .capture()
-            .map_err(|reason| TrialError::Refused(reason).message())?;
-        validate(&snapshot, &expected, preflight.now_ms(), false)
-            .map_err(|reason| TrialError::Refused(reason).message())?;
+fn owned_result(
+    trial: Result<(), &'static str>,
+    close: Option<SessionClose>,
+    runner_alive: bool,
+    runner_joined: bool,
+) -> Result<(), &'static str> {
+    if !runner_alive
+        || !runner_joined
+        || close.is_some_and(|close| close != SessionClose::Acknowledged)
+    {
+        Err("unknown")
+    } else {
+        trial
     }
+}
+
+fn settings_command(args: &[String]) -> Result<(), &'static str> {
+    let (expected, transport) = options(args)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -169,32 +256,23 @@ fn settings_command(args: &[String], owned: bool) -> Result<(), &'static str> {
                 let mut bound = SessionBound {
                     device: &mut live,
                     session: &worker_session,
+                    admission: None,
                 };
                 run(&mut bound, &expected, transport)
             })
             .await
         };
-        let outcome = if owned {
-            with_owned_session_idle_settings(&wda, || Ok(()), action)
-                .await
-                .map_err(|error| error.message())?
-        } else {
-            let response = wda
-                .request("GET", "/status", b"", Duration::from_secs(10))
-                .await
-                .map_err(|_| "refused reason=session_unproven")?;
-            let session =
-                session_from_response(response).map_err(|_| "refused reason=session_unproven")?;
-            with_temporary_idle_settings(&wda, &session, || action(session.clone())).await
-        };
+        let response = wda
+            .request("GET", "/status", b"", Duration::from_secs(10))
+            .await
+            .map_err(|_| "refused reason=session_unproven")?;
+        let session =
+            session_from_response(response).map_err(|_| "refused reason=session_unproven")?;
+        let outcome =
+            with_temporary_idle_settings(&wda, &session, || action(session.clone())).await;
         idle_result(outcome)
     })?;
-    let command = if owned {
-        "touch_trial_owned_session"
-    } else {
-        "touch_trial_idle"
-    };
-    println!("{command}=confirmed transport={}", transport.name());
+    println!("touch_trial_idle=confirmed transport={}", transport.name());
     Ok(())
 }
 
@@ -240,10 +318,14 @@ trait TrialDevice {
 struct SessionBound<'a, D> {
     device: &'a mut D,
     session: &'a str,
+    admission: Option<&'a dyn Fn() -> bool>,
 }
 
 impl<D: TrialDevice> TrialDevice for SessionBound<'_, D> {
     fn capture(&mut self) -> Result<Snapshot, RefusalReason> {
+        if self.admission.is_some_and(|admit| !admit()) {
+            return Err(RefusalReason::SessionUnproven);
+        }
         let snapshot = self.device.capture()?;
         if snapshot.session != self.session {
             return Err(RefusalReason::SessionUnproven);
@@ -261,6 +343,9 @@ impl<D: TrialDevice> TrialDevice for SessionBound<'_, D> {
         at: Point,
         fresh_until: Instant,
     ) -> Result<(), CoordinateTapError> {
+        if self.admission.is_some_and(|admit| !admit()) {
+            return Err(CoordinateTapError::ReceiptUnproven);
+        }
         self.device.tap(transport, at, fresh_until)
     }
 }
@@ -977,6 +1062,7 @@ mod tests {
         let mut bound = SessionBound {
             device: fixture,
             session,
+            admission: None,
         };
         run(
             &mut bound,
@@ -1028,6 +1114,59 @@ mod tests {
                 assert!(fixture.captures.is_empty());
             }
         }
+    }
+
+    #[test]
+    fn owned_trial_refuses_lost_admission_before_input() {
+        use std::cell::Cell;
+        for fail_on in [1, 2, 3] {
+            let checks = Cell::new(0);
+            let admit = || {
+                checks.set(checks.get() + 1);
+                checks.get() < fail_on
+            };
+            let mut fixture = Fixture::new();
+            let mut bound = SessionBound {
+                device: &mut fixture,
+                session: "fixture-session",
+                admission: Some(&admit),
+            };
+            assert!(
+                run(
+                    &mut bound,
+                    &HardwareId::new("fixture-device").unwrap(),
+                    Transport::W3c
+                )
+                .is_err()
+            );
+            assert!(fixture.taps.is_empty());
+        }
+    }
+
+    #[test]
+    fn owned_trial_never_confirms_uncertain_cleanup() {
+        assert_eq!(
+            owned_result(Ok(()), Some(SessionClose::Acknowledged), true, true),
+            Ok(())
+        );
+        for close in [SessionClose::Refused, SessionClose::Unknown] {
+            assert_eq!(
+                owned_result(Ok(()), Some(close), true, true),
+                Err("unknown")
+            );
+        }
+        assert_eq!(
+            owned_result(Ok(()), Some(SessionClose::Acknowledged), false, true),
+            Err("unknown")
+        );
+        assert_eq!(
+            owned_result(Ok(()), Some(SessionClose::Acknowledged), true, false),
+            Err("unknown")
+        );
+        assert_eq!(
+            owned_result(Err("refused reason=session_admission"), None, true, true),
+            Err("refused reason=session_admission")
+        );
     }
 
     #[test]
