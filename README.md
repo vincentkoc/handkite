@@ -63,12 +63,13 @@ Keep the actual ID only in the protected host config. The library API
 `install_config::load_protected_config` returns the binding and optional ID
 through the same anchored reader. `RetainedConfig::wda_runner_bundle_id` exposes
 the original retained value; revalidation still requires the exact original
-bytes. Neither API starts WDA or verifies that the runner is installed, and
-daemon startup continues to use an externally ready WDA.
+bytes. Neither config API starts WDA or verifies runner installation. The
+default daemon mode uses an externally ready WDA; explicit `--owned-wda` mode
+requires this runner ID and starts the configured XCTest task and a new session.
 
-The CLI's `request` subcommand reads one JSON request from stdin and returns the complete JSON response. An `observe` response contains a screenshot and accessibility tree, so keep its raw output inside the protected local boundary. While holding the fixed process lock, the daemon can reclaim an owned mode-0600 socket left by a crash. It first checks endpoint liveness with a nonblocking datagram connect, then rechecks the socket inode, owner, mode, link count, size, and modification/change timestamps before removing it through the anchored runtime directory. Only `ECONNREFUSED` permits reclamation; a live endpoint, symlink, non-socket, unsafe owner/mode, changed metadata, or uncertain probe result stops startup. A datagram probe creates no stream connection and sends no request. This trial service currently requires a ready WDA on the pinned phone. It does not yet own pairing, WDA startup, signing, PIN entry, or remote-agent authentication.
+The CLI's `request` subcommand reads one JSON request from stdin and returns the complete JSON response. An `observe` response contains a screenshot and accessibility tree, so keep its raw output inside the protected local boundary. While holding the fixed process lock, the daemon can reclaim an owned mode-0600 socket left by a crash. It first checks endpoint liveness with a nonblocking datagram connect, then rechecks the socket inode, owner, mode, link count, size, and modification/change timestamps before removing it through the anchored runtime directory. Only `ECONNREFUSED` permits reclamation; a live endpoint, symlink, non-socket, unsafe owner/mode, changed metadata, or uncertain probe result stops startup. A datagram probe creates no stream connection and sends no request. Default mode requires a ready external WDA. Explicit `--owned-wda` starts a runner and session after protected config and socket checks. Neither mode yet owns pairing, signing, PIN entry, or remote-agent authentication.
 
-Before each action, the daemon checks the existing WDA session on the pinned USB route and validates its session endpoint. It adopts that session on the first action and rejects absent, invalid, stale, or replacement sessions before sending input. It never creates or renews a WDA session. WDA ownership and session renewal remain external and unqualified; a replaced session requires an explicit daemon restart after owner inspection.
+Before each action, default mode checks the existing WDA session on the pinned USB route and validates its session endpoint. It adopts that session on the first action and rejects absent, invalid, stale, or replacement sessions. Owned mode instead retains the exact session it created, checks runner liveness and session identity around observation and input, and refuses drift. Neither mode renews a session automatically. A replaced session requires owner inspection.
 
 The separate `wda_runner::OwnedWdaRunner` library can start one exact installed
 `.xctrunner` bundle through pinned `idevice` 0.1.68. It requires a callback from
@@ -79,12 +80,14 @@ handle Drop abort the owned host task; `abort_and_join` also observes completion
 Callers must retain the handle inside an active Tokio runtime and establish
 exclusive device/WDA ownership before calling it.
 
-This module is offline-tested and is not connected to daemon startup. It neither
-installs a runner nor creates a WDA session. Readiness does not authenticate the
-HTTP endpoint as the new process, and host-task cancellation does not prove
-device-process termination. It returns fixed error categories, discards callback
-logs, and configures no logging subscriber; upstream `idevice` tracing must stay
-inside the caller's private boundary. Live startup and shutdown remain unqualified.
+Owned daemon mode now uses this module, then creates a fresh exact session.
+On adapter Drop it attempts one bounded, identity-checked session DELETE before
+aborting the host task. Acknowledgement does not prove endpoint ownership or
+device-process termination; abrupt process termination may skip Drop entirely.
+The module does not install a runner. It returns fixed error categories, discards
+callback logs, and configures no logging subscriber; upstream `idevice` tracing
+must stay inside the caller's private boundary. Live startup and shutdown remain
+unqualified.
 
 Run `handkited --check --config /path/to/config.json` for a read-only preflight. It prints the same bounded JSON health flags and native lock state as `handkite-doctor`, with no USB identifier or screen contents. Exit codes are 0 for observation readiness, 1 for failed readiness, and 2 for invalid arguments, configuration, or reporting errors. The check does not bind or remove a socket, start WDA, create a WDA session, or send input. This is a candidate-only readiness check, not signed-install or independent WDA startup proof.
 
@@ -94,7 +97,7 @@ service configuration satisfies the protected startup checks.
 
 For `act`, `receipt.accepted` is `true` or `false` for a known acknowledgment, or `null` when delivery is unknown. A lock action sends the named Shortcut once, then queries native lock state once even if the WDA acknowledgment was lost. Its `native_lock` field is `locked`, `unlocked`, or `uncertain`; non-lock actions return `null`. Only native `locked` produces `effect: "lock_confirmed"`. This confirms the postcondition, not that the request caused a transition. Opening Shortcuts or a changed screenshot cannot confirm a lock. The optional `after` capture can be absent even when native lock is confirmed.
 
-Lock retains the existing lease, pinned-identity, revision, and unlocked-screen preconditions. Native querying has a five-second command timeout and an eight-second process budget. The complete action has no shared deadline across its WDA steps, so the local client's 65-second read timeout can expire before a result arrives. A timeout leaves delivery and lock state unknown to that caller; inspect fresh native state before deciding what to do. The controller never automatically resends a lock action. This receipt behavior is covered offline; a live Handkite lock cycle remains unqualified.
+Lock retains the existing lease, pinned-identity, revision, and unlocked-screen preconditions. The action POST cannot send bytes after the earlier of observation freshness and lease expiry. Native querying has a five-second command timeout and an eight-second process budget. The complete result, including post-action capture, has no shared deadline, so the local client's 65-second read timeout can still expire before a result arrives. A timeout leaves delivery and lock state unknown to that caller; inspect fresh native state before deciding what to do. The controller never automatically resends a lock action. This behavior is covered offline; a live Handkite lock cycle remains unqualified.
 
 ## Staged Mac service layout
 
