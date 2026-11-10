@@ -129,6 +129,13 @@ remain external inputs; this path pin does not qualify them.
 
 `handkite-doctor --config /path/to/config.json` checks the pinned USB device, WDA status, the existing WDA session, and native lock state. It reports only readiness flags and lock state as JSON; it does not create a WDA session or send device input. Exit code 0 means the locked or unlocked phone can be observed. It does not mean app actions or PIN entry are qualified.
 
+## Read-only idle settings
+
+`handkite-probe idle-settings --config PRIVATE_FILE` reads the active existing
+WDA session through the private USB pin. It prints only finite nonnegative
+`waitForIdleTimeout` and `animationCoolOffTimeout` values, or a fixed refusal.
+It sends no POST, creates no session, and performs no phone input.
+
 ## One-shot Clock touch diagnostic
 
 An explicitly supervised trial can run

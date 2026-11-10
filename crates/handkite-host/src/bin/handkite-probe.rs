@@ -16,6 +16,8 @@ use std::time::Duration;
 
 #[path = "probe/clock_attrs.rs"]
 mod clock_attrs;
+#[path = "probe/idle_settings.rs"]
+mod idle_settings;
 #[path = "probe/lock_ui_attrs.rs"]
 mod lock_ui_attrs;
 #[path = "probe/normal_lock_attrs.rs"]
@@ -27,6 +29,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "idle-settings") {
+        if let Err(error) = idle_settings::command(&args[1..]) {
+            eprintln!("idle_settings={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "normal-lock-attrs") {
         if let Err(error) = normal_lock_attrs::command(&args[1..]) {
             eprintln!("normal_lock_attrs={error}");

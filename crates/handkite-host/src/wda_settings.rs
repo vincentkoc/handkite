@@ -41,6 +41,44 @@ pub struct IdleSettingsOutcome<T, E> {
     pub restoration: Restoration,
 }
 
+/// Only the two validated numeric settings; no session or other response data.
+pub struct IdleTimeouts(Settings);
+
+impl IdleTimeouts {
+    pub fn wait_for_idle_timeout(&self) -> &str {
+        self.0.idle.get()
+    }
+
+    pub fn animation_cool_off_timeout(&self) -> &str {
+        self.0.animation.get()
+    }
+}
+
+/// Read the active existing session's settings without creating or changing it.
+pub async fn read_active_idle_settings(wda: &UsbWda) -> Result<IdleTimeouts, SettingsError> {
+    read_active(wda).await
+}
+
+async fn read_active(wda: &impl WdaRequest) -> Result<IdleTimeouts, SettingsError> {
+    let status = wda
+        .request("GET", "/status", b"", DEADLINE)
+        .await
+        .map_err(|_| SettingsError::SessionUnproven)?;
+    if status.status != 200 {
+        return Err(SettingsError::SessionUnproven);
+    }
+    let status: Envelope<Value> =
+        serde_json::from_slice(&status.body).map_err(|_| SettingsError::SessionUnproven)?;
+    if status.value["ready"].as_bool() != Some(true) || status.value.get("error").is_some() {
+        return Err(SettingsError::SessionUnproven);
+    }
+    let session = status.session_id.ok_or(SettingsError::SessionUnproven)?;
+    validate_session(wda, &session).await?;
+    let settings = read(wda, &session).await?;
+    validate_session(wda, &session).await?;
+    Ok(IdleTimeouts(settings))
+}
+
 /// Run one action only after the temporary settings are acknowledged and verified.
 /// Restore the original two numeric values after every attempted set, even when
 /// that set or the action fails. No request or action is retried.
@@ -452,6 +490,116 @@ mod tests {
         })
         .await;
         (result, calls.get())
+    }
+
+    fn read_only_preflight() -> Vec<Step> {
+        let mut steps = vec![session().remove(0)];
+        steps.extend(session());
+        steps
+    }
+
+    #[tokio::test]
+    async fn read_only_snapshot_returns_only_two_validated_values_without_posts() {
+        let mut steps = read_only_preflight();
+        steps.push(settings(r#"{"waitForIdleTimeout":2.50e0,"animationCoolOffTimeout":0.12500000000000000001,"unrelated":"not-for-output"}"#));
+        steps.extend(session());
+        let fake = Fake::new(steps);
+        let result = read_active(&fake).await.unwrap();
+        assert_eq!(result.wait_for_idle_timeout(), "2.50e0");
+        assert_eq!(
+            result.animation_cool_off_timeout(),
+            "0.12500000000000000001"
+        );
+        fake.done(0);
+    }
+
+    #[tokio::test]
+    async fn read_only_snapshot_refuses_changed_or_wrong_session_without_posts() {
+        let mut before = vec![session().remove(0)];
+        before.push(changed_session());
+        let mut during = read_only_preflight();
+        during.push(get(
+            SETTINGS,
+            &format!(r#"{{"sessionId":"replacement","value":{ORIGINAL}}}"#),
+        ));
+        let mut after = read_only_preflight();
+        after.extend([settings(ORIGINAL), changed_session()]);
+        for steps in [before, during, after] {
+            let fake = Fake::new(steps);
+            assert!(matches!(
+                read_active(&fake).await,
+                Err(SettingsError::SessionUnproven)
+            ));
+            fake.done(0);
+        }
+        for status in [
+            r#"{"value":{"ready":true}}"#,
+            r#"{"sessionId":"../invalid","value":{"ready":true}}"#,
+            r#"{"sessionId":"fixture-session","value":{"ready":false}}"#,
+        ] {
+            let fake = Fake::new(vec![get("/status", status)]);
+            assert!(matches!(
+                read_active(&fake).await,
+                Err(SettingsError::SessionUnproven)
+            ));
+            fake.done(0);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_snapshot_refuses_malformed_values_without_posts() {
+        for values in [
+            "null",
+            "{}",
+            "{",
+            r#"{"waitForIdleTimeout":-1,"animationCoolOffTimeout":2}"#,
+            r#"{"waitForIdleTimeout":1e999,"animationCoolOffTimeout":2}"#,
+            r#"{"waitForIdleTimeout":"not-for-output","animationCoolOffTimeout":2}"#,
+            r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":false}"#,
+            r#"{"waitForIdleTimeout":1,"waitForIdleTimeout":2,"animationCoolOffTimeout":2}"#,
+        ] {
+            let mut steps = read_only_preflight();
+            steps.push(settings(values));
+            let fake = Fake::new(steps);
+            assert!(matches!(
+                read_active(&fake).await,
+                Err(SettingsError::ReadUnproven | SettingsError::InvalidSettings)
+            ));
+            fake.done(0);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_snapshot_refuses_http_and_transport_failures_without_posts() {
+        for at_status in [false, true] {
+            for http_failure in [false, true] {
+                let mut failed = if at_status {
+                    session().remove(0)
+                } else {
+                    settings(ORIGINAL)
+                };
+                failed.response = if http_failure {
+                    Ok(HttpResponse {
+                        status: 503,
+                        body: b"not-for-output".to_vec(),
+                    })
+                } else {
+                    Err(WdaError::NotConnected)
+                };
+                let mut steps = if at_status {
+                    vec![]
+                } else {
+                    read_only_preflight()
+                };
+                steps.push(failed);
+                let fake = Fake::new(steps);
+                assert!(matches!(
+                    read_active(&fake).await,
+                    Err(SettingsError::SessionUnproven | SettingsError::ReadUnproven)
+                ));
+                fake.done(0);
+            }
+        }
     }
 
     #[tokio::test]
