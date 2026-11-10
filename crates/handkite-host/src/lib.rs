@@ -29,6 +29,7 @@ pub mod release_verify;
 pub mod selection_intent;
 pub mod service_layout;
 pub mod service_lock;
+pub mod ssh_bridge;
 pub mod unlock_state;
 pub mod usb;
 pub mod wda_action;

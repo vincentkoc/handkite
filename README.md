@@ -127,6 +127,7 @@ The library's `ServiceLayout::current_account()` derives fixed paths from the ef
 | Versioned signed releases | `releases/` |
 | Current release selection | `releases/current` |
 | Selected daemon executable | `releases/current/handkited` |
+| Selected MCP executable | `releases/current/handkite-mcp` |
 | Private runtime socket | `runtime/handkite.sock` |
 | Process ownership lock | `runtime/handkite.lock` |
 | Durable state | `state/` |
@@ -191,6 +192,25 @@ SSH forced command, with forwarding and PTY allocation disabled. The default
 capability remains observation only.
 
 The host can explicitly add `--capabilities navigation` or `--capabilities observation,navigation`. Navigation permits only `handkite_acquire_control`, `handkite_release_control`, `handkite_home`, and `handkite_launch_clock`. Home and Clock require an unsigned integer `expected_revision` and reject every other argument. Clock always means `com.apple.mobiletimer`. Navigation alone does not grant either observation tool. There are no generic input, lock, unlock, or PIN tools.
+
+The pure `ssh_bridge::render` helper accepts a `ServiceLayout`, one bare canonical
+`ssh-ed25519` public key, and an explicit `mcp::Capabilities` value. It returns one
+LF-terminated `authorized_keys` entry with `restrict` and a forced command:
+`exec '<fixed releases/current/handkite-mcp path>' --service --capabilities <value>`.
+Key options, comments, certificates, extra whitespace, and malformed SSH wire
+lengths are rejected. The absolute path must be normalized, at most 4096 bytes,
+and contain only ASCII letters, digits, slash, space, dot, underscore, and hyphen.
+It is derived from the account layout, never a client-supplied command or path.
+
+OpenSSH documents `restrict` as disabling port, agent, and X11 forwarding, PTY
+allocation, and user SSH rc execution. Its `command` option replaces the requested
+command; the renderer never references `SSH_ORIGINAL_COMMAND`.
+See the official [OpenSSH authorized_keys format](https://man.openbsd.org/sshd.8#AUTHORIZED_KEYS_FILE_FORMAT).
+The helper reads and writes no files and does not verify the key owner, selected
+release, SSH configuration, or effective restrictions. Offline shell fixtures
+establish exact argv only. Live sshd enforcement, host identity, key enrollment,
+account isolation, and agent acceptance remain unqualified. Account shell startup
+and server configuration, including `ForceCommand`, need separate review.
 
 Acquire control explicitly before an action. The process holds the controller's random lease token internally for a fixed two-minute TTL; neither the token nor an owner override is exposed through MCP. Acquire never renews an existing lease. A competing session receives `Busy`. Release is explicit, with best-effort release again on EOF or input/output failure. A killed process relies on expiry. If the acquire response is lost, that process refuses further acquisition: close it and wait two minutes before starting a new session.
 

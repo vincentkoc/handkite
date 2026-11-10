@@ -42,6 +42,11 @@ impl ServiceLayout {
         self.current_release_selection().join("handkited")
     }
 
+    /// Fixed bridge executable; no release selection is read or changed.
+    pub fn current_release_mcp_executable(&self) -> PathBuf {
+        self.current_release_selection().join("handkite-mcp")
+    }
+
     pub fn runtime_directory(&self) -> PathBuf {
         self.root().join("runtime")
     }
@@ -177,6 +182,10 @@ pub(crate) mod tests {
             assert_eq!(
                 layout.current_release_executable(),
                 root.join("releases/current/handkited")
+            );
+            assert_eq!(
+                layout.current_release_mcp_executable(),
+                root.join("releases/current/handkite-mcp")
             );
             assert_eq!(layout.runtime_directory(), root.join("runtime"));
             assert_eq!(layout.socket(), root.join("runtime/handkite.sock"));
