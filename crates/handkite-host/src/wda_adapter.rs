@@ -3,7 +3,7 @@ use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
 use crate::wda_http::HttpResponse;
 use crate::wda_runner::OwnedWdaRunner;
-use crate::wda_session::create_owned_session;
+use crate::wda_session::{SessionClose, close_owned_session, create_owned_session};
 use crate::wda_settings::validate_session;
 use crate::wda_transport::UsbWda;
 use base64::Engine;
@@ -219,7 +219,24 @@ impl DeviceAdapter for WdaAdapter {
 impl Drop for WdaAdapter {
     fn drop(&mut self) {
         if let Some(runner) = self.owned_runner.take() {
-            let _ = self.runtime.block_on(runner.abort_and_join());
+            if let Some(session) = self.owned_session.take() {
+                if runner.is_finished() {
+                    eprintln!("handkite: owned runner exited before session close");
+                } else if self.runtime.block_on(close_owned_session(
+                    &UsbWda::new(self.usb.clone()),
+                    &session,
+                )) != SessionClose::Acknowledged
+                {
+                    eprintln!("handkite: owned session close unproven");
+                }
+            }
+            if self.runtime.block_on(tokio::time::timeout(
+                Duration::from_secs(5),
+                runner.abort_and_join(),
+            )) != Ok(Ok(()))
+            {
+                eprintln!("handkite: owned runner host task termination unproven");
+            }
         }
     }
 }
