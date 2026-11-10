@@ -139,6 +139,14 @@ Daemon startup now uses the layout and process lock, but no live installation is
 
 `handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
 
+`handkite-mcp --service` derives the device key from the protected fixed host
+config and the socket from the effective account's fixed service layout. It does
+not accept a caller-selected device or socket in this mode. This is the preferred
+command for a restricted SSH principal once the service is installed. It does
+not authenticate the caller: bind the exact invocation and capabilities to an
+SSH forced command, with forwarding and PTY allocation disabled. The default
+capability remains observation only.
+
 The host can explicitly add `--capabilities navigation` or `--capabilities observation,navigation`. Navigation permits only `handkite_acquire_control`, `handkite_release_control`, `handkite_home`, and `handkite_launch_clock`. Home and Clock require an unsigned integer `expected_revision` and reject every other argument. Clock always means `com.apple.mobiletimer`. Navigation alone does not grant either observation tool. There are no generic input, lock, unlock, or PIN tools.
 
 Acquire control explicitly before an action. The process holds the controller's random lease token internally for a fixed two-minute TTL; neither the token nor an owner override is exposed through MCP. Acquire never renews an existing lease. A competing session receives `Busy`. Release is explicit, with best-effort release again on EOF or input/output failure. A killed process relies on expiry. If the acquire response is lost, that process refuses further acquisition: close it and wait two minutes before starting a new session.
