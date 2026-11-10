@@ -1,9 +1,24 @@
 use super::*;
+use crate::install_config::RetainedConfig;
 use crate::install_plan::Operation;
 use crate::selection_intent::macos::preparation::{self as prep, Hooks, Point};
 use crate::selection_intent::{PENDING_JOURNAL, PreparationFailure, PreparedSelection};
+use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
+
+mod config;
 
 const CANDIDATE: &str = ".selection-31313131313131313131313131313131";
+
+fn retain_config(owner: &InstallerLock) -> RetainedConfig<'_> {
+    RetainedConfig::acquire(
+        owner,
+        &DeviceBinding {
+            key: DeviceKey::new("phone").unwrap(),
+            usb_id: HardwareId::new("test-device").unwrap(),
+        },
+    )
+    .unwrap()
+}
 
 fn setup(operation: Operation) -> (Fixture, Vec<u8>) {
     let (fixture, bytes) = pair();
@@ -17,6 +32,7 @@ fn setup(operation: Operation) -> (Fixture, Vec<u8>) {
 
 fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
+    config: &'held mut RetainedConfig<'lock>,
     operation: Operation,
     previous: Option<&'held mut PublishedRelease<'lock>>,
     destination: &'held mut PublishedRelease<'lock>,
@@ -24,6 +40,7 @@ fn prepare<'held, 'lock>(
 ) -> Result<PreparedSelection<'held, 'lock>, PreparationFailure> {
     prep::prepare(
         owner,
+        config,
         operation,
         previous,
         destination,
@@ -47,9 +64,11 @@ fn random_names_are_bounded_and_zero_id_never_creates_entries() {
     let mut names = Vec::new();
     for nonce in [None, None, Some([0; 16])] {
         let (fixture, bytes) = setup(Operation::InitialInstall);
+        let mut config = retain_config(&fixture.owner);
         let mut destination = open(&fixture.owner, &bytes);
         let result = prep::prepare(
             &fixture.owner,
+            &mut config,
             Operation::InitialInstall,
             None,
             &mut destination,
@@ -81,11 +100,13 @@ fn random_names_are_bounded_and_zero_id_never_creates_entries() {
 fn changes_after_final_verification_still_prevent_a_prepared_handle() {
     for mutation in 0..5 {
         let (fixture, bytes) = setup(Operation::Upgrade);
+        let mut config = retain_config(&fixture.owner);
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let parent = fixture.layout().releases_directory();
         let error = prepare(
             &fixture.owner,
+            &mut config,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
@@ -129,12 +150,14 @@ fn preparation_records_actual_links_and_retains_original_pairs_for_all_operation
         Operation::Rollback,
     ] {
         let (fixture, bytes) = setup(operation);
+        let mut config = retain_config(&fixture.owner);
         let before = unchanged(&fixture);
         let original = fs::symlink_metadata(fixture.layout().current_release_selection()).ok();
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let mut value = prepare(
             &fixture.owner,
+            &mut config,
             operation,
             (operation != Operation::InitialInstall).then_some(&mut previous),
             &mut destination,
@@ -182,10 +205,12 @@ fn preparation_records_actual_links_and_retains_original_pairs_for_all_operation
 #[test]
 fn public_preparation_and_retained_revalidation_require_real_signers() {
     let (fixture, bytes) = setup(Operation::Upgrade);
+    let mut config = retain_config(&fixture.owner);
     let mut previous = open(&fixture.owner, &fixture.bytes);
     let mut destination = open(&fixture.owner, &bytes);
     let error = intent::prepare(
         &fixture.owner,
+        &mut config,
         Operation::Upgrade,
         Some(&mut previous),
         &mut destination,
@@ -206,6 +231,7 @@ fn public_preparation_and_retained_revalidation_require_real_signers() {
     );
     let mut value = prepare(
         &fixture.owner,
+        &mut config,
         Operation::Upgrade,
         Some(&mut previous),
         &mut destination,
@@ -222,6 +248,7 @@ fn public_preparation_and_retained_revalidation_require_real_signers() {
 fn collisions_of_any_kind_are_preserved_without_new_selection_entries() {
     for collision in 0..5 {
         let (fixture, bytes) = setup(Operation::Upgrade);
+        let mut config = retain_config(&fixture.owner);
         let parent = fixture.layout().releases_directory();
         let path = parent.join(if collision == 0 {
             CANDIDATE
@@ -243,6 +270,7 @@ fn collisions_of_any_kind_are_preserved_without_new_selection_entries() {
         let mut destination = open(&fixture.owner, &bytes);
         let error = prepare(
             &fixture.owner,
+            &mut config,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
@@ -263,6 +291,7 @@ fn collisions_of_any_kind_are_preserved_without_new_selection_entries() {
 fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
     for case in 0..5 {
         let (fixture, bytes) = setup(Operation::Upgrade);
+        let mut config = retain_config(&fixture.owner);
         let other = Fixture::new();
         let parent = fixture.layout().releases_directory();
         let mut previous = open(&fixture.owner, &fixture.bytes);
@@ -270,6 +299,7 @@ fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
         let result = match case {
             0 => prepare(
                 &fixture.owner,
+                &mut config,
                 Operation::InitialInstall,
                 None,
                 &mut destination,
@@ -277,6 +307,7 @@ fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
             ),
             1 => prepare(
                 &fixture.owner,
+                &mut config,
                 Operation::Upgrade,
                 None,
                 &mut destination,
@@ -284,6 +315,7 @@ fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
             ),
             2 => prepare(
                 &other.owner,
+                &mut config,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
@@ -291,6 +323,7 @@ fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
             ),
             3 => prepare(
                 &fixture.owner,
+                &mut config,
                 Operation::Rollback,
                 Some(&mut destination),
                 &mut previous,
@@ -300,6 +333,7 @@ fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
                 fs::remove_file(fixture.layout().current_release_selection()).unwrap();
                 prepare(
                     &fixture.owner,
+                    &mut config,
                     Operation::Upgrade,
                     Some(&mut previous),
                     &mut destination,
@@ -328,11 +362,13 @@ fn every_failure_boundary_preserves_residues_and_the_original_selection() {
         Point::Complete,
     ] {
         let (fixture, bytes) = setup(Operation::Upgrade);
+        let mut config = retain_config(&fixture.owner);
         let before = unchanged(&fixture);
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let error = prepare(
             &fixture.owner,
+            &mut config,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
@@ -365,10 +401,12 @@ fn checked_parent_transition_rejects_unrelated_entry_and_original_pair_changes()
     for point in [Point::LinkCreated, Point::JournalCreated] {
         for mutation in 0..4 {
             let (fixture, bytes) = setup(Operation::Upgrade);
+            let mut config = retain_config(&fixture.owner);
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let error = prepare(
                 &fixture.owner,
+                &mut config,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
@@ -409,10 +447,12 @@ fn checked_parent_transition_rejects_unrelated_entry_and_original_pair_changes()
 fn retained_preparation_never_rebaselines_changed_files() {
     for mutation in 0..7 {
         let (fixture, bytes) = setup(Operation::Upgrade);
+        let mut config = retain_config(&fixture.owner);
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let mut value = prepare(
             &fixture.owner,
+            &mut config,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
@@ -462,6 +502,7 @@ fn retained_preparation_never_rebaselines_changed_files() {
 fn final_signer_cannot_hide_changes_to_the_earlier_pair_or_journal() {
     for journal_change in [false, true] {
         let (fixture, bytes) = setup(Operation::Upgrade);
+        let mut config = retain_config(&fixture.owner);
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let mut calls = 0;
@@ -482,6 +523,7 @@ fn final_signer_cannot_hide_changes_to_the_earlier_pair_or_journal() {
         };
         let error = prep::prepare(
             &fixture.owner,
+            &mut config,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,

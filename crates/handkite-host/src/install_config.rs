@@ -65,6 +65,19 @@ impl<'lock> RetainedConfig<'lock> {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl RetainedConfig<'_> {
+    pub(crate) fn revalidate_for_owner(
+        &mut self,
+        owner: &InstallerLock,
+    ) -> Result<(), &'static str> {
+        if !std::ptr::eq(self._owner, owner) {
+            return Err("service configuration installer lock mismatch");
+        }
+        self.revalidate()
+    }
+}
+
 /// Validate existing config bytes against an independently supplied device binding.
 ///
 /// This neither observes a device nor grants installation authority. It creates

@@ -22,6 +22,7 @@ mod selection_intent;
 const CERTIFICATE: &str = "1111111111111111111111111111111111111111";
 const NONCE: [u8; 16] = [0x24; 16];
 const TEMPORARY: &str = ".receipt-24242424242424242424242424242424";
+const CONFIG: &[u8] = br#"{"device_key":"phone","usb_id":"test-device"}"#;
 
 fn hash(bytes: &[u8]) -> [u8; 32] {
     ring::digest::digest(&ring::digest::SHA256, bytes)
@@ -80,8 +81,9 @@ struct Fixture {
 impl Fixture {
     fn new() -> Self {
         let (home, layout) = fixture_in(&std::env::current_dir().unwrap());
+        fs::write(layout.config_file(), CONFIG).unwrap();
+        chmod(&layout.config_file(), 0o600);
         for path in [
-            layout.config_file(),
             layout.state_directory().join("UNLOCK-DISABLED"),
             layout.state_directory().join("state.json"),
         ] {

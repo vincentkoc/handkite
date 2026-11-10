@@ -60,6 +60,7 @@ impl Hooks<'_> {
 }
 
 pub(in crate::selection_intent) struct Prepared<'held, 'lock> {
+    config: &'held mut RetainedConfig<'lock>,
     retained: Retained<'held, 'lock>,
     link: RetainedLink,
     journal: Journal,
@@ -77,6 +78,7 @@ impl Prepared<'_, '_> {
         &mut self,
         #[cfg(test)] check: Option<Check<'_>>,
     ) -> Result<(), &'static str> {
+        self.config.revalidate_for_owner(self.retained.owner)?;
         self.custody()?;
         if self.retained.reobserve(
             #[cfg(test)]
@@ -85,20 +87,24 @@ impl Prepared<'_, '_> {
         {
             return Err(UNSAFE);
         }
+        self.config.revalidate_for_owner(self.retained.owner)?;
         self.custody()?;
         self.retained.destination.revalidate_custody()?;
         if let Some(previous) = &self.retained.previous {
             previous.revalidate_custody()?;
         }
         self.retained.snapshot.reobserve_unchanged()?;
-        self.retained.owner.revalidate()
+        self.retained.owner.revalidate()?;
+        self.config.revalidate_for_owner(self.retained.owner)
     }
 }
 
 fn checkpoint(
     retained: &Retained<'_, '_>,
+    config: &mut RetainedConfig<'_>,
     link: Option<&RetainedLink>,
 ) -> Result<(), &'static str> {
+    config.revalidate_for_owner(retained.owner)?;
     retained.owner.revalidate()?;
     retained.snapshot.reobserve_unchanged()?;
     if let Some(previous) = &retained.previous {
@@ -108,21 +114,27 @@ fn checkpoint(
     if let Some(link) = link {
         link.check(retained.destination.selection_parent())?;
     }
-    Ok(())
+    config.revalidate_for_owner(retained.owner)
 }
 
-fn transition(retained: &mut Retained<'_, '_>, change: &ParentChange) -> Result<(), &'static str> {
+fn transition(
+    retained: &mut Retained<'_, '_>,
+    config: &mut RetainedConfig<'_>,
+    change: &ParentChange,
+) -> Result<(), &'static str> {
+    config.revalidate_for_owner(retained.owner)?;
     retained.owner.revalidate()?;
     retained.snapshot.reobserve_unchanged()?;
     if let Some(previous) = &mut retained.previous {
         previous.selection_parent_transition(change)?;
     }
     retained.destination.selection_parent_transition(change)?;
-    checkpoint(retained, None)
+    checkpoint(retained, config, None)
 }
 
 pub(crate) fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
+    config: &'held mut RetainedConfig<'lock>,
     operation: Operation,
     previous: Option<&'held mut PublishedRelease<'lock>>,
     destination: &'held mut PublishedRelease<'lock>,
@@ -130,6 +142,7 @@ pub(crate) fn prepare<'held, 'lock>(
 ) -> Result<PreparedSelection<'held, 'lock>, PreparationFailure> {
     let mut residues = Vec::new();
     let result = (|| {
+        config.revalidate_for_owner(owner)?;
         owner.revalidate()?;
         let destination_digest = parse_target(destination.directory_name().as_bytes())?;
         if !destination.matches_owner_and_digest(owner, &destination_digest) {
@@ -195,6 +208,7 @@ pub(crate) fn prepare<'held, 'lock>(
                 },
             },
         };
+        config.revalidate_for_owner(owner)?;
         #[cfg(test)]
         let observed = if let Some(check) = hooks.check.as_mut() {
             retained.reobserve(Some(&mut **check))?
@@ -203,6 +217,7 @@ pub(crate) fn prepare<'held, 'lock>(
         };
         #[cfg(not(test))]
         let observed = retained.reobserve()?;
+        config.revalidate_for_owner(owner)?;
         if observed != Observation::PreviousSelection {
             return Err(MISMATCH);
         }
@@ -210,7 +225,7 @@ pub(crate) fn prepare<'held, 'lock>(
         let before = BeforeChange::capture(retained.destination.selection_parent(), &candidate)?;
         #[cfg(test)]
         hooks.at(Point::BeforeLink)?;
-        checkpoint(&retained, None)?;
+        checkpoint(&retained, config, None)?;
         residues.push(candidate_name);
         let target =
             CString::new(encode_target(&destination_digest).as_slice()).map_err(|_| UNSAFE)?;
@@ -236,8 +251,8 @@ pub(crate) fn prepare<'held, 'lock>(
             &candidate,
             link.identity(),
         )?;
-        transition(&mut retained, &change)?;
-        checkpoint(&retained, Some(&link))?;
+        transition(&mut retained, config, &change)?;
+        checkpoint(&retained, config, Some(&link))?;
         retained
             .destination
             .selection_parent()
@@ -245,7 +260,7 @@ pub(crate) fn prepare<'held, 'lock>(
             .map_err(|_| "selection candidate sync failed")?;
         #[cfg(test)]
         hooks.at(Point::LinkSynced)?;
-        checkpoint(&retained, Some(&link))?;
+        checkpoint(&retained, config, Some(&link))?;
         let (device, inode) = link.identity();
         retained.intent.destination = LinkClaim {
             manifest: destination_digest,
@@ -257,7 +272,7 @@ pub(crate) fn prepare<'held, 'lock>(
         let before = BeforeChange::capture(retained.destination.selection_parent(), JOURNAL)?;
         #[cfg(test)]
         hooks.at(Point::BeforeJournal)?;
-        checkpoint(&retained, Some(&link))?;
+        checkpoint(&retained, config, Some(&link))?;
         residues.push(PENDING_JOURNAL.into());
         let fd = unsafe {
             libc::openat(
@@ -285,15 +300,15 @@ pub(crate) fn prepare<'held, 'lock>(
             JOURNAL,
             (metadata.dev() as i32, metadata.ino()),
         )?;
-        transition(&mut retained, &change)?;
-        checkpoint(&retained, Some(&link))?;
+        transition(&mut retained, config, &change)?;
+        checkpoint(&retained, config, Some(&link))?;
         journal::check_writer(&writer, retained.destination.selection_parent(), 0o600, b"")?;
         writer
             .write_all(&bytes)
             .map_err(|_| "selection journal write failed")?;
         #[cfg(test)]
         hooks.at(Point::JournalWritten)?;
-        checkpoint(&retained, Some(&link))?;
+        checkpoint(&retained, config, Some(&link))?;
         journal::check_writer(
             &writer,
             retained.destination.selection_parent(),
@@ -311,7 +326,7 @@ pub(crate) fn prepare<'held, 'lock>(
             0o400,
             &bytes,
         )?;
-        checkpoint(&retained, Some(&link))?;
+        checkpoint(&retained, config, Some(&link))?;
         writer
             .sync_all()
             .map_err(|_| "selection journal sync failed")?;
@@ -319,12 +334,13 @@ pub(crate) fn prepare<'held, 'lock>(
         #[cfg(test)]
         hooks.at(Point::JournalSynced)?;
         let mut value = Prepared {
+            config,
             retained,
             link,
             journal,
         };
         value.custody()?;
-        checkpoint(&value.retained, Some(&value.link))?;
+        checkpoint(&value.retained, value.config, Some(&value.link))?;
         value
             .retained
             .destination
@@ -344,7 +360,7 @@ pub(crate) fn prepare<'held, 'lock>(
         #[cfg(test)]
         hooks.at(Point::Complete)?;
         value.custody()?;
-        checkpoint(&value.retained, Some(&value.link))?;
+        checkpoint(&value.retained, value.config, Some(&value.link))?;
         Ok(PreparedSelection { inner: value })
     })();
     result.map_err(|reason| PreparationFailure { reason, residues })

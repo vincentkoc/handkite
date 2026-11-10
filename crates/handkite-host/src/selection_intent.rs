@@ -1,6 +1,7 @@
 //! Bounded intent syntax, durable preparation, and present-state reconciliation.
 
 use crate::current_selection::{encode_target, parse_target};
+use crate::install_config::RetainedConfig;
 use crate::install_plan::{ManifestDigest, Operation};
 use crate::installer_lock::InstallerLock;
 use crate::release_stage::PublishedRelease;
@@ -235,14 +236,17 @@ impl PreparationFailure {
     }
 }
 
-/// Retains the original lock, releases, current snapshot, candidate link and journal.
+/// Retains the original config, lock, releases, current snapshot, link and journal.
 /// Dropping it preserves every file. It cannot select a release or activate a job.
 pub struct PreparedSelection<'held, 'lock> {
     #[cfg(target_os = "macos")]
     inner: macos::preparation::Prepared<'held, 'lock>,
     #[cfg(not(target_os = "macos"))]
-    _unsupported:
-        std::marker::PhantomData<(&'held mut PublishedRelease<'lock>, &'lock InstallerLock)>,
+    _unsupported: std::marker::PhantomData<(
+        &'held mut RetainedConfig<'lock>,
+        &'held mut PublishedRelease<'lock>,
+        &'lock InstallerLock,
+    )>,
 }
 
 impl PreparedSelection<'_, '_> {
@@ -262,9 +266,12 @@ impl PreparedSelection<'_, '_> {
 
 /// Create one unique sibling link and one exclusive fixed canonical intent journal.
 /// Current must match the real previous release, or be absent for initial install.
+/// Config and release handles must retain this exact lock. Config agreement is
+/// not a device observation or authority to select or activate a release.
 /// All errors preserve residues, with no retry, rollback, adoption, or cleanup.
 pub fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
+    config: &'held mut RetainedConfig<'lock>,
     operation: Operation,
     previous: Option<&'held mut PublishedRelease<'lock>>,
     destination: &'held mut PublishedRelease<'lock>,
@@ -273,6 +280,7 @@ pub fn prepare<'held, 'lock>(
     {
         macos::preparation::prepare(
             owner,
+            config,
             operation,
             previous,
             destination,
@@ -282,7 +290,7 @@ pub fn prepare<'held, 'lock>(
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (owner, operation, previous, destination);
+        let _ = (owner, config, operation, previous, destination);
         Err(PreparationFailure {
             reason: "selection preparation requires macOS",
             residues: Vec::new(),
