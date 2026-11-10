@@ -191,6 +191,9 @@ Use `handkite_observe` only when the agent needs private screen content. A navig
 
 Production USB discovery and transport use the Mac's fixed `/var/run/usbmuxd`
 socket. `USBMUXD_SOCKET_ADDRESS` cannot select a TCP bridge or alternate socket.
+Discovery accepts exactly one USB entry with the configured UDID and retains its
+actual UDID and mux device ID. The provider keeps the pinned upstream discovery
+and connection transport, including its existing private tracing boundary.
 Native lock queries invoke `/usr/bin/xcrun` by absolute path, so `PATH` cannot
 replace that executable. The selected Apple developer tools and their environment
 remain external inputs; this path pin does not qualify them.
