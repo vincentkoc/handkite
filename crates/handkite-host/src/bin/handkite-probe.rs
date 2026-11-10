@@ -71,6 +71,13 @@ fn main() {
         }
         return;
     }
+    if args.first().is_some_and(|arg| arg == "touch-trial-idle") {
+        if let Err(error) = touch_trial::idle_command(&args[1..]) {
+            eprintln!("touch_trial_idle={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let expected = match std::env::var("HANDKITE_DEVICE_UDID")
         .ok()
         .and_then(|value| HardwareId::new(value).ok())

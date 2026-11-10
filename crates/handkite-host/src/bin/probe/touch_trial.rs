@@ -3,6 +3,10 @@ use handkite_core::protocol::{Action, HardwareId, LockState, Point};
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_action::WdaActions;
 use handkite_host::wda_adapter::WdaAdapter;
+use handkite_host::wda_http::HttpResponse;
+use handkite_host::wda_settings::{
+    IdleAction, IdleSettingsOutcome, Restoration, with_temporary_idle_settings,
+};
 use handkite_host::wda_transport::UsbWda;
 use handkite_host::{host_config, native_lock};
 use quick_xml::events::Event;
@@ -80,6 +84,15 @@ impl Transport {
 }
 
 pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
+    let (expected, transport) = options(args)?;
+    let mut live =
+        Live::new(expected.clone()).map_err(|reason| TrialError::Refused(reason).message())?;
+    run(&mut live, &expected, transport).map_err(TrialError::message)?;
+    println!("touch_trial=confirmed transport={}", transport.name());
+    Ok(())
+}
+
+fn options(args: &[String]) -> Result<(HardwareId, Transport), &'static str> {
     let [config_flag, config, transport_flag, transport] = args else {
         return Err("invalid_arguments");
     };
@@ -92,11 +105,66 @@ pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
         _ => return Err("invalid_arguments"),
     };
     let binding = host_config::load(Path::new(config)).map_err(|_| "configuration_invalid")?;
-    let mut live = Live::new(binding.usb_id.clone())
-        .map_err(|reason| TrialError::Refused(reason).message())?;
-    run(&mut live, &binding.usb_id, transport).map_err(TrialError::message)?;
-    println!("touch_trial=confirmed transport={}", transport.name());
+    Ok((binding.usb_id, transport))
+}
+
+pub(super) fn idle_command(args: &[String]) -> Result<(), &'static str> {
+    let (expected, transport) = options(args)?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|_| "refused reason=settings_unproven")?;
+    runtime.block_on(async {
+        let usb = PinnedUsb::new(expected.clone());
+        usb.provider()
+            .await
+            .map_err(|_| "refused reason=identity_unproven")?;
+        let wda = UsbWda::new(usb);
+        let response = wda
+            .request("GET", "/status", b"", Duration::from_secs(10))
+            .await
+            .map_err(|_| "refused reason=session_unproven")?;
+        let session =
+            session_from_response(response).map_err(|_| "refused reason=session_unproven")?;
+        let worker_session = session.clone();
+        let outcome = with_temporary_idle_settings(&wda, &session, || async move {
+            blocking_trial(move || {
+                // Both runtimes are constructed and dropped on the blocking thread.
+                let mut live = Live::new(expected.clone()).map_err(TrialError::Refused)?;
+                let mut bound = SessionBound {
+                    device: &mut live,
+                    session: &worker_session,
+                };
+                run(&mut bound, &expected, transport)
+            })
+            .await
+        })
+        .await;
+        idle_result(outcome)
+    })?;
+    println!("touch_trial_idle=confirmed transport={}", transport.name());
     Ok(())
+}
+
+async fn blocking_trial(
+    work: impl FnOnce() -> Result<(), TrialError> + Send + 'static,
+) -> Result<(), TrialError> {
+    // Always join before the transaction restores settings; never detach or retry.
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|_| TrialError::Unknown)?
+}
+
+fn idle_result(outcome: IdleSettingsOutcome<(), TrialError>) -> Result<(), &'static str> {
+    match (outcome.action, outcome.restoration) {
+        (IdleAction::Completed(result), Restoration::Verified) => {
+            result.map_err(TrialError::message)
+        }
+        (IdleAction::NotRun(_), Restoration::NotNeeded | Restoration::Verified) => {
+            Err("refused reason=settings_unproven")
+        }
+        _ => Err("unknown"),
+    }
 }
 
 struct Snapshot {
@@ -110,6 +178,29 @@ trait TrialDevice {
     fn capture(&mut self) -> Result<Snapshot, RefusalReason>;
     fn now_ms(&self) -> Result<u64, ()>;
     fn tap(&mut self, transport: Transport, at: Point, fresh_until: Instant) -> Result<(), ()>;
+}
+
+struct SessionBound<'a, D> {
+    device: &'a mut D,
+    session: &'a str,
+}
+
+impl<D: TrialDevice> TrialDevice for SessionBound<'_, D> {
+    fn capture(&mut self) -> Result<Snapshot, RefusalReason> {
+        let snapshot = self.device.capture()?;
+        if snapshot.session != self.session {
+            return Err(RefusalReason::SessionUnproven);
+        }
+        Ok(snapshot)
+    }
+
+    fn now_ms(&self) -> Result<u64, ()> {
+        self.device.now_ms()
+    }
+
+    fn tap(&mut self, transport: Transport, at: Point, fresh_until: Instant) -> Result<(), ()> {
+        self.device.tap(transport, at, fresh_until)
+    }
 }
 
 fn run(
@@ -551,20 +642,24 @@ impl Live {
                     .request("GET", "/status", b"", Duration::from_secs(10)),
             )
             .map_err(|_| RefusalReason::SessionUnproven)?;
-        let json: serde_json::Value =
-            serde_json::from_slice(&response.body).map_err(|_| RefusalReason::SessionUnproven)?;
-        let session = json["sessionId"]
-            .as_str()
-            .filter(|id| valid_session(id))
-            .ok_or(RefusalReason::SessionUnproven)?;
-        if response.status != 200
-            || json["value"]["ready"] != true
-            || json["value"].get("error").is_some()
-        {
-            return Err(RefusalReason::SessionUnproven);
-        }
-        Ok(session.to_owned())
+        session_from_response(response)
     }
+}
+
+fn session_from_response(response: HttpResponse) -> Result<String, RefusalReason> {
+    let json: serde_json::Value =
+        serde_json::from_slice(&response.body).map_err(|_| RefusalReason::SessionUnproven)?;
+    let session = json["sessionId"]
+        .as_str()
+        .filter(|id| valid_session(id))
+        .ok_or(RefusalReason::SessionUnproven)?;
+    if response.status != 200
+        || json["value"]["ready"] != true
+        || json["value"].get("error").is_some()
+    {
+        return Err(RefusalReason::SessionUnproven);
+    }
+    Ok(session.to_owned())
 }
 
 fn valid_session(id: &str) -> bool {
@@ -791,6 +886,135 @@ mod tests {
             self.taps.push((transport, at, fresh_until));
             self.receipt
         }
+    }
+
+    fn run_bound(
+        fixture: &mut Fixture,
+        transport: Transport,
+        session: &str,
+    ) -> Result<(), TrialError> {
+        let mut bound = SessionBound {
+            device: fixture,
+            session,
+        };
+        run(
+            &mut bound,
+            &HardwareId::new("fixture-device").unwrap(),
+            transport,
+        )
+    }
+
+    #[test]
+    fn idle_trial_binds_both_pre_captures_to_the_settings_session() {
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            // Both Clock captures agree with each other but not the transaction.
+            let mut wrong = Fixture::new();
+            assert_eq!(
+                run_bound(&mut wrong, transport, "different-valid-session"),
+                Err(TrialError::Refused(RefusalReason::SessionUnproven))
+            );
+            assert!(wrong.taps.is_empty());
+            assert_eq!(wrong.captures.len(), 2);
+
+            let mut drift = Fixture::new();
+            drift.captures[1].as_mut().unwrap().session = "replacement-session".into();
+            assert_eq!(
+                run_bound(&mut drift, transport, "fixture-session"),
+                Err(TrialError::Refused(RefusalReason::SessionUnproven))
+            );
+            assert!(drift.taps.is_empty());
+            assert_eq!(drift.captures.len(), 1);
+        }
+    }
+
+    #[test]
+    fn idle_trial_post_session_mismatch_is_unknown_without_replay() {
+        for transport in [Transport::W3c, Transport::Coordinate] {
+            for changed in [false, true] {
+                let mut fixture = Fixture::new();
+                if changed {
+                    fixture.captures[2].as_mut().unwrap().session = "replacement-session".into();
+                }
+                assert_eq!(
+                    run_bound(&mut fixture, transport, "fixture-session"),
+                    if changed {
+                        Err(TrialError::Unknown)
+                    } else {
+                        Ok(())
+                    }
+                );
+                assert_eq!(fixture.taps.len(), 1);
+                assert!(fixture.captures.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn idle_bridge_requires_verified_restore_and_preserves_fixed_outcomes() {
+        use handkite_host::wda_settings::SettingsError;
+        for restoration in [
+            Restoration::NotNeeded,
+            Restoration::Verified,
+            Restoration::Unproven(SettingsError::WriteUnproven),
+        ] {
+            for result in [
+                Ok(()),
+                Err(TrialError::Unknown),
+                Err(TrialError::Refused(RefusalReason::SessionUnproven)),
+            ] {
+                let expected = if restoration == Restoration::Verified {
+                    result.map_err(TrialError::message)
+                } else {
+                    Err("unknown")
+                };
+                assert_eq!(
+                    idle_result(IdleSettingsOutcome {
+                        action: IdleAction::Completed(result),
+                        restoration,
+                    }),
+                    expected
+                );
+            }
+            assert_eq!(
+                idle_result(IdleSettingsOutcome {
+                    action: IdleAction::NotRun(SettingsError::SessionUnproven),
+                    restoration,
+                }),
+                if matches!(restoration, Restoration::Unproven(_)) {
+                    Err("unknown")
+                } else {
+                    Err("refused reason=settings_unproven")
+                }
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_bridge_awaits_worker_runtime_and_maps_join_panic_to_unknown() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let worker_calls = calls.clone();
+        assert_eq!(
+            blocking_trial(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap();
+                runtime.block_on(async {
+                    worker_calls.fetch_add(1, Ordering::SeqCst);
+                });
+                Ok(())
+            })
+            .await,
+            Ok(())
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            blocking_trial(|| panic!("fixture worker panic")).await,
+            Err(TrialError::Unknown)
+        );
     }
 
     #[test]
@@ -1270,10 +1494,9 @@ mod tests {
             vec!["--config", "missing", "--transport", "fallback"],
             vec!["--config", "missing", "--transport", "w3c", "extra"],
         ] {
-            assert_eq!(
-                command(&args.into_iter().map(str::to_owned).collect::<Vec<_>>()),
-                Err("invalid_arguments")
-            );
+            let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            assert_eq!(command(&args), Err("invalid_arguments"));
+            assert_eq!(idle_command(&args), Err("invalid_arguments"));
         }
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("config.json");
@@ -1284,6 +1507,15 @@ mod tests {
         .unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            idle_command(&[
+                "--config".into(),
+                config.to_str().unwrap().into(),
+                "--transport".into(),
+                "w3c".into()
+            ]),
+            Err("configuration_invalid")
+        );
         assert_eq!(
             command(&[
                 "--config".into(),

@@ -1,4 +1,4 @@
-//! Explicit session-scoped idle settings restoration; not connected to device actions.
+//! Explicit session-scoped idle settings observation and restoration.
 
 use crate::wda_action::WdaRequest;
 use crate::wda_transport::UsbWda;
@@ -86,7 +86,7 @@ async fn read_active(wda: &impl WdaRequest) -> Result<IdleTimeouts, SettingsErro
 /// The caller must provide exclusive session ownership and await completion:
 /// dropping this future cannot perform asynchronous restoration. Readback checks
 /// detect observed conflicts, but WDA offers no atomic compare-and-set or lease.
-/// This helper creates no session and is not used by the probe or PIN backend.
+/// This helper creates no session and is not used by the PIN backend.
 pub async fn with_temporary_idle_settings<T, E, F, Fut>(
     wda: &UsbWda,
     session: &str,

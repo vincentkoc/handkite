@@ -136,6 +136,19 @@ WDA session through the private USB pin. It prints only finite nonnegative
 `waitForIdleTimeout` and `animationCoolOffTimeout` values, or a fixed refusal.
 It sends no POST, creates no session, and performs no phone input.
 
+## Clock trial with temporary idle settings
+
+`handkite-probe touch-trial-idle --config PRIVATE_FILE --transport w3c`
+(or `coordinate`) explicitly brackets the guarded Clock trial below with
+temporary idle settings `1.0` and `0.2`, then restores the exact original values.
+It requires externally proven exclusive WDA ownership for the entire invocation;
+the command does not acquire a lease. Do not cancel the bracket while it runs.
+Both pre-input Clock captures must match the settings transaction's session.
+Confirmation requires both the Clock transition and verified settings restoration;
+an unproven restoration or worker join reports unknown. There is no retry or
+fallback. This command is offline-tested only; live use is not yet qualified.
+The default `touch-trial` command does not change idle settings.
+
 ## One-shot Clock touch diagnostic
 
 An explicitly supervised trial can run
