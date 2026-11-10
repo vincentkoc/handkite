@@ -32,5 +32,6 @@ pub mod usb;
 pub mod wda_action;
 pub mod wda_adapter;
 pub mod wda_http;
+pub mod wda_settings;
 pub mod wda_transport;
 pub mod wire;
