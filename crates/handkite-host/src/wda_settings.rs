@@ -5,11 +5,78 @@ use crate::wda_transport::UsbWda;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, value::RawValue};
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const TEMPORARY: &[u8] =
     br#"{"settings":{"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.2}}"#;
 const DEADLINE: Duration = Duration::from_secs(10);
+const RECOVERY_BUDGET: Duration = Duration::from_secs(5);
+const KNOWN_ORIGINAL: &str = r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":2}"#;
+const RESTORE_KNOWN: &[u8] =
+    br#"{"settings":{"waitForIdleTimeout":10,"animationCoolOffTimeout":2}}"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KnownIdleRecovery {
+    Restored,
+    AlreadyRestored,
+    Refused,
+    Unknown,
+}
+
+/// One explicit recovery for the known 10/2 preimage. Requires exclusive ownership.
+/// Only the stranded temporary pair is writable; no retries or device input.
+pub async fn restore_known_idle(wda: &UsbWda) -> KnownIdleRecovery {
+    let fresh_until = Instant::now() + RECOVERY_BUDGET;
+    recover_known(
+        wda,
+        &wda.with_write_deadline(fresh_until),
+        fresh_until,
+        Instant::now,
+    )
+    .await
+}
+
+async fn recover_known(
+    reader: &impl WdaRequest,
+    writer: &impl WdaRequest,
+    fresh_until: Instant,
+    now: impl Fn() -> Instant,
+) -> KnownIdleRecovery {
+    let preflight = async {
+        let session = active_session(reader).await?;
+        let first = read(reader, &session).await?;
+        validate_session(reader, &session).await?;
+        let second = read(reader, &session).await?;
+        validate_session(reader, &session).await?;
+        if !first.same(&second) || now() >= fresh_until {
+            return Err(SettingsError::VerificationFailed);
+        }
+        Ok((session, second))
+    }
+    .await;
+    let Ok((session, current)) = preflight else {
+        return KnownIdleRecovery::Refused;
+    };
+    let original: Settings = serde_json::from_str(KNOWN_ORIGINAL).expect("constant settings");
+    if current.same(&original) {
+        return KnownIdleRecovery::AlreadyRestored;
+    }
+    if !current.is_temporary() {
+        return KnownIdleRecovery::Refused;
+    }
+    let receipt = write(writer, &session, RESTORE_KNOWN).await;
+    // Both checks are attempted even after an uncertain receipt or failed readback.
+    let readback = read(reader, &session).await;
+    let same_session = validate_session(reader, &session).await;
+    if receipt.is_ok()
+        && same_session.is_ok()
+        && readback.is_ok_and(|settings| settings.same(&original))
+    {
+        KnownIdleRecovery::Restored
+    } else {
+        KnownIdleRecovery::Unknown
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SettingsError {
@@ -60,6 +127,13 @@ pub async fn read_active_idle_settings(wda: &UsbWda) -> Result<IdleTimeouts, Set
 }
 
 async fn read_active(wda: &impl WdaRequest) -> Result<IdleTimeouts, SettingsError> {
+    let session = active_session(wda).await?;
+    let settings = read(wda, &session).await?;
+    validate_session(wda, &session).await?;
+    Ok(IdleTimeouts(settings))
+}
+
+async fn active_session(wda: &impl WdaRequest) -> Result<String, SettingsError> {
     let status = wda
         .request("GET", "/status", b"", DEADLINE)
         .await
@@ -74,9 +148,7 @@ async fn read_active(wda: &impl WdaRequest) -> Result<IdleTimeouts, SettingsErro
     }
     let session = status.session_id.ok_or(SettingsError::SessionUnproven)?;
     validate_session(wda, &session).await?;
-    let settings = read(wda, &session).await?;
-    validate_session(wda, &session).await?;
-    Ok(IdleTimeouts(settings))
+    Ok(session)
 }
 
 /// Run one action only after the temporary settings are acknowledged and verified.
@@ -118,7 +190,7 @@ where
         }
     };
     let receipt = write(wda, session, TEMPORARY).await;
-    let verified = verify(wda, session, &Settings::temporary()).await;
+    let verified = verify_temporary(wda, session).await;
     let action = match receipt.and(verified) {
         Ok(()) => IdleAction::Completed(action().await),
         Err(reason) => IdleAction::NotRun(reason),
@@ -171,6 +243,16 @@ async fn verify(
     let current = read(wda, session).await?;
     validate_session(wda, session).await?;
     if current.same(expected) {
+        Ok(())
+    } else {
+        Err(SettingsError::VerificationFailed)
+    }
+}
+
+async fn verify_temporary(wda: &impl WdaRequest, session: &str) -> Result<(), SettingsError> {
+    let current = read(wda, session).await?;
+    validate_session(wda, session).await?;
+    if current.is_temporary() {
         Ok(())
     } else {
         Err(SettingsError::VerificationFailed)
@@ -306,12 +388,25 @@ impl Settings {
         same_number(&self.idle, &other.idle) && same_number(&self.animation, &other.animation)
     }
 
+    fn is_temporary(&self) -> bool {
+        same_number(&self.idle, &Self::temporary().idle)
+            && temporary_animation(self.animation.get())
+    }
+
     fn is_owned_transition(&self, original: &Self) -> bool {
         let temporary = Self::temporary();
         (same_number(&self.idle, &original.idle) || same_number(&self.idle, &temporary.idle))
             && (same_number(&self.animation, &original.animation)
-                || same_number(&self.animation, &temporary.animation))
+                || temporary_animation(self.animation.get()))
     }
+}
+
+// Only this known temporary value admits WDA's alternate f64 serialization.
+// Original settings and all other numbers retain exact decimal comparisons.
+fn temporary_animation(raw: &str) -> bool {
+    matches!(number(raw), Ok((digits, exponent))
+        if (digits == "2" && exponent == -1)
+            || (digits == "20000000000000001" && exponent == -17))
 }
 
 fn same_number(left: &RawValue, right: &RawValue) -> bool {
@@ -496,6 +591,155 @@ mod tests {
         let mut steps = vec![session().remove(0)];
         steps.extend(session());
         steps
+    }
+
+    const ROUNDTRIP: &str =
+        r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":0.20000000000000001}"#;
+
+    #[tokio::test]
+    async fn temporary_roundtrip_verifies_and_restores_without_relaxing_originals() {
+        let mut steps = preflight(ORIGINAL);
+        steps.extend([post(TARGET), settings(ROUNDTRIP)]);
+        steps.extend(session());
+        steps.extend(restoration(ORIGINAL, ROUNDTRIP));
+        let fake = Fake::new(steps);
+        let (result, calls) = invoke(&fake, false).await;
+        assert_eq!(result.action, IdleAction::Completed(Ok(7)));
+        assert_eq!(result.restoration, Restoration::Verified);
+        assert_eq!(calls, 1);
+        fake.done(2);
+
+        let mut steps = vec![settings(ROUNDTRIP)];
+        steps.extend(session());
+        let fake = Fake::new(steps);
+        assert_eq!(
+            verify(&fake, SESSION, &Settings::temporary()).await,
+            Err(SettingsError::VerificationFailed)
+        );
+        fake.done(0);
+        for raw in [
+            "0.19999999999999999",
+            "0.20000000000000002",
+            "0.2000000000000000101",
+            "2",
+        ] {
+            assert!(!temporary_animation(raw));
+        }
+    }
+
+    fn recovery_preflight(first: &str, second: &str) -> Vec<Step> {
+        let mut steps = read_only_preflight();
+        steps.push(settings(first));
+        steps.extend(session());
+        steps.push(settings(second));
+        steps.extend(session());
+        steps
+    }
+
+    async fn recover(fake: &Fake) -> KnownIdleRecovery {
+        let now = Instant::now();
+        recover_known(fake, fake, now + RECOVERY_BUDGET, || now).await
+    }
+
+    #[tokio::test]
+    async fn known_recovery_posts_exact_body_once_or_leaves_exact_original_alone() {
+        for temporary in [TARGET, ROUNDTRIP] {
+            let mut steps = recovery_preflight(temporary, temporary);
+            steps.extend([post(ORIGINAL), settings(ORIGINAL)]);
+            steps.extend(session());
+            let fake = Fake::new(steps);
+            assert_eq!(recover(&fake).await, KnownIdleRecovery::Restored);
+            fake.done(1);
+        }
+        let fake = Fake::new(recovery_preflight(ORIGINAL, ORIGINAL));
+        assert_eq!(recover(&fake).await, KnownIdleRecovery::AlreadyRestored);
+        fake.done(0);
+    }
+
+    #[tokio::test]
+    async fn known_recovery_refuses_foreign_changed_stale_or_invalid_values_without_post() {
+        for values in [
+            r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":2}"#,
+            r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":0.2}"#,
+            r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":0.20000000000000002}"#,
+            r#"{"waitForIdleTimeout":1.00000000000000001,"animationCoolOffTimeout":0.2}"#,
+        ] {
+            let fake = Fake::new(recovery_preflight(values, values));
+            assert_eq!(recover(&fake).await, KnownIdleRecovery::Refused);
+            fake.done(0);
+        }
+        let fake = Fake::new(recovery_preflight(TARGET, ROUNDTRIP));
+        assert_eq!(recover(&fake).await, KnownIdleRecovery::Refused);
+        fake.done(0);
+        for invalid in [
+            "{",
+            "null",
+            r#"{"waitForIdleTimeout":1,"waitForIdleTimeout":1,"animationCoolOffTimeout":0.2}"#,
+            r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":"0.2"}"#,
+        ] {
+            let mut steps = read_only_preflight();
+            steps.push(settings(invalid));
+            let fake = Fake::new(steps);
+            assert_eq!(recover(&fake).await, KnownIdleRecovery::Refused);
+            fake.done(0);
+        }
+        for late in [Duration::ZERO, Duration::from_nanos(1)] {
+            let fake = Fake::new(recovery_preflight(TARGET, TARGET));
+            let expires = Instant::now();
+            assert_eq!(
+                recover_known(&fake, &fake, expires, || expires + late).await,
+                KnownIdleRecovery::Refused
+            );
+            fake.done(0);
+        }
+    }
+
+    #[tokio::test]
+    async fn known_recovery_always_checks_readback_and_session_after_uncertain_receipt() {
+        for receipt_error in [false, true] {
+            for read_error in [false, true] {
+                let mut steps = recovery_preflight(ROUNDTRIP, ROUNDTRIP);
+                let mut receipt = post(ORIGINAL);
+                receipt.response = if receipt_error {
+                    Err(WdaError::AfterSent)
+                } else {
+                    Ok(HttpResponse {
+                        status: 503,
+                        body: b"fixture rejection".to_vec(),
+                    })
+                };
+                let mut readback = settings(ORIGINAL);
+                if read_error {
+                    readback.response = Err(WdaError::NotConnected);
+                }
+                steps.extend([receipt, readback]);
+                steps.extend(session());
+                let fake = Fake::new(steps);
+                assert_eq!(recover(&fake).await, KnownIdleRecovery::Unknown);
+                fake.done(1);
+            }
+        }
+        let mut steps = recovery_preflight(TARGET, TARGET);
+        steps.extend([post(ORIGINAL), settings(TARGET)]);
+        steps.extend(session());
+        let fake = Fake::new(steps);
+        assert_eq!(recover(&fake).await, KnownIdleRecovery::Unknown);
+        fake.done(1);
+    }
+
+    #[tokio::test]
+    async fn known_recovery_session_drift_refuses_before_post_and_is_unknown_after() {
+        let mut before = read_only_preflight();
+        before.extend([settings(TARGET), changed_session()]);
+        let fake = Fake::new(before);
+        assert_eq!(recover(&fake).await, KnownIdleRecovery::Refused);
+        fake.done(0);
+
+        let mut after = recovery_preflight(TARGET, TARGET);
+        after.extend([post(ORIGINAL), settings(ORIGINAL), changed_session()]);
+        let fake = Fake::new(after);
+        assert_eq!(recover(&fake).await, KnownIdleRecovery::Unknown);
+        fake.done(1);
     }
 
     #[tokio::test]

@@ -29,6 +29,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "restore-known-idle") {
+        if let Err(error) = idle_settings::restore_command(&args[1..]) {
+            eprintln!("restore_known_idle={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "idle-settings") {
         if let Err(error) = idle_settings::command(&args[1..]) {
             eprintln!("idle_settings={error}");

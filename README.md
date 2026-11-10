@@ -136,6 +136,14 @@ WDA session through the private USB pin. It prints only finite nonnegative
 `waitForIdleTimeout` and `animationCoolOffTimeout` values, or a fixed refusal.
 It sends no POST, creates no session, and performs no phone input.
 
+`handkite-probe restore-known-idle --config PRIVATE_FILE` is an explicit one-shot
+recovery for the known original settings `10` and `2`. Under externally proven
+exclusive WDA ownership, it requires two fresh, agreeing reads of stranded
+`1` and `0.2` (including `0.20000000000000001`) before one fixed restoration POST.
+Already restored `10`/`2` sends no POST; other values refuse. Readback and session
+checks run even after an uncertain receipt, which remains unknown. It never
+retries or sends phone input. Live recovery remains unqualified by offline tests.
+
 ## Clock trial with temporary idle settings
 
 `handkite-probe touch-trial-idle --config PRIVATE_FILE --transport w3c`
