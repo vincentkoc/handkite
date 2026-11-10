@@ -103,6 +103,12 @@ SIGKILL. These are offline-tested shutdown paths, not proof of a live device exi
 
 Run `handkited --check --config /path/to/config.json` for a read-only preflight. It prints the same bounded JSON health flags and native lock state as `handkite-doctor`, with no USB identifier or screen contents. Exit codes are 0 for observation readiness, 1 for failed readiness, and 2 for invalid arguments, configuration, or reporting errors. The check does not bind or remove a socket, start WDA, create a WDA session, or send input. This is a candidate-only readiness check, not signed-install or independent WDA startup proof.
 
+`handkited --check-service-layout` checks the effective account's fixed directory
+layout and protected host config, including a configured runner ID. Success
+prints only `service_layout=ready`. It does not check that the runner is
+installed, inspect the phone, acquire the process lock, bind a socket, or start
+WDA. This is the read-only preflight for preparing the owned service layout.
+
 The `--check` diagnostic retains its explicit arbitrary-file config route and
 existing file/parser checks. Its success does not establish that the fixed
 service configuration satisfies the protected startup checks.
