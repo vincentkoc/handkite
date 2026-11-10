@@ -1,3 +1,4 @@
+use handkite_core::protocol::DeviceBinding;
 use handkite_host::{
     device_agreement::{
         DeviceAgreement, LockdownQueryFailure, ObservationFailure, PlistDecodeFailure,
@@ -7,8 +8,13 @@ use handkite_host::{
     service_layout::ServiceLayout,
 };
 use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{self, Write};
+use std::os::fd::AsFd;
 use std::process::ExitCode;
+
+#[path = "device_agreement/input.rs"]
+mod input;
 
 #[derive(Debug, PartialEq, Eq)]
 enum Outcome {
@@ -19,6 +25,7 @@ enum Outcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FailureStage {
     Arguments,
+    Input,
     Layout,
     ConfigLoad,
     Lock,
@@ -30,6 +37,7 @@ impl FailureStage {
     fn label(self) -> &'static str {
         match self {
             Self::Arguments => "arguments",
+            Self::Input => "pinned_input",
             Self::Layout => "service_layout",
             Self::ConfigLoad => "config_load",
             Self::Lock => "installer_lock",
@@ -40,28 +48,48 @@ impl FailureStage {
 }
 
 fn main() -> ExitCode {
-    let outcome = run(std::env::args_os().skip(1), observe_service);
+    let outcome = run(std::env::args_os().skip(1), read_pin, observe_service);
     ExitCode::from(report(outcome, &mut io::stdout().lock()))
 }
 
 fn run(
     mut args: impl Iterator<Item = OsString>,
-    observe: impl FnOnce() -> Result<(), FailureStage>,
+    read_pin: impl FnOnce() -> Option<DeviceBinding>,
+    observe: impl FnOnce(Option<DeviceBinding>) -> Result<(), FailureStage>,
 ) -> Outcome {
-    if args.next().as_deref() != Some(OsStr::new("--service")) || args.next().is_some() {
+    let mode = args.next();
+    if !matches!(mode.as_deref(), Some(value) if value == OsStr::new("--service") || value == OsStr::new("--pinned-stdin"))
+        || args.next().is_some()
+    {
         return Outcome::Reject(FailureStage::Arguments);
     }
-    match observe() {
+    let expected = if mode.as_deref() == Some(OsStr::new("--pinned-stdin")) {
+        let Some(expected) = read_pin() else {
+            return Outcome::Reject(FailureStage::Input);
+        };
+        Some(expected)
+    } else {
+        None
+    };
+    match observe(expected) {
         Ok(()) => Outcome::Pass,
         Err(stage) => Outcome::Reject(stage),
     }
 }
 
-fn observe_service() -> Result<(), FailureStage> {
+fn read_pin() -> Option<DeviceBinding> {
+    let fd = io::stdin().as_fd().try_clone_to_owned().ok()?;
+    input::read_binding(&mut File::from(fd))
+}
+
+fn observe_service(expected: Option<DeviceBinding>) -> Result<(), FailureStage> {
     let layout = ServiceLayout::current_account().map_err(|_| FailureStage::Layout)?;
-    // This binding is self-loaded, not an independently supplied installer pin.
-    // Read it before lock acquisition, which can create the fixed lock file.
-    let expected = install_config::load_protected(&layout).map_err(|_| FailureStage::ConfigLoad)?;
+    let expected = match expected {
+        Some(expected) => expected,
+        // Advisory mode self-loads before lock acquisition, which can create
+        // the fixed lock file. Pinned mode never derives its pin from config.
+        None => install_config::load_protected(&layout).map_err(|_| FailureStage::ConfigLoad)?,
+    };
     let owner = InstallerLock::acquire(&layout).map_err(|_| FailureStage::Lock)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -128,6 +156,11 @@ mod tests {
             vec![""],
             vec!["--help"],
             vec!["--service=true"],
+            vec!["--pinned-stdin=true"],
+            vec!["--pinned-stdin", "--service"],
+            vec!["--service", "--pinned-stdin"],
+            vec!["--pinned-stdin", "--pinned-stdin"],
+            vec!["--pinned-stdin", "--config", "/fixture"],
             vec!["--Service"],
             vec![" --service"],
             vec!["--service", ""],
@@ -139,7 +172,11 @@ mod tests {
             vec!["--", "--service"],
         ] {
             assert_eq!(
-                run(args(&values), || panic!("unexpected service setup")),
+                run(
+                    args(&values),
+                    || panic!("unexpected input"),
+                    |_| panic!("unexpected service setup")
+                ),
                 Outcome::Reject(FailureStage::Arguments)
             );
         }
@@ -148,19 +185,73 @@ mod tests {
             vec!["--service".into(), OsString::from_vec(vec![0xff])],
         ] {
             assert_eq!(
-                run(values.into_iter(), || panic!("unexpected service setup")),
+                run(
+                    values.into_iter(),
+                    || panic!("unexpected input"),
+                    |_| panic!("unexpected service setup")
+                ),
                 Outcome::Reject(FailureStage::Arguments)
             );
         }
     }
 
     #[test]
+    fn pinned_input_is_read_once_and_forwarded_without_self_loaded_defaults() {
+        use handkite_core::protocol::{DeviceKey, HardwareId};
+        let mut reads = 0;
+        let mut observations = 0;
+        let outcome = run(
+            args(&["--pinned-stdin"]),
+            || {
+                reads += 1;
+                Some(DeviceBinding {
+                    key: DeviceKey::new("Pinned_Phone").unwrap(),
+                    usb_id: HardwareId::new("TEST-device").unwrap(),
+                })
+            },
+            |expected| {
+                observations += 1;
+                let expected = expected.unwrap();
+                assert_eq!(expected.key.as_str(), "Pinned_Phone");
+                assert_eq!(expected.usb_id.as_str(), "TEST-device");
+                Ok(())
+            },
+        );
+        assert_eq!((reads, observations), (1, 1));
+        let mut output = Vec::new();
+        assert_eq!(report(outcome, &mut output), 0);
+        assert_eq!(output, b"device_agreement=pass\n");
+    }
+
+    #[test]
+    fn rejected_pinned_input_never_enters_service_setup() {
+        let mut reads = 0;
+        let outcome = run(
+            args(&["--pinned-stdin"]),
+            || {
+                reads += 1;
+                None
+            },
+            |_| panic!("unexpected service setup"),
+        );
+        assert_eq!(reads, 1);
+        let mut output = Vec::new();
+        assert_eq!(report(outcome, &mut output), 1);
+        assert_eq!(output, b"device_agreement=reject stage=pinned_input\n");
+    }
+
+    #[test]
     fn exact_service_form_calls_continuation_once() {
         let mut calls = 0;
-        let outcome = run(args(&["--service"]), || {
-            calls += 1;
-            Ok(())
-        });
+        let outcome = run(
+            args(&["--service"]),
+            || panic!("unexpected input"),
+            |expected| {
+                assert!(expected.is_none());
+                calls += 1;
+                Ok(())
+            },
+        );
         assert_eq!(calls, 1);
         let mut output = Vec::new();
         assert_eq!(report(outcome, &mut output), 0);
@@ -172,6 +263,7 @@ mod tests {
         use ObservationFailure::*;
         for (stage, label) in [
             (FailureStage::Arguments, "arguments"),
+            (FailureStage::Input, "pinned_input"),
             (FailureStage::Layout, "service_layout"),
             (FailureStage::ConfigLoad, "config_load"),
             (FailureStage::Lock, "installer_lock"),
@@ -203,10 +295,15 @@ mod tests {
             (FailureStage::Observation(Deadline), "observation_deadline"),
         ] {
             let mut calls = 0;
-            let outcome = run(args(&["--service"]), || {
-                calls += 1;
-                Err(stage)
-            });
+            let outcome = run(
+                args(&["--service"]),
+                || panic!("unexpected input"),
+                |expected| {
+                    assert!(expected.is_none());
+                    calls += 1;
+                    Err(stage)
+                },
+            );
             assert_eq!(calls, 1);
             let mut output = Vec::new();
             assert_eq!(report(outcome, &mut output), 1);
@@ -229,10 +326,15 @@ mod tests {
             let mut calls = 0;
             let failure = ObservationFailure::LockdownQuery(query);
             assert_eq!(failure.stage(), "lockdown_query");
-            let outcome = run(args(&["--service"]), || {
-                calls += 1;
-                Err(FailureStage::Observation(failure))
-            });
+            let outcome = run(
+                args(&["--service"]),
+                || panic!("unexpected input"),
+                |expected| {
+                    assert!(expected.is_none());
+                    calls += 1;
+                    Err(FailureStage::Observation(failure))
+                },
+            );
             assert_eq!(calls, 1);
             let mut output = Vec::new();
             assert_eq!(report(outcome, &mut output), 1);
@@ -321,10 +423,15 @@ mod tests {
             let query = LockdownQueryFailure::PlistDecode(cause);
             let stage = FailureStage::Observation(ObservationFailure::LockdownQuery(query));
             let mut calls = 0;
-            let outcome = run(args(&["--service"]), || {
-                calls += 1;
-                Err(stage)
-            });
+            let outcome = run(
+                args(&["--service"]),
+                || panic!("unexpected input"),
+                |expected| {
+                    assert!(expected.is_none());
+                    calls += 1;
+                    Err(stage)
+                },
+            );
             assert_eq!(calls, 1);
             let mut output = Vec::new();
             assert_eq!(report(outcome, &mut output), 1);
