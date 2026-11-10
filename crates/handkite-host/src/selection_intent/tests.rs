@@ -1,6 +1,18 @@
 use super::*;
 
 #[cfg(not(target_os = "macos"))]
+#[test]
+fn pending_reobservation_fails_closed_on_unsupported_platforms() {
+    let mut value = PendingInspection {
+        _unsupported: std::marker::PhantomData,
+    };
+    assert_eq!(
+        value.reobserve(),
+        Err("pending selection inspection requires macOS")
+    );
+}
+
+#[cfg(not(target_os = "macos"))]
 #[tokio::test]
 async fn commit_fails_closed_on_unsupported_platforms() {
     let prepared = PreparedSelection {
