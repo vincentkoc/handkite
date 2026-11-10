@@ -8,10 +8,62 @@ use serde::Deserialize;
 use serde_json::Value;
 use std::cell::Cell;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const DEADLINE: Duration = Duration::from_secs(10);
 const CREATE: &[u8] = br#"{"capabilities":{"alwaysMatch":{}}}"#;
+const CLOSE_BUDGET: Duration = Duration::from_secs(5);
+
+/// Acknowledgement is not proof that the device-side runner exited.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionClose {
+    Acknowledged,
+    Refused,
+    Unknown,
+}
+
+/// Attempt one bounded DELETE for the exact session created by this owner.
+/// A missing or drifted session refuses deletion; an uncertain DELETE is never retried.
+pub async fn close_owned_session(wda: &UsbWda, session: &str) -> SessionClose {
+    let deadline = Instant::now() + CLOSE_BUDGET;
+    let guarded = wda.with_write_deadline(deadline);
+    tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        close_session(&guarded, session),
+    )
+    .await
+    .unwrap_or(SessionClose::Unknown)
+}
+
+async fn close_session(wda: &impl WdaRequest, session: &str) -> SessionClose {
+    if wda_settings::validate_session(wda, session).await.is_err() {
+        return SessionClose::Refused;
+    }
+    let result = wda
+        .request("DELETE", &format!("/session/{session}"), b"", DEADLINE)
+        .await;
+    let Ok(response) = result else {
+        return SessionClose::Unknown;
+    };
+    if response.status != 200 {
+        return SessionClose::Unknown;
+    }
+    let Ok(value) = serde_json::from_slice::<Value>(&response.body) else {
+        return SessionClose::Unknown;
+    };
+    if value.get("value") != Some(&Value::Null)
+        || value.get("error").is_some()
+        || value
+            .get("status")
+            .is_some_and(|status| status.as_u64() != Some(0))
+        || value
+            .get("sessionId")
+            .is_some_and(|id| !id.is_null() && id.as_str() != Some(session))
+    {
+        return SessionClose::Unknown;
+    }
+    SessionClose::Acknowledged
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OwnedSessionError {
@@ -336,6 +388,10 @@ mod tests {
                 ("GET", "/session/owned-session") => {
                     Ok(response(json!({"sessionId":self.current.get(),"value":{}})))
                 }
+                ("DELETE", "/session/owned-session") => {
+                    assert!(body.is_empty());
+                    Ok(response(json!({"value":null})))
+                }
                 ("GET", "/session/owned-session/appium/settings") => Ok(response(
                     json!({"sessionId":self.current.get(),"value":self.settings.borrow().clone()}),
                 )),
@@ -348,6 +404,62 @@ mod tests {
                 }
                 _ => panic!("unexpected request {method} {path}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_session_close_sends_one_delete_after_validation() {
+        let fake = Fake::ready();
+        fake.current.set("owned-session");
+        assert_eq!(
+            close_session(&fake, "owned-session").await,
+            SessionClose::Acknowledged
+        );
+        assert_eq!(
+            *fake.requests.borrow(),
+            [
+                ("GET".into(), "/status".into()),
+                ("GET".into(), "/session/owned-session".into()),
+                ("DELETE".into(), "/session/owned-session".into()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn drift_or_bad_session_refuses_close_before_delete() {
+        for session in ["replacement", "../owned-session", ""] {
+            let fake = Fake::ready();
+            fake.current.set("owned-session");
+            assert_eq!(close_session(&fake, session).await, SessionClose::Refused);
+            assert!(
+                fake.requests
+                    .borrow()
+                    .iter()
+                    .all(|(method, _)| method != "DELETE")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn uncertain_close_receipt_is_never_retried() {
+        for reply in [
+            Err(WdaError::TimedOutAfterSent),
+            Ok(HttpResponse {
+                status: 500,
+                body: b"failure".to_vec(),
+            }),
+            Ok(response(json!({"value":{"error":"failed"}}))),
+            Ok(response(json!({"value":null,"sessionId":"replacement"}))),
+        ] {
+            let fake = Fake::ready();
+            fake.current.set("owned-session");
+            *fake.response_override.borrow_mut() = Some((3, reply));
+            assert_eq!(
+                close_session(&fake, "owned-session").await,
+                SessionClose::Unknown
+            );
+            assert_eq!(fake.requests.borrow().len(), 3);
+            assert_eq!(fake.requests.borrow()[2].0, "DELETE");
         }
     }
 
