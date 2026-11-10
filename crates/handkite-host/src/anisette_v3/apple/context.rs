@@ -78,7 +78,10 @@ impl AppleProvisioningContext {
             value.set_sensitive(true);
             headers.insert(name, value);
         }
-        headers.insert(CONTENT_TYPE, HeaderValue::from_static("text/x-xml-plist"));
+        headers.insert(
+            CONTENT_TYPE,
+            HeaderValue::from_static("application/x-www-form-urlencoded"),
+        );
         headers.insert(
             USER_AGENT,
             HeaderValue::from_str(self.info.user_agent()).map_err(|_| INVALID_CONTEXT)?,
@@ -128,7 +131,7 @@ mod tests {
             assert_eq!(headers["x-apple-i-client-time"], "2023-11-14T22:13:20Z");
             assert_eq!(headers["x-apple-i-timezone"], "UTC");
             assert_eq!(headers["x-apple-locale"], "en_US");
-            assert_eq!(headers[CONTENT_TYPE], "text/x-xml-plist");
+            assert_eq!(headers[CONTENT_TYPE], "application/x-www-form-urlencoded");
             assert_eq!(headers[USER_AGENT], "fixture/1");
             assert_eq!(
                 headers["x-mme-client-info"],

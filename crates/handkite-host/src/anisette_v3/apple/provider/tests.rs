@@ -89,7 +89,7 @@ async fn approved_lookup_precedes_one_use_start_and_finish() {
         let request = std::str::from_utf8(request).unwrap();
         assert!(request.starts_with(&format!("{path} HTTP/1.1\r\n")));
         assert!(request.contains("user-agent: fixture/1\r\n"));
-        assert!(request.contains("content-type: text/x-xml-plist\r\n"));
+        assert!(request.contains("content-type: application/x-www-form-urlencoded\r\n"));
         assert!(request.contains("x-mme-device-id: 07070707-0707-0707-0707-070707070707\r\n"));
         assert!(!request.contains("accept-encoding:"));
         assert!(!request.contains("cookie:"));
@@ -100,16 +100,14 @@ async fn approved_lookup_precedes_one_use_start_and_finish() {
             .unwrap()
             .contains("<com.apple.AuthKit/1 (com.apple.akd/1.0)>")
     );
-    assert!(
-        std::str::from_utf8(&requests[1])
-            .unwrap()
-            .ends_with(&*encode_start_request())
-    );
-    assert!(
-        std::str::from_utf8(&requests[2])
-            .unwrap()
-            .ends_with(&*encode_finish_request("Yg==").unwrap())
-    );
+    for (request, expected) in requests.iter().zip([
+        "",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Header</key><dict/><key>Request</key><dict/></dict></plist>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><plist version=\"1.0\"><dict><key>Header</key><dict/><key>Request</key><dict><key>cpim</key><string>Yg==</string></dict></dict></plist>",
+    ]) {
+        let (_, body) = std::str::from_utf8(request).unwrap().split_once("\r\n\r\n").unwrap();
+        assert_eq!(body, expected);
+    }
 }
 
 #[tokio::test]
