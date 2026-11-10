@@ -24,6 +24,8 @@ mod idle_settings;
 mod lock_ui_attrs;
 #[path = "probe/normal_lock_attrs.rs"]
 mod normal_lock_attrs;
+#[path = "probe/pin_field_compare.rs"]
+mod pin_field_compare;
 #[path = "probe/pin_geometry.rs"]
 mod pin_geometry;
 #[path = "probe/reveal_keypad.rs"]
@@ -33,6 +35,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "pin-field-compare") {
+        if let Err(error) = pin_field_compare::command(&args[1..]) {
+            eprintln!("pin_field_compare={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "cancel-geometry") {
         if let Err(error) = cancel_trial::geometry_command(&args[1..]) {
             eprintln!("cancel_geometry={error}");

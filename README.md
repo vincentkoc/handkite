@@ -209,6 +209,16 @@ control flow only; live touch delivery and PIN entry remain unqualified.
 
 ## PIN stop gate
 
+`handkite-probe pin-field-compare --config PRIVATE_FILE` is read-only. It compares
+the source's empty six-digit field with one direct secure-field lookup and one
+value-attribute GET, requiring the same pinned existing session, native/WDA lock,
+prior unlock, and a valid empty keypad without alerts before and after. The
+`/elements` POST only queries elements; no input or settings endpoint is used.
+It prints only source/direct counts, total six, and elapsed milliseconds bounded
+to 60,000. Duplicate elements, malformed responses, and session drift refuse.
+The sequential observations are not atomic and do not prove input delivery.
+There is no PIN credential read, stop-marker access, retry, or saved XML.
+
 `handkite-probe cancel-trial-idle --config PRIVATE_FILE --supervised-hidden-cancel`
 is a one-shot Cancel diagnostic, with no PIN or stop-marker access. Before use,
 the operator must visually confirm Cancel and six empty dots, and externally
