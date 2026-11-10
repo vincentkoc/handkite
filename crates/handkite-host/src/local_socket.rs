@@ -22,6 +22,15 @@ impl ServiceListener<'_> {
     pub fn serve<A: DeviceAdapter>(self, controller: &Controller<A>) -> io::Result<()> {
         serve(self.listener, controller)
     }
+
+    /// Stop accepting new work after the daemon observes a shutdown signal.
+    pub fn serve_until<A: DeviceAdapter>(
+        self,
+        controller: &Controller<A>,
+        should_stop: impl Fn() -> bool,
+    ) -> io::Result<()> {
+        serve_until(self.listener, controller, should_stop)
+    }
 }
 
 pub fn bind_service(owner: &ServiceLock) -> io::Result<ServiceListener<'_>> {
@@ -149,11 +158,65 @@ pub fn serve<A: DeviceAdapter>(
     Ok(())
 }
 
+pub fn serve_until<A: DeviceAdapter>(
+    listener: UnixListener,
+    controller: &Controller<A>,
+    should_stop: impl Fn() -> bool,
+) -> io::Result<()> {
+    accept_until(listener, &should_stop, |mut stream| {
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(15)))?;
+        let _ = handle_checked(&mut stream, controller, &should_stop);
+        Ok(())
+    })
+}
+
+fn accept_until(
+    listener: UnixListener,
+    should_stop: &impl Fn() -> bool,
+    mut serve_stream: impl FnMut(UnixStream) -> io::Result<()>,
+) -> io::Result<()> {
+    listener.set_nonblocking(true)?;
+    while !should_stop() {
+        match listener.accept() {
+            Ok((stream, _)) => {
+                stream.set_nonblocking(false)?;
+                if should_stop() {
+                    break;
+                }
+                serve_stream(stream)?;
+            }
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn handle<A: DeviceAdapter>(
     stream: &mut UnixStream,
     controller: &Controller<A>,
 ) -> io::Result<()> {
-    let reply = match read_request(stream) {
+    handle_checked(stream, controller, &|| false)
+}
+
+fn handle_checked<A: DeviceAdapter>(
+    stream: &mut UnixStream,
+    controller: &Controller<A>,
+    should_stop: &impl Fn() -> bool,
+) -> io::Result<()> {
+    let request = read_request(stream);
+    if should_stop() {
+        return Ok(());
+    }
+    let reply = match request {
         Ok(bytes) => match serde_json::from_slice::<Request>(&bytes) {
             Ok(request) => dispatch(controller, request),
             Err(_) => Reply::Error {
@@ -208,6 +271,46 @@ fn read_request(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::DirBuilderExt;
+
+    #[test]
+    fn idle_listener_stops_without_a_client() {
+        let directory = tempfile::tempdir().unwrap();
+        let listener = UnixListener::bind(directory.path().join("socket")).unwrap();
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stopped.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = std::time::Instant::now();
+        accept_until(
+            listener,
+            &|| stopped.load(std::sync::atomic::Ordering::Acquire),
+            |_| panic!("no client was admitted"),
+        )
+        .unwrap();
+        setter.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn stop_after_accept_discards_queued_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("socket");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let _queued = UnixStream::connect(socket).unwrap();
+        let checks = std::cell::Cell::new(0);
+        accept_until(
+            listener,
+            &|| {
+                checks.set(checks.get() + 1);
+                checks.get() == 2
+            },
+            |_| panic!("queued client must not dispatch after stop"),
+        )
+        .unwrap();
+        assert_eq!(checks.get(), 2);
+    }
 
     #[test]
     fn socket_has_private_permissions_and_refuses_a_second_owner() {
