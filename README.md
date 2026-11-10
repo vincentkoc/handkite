@@ -209,6 +209,13 @@ control flow only; live touch delivery and PIN entry remain unqualified.
 
 ## PIN stop gate
 
+`handkite-probe pin-geometry --config PRIVATE_FILE` is read-only. After pinned
+device, unchanged existing session, and native/WDA lock checks, it reports bounded
+screen/PNG dimensions and centers for keys 0-9 in permille (0-1000) of the screen.
+It requires a fresh paired capture and a unique empty six-digit keypad, including
+the known hidden-visibility schema. No screenshot, XML, field value, or identifier
+is printed or saved. PNG header/aspect checks do not classify screenshot pixels.
+
 `handkite-probe normal-lock-attrs --config PRIVATE_FILE` is a read-only aid for
 diagnosing a normal-lock-screen refusal. It reports only fixed Application and
 proud-lock categories, prohibited-element presence, and geometry validity after

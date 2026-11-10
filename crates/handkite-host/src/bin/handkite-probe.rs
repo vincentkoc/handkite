@@ -22,6 +22,8 @@ mod idle_settings;
 mod lock_ui_attrs;
 #[path = "probe/normal_lock_attrs.rs"]
 mod normal_lock_attrs;
+#[path = "probe/pin_geometry.rs"]
+mod pin_geometry;
 #[path = "probe/reveal_keypad.rs"]
 mod reveal_keypad;
 #[path = "probe/touch_trial.rs"]
@@ -29,6 +31,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "pin-geometry") {
+        if let Err(error) = pin_geometry::command(&args[1..]) {
+            eprintln!("pin_geometry={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "restore-known-idle") {
         if let Err(error) = idle_settings::restore_command(&args[1..]) {
             eprintln!("restore_known_idle={error}");
