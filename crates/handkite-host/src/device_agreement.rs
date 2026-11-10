@@ -187,7 +187,7 @@ impl<'lock> DeviceAgreement<'lock> {
 
     /// Recheck the original config and exact lock without device transport.
     /// A poisoned observation is never reusable as retained selection evidence.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg(target_os = "macos")]
     pub(crate) fn revalidate_for_owner(
         &mut self,
         owner: &InstallerLock,
