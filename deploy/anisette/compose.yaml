@@ -13,5 +13,7 @@ services:
       - type: bind
         source: ${HANDKITE_ANISETTE_DATA:?set an absolute private data directory}
         target: /data
+        bind:
+          create_host_path: false
     logging:
       driver: "none"
