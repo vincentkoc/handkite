@@ -9,6 +9,38 @@ use std::future::Future;
 
 const UNAVAILABLE: &str = "device agreement unavailable or changed";
 
+/// Closed diagnostic categories. They carry no upstream error or device data.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ObservationFailure {
+    UnsupportedPlatform,
+    ConfigBefore,
+    UsbBefore,
+    Route,
+    LockdownConnect,
+    LockdownQuery,
+    Identity,
+    UsbAfter,
+    ConfigAfter,
+    Deadline,
+}
+
+impl ObservationFailure {
+    pub fn stage(self) -> &'static str {
+        match self {
+            Self::UnsupportedPlatform => "observation_platform",
+            Self::ConfigBefore => "config_revalidate_before",
+            Self::UsbBefore => "usb_inventory_before",
+            Self::Route => "usb_route_agreement",
+            Self::LockdownConnect => "lockdown_connect",
+            Self::LockdownQuery => "lockdown_query",
+            Self::Identity => "lockdown_identity_agreement",
+            Self::UsbAfter => "usb_inventory_after",
+            Self::ConfigAfter => "config_revalidate_after",
+            Self::Deadline => "observation_deadline",
+        }
+    }
+}
+
 /// Sealed observation borrowing the exact installer lock and retained config.
 /// It exposes no identity, serializer, claim constructor, or install capability.
 pub struct DeviceAgreement<'config, 'lock> {
@@ -27,6 +59,16 @@ impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
         owner: &'lock InstallerLock,
         config: &'config mut RetainedConfig<'lock>,
     ) -> Result<Self, &'static str> {
+        Self::observe_diagnostic(owner, config)
+            .await
+            .map_err(|_| UNAVAILABLE)
+    }
+
+    /// The same single observation, exposing only a fixed failure stage.
+    pub async fn observe_diagnostic(
+        owner: &'lock InstallerLock,
+        config: &'config mut RetainedConfig<'lock>,
+    ) -> Result<Self, ObservationFailure> {
         #[cfg(target_os = "macos")]
         {
             Self::observe_with(owner, config, &mut FixedUsb).await
@@ -34,7 +76,7 @@ impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
         #[cfg(not(target_os = "macos"))]
         {
             let _ = (owner, config);
-            Err(UNAVAILABLE)
+            Err(ObservationFailure::UnsupportedPlatform)
         }
     }
 
@@ -59,7 +101,7 @@ impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
         owner: &'lock InstallerLock,
         config: &'config mut RetainedConfig<'lock>,
         transport: &mut impl Transport,
-    ) -> Result<Self, &'static str> {
+    ) -> Result<Self, ObservationFailure> {
         let deadline = tokio::time::Instant::now() + OBSERVATION_TIMEOUT;
         let route = observe_route(owner, config, transport, deadline, None).await?;
         Ok(Self {
@@ -88,7 +130,8 @@ impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
                 deadline,
                 Some(&self.route),
             )
-            .await?;
+            .await
+            .map_err(|_| UNAVAILABLE)?;
             self.poisoned = false;
             Ok(())
         }
@@ -104,7 +147,15 @@ trait Transport {
         &mut self,
         expected: &handkite_core::protocol::HardwareId,
     ) -> impl Future<Output = Result<Route, &'static str>>;
-    fn unique_id(&mut self, route: &Route) -> impl Future<Output = Result<String, &'static str>>;
+    fn unique_id(&mut self, route: &Route)
+    -> impl Future<Output = Result<String, LockdownFailure>>;
+}
+
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum LockdownFailure {
+    Connect,
+    Query,
 }
 
 #[cfg(target_os = "macos")]
@@ -122,9 +173,14 @@ impl Transport for FixedUsb {
             .map_err(|_| UNAVAILABLE)
     }
 
-    async fn unique_id(&mut self, route: &Route) -> Result<String, &'static str> {
-        let mut socket = route.lockdown_socket().await.map_err(|_| UNAVAILABLE)?;
-        lockdown::unique_id(&mut socket).await
+    async fn unique_id(&mut self, route: &Route) -> Result<String, LockdownFailure> {
+        let mut socket = route
+            .lockdown_socket()
+            .await
+            .map_err(|_| LockdownFailure::Connect)?;
+        lockdown::unique_id(&mut socket)
+            .await
+            .map_err(|_| LockdownFailure::Query)
     }
 }
 
@@ -135,43 +191,47 @@ async fn observe_route(
     transport: &mut impl Transport,
     deadline: tokio::time::Instant,
     original: Option<&Route>,
-) -> Result<Route, &'static str> {
+) -> Result<Route, ObservationFailure> {
     tokio::time::timeout_at(deadline, async {
         check_deadline(deadline)?;
-        config
-            .revalidate_for_owner(owner)
-            .map_err(|_| UNAVAILABLE)?;
+        let validation = config.revalidate_for_owner(owner);
         check_deadline(deadline)?;
+        validation.map_err(|_| ObservationFailure::ConfigBefore)?;
         let expected = config.binding().usb_id.clone();
-        let route = transport.enumerate(&expected).await?;
+        let route = transport.enumerate(&expected).await;
         check_deadline(deadline)?;
+        let route = route.map_err(|_| ObservationFailure::UsbBefore)?;
         if route.udid() != expected.as_str() || original.is_some_and(|original| original != &route)
         {
-            return Err(UNAVAILABLE);
+            return Err(ObservationFailure::Route);
         }
-        let reported = transport.unique_id(&route).await?;
+        let reported = transport.unique_id(&route).await;
         check_deadline(deadline)?;
+        let reported = reported.map_err(|failure| match failure {
+            LockdownFailure::Connect => ObservationFailure::LockdownConnect,
+            LockdownFailure::Query => ObservationFailure::LockdownQuery,
+        })?;
         if reported != route.udid() || reported != expected.as_str() {
-            return Err(UNAVAILABLE);
+            return Err(ObservationFailure::Identity);
         }
-        if transport.enumerate(&expected).await? != route {
-            return Err(UNAVAILABLE);
+        let final_route = transport.enumerate(&expected).await;
+        check_deadline(deadline)?;
+        if final_route.map_err(|_| ObservationFailure::UsbAfter)? != route {
+            return Err(ObservationFailure::UsbAfter);
         }
+        let validation = config.revalidate_for_owner(owner);
         check_deadline(deadline)?;
-        config
-            .revalidate_for_owner(owner)
-            .map_err(|_| UNAVAILABLE)?;
-        check_deadline(deadline)?;
+        validation.map_err(|_| ObservationFailure::ConfigAfter)?;
         Ok(route)
     })
     .await
-    .map_err(|_| UNAVAILABLE)?
+    .map_err(|_| ObservationFailure::Deadline)?
 }
 
 #[cfg(target_os = "macos")]
-fn check_deadline(deadline: tokio::time::Instant) -> Result<(), &'static str> {
+fn check_deadline(deadline: tokio::time::Instant) -> Result<(), ObservationFailure> {
     if tokio::time::Instant::now() >= deadline {
-        Err(UNAVAILABLE)
+        Err(ObservationFailure::Deadline)
     } else {
         Ok(())
     }

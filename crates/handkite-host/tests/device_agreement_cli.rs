@@ -19,7 +19,7 @@ fn invalid_production_invocations_have_only_fixed_output() {
             .output()
             .unwrap();
         assert_eq!(output.status.code(), Some(1));
-        assert_eq!(output.stdout, b"device_agreement=reject\n");
+        assert_eq!(output.stdout, b"device_agreement=reject stage=arguments\n");
         assert!(output.stderr.is_empty());
     }
 }

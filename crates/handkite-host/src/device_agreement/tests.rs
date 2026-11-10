@@ -68,10 +68,11 @@ fn unchanged(before: Vec<(std::path::PathBuf, Fingerprint)>) {
 
 struct Fake {
     routes: VecDeque<Result<Route, &'static str>>,
-    reply: Result<String, &'static str>,
+    reply: Result<String, LockdownFailure>,
     events: Rc<RefCell<Vec<&'static str>>>,
     after_reply: Option<Box<dyn FnMut()>>,
     delay: Duration,
+    delay_step: Option<usize>,
     stall: bool,
 }
 
@@ -87,7 +88,17 @@ impl Fake {
             events: Rc::default(),
             after_reply: None,
             delay: Duration::ZERO,
+            delay_step: None,
             stall: false,
+        }
+    }
+
+    async fn wait(&self) {
+        if self
+            .delay_step
+            .is_none_or(|step| step == self.events.borrow().len())
+        {
+            tokio::time::sleep(self.delay).await;
         }
     }
 }
@@ -96,17 +107,17 @@ impl Transport for Fake {
     async fn enumerate(&mut self, expected: &HardwareId) -> Result<Route, &'static str> {
         assert_eq!(expected.as_str(), "test-device");
         self.events.borrow_mut().push("enumerate");
-        tokio::time::sleep(self.delay).await;
+        self.wait().await;
         self.routes.pop_front().unwrap()
     }
 
-    async fn unique_id(&mut self, route: &Route) -> Result<String, &'static str> {
+    async fn unique_id(&mut self, route: &Route) -> Result<String, LockdownFailure> {
         assert_eq!(route.udid(), "test-device");
         self.events.borrow_mut().push("GetValue");
         if self.stall {
             std::future::pending::<()>().await;
         }
-        tokio::time::sleep(self.delay).await;
+        self.wait().await;
         if let Some(hook) = &mut self.after_reply {
             hook();
         }
@@ -148,35 +159,70 @@ async fn different_owner_is_rejected_before_transport() {
         DeviceAgreement::observe_with(&other, &mut config, &mut transport)
             .await
             .err(),
-        Some(UNAVAILABLE)
+        Some(ObservationFailure::ConfigBefore)
     );
     assert!(transport.events.borrow().is_empty());
 }
 
 #[tokio::test]
 async fn missing_ambiguous_mismatching_and_replaced_routes_or_replies_fail() {
-    for case in 0..8 {
+    for case in 0..9 {
         let (_scratch, layout) = fixture();
         let owner = InstallerLock::acquire(&layout).unwrap();
         let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
         let before = protected(&layout);
         let mut transport = Fake::good();
-        match case {
-            0 => transport.routes[0] = Err(UNAVAILABLE),
-            1 => transport.routes[0] = Ok(Route::fixture("other", 7)),
-            2 => transport.reply = Ok("TEST-device".into()),
-            3 => transport.reply = Ok("test-device ".into()),
-            4 => transport.reply = Err(UNAVAILABLE),
-            5 => transport.routes[1] = Err(UNAVAILABLE),
-            6 => transport.routes[1] = Ok(Route::fixture("test-device", 8)),
-            _ => transport.routes[1] = Ok(Route::fixture("other", 7)),
-        }
+        let stage = match case {
+            0 => {
+                transport.routes[0] = Err("private fixture transport detail");
+                ObservationFailure::UsbBefore
+            }
+            1 => {
+                transport.routes[0] = Ok(Route::fixture("other", 7));
+                ObservationFailure::Route
+            }
+            2 | 3 => {
+                transport.reply = Ok(if case == 2 {
+                    "TEST-device"
+                } else {
+                    "test-device "
+                }
+                .into());
+                ObservationFailure::Identity
+            }
+            4 => {
+                transport.reply = Err(LockdownFailure::Query);
+                ObservationFailure::LockdownQuery
+            }
+            5 => {
+                transport.routes[1] = Err("private fixture transport detail");
+                ObservationFailure::UsbAfter
+            }
+            6 | 7 => {
+                transport.routes[1] = Ok(if case == 6 {
+                    Route::fixture("test-device", 8)
+                } else {
+                    Route::fixture("other", 7)
+                });
+                ObservationFailure::UsbAfter
+            }
+            _ => {
+                transport.reply = Err(LockdownFailure::Connect);
+                ObservationFailure::LockdownConnect
+            }
+        };
         assert_eq!(
             DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
                 .await
                 .err(),
-            Some(UNAVAILABLE)
+            Some(stage)
         );
+        let expected_events: &[&str] = match case {
+            0 | 1 => &["enumerate"],
+            5..=7 => &["enumerate", "GetValue", "enumerate"],
+            _ => &["enumerate", "GetValue"],
+        };
+        assert_eq!(&*transport.events.borrow(), expected_events);
         unchanged(before);
     }
 }
@@ -218,7 +264,11 @@ async fn config_and_lock_drift_before_or_during_observation_fail() {
                 DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
                     .await
                     .err(),
-                Some(UNAVAILABLE)
+                Some(if during {
+                    ObservationFailure::ConfigAfter
+                } else {
+                    ObservationFailure::ConfigBefore
+                })
             );
             assert_eq!(transport.events.borrow().is_empty(), !during);
         }
@@ -285,6 +335,18 @@ async fn one_absolute_deadline_covers_all_transport_steps_and_poisons_reobserve(
     let (_scratch, layout) = fixture();
     let owner = InstallerLock::acquire(&layout).unwrap();
     let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+    let before = protected(&layout);
+    let mut slow = Fake::good();
+    slow.delay = Duration::from_secs(6);
+    let start = tokio::time::Instant::now();
+    assert_eq!(
+        DeviceAgreement::observe_with(&owner, &mut config, &mut slow)
+            .await
+            .err(),
+        Some(ObservationFailure::Deadline)
+    );
+    assert_eq!(tokio::time::Instant::now() - start, OBSERVATION_TIMEOUT);
+    unchanged(before);
     let mut agreement = DeviceAgreement::observe_with(&owner, &mut config, &mut Fake::good())
         .await
         .unwrap();
@@ -297,6 +359,54 @@ async fn one_absolute_deadline_covers_all_transport_steps_and_poisons_reobserve(
         agreement.reobserve_with(Fake::good()).await,
         Err(UNAVAILABLE)
     );
+}
+
+#[tokio::test]
+async fn expired_deadline_rejects_before_config_or_transport_access() {
+    let (_scratch, layout) = fixture();
+    let owner = InstallerLock::acquire(&layout).unwrap();
+    let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+    let mut transport = Fake::good();
+    assert_eq!(
+        observe_route(
+            &owner,
+            &mut config,
+            &mut transport,
+            tokio::time::Instant::now(),
+            None,
+        )
+        .await
+        .err(),
+        Some(ObservationFailure::Deadline)
+    );
+    assert!(transport.events.borrow().is_empty());
+}
+
+#[tokio::test(start_paused = true)]
+async fn shared_deadline_takes_precedence_over_each_transport_error() {
+    for step in 1..=3 {
+        let (_scratch, layout) = fixture();
+        let owner = InstallerLock::acquire(&layout).unwrap();
+        let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+        let before = protected(&layout);
+        let mut transport = Fake::good();
+        transport.delay = OBSERVATION_TIMEOUT;
+        transport.delay_step = Some(step);
+        match step {
+            1 => transport.routes[0] = Err("private fixture transport detail"),
+            2 => transport.reply = Err(LockdownFailure::Query),
+            _ => transport.routes[1] = Err("private fixture transport detail"),
+        }
+        assert_eq!(
+            DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
+                .await
+                .err(),
+            Some(ObservationFailure::Deadline),
+            "transport step {step}",
+        );
+        assert_eq!(transport.events.borrow().len(), step);
+        unchanged(before);
+    }
 }
 
 #[tokio::test]
