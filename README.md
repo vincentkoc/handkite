@@ -294,6 +294,16 @@ Failures report fixed action/restoration categories. An incomplete result can
 include only the first unconfirmed position from 1 through 6, never a PIN value
 or proof of physical delivery. A marked gate remains disabled on failure.
 
+With both `--temporary-idle-settings` and `--supervised-visibility-fallback`,
+an explicitly hidden keypad requires fresh locked zero-of-six evidence before one
+session-validated wake event. The event retains the prepared view's original
+five-second write deadline. After a 1.5-second settle, fresh snapshots must still
+prove the pinned session, native/visible/WDA lock, no alert or first-unlock state,
+and an empty ready keypad before marking the gate. A genuinely visible empty
+keypad needs no wake. There is no swipe or wake/first-digit retry on this path.
+This offline change does not establish the cause of the earlier unconfirmed
+first digit or qualify live PIN entry; default behavior remains unchanged.
+
 ## Anisette
 
 The [deployment bundle](deploy/anisette/README.md) pins a separate V3 sidecar behind a loopback listener and a TLS client-authenticated proxy. It is staged only. The final domain, host, client certificate, provisioning flow, and signing result must be verified before use.

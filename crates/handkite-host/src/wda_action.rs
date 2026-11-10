@@ -324,6 +324,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bound_wake_sends_one_existing_hid_event_even_with_uncertain_receipt() {
+        for lost in [false, true] {
+            let mut post = response(
+                "POST",
+                "/session/fixture-session/wda/performIoHidEvent",
+                200,
+                json!({"value": null}),
+            );
+            if lost {
+                post.response = Err(WdaError::AfterSent);
+            }
+            let mut wda = Script::new(vec![
+                status(json!("fixture-session")),
+                response("GET", "/session/fixture-session", 200, json!({"value": {}})),
+                post,
+            ]);
+            wda.1 = Some(json!({"page": 12, "usage": 547, "duration": 0.05}));
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert_eq!(
+                actions.wake_with_existing_session(&wda).await.is_err(),
+                lost
+            );
+            wda.done();
+        }
+    }
+
+    #[tokio::test]
     async fn transaction_bound_inputs_refuse_a_different_valid_session_before_any_post() {
         for action in [
             Action::Tap {

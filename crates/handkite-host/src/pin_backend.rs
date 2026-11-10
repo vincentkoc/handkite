@@ -3,6 +3,7 @@ use crate::pin_screen::{self, ParsedPasscodeView};
 use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
 use crate::wda_transport::{UsbWda, WdaError};
+use handkite_core::passcode::PasscodeProgress;
 use handkite_core::protocol::{Action, HardwareId, LockState, Point};
 use handkite_core::unlock::{BackendError, PasscodeBackend, PasscodeScreen};
 use std::thread;
@@ -10,10 +11,12 @@ use std::time::{Duration, Instant};
 
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_VIEW_BUDGET: Duration = Duration::from_secs(5);
+const SUPERVISED_WAKE_SETTLE: Duration = Duration::from_millis(1500);
 
 struct PreparedPinView {
     view: ParsedPasscodeView,
     fresh_until: Instant,
+    empty_locked: bool,
 }
 
 pub struct NativePasscodeBackend {
@@ -25,6 +28,7 @@ pub struct NativePasscodeBackend {
     last_diagnostics: Option<PinDiagnostics>,
     supervised_visibility_fallback: bool,
     session_bound: bool,
+    awaiting_first_digit: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -65,6 +69,7 @@ impl NativePasscodeBackend {
             last_diagnostics: None,
             supervised_visibility_fallback,
             session_bound: false,
+            awaiting_first_digit: false,
         })
     }
 
@@ -121,6 +126,62 @@ impl NativePasscodeBackend {
         }
         dispatch(self, action, prepared.fresh_until)
     }
+
+    fn wake_hidden_with(
+        &mut self,
+        now: Instant,
+        wake: impl FnOnce(&mut Self, Instant) -> Result<(), BackendError>,
+        settle: impl FnOnce(Duration),
+        snapshot: impl FnOnce(&mut Self) -> Result<PasscodeScreen, BackendError>,
+    ) -> Result<(), BackendError> {
+        let prepared = self.last_view.take().ok_or(BackendError::Unavailable)?;
+        if !self.supervised_visibility_fallback
+            || !self.session_bound
+            || now >= prepared.fresh_until
+            || !prepared.empty_locked
+            || !prepared.view.visibility_fallback
+        {
+            return Err(BackendError::Unavailable);
+        }
+        wake(self, prepared.fresh_until)?;
+        settle(SUPERVISED_WAKE_SETTLE);
+        // The core samples again before marking the gate. Keep the same zero-progress
+        // requirement through that snapshot, until the first digit dispatch begins.
+        self.awaiting_first_digit = true;
+        snapshot(self)?;
+        if !self
+            .last_view
+            .as_ref()
+            .is_some_and(|view| view.empty_locked)
+        {
+            self.last_view = None;
+            return Err(BackendError::Unavailable);
+        }
+        Ok(())
+    }
+}
+
+fn empty_locked(screen: &PasscodeScreen, view: &ParsedPasscodeView, expected: &HardwareId) -> bool {
+    screen.connected_usb == *expected
+        && screen.wda_target == *expected
+        && screen.native_lock == LockState::Locked
+        && screen.visible_lock == LockState::Locked
+        && screen.wda_lock == LockState::Locked
+        && !screen.before_first_unlock
+        && !screen.trust_prompt
+        && screen.keypad_ready
+        && !view.has_alert
+        && view.visible_lock == LockState::Locked
+        && view.layout_valid
+        && view.keypad.is_some()
+        && [&screen.secure_field_value, &view.secure_field_value]
+            .into_iter()
+            .all(|field| {
+                field
+                    .as_deref()
+                    .and_then(|value| PasscodeProgress::parse(value, 6).ok())
+                    .is_some_and(|progress| progress.entered == 0)
+            })
 }
 
 fn wda_error(error: WdaError) -> BackendError {
@@ -181,7 +242,15 @@ impl NativePasscodeBackend {
         if now() >= fresh_until {
             return Err(BackendError::Unavailable);
         }
-        self.last_view = Some(PreparedPinView { view, fresh_until });
+        let empty_locked = empty_locked(&screen, &view, &self.expected);
+        if self.awaiting_first_digit && !empty_locked {
+            return Err(BackendError::Unavailable);
+        }
+        self.last_view = Some(PreparedPinView {
+            view,
+            fresh_until,
+            empty_locked,
+        });
         Ok(screen)
     }
 
@@ -254,6 +323,28 @@ impl PasscodeBackend for NativePasscodeBackend {
     }
 
     fn show_keypad(&mut self) -> Result<(), BackendError> {
+        if self.supervised_visibility_fallback && self.session_bound {
+            if self.last_view.as_ref().is_some_and(|prepared| {
+                prepared.empty_locked
+                    && !prepared.view.visibility_fallback
+                    && prepared.view.field_visible
+                    && prepared.view.digit_keys_visible == 10
+            }) {
+                return Ok(());
+            }
+            return self.wake_hidden_with(
+                Instant::now(),
+                |backend, fresh_until| {
+                    let wda = UsbWda::new(backend.usb.clone()).with_write_deadline(fresh_until);
+                    backend
+                        .runtime
+                        .block_on(backend.actions.wake_with_existing_session(&wda))
+                        .map_err(|_| BackendError::Unavailable)
+                },
+                thread::sleep,
+                Self::snapshot,
+            );
+        }
         if self.supervised_visibility_fallback {
             return self
                 .last_view
@@ -312,6 +403,7 @@ impl PasscodeBackend for NativePasscodeBackend {
             .and_then(|keys| keys.get(usize::from(digit)))
             .copied()
             .ok_or(BackendError::Unavailable)?;
+        self.awaiting_first_digit = false;
         self.request_action(&Action::Tap { at })
     }
 
@@ -359,6 +451,317 @@ mod tests {
         backend
             .snapshot_with(started, |_, _| Ok(capture()), || started)
             .unwrap();
+    }
+
+    fn hidden_capture() -> (PasscodeScreen, ParsedPasscodeView) {
+        keypad_capture(true)
+    }
+
+    fn keypad_capture(hidden: bool) -> (PasscodeScreen, ParsedPasscodeView) {
+        let mut xml = String::from(
+            r#"<XCUIElementTypeApplication width="400" height="800"><XCUIElementTypeOther name="passcode-view"/>"#,
+        );
+        for digit in 0..10 {
+            let (column, row) = if digit == 0 {
+                (1, 3)
+            } else {
+                ((digit - 1) % 3, (digit - 1) / 3)
+            };
+            xml.push_str(&format!(r#"<XCUIElementTypeKey name="{digit}" visible="false" enabled="true" x="{}" y="{}" width="80" height="80"/>"#, 40 + column * 100, 300 + row * 100));
+        }
+        xml.push_str(r#"<XCUIElementTypeSecureTextField visible="false" enabled="true" value="0 of 6 digits" x="0" y="220" width="400" height="13"/></XCUIElementTypeApplication>"#);
+        let xml = if hidden {
+            xml
+        } else {
+            xml.replace("visible=\"false\"", "visible=\"true\"")
+        };
+        let view = pin_screen::parse(&xml).unwrap();
+        let (mut screen, _) = capture();
+        screen.keypad_ready = true;
+        screen.secure_field_value = view.secure_field_value.clone();
+        (screen, view)
+    }
+
+    fn bound_backend() -> NativePasscodeBackend {
+        NativePasscodeBackend::new_for_session(
+            HardwareId::new("fixture-phone").unwrap(),
+            true,
+            "fixture-session",
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn visible_opt_in_and_existing_default_keypads_do_not_wake() {
+        for (mut backend, hidden) in [
+            (bound_backend(), false),
+            (backend(), false),
+            (
+                NativePasscodeBackend::new_with_supervised_visibility_fallback(
+                    HardwareId::new("fixture-phone").unwrap(),
+                    true,
+                )
+                .unwrap(),
+                true,
+            ),
+        ] {
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(keypad_capture(hidden)), || start)
+                .unwrap();
+            assert_eq!(backend.show_keypad(), Ok(()));
+            assert!(!backend.awaiting_first_digit);
+            assert!(backend.last_view.is_some());
+        }
+        let mut backend = backend();
+        let start = Instant::now();
+        let (mut screen, view) = keypad_capture(false);
+        screen.secure_field_value = Some("1 of 6 digits".into());
+        assert!(
+            backend
+                .snapshot_with(start, |_, _| Ok((screen, view)), || start)
+                .is_ok()
+        );
+        assert_eq!(backend.show_keypad(), Ok(()));
+    }
+
+    #[test]
+    fn supervised_bound_wake_consumes_original_deadline_and_settles_once() {
+        let mut backend = bound_backend();
+        let start = Instant::now();
+        backend
+            .snapshot_with(start, |_, _| Ok(hidden_capture()), || start)
+            .unwrap();
+        let mut wakes = 0;
+        let mut settles = 0;
+        let mut captures = 0;
+        assert_eq!(
+            backend.wake_hidden_with(
+                start + Duration::from_millis(100),
+                |backend, deadline| {
+                    assert!(backend.last_view.is_none());
+                    assert_eq!(deadline, start + PIN_VIEW_BUDGET);
+                    wakes += 1;
+                    Ok(())
+                },
+                |delay| {
+                    assert_eq!(delay, Duration::from_millis(1500));
+                    settles += 1;
+                },
+                |backend| {
+                    captures += 1;
+                    backend.snapshot_with(
+                        start + SUPERVISED_WAKE_SETTLE,
+                        |_, _| Ok(hidden_capture()),
+                        || start + SUPERVISED_WAKE_SETTLE,
+                    )
+                }
+            ),
+            Ok(())
+        );
+        assert_eq!((wakes, settles, captures), (1, 1, 1));
+        assert!(backend.awaiting_first_digit);
+        assert_eq!(
+            backend.last_view.as_ref().unwrap().fresh_until,
+            start + SUPERVISED_WAKE_SETTLE + PIN_VIEW_BUDGET
+        );
+    }
+
+    #[test]
+    fn hidden_wake_requires_opt_in_fresh_empty_locked_evidence() {
+        type Change = fn(&mut PasscodeScreen, &mut ParsedPasscodeView);
+        for change in [
+            (|s: &mut PasscodeScreen, _: &mut ParsedPasscodeView| {
+                s.wda_target = HardwareId::new("other").unwrap()
+            }) as Change,
+            |s, _| s.native_lock = LockState::Unlocked,
+            |s, _| s.visible_lock = LockState::Uncertain,
+            |s, _| s.wda_lock = LockState::Uncertain,
+            |s, _| s.before_first_unlock = true,
+            |s, _| s.trust_prompt = true,
+            |s, _| s.keypad_ready = false,
+            |s, _| s.secure_field_value = Some("1 of 6 digits".into()),
+            |_, v| v.secure_field_value = Some("0 of 4 digits".into()),
+            |_, v| v.has_alert = true,
+            |_, v| v.visibility_fallback = false,
+            |_, v| v.layout_valid = false,
+        ] {
+            let mut backend = bound_backend();
+            let start = Instant::now();
+            let (mut screen, mut view) = hidden_capture();
+            change(&mut screen, &mut view);
+            backend
+                .snapshot_with(start, |_, _| Ok((screen, view)), || start)
+                .unwrap();
+            assert_eq!(
+                backend.wake_hidden_with(
+                    start,
+                    |_, _| panic!("no wake"),
+                    |_| panic!("no settle"),
+                    |_| panic!("no capture")
+                ),
+                Err(BackendError::Unavailable)
+            );
+            assert!(backend.last_view.is_none());
+        }
+        for elapsed in [PIN_VIEW_BUDGET, PIN_VIEW_BUDGET + Duration::from_nanos(1)] {
+            let mut backend = bound_backend();
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(hidden_capture()), || start)
+                .unwrap();
+            assert_eq!(
+                backend.wake_hidden_with(
+                    start + elapsed,
+                    |_, _| panic!("expired view"),
+                    |_| panic!("no settle"),
+                    |_| panic!("no capture")
+                ),
+                Err(BackendError::Unavailable)
+            );
+            assert!(backend.last_view.is_none());
+        }
+        for supervised in [false, true] {
+            let mut backend = backend();
+            backend.supervised_visibility_fallback = supervised;
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(hidden_capture()), || start)
+                .unwrap();
+            assert_eq!(
+                backend.wake_hidden_with(
+                    start,
+                    |_, _| panic!("unbound path"),
+                    |_| panic!("no settle"),
+                    |_| panic!("no capture")
+                ),
+                Err(BackendError::Unavailable)
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_wake_has_no_settle_reobserve_or_fallback() {
+        let mut backend = bound_backend();
+        let start = Instant::now();
+        backend
+            .snapshot_with(start, |_, _| Ok(hidden_capture()), || start)
+            .unwrap();
+        let mut wakes = 0;
+        assert_eq!(
+            backend.wake_hidden_with(
+                start,
+                |_, _| {
+                    wakes += 1;
+                    Err(BackendError::Unavailable)
+                },
+                |_| panic!("no settle"),
+                |_| panic!("no capture")
+            ),
+            Err(BackendError::Unavailable)
+        );
+        assert_eq!(wakes, 1);
+        assert!(backend.last_view.is_none());
+        assert_eq!(
+            backend.wake_hidden_with(
+                start,
+                |_, _| panic!("no replay"),
+                |_| panic!("no settle"),
+                |_| panic!("no capture")
+            ),
+            Err(BackendError::Unavailable)
+        );
+    }
+
+    #[test]
+    fn settled_and_core_pre_mark_snapshots_must_still_be_empty_and_locked() {
+        use handkite_core::passcode::Passcode;
+        use handkite_core::protocol::{DeviceBinding, DeviceKey};
+        use handkite_core::unlock::{AttemptGate, GateError, UnlockPolicy, unlock_once};
+        struct Harness {
+            backend: NativePasscodeBackend,
+            start: Instant,
+            fail_settled: bool,
+            samples: usize,
+            wakes: usize,
+        }
+        impl PasscodeBackend for Harness {
+            fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError> {
+                let (mut screen, view) = hidden_capture();
+                if self.samples > 0 {
+                    screen.wda_lock = LockState::Uncertain;
+                }
+                self.samples += 1;
+                self.backend
+                    .snapshot_with(self.start, |_, _| Ok((screen, view)), || self.start)
+            }
+            fn show_keypad(&mut self) -> Result<(), BackendError> {
+                let fail = self.fail_settled;
+                let start = self.start + SUPERVISED_WAKE_SETTLE;
+                let wakes = &mut self.wakes;
+                self.backend.wake_hidden_with(
+                    self.start,
+                    |_, _| {
+                        *wakes += 1;
+                        Ok(())
+                    },
+                    |_| {},
+                    |backend| {
+                        let (mut screen, view) = hidden_capture();
+                        if fail {
+                            screen.secure_field_value = Some("1 of 6 digits".into());
+                        }
+                        backend.snapshot_with(start, |_, _| Ok((screen, view)), || start)
+                    },
+                )
+            }
+            fn press_digit(&mut self, _: u8) -> Result<(), BackendError> {
+                panic!("no digit submission")
+            }
+            fn delete_digit(&mut self) -> Result<(), BackendError> {
+                panic!("no deletion")
+            }
+        }
+        struct Gate;
+        impl AttemptGate for Gate {
+            fn is_disabled(&self) -> Result<bool, GateError> {
+                Ok(false)
+            }
+            fn mark_uncertain(&mut self) -> Result<(), GateError> {
+                panic!("preflight must not mark")
+            }
+            fn clear(&mut self) -> Result<(), GateError> {
+                panic!("preflight must not clear")
+            }
+        }
+        for fail_settled in [false, true] {
+            let mut harness = Harness {
+                backend: bound_backend(),
+                start: Instant::now(),
+                fail_settled,
+                samples: 0,
+                wakes: 0,
+            };
+            let binding = DeviceBinding {
+                key: DeviceKey::new("iphone").unwrap(),
+                usb_id: HardwareId::new("fixture-phone").unwrap(),
+            };
+            // A synthetic code is required by the core interface but never read or submitted.
+            let code = Passcode::new("0".repeat(6)).unwrap();
+            assert!(
+                unlock_once(
+                    &mut harness,
+                    &mut Gate,
+                    &binding,
+                    &binding.key,
+                    &code,
+                    UnlockPolicy::default()
+                )
+                .is_err()
+            );
+            assert_eq!(harness.wakes, 1);
+            assert!(harness.backend.last_view.is_none());
+        }
     }
 
     #[test]
