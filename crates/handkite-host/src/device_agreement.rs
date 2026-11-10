@@ -5,6 +5,7 @@
 #[cfg(target_os = "macos")]
 use crate::usb::{PinnedUsb, Route};
 use crate::{install_config::RetainedConfig, installer_lock::InstallerLock};
+use handkite_core::protocol::DeviceBinding;
 use std::future::Future;
 
 const UNAVAILABLE: &str = "device agreement unavailable or changed";
@@ -13,6 +14,7 @@ const UNAVAILABLE: &str = "device agreement unavailable or changed";
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ObservationFailure {
     UnsupportedPlatform,
+    ConfigRetain,
     ConfigBefore,
     UsbBefore,
     Route,
@@ -28,6 +30,7 @@ impl ObservationFailure {
     pub fn stage(self) -> &'static str {
         match self {
             Self::UnsupportedPlatform => "observation_platform",
+            Self::ConfigRetain => "config_retain",
             Self::ConfigBefore => "config_revalidate_before",
             Self::UsbBefore => "usb_inventory_before",
             Self::Route => "usb_route_agreement",
@@ -123,25 +126,29 @@ impl ReplyEnvelope {
     }
 }
 
-/// Sealed observation borrowing the exact installer lock and retained config.
+/// Sealed observation owning config matched against an independent binding.
+/// The config and observation borrow the same exact installer lock.
 /// It exposes no identity, serializer, claim constructor, or install capability.
-pub struct DeviceAgreement<'config, 'lock> {
+pub struct DeviceAgreement<'lock> {
     owner: &'lock InstallerLock,
-    config: &'config mut RetainedConfig<'lock>,
+    config: RetainedConfig<'lock>,
     #[cfg(target_os = "macos")]
     route: Route,
     poisoned: bool,
 }
 
-impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
-    /// Observe once under one ten-second absolute deadline. This sends only mux
-    /// ListDevices/Connect and one Lockdown GetValue for UniqueDeviceID.
+impl<'lock> DeviceAgreement<'lock> {
+    /// Retain the lock's protected config against both independently supplied
+    /// binding fields, then observe under one ten-second absolute deadline.
+    /// The caller must obtain the expected binding independently of that config.
+    /// This sends only mux ListDevices/Connect and one Lockdown GetValue for
+    /// UniqueDeviceID.
     /// No pairing, session, service start, WDA, or persistent state is changed.
     pub async fn observe(
         owner: &'lock InstallerLock,
-        config: &'config mut RetainedConfig<'lock>,
+        expected: &DeviceBinding,
     ) -> Result<Self, &'static str> {
-        Self::observe_diagnostic(owner, config)
+        Self::observe_diagnostic(owner, expected)
             .await
             .map_err(|_| UNAVAILABLE)
     }
@@ -149,15 +156,15 @@ impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
     /// The same single observation, exposing only a fixed failure stage.
     pub async fn observe_diagnostic(
         owner: &'lock InstallerLock,
-        config: &'config mut RetainedConfig<'lock>,
+        expected: &DeviceBinding,
     ) -> Result<Self, ObservationFailure> {
         #[cfg(target_os = "macos")]
         {
-            Self::observe_with(owner, config, &mut FixedUsb).await
+            Self::observe_with(owner, expected, &mut FixedUsb).await
         }
         #[cfg(not(target_os = "macos"))]
         {
-            let _ = (owner, config);
+            let _ = (owner, expected);
             Err(ObservationFailure::UnsupportedPlatform)
         }
     }
@@ -181,11 +188,22 @@ impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
     #[cfg(target_os = "macos")]
     async fn observe_with(
         owner: &'lock InstallerLock,
-        config: &'config mut RetainedConfig<'lock>,
+        expected: &DeviceBinding,
+        transport: &mut impl Transport,
+    ) -> Result<Self, ObservationFailure> {
+        let config = RetainedConfig::acquire(owner, expected)
+            .map_err(|_| ObservationFailure::ConfigRetain)?;
+        Self::observe_retained_with(owner, config, transport).await
+    }
+
+    #[cfg(target_os = "macos")]
+    async fn observe_retained_with(
+        owner: &'lock InstallerLock,
+        mut config: RetainedConfig<'lock>,
         transport: &mut impl Transport,
     ) -> Result<Self, ObservationFailure> {
         let deadline = tokio::time::Instant::now() + OBSERVATION_TIMEOUT;
-        let route = observe_route(owner, config, transport, deadline, None).await?;
+        let route = observe_route(owner, &mut config, transport, deadline, None).await?;
         Ok(Self {
             owner,
             config,
@@ -207,7 +225,7 @@ impl<'config, 'lock> DeviceAgreement<'config, 'lock> {
             }
             observe_route(
                 self.owner,
-                self.config,
+                &mut self.config,
                 &mut transport,
                 deadline,
                 Some(&self.route),

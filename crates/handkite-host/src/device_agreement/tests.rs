@@ -126,14 +126,13 @@ impl Transport for Fake {
 }
 
 #[tokio::test]
-async fn borrows_exact_owner_config_and_retains_route_without_changing_state() {
+async fn owns_original_config_and_borrows_exact_owner_without_changing_state() {
     let (_scratch, layout) = fixture();
     let owner = InstallerLock::acquire(&layout).unwrap();
-    let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
     let before = protected(&layout);
     let mut transport = Fake::good();
     let events = transport.events.clone();
-    let mut agreement = DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
+    let mut agreement = DeviceAgreement::observe_with(&owner, &expected(), &mut transport)
         .await
         .unwrap();
     assert!(std::ptr::eq(agreement.owner, &owner));
@@ -142,9 +141,63 @@ async fn borrows_exact_owner_config_and_retains_route_without_changing_state() {
     for _ in 0..2 {
         agreement.reobserve_with(Fake::good()).await.unwrap();
     }
+    agreement.config.revalidate().unwrap();
     drop(agreement);
-    config.revalidate().unwrap();
     unchanged(before);
+}
+
+#[tokio::test]
+async fn independent_binding_mismatch_rejects_before_any_transport() {
+    for (key, usb) in [
+        ("other", "test-device"),
+        ("phone", "other-device"),
+        ("other", "other-device"),
+    ] {
+        let (_scratch, layout) = fixture();
+        let owner = InstallerLock::acquire(&layout).unwrap();
+        let before = protected(&layout);
+        let pin = DeviceBinding {
+            key: DeviceKey::new(key).unwrap(),
+            usb_id: HardwareId::new(usb).unwrap(),
+        };
+        let mut transport = Fake::good();
+        assert_eq!(
+            DeviceAgreement::observe_with(&owner, &pin, &mut transport)
+                .await
+                .err(),
+            Some(ObservationFailure::ConfigRetain)
+        );
+        assert!(transport.events.borrow().is_empty());
+        unchanged(before);
+    }
+}
+
+#[tokio::test]
+async fn owned_config_replacement_poisons_reobservation_before_transport() {
+    let (_scratch, layout) = fixture();
+    let owner = InstallerLock::acquire(&layout).unwrap();
+    let mut agreement = DeviceAgreement::observe_with(&owner, &expected(), &mut Fake::good())
+        .await
+        .unwrap();
+    let path = layout.config_file();
+    fs::rename(&path, path.with_extension("original")).unwrap();
+    fs::write(&path, CONFIG).unwrap();
+    chmod(&path, 0o600);
+    let transport = Fake::good();
+    let events = transport.events.clone();
+    assert_eq!(agreement.reobserve_with(transport).await, Err(UNAVAILABLE));
+    assert!(events.borrow().is_empty());
+    assert!(agreement.route == Route::fixture("test-device", 7));
+    assert_eq!(
+        agreement.reobserve_with(Fake::good()).await,
+        Err(UNAVAILABLE)
+    );
+    drop(agreement);
+    owner.revalidate().unwrap();
+    // A fresh observation may acquire the replacement; the old one never does.
+    DeviceAgreement::observe_with(&owner, &expected(), &mut Fake::good())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -153,10 +206,10 @@ async fn different_owner_is_rejected_before_transport() {
     let (_other_scratch, other_layout) = fixture();
     let owner = InstallerLock::acquire(&layout).unwrap();
     let other = InstallerLock::acquire(&other_layout).unwrap();
-    let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+    let config = RetainedConfig::acquire(&owner, &expected()).unwrap();
     let mut transport = Fake::good();
     assert_eq!(
-        DeviceAgreement::observe_with(&other, &mut config, &mut transport)
+        DeviceAgreement::observe_retained_with(&other, config, &mut transport)
             .await
             .err(),
         Some(ObservationFailure::ConfigBefore)
@@ -169,7 +222,7 @@ async fn missing_ambiguous_mismatching_and_replaced_routes_or_replies_fail() {
     for case in 0..9 {
         let (_scratch, layout) = fixture();
         let owner = InstallerLock::acquire(&layout).unwrap();
-        let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+        let config = RetainedConfig::acquire(&owner, &expected()).unwrap();
         let before = protected(&layout);
         let mut transport = Fake::good();
         let stage = match case {
@@ -216,7 +269,7 @@ async fn missing_ambiguous_mismatching_and_replaced_routes_or_replies_fail() {
             }
         };
         assert_eq!(
-            DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
+            DeviceAgreement::observe_retained_with(&owner, config, &mut transport)
                 .await
                 .err(),
             Some(stage)
@@ -237,7 +290,7 @@ async fn config_and_lock_drift_before_or_during_observation_fail() {
         for case in 0..5 {
             let (_scratch, layout) = fixture();
             let owner = InstallerLock::acquire(&layout).unwrap();
-            let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+            let config = RetainedConfig::acquire(&owner, &expected()).unwrap();
             let mut transport = Fake::good();
             let changed_layout = layout.clone();
             let mut change: Box<dyn FnMut()> = Box::new(move || {
@@ -265,7 +318,7 @@ async fn config_and_lock_drift_before_or_during_observation_fail() {
                 change();
             }
             assert_eq!(
-                DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
+                DeviceAgreement::observe_retained_with(&owner, config, &mut transport)
                     .await
                     .err(),
                 Some(if during {
@@ -290,18 +343,18 @@ async fn query_substages_preserve_generic_reobservation_errors_and_poisoning() {
     ] {
         let (_scratch, layout) = fixture();
         let owner = InstallerLock::acquire(&layout).unwrap();
-        let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+        let config = RetainedConfig::acquire(&owner, &expected()).unwrap();
         let before = protected(&layout);
         let mut transport = Fake::good();
         transport.reply = Err(LockdownFailure::Query(query));
         assert_eq!(
-            DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
+            DeviceAgreement::observe_retained_with(&owner, config, &mut transport)
                 .await
                 .err(),
             Some(ObservationFailure::LockdownQuery(query)),
         );
         assert_eq!(&*transport.events.borrow(), &["enumerate", "GetValue"]);
-        let mut agreement = DeviceAgreement::observe_with(&owner, &mut config, &mut Fake::good())
+        let mut agreement = DeviceAgreement::observe_with(&owner, &expected(), &mut Fake::good())
             .await
             .unwrap();
         let mut transport = Fake::good();
@@ -320,8 +373,7 @@ async fn query_substages_preserve_generic_reobservation_errors_and_poisoning() {
 async fn reobservation_never_rebases_the_route_and_failure_is_permanent() {
     let (_scratch, layout) = fixture();
     let owner = InstallerLock::acquire(&layout).unwrap();
-    let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
-    let mut agreement = DeviceAgreement::observe_with(&owner, &mut config, &mut Fake::good())
+    let mut agreement = DeviceAgreement::observe_with(&owner, &expected(), &mut Fake::good())
         .await
         .unwrap();
     let mut replacement = Fake::good();
@@ -344,9 +396,8 @@ async fn cancellation_including_an_unpolled_future_permanently_poisons_handle() 
     for polled in [false, true] {
         let (_scratch, layout) = fixture();
         let owner = InstallerLock::acquire(&layout).unwrap();
-        let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
         let before = protected(&layout);
-        let mut agreement = DeviceAgreement::observe_with(&owner, &mut config, &mut Fake::good())
+        let mut agreement = DeviceAgreement::observe_with(&owner, &expected(), &mut Fake::good())
             .await
             .unwrap();
         let mut stalled = Fake::good();
@@ -365,8 +416,8 @@ async fn cancellation_including_an_unpolled_future_permanently_poisons_handle() 
             agreement.reobserve_with(Fake::good()).await,
             Err(UNAVAILABLE)
         );
+        agreement.config.revalidate().unwrap();
         drop(agreement);
-        config.revalidate().unwrap();
         unchanged(before);
     }
 }
@@ -375,20 +426,20 @@ async fn cancellation_including_an_unpolled_future_permanently_poisons_handle() 
 async fn one_absolute_deadline_covers_all_transport_steps_and_poisons_reobserve() {
     let (_scratch, layout) = fixture();
     let owner = InstallerLock::acquire(&layout).unwrap();
-    let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+    let config = RetainedConfig::acquire(&owner, &expected()).unwrap();
     let before = protected(&layout);
     let mut slow = Fake::good();
     slow.delay = Duration::from_secs(6);
     let start = tokio::time::Instant::now();
     assert_eq!(
-        DeviceAgreement::observe_with(&owner, &mut config, &mut slow)
+        DeviceAgreement::observe_retained_with(&owner, config, &mut slow)
             .await
             .err(),
         Some(ObservationFailure::Deadline)
     );
     assert_eq!(tokio::time::Instant::now() - start, OBSERVATION_TIMEOUT);
     unchanged(before);
-    let mut agreement = DeviceAgreement::observe_with(&owner, &mut config, &mut Fake::good())
+    let mut agreement = DeviceAgreement::observe_with(&owner, &expected(), &mut Fake::good())
         .await
         .unwrap();
     let mut slow = Fake::good();
@@ -428,7 +479,7 @@ async fn shared_deadline_takes_precedence_over_each_transport_error() {
     for step in 1..=3 {
         let (_scratch, layout) = fixture();
         let owner = InstallerLock::acquire(&layout).unwrap();
-        let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+        let config = RetainedConfig::acquire(&owner, &expected()).unwrap();
         let before = protected(&layout);
         let mut transport = Fake::good();
         transport.delay = OBSERVATION_TIMEOUT;
@@ -443,7 +494,7 @@ async fn shared_deadline_takes_precedence_over_each_transport_error() {
             _ => transport.routes[1] = Err("private fixture transport detail"),
         }
         assert_eq!(
-            DeviceAgreement::observe_with(&owner, &mut config, &mut transport)
+            DeviceAgreement::observe_retained_with(&owner, config, &mut transport)
                 .await
                 .err(),
             Some(ObservationFailure::Deadline),
@@ -458,17 +509,20 @@ async fn shared_deadline_takes_precedence_over_each_transport_error() {
 async fn cancelled_initial_observation_leaves_no_handle_or_persistent_changes() {
     let (_scratch, layout) = fixture();
     let owner = InstallerLock::acquire(&layout).unwrap();
-    let mut config = RetainedConfig::acquire(&owner, &expected()).unwrap();
+    let config = RetainedConfig::acquire(&owner, &expected()).unwrap();
     let before = protected(&layout);
     let mut stalled = Fake::good();
     stalled.stall = true;
     {
-        let future = DeviceAgreement::observe_with(&owner, &mut config, &mut stalled);
+        let future = DeviceAgreement::observe_retained_with(&owner, config, &mut stalled);
         tokio::select! {
             _ = future => panic!("stalled observation unexpectedly completed"),
             _ = tokio::time::sleep(Duration::from_millis(10)) => {}
         }
     }
-    config.revalidate().unwrap();
+    RetainedConfig::acquire(&owner, &expected())
+        .unwrap()
+        .revalidate()
+        .unwrap();
     unchanged(before);
 }

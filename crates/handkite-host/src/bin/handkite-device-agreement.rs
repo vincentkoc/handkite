@@ -2,7 +2,7 @@ use handkite_host::{
     device_agreement::{
         DeviceAgreement, LockdownQueryFailure, ObservationFailure, PlistDecodeFailure,
     },
-    install_config::{self, RetainedConfig},
+    install_config,
     installer_lock::InstallerLock,
     service_layout::ServiceLayout,
 };
@@ -22,7 +22,6 @@ enum FailureStage {
     Layout,
     ConfigLoad,
     Lock,
-    ConfigRetain,
     Runtime,
     Observation(ObservationFailure),
 }
@@ -34,7 +33,6 @@ impl FailureStage {
             Self::Layout => "service_layout",
             Self::ConfigLoad => "config_load",
             Self::Lock => "installer_lock",
-            Self::ConfigRetain => "config_retain",
             Self::Runtime => "runtime",
             Self::Observation(failure) => failure.stage(),
         }
@@ -65,14 +63,12 @@ fn observe_service() -> Result<(), FailureStage> {
     // Read it before lock acquisition, which can create the fixed lock file.
     let expected = install_config::load_protected(&layout).map_err(|_| FailureStage::ConfigLoad)?;
     let owner = InstallerLock::acquire(&layout).map_err(|_| FailureStage::Lock)?;
-    let mut config =
-        RetainedConfig::acquire(&owner, &expected).map_err(|_| FailureStage::ConfigRetain)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .map_err(|_| FailureStage::Runtime)?;
     runtime.block_on(async {
-        DeviceAgreement::observe_diagnostic(&owner, &mut config)
+        DeviceAgreement::observe_diagnostic(&owner, &expected)
             .await
             .map(|_| ())
             .map_err(FailureStage::Observation)
@@ -179,7 +175,7 @@ mod tests {
             (FailureStage::Layout, "service_layout"),
             (FailureStage::ConfigLoad, "config_load"),
             (FailureStage::Lock, "installer_lock"),
-            (FailureStage::ConfigRetain, "config_retain"),
+            (FailureStage::Observation(ConfigRetain), "config_retain"),
             (FailureStage::Runtime, "runtime"),
             (
                 FailureStage::Observation(UnsupportedPlatform),
