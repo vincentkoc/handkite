@@ -6,7 +6,6 @@ use handkite_host::file_gate::FileAttemptGate;
 use handkite_host::pin_backend::NativePasscodeBackend;
 use handkite_host::pin_input;
 use handkite_host::usb::PinnedUsb;
-use handkite_host::wda_session::with_owned_session_idle_settings;
 use handkite_host::wda_settings::{
     IdleAction, IdleSettingsOutcome, Restoration, validated_active_session,
     with_temporary_idle_settings,
@@ -15,7 +14,7 @@ use handkite_host::wda_transport::UsbWda;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy)]
-enum WorkerError {
+pub(super) enum WorkerError {
     Unlock(UnlockError),
     Initialization,
     GateAccess,
@@ -27,7 +26,6 @@ pub(super) fn run(
     gate: FileAttemptGate,
     supervised: bool,
     coordinate_pin_taps: bool,
-    owned_session: bool,
 ) -> Result<(), String> {
     admitted(gate, |gate| {
         // The gate check precedes secret input and every possible settings POST.
@@ -71,27 +69,12 @@ pub(super) fn run(
                 .await
                 .map_err(|_| WorkerError::Join)?
             };
-            if owned_session {
-                with_owned_session_idle_settings(
-                    &wda,
-                    || {
-                        let gate = gate.lock().map_err(|_| ())?;
-                        if gate.is_disabled().map_err(|_| ())? {
-                            Err(())
-                        } else {
-                            Ok(())
-                        }
-                    },
-                    action,
-                )
+            let session = validated_active_session(&wda)
                 .await
-                .map_err(|error| format!("unlock_idle={}", error.message()))
-            } else {
-                let session = validated_active_session(&wda)
-                    .await
-                    .map_err(|_| "unlock_idle=refused")?;
-                Ok(with_temporary_idle_settings(&wda, &session, || action(session.clone())).await)
-            }
+                .map_err(|_| "unlock_idle=refused")?;
+            Ok::<_, String>(
+                with_temporary_idle_settings(&wda, &session, || action(session.clone())).await,
+            )
         })?;
         // Diagnose worker failure before touching a possibly poisoned gate mutex.
         if let Some(error) = failure(&outcome) {
@@ -119,13 +102,13 @@ fn admitted<G: AttemptGate, T, E: From<&'static str>>(
     work(gate)
 }
 
-struct DeferredGate<G> {
+pub(super) struct DeferredGate<G> {
     inner: G,
     clear_requested: bool,
 }
 
 impl<G> DeferredGate<G> {
-    fn new(inner: G) -> Self {
+    pub(super) fn new(inner: G) -> Self {
         Self {
             inner,
             clear_requested: false,
@@ -146,7 +129,7 @@ impl<G: AttemptGate> AttemptGate for DeferredGate<G> {
     }
 }
 
-fn finish<G: AttemptGate>(
+pub(super) fn finish<G: AttemptGate>(
     gate: &mut DeferredGate<G>,
     outcome: IdleSettingsOutcome<UnlockOutcome, WorkerError>,
 ) -> Result<&'static str, String> {
@@ -167,7 +150,7 @@ fn finish<G: AttemptGate>(
     }
 }
 
-fn failure(outcome: &IdleSettingsOutcome<UnlockOutcome, WorkerError>) -> Option<String> {
+pub(super) fn failure(outcome: &IdleSettingsOutcome<UnlockOutcome, WorkerError>) -> Option<String> {
     let reason = if matches!(outcome.restoration, Restoration::Unproven(_))
         || (outcome.restoration == Restoration::NotNeeded
             && !matches!(outcome.action, IdleAction::NotRun(_)))
@@ -182,7 +165,7 @@ fn failure(outcome: &IdleSettingsOutcome<UnlockOutcome, WorkerError>) -> Option<
     Some(diagnostic(outcome, reason))
 }
 
-fn diagnostic(
+pub(super) fn diagnostic(
     outcome: &IdleSettingsOutcome<UnlockOutcome, WorkerError>,
     reason: &'static str,
 ) -> String {

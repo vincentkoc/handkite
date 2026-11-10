@@ -7,6 +7,8 @@ use std::path::Path;
 
 #[path = "unlock/idle.rs"]
 mod idle;
+#[path = "unlock/owned.rs"]
+mod owned;
 
 fn main() {
     if let Err(error) = run() {
@@ -28,6 +30,13 @@ fn run() -> Result<(), String> {
             "usage: handkite-unlock-once --config FILE [--supervised-visibility-fallback] [--temporary-idle-settings] [--coordinate-pin-taps] [--owned-wda-session]".into(),
         );
     }
+    if owned_session {
+        return owned::run(
+            Path::new(&args[2]),
+            supervised_visibility_fallback,
+            coordinate_pin_taps,
+        );
+    }
     let binding = host_config::load(Path::new(&args[2])).map_err(str::to_owned)?;
     if binding.key.as_str() != "iphone" {
         return Err("PIN entry requires the fixed device key iphone".into());
@@ -46,7 +55,6 @@ fn run() -> Result<(), String> {
             gate,
             supervised_visibility_fallback,
             coordinate_pin_taps,
-            owned_session,
         );
     }
     let code = pin_input::read_once(std::io::stdin().lock()).map_err(str::to_owned)?;

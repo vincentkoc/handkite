@@ -94,6 +94,22 @@ fn owned_session_flags_refuse_before_config_state_or_input() {
 }
 
 #[test]
+fn owned_session_requires_fixed_protected_config_before_stdin_or_device_work() {
+    let config = Config::new("iphone");
+    let output = config.run(&[
+        "--owned-wda-session",
+        "--temporary-idle-settings",
+        "--supervised-visibility-fallback",
+    ]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stderr).unwrap(),
+        "handkite-unlock-once: unlock_idle=refused reason=protected_config_required\n"
+    );
+}
+
+#[test]
 fn alternate_device_keys_are_rejected_before_state_or_pin_input() {
     for key in ["phone", "iphone-15-pro", "other"] {
         let config = Config::new(key);

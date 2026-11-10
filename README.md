@@ -487,15 +487,27 @@ include only the first unconfirmed position from 1 through 6, never a PIN value
 or proof of physical delivery. A marked gate remains disabled on failure.
 
 `--owned-wda-session` additionally requires `--temporary-idle-settings` and
-`--supervised-visibility-fallback`. After gate admission and again checking the
-gate immediately before its only session-creation POST, it accepts only an exact
+`--supervised-visibility-fallback`. It requires the fixed protected service config
+with a runner bundle ID and device key `iphone`, and retains `ServiceLock` before
+reading stdin or contacting the device. It checks the durable stop gate before
+stdin and runner launch, then starts and retains its own XCTest runner on a
+continuously driven runtime. Runner, lock, and gate admission run before session
+creation, including immediately before its only POST. It accepts only an exact
 new receipt ID. Conflicting top-level/nested IDs, reused IDs, uncertain delivery,
 or failed status/session validation stop without adoption, renewal, or fallback.
-The settings bracket and PIN backend bind to that ID; observed session drift
-stops further settings writes. The new session is retained for explicit owner
-handoff, never automatically deleted. Session ownership still requires external
-exclusivity; WDA has no atomic lease, and process termination can prevent settings
-restoration. Existing defaults and stop-marker behavior are unchanged.
+
+The settings bracket and PIN backend bind to that ID. Every input checks runner
+and lock ownership again after asynchronous session validation and through each
+socket write and flush poll. The stop gate is not rechecked after this attempt
+deliberately marks it. Teardown awaits the input worker and settings restoration,
+attempts one identity-checked close for the exact receipt, and aborts and joins
+the host runner while retaining the lock. A failed creation supplies no close
+target. Only a confirmed code submission with verified restoration, acknowledged
+close, retained ownership, and successful runner join may clear this attempt's
+marker. Uncertain cleanup preserves it. Close acknowledgement and host-task join
+do not prove device-side runner termination or endpoint ownership. External
+exclusivity is still required; WDA has no atomic lease, and process termination
+can prevent restoration. Existing default modes remain unchanged.
 
 Live admission remains blocked until the baseline daemon that owns the WDA runner
 is quiesced through a reviewed handoff, then the no-PIN Clock route above is
