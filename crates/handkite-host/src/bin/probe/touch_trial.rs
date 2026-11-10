@@ -222,7 +222,13 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
         };
         let alive = !runner.is_finished();
         let stopped = runner.abort_and_join().await;
-        owned_result(trial, close, alive, stopped.is_ok())
+        owned_result(
+            trial,
+            close,
+            alive,
+            stopped.is_ok(),
+            owner.validate_current().is_ok(),
+        )
     });
     result?;
     println!(
@@ -237,9 +243,11 @@ fn owned_result(
     close: Option<SessionClose>,
     runner_alive: bool,
     runner_joined: bool,
+    service_owned: bool,
 ) -> Result<(), &'static str> {
     if !runner_alive
         || !runner_joined
+        || !service_owned
         || close.is_some_and(|close| close != SessionClose::Acknowledged)
     {
         Err("unknown")
@@ -1199,25 +1207,35 @@ mod tests {
     #[test]
     fn owned_trial_never_confirms_uncertain_cleanup() {
         assert_eq!(
-            owned_result(Ok(()), Some(SessionClose::Acknowledged), true, true),
+            owned_result(Ok(()), Some(SessionClose::Acknowledged), true, true, true),
             Ok(())
         );
         for close in [SessionClose::Refused, SessionClose::Unknown] {
             assert_eq!(
-                owned_result(Ok(()), Some(close), true, true),
+                owned_result(Ok(()), Some(close), true, true, true),
                 Err("unknown")
             );
         }
         assert_eq!(
-            owned_result(Ok(()), Some(SessionClose::Acknowledged), false, true),
+            owned_result(Ok(()), Some(SessionClose::Acknowledged), false, true, true),
             Err("unknown")
         );
         assert_eq!(
-            owned_result(Ok(()), Some(SessionClose::Acknowledged), true, false),
+            owned_result(Ok(()), Some(SessionClose::Acknowledged), true, false, true),
             Err("unknown")
         );
         assert_eq!(
-            owned_result(Err("refused reason=session_admission"), None, true, true),
+            owned_result(Ok(()), Some(SessionClose::Acknowledged), true, true, false),
+            Err("unknown")
+        );
+        assert_eq!(
+            owned_result(
+                Err("refused reason=session_admission"),
+                None,
+                true,
+                true,
+                true
+            ),
             Err("refused reason=session_admission")
         );
     }
