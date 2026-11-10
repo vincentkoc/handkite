@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 pub mod apple;
+pub mod state;
 mod tls;
 mod transport;
 pub use tls::AnisetteIdentity;
