@@ -84,18 +84,29 @@ impl WdaAdapter {
             owned_runner: Some(runner),
             owned_session: None,
         };
+        let liveness = adapter
+            .owned_runner
+            .as_ref()
+            .expect("owned runner")
+            .liveness();
         let session = adapter
             .runtime
             .as_ref()
             .expect("adapter runtime")
             .block_on(create_owned_session(
                 &UsbWda::new(adapter.usb.clone()),
-                || if should_stop() { Err(()) } else { Ok(()) },
+                || {
+                    if should_stop() || liveness.is_finished() {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
             ))
             .map_err(|_| AdapterError)?;
         adapter.owned_session = Some(session.clone());
         adapter.actions = WdaActions::bound_to_existing(&session)?;
-        if should_stop() {
+        if should_stop() || liveness.is_finished() {
             return Err(AdapterError);
         }
         Ok(adapter)
