@@ -522,7 +522,9 @@ The Mac-side state store reserves only the effective account's fixed `state/anis
 
 Local TLS fixtures qualify the transport behavior only. No live domain, Apple provisioning, signing result, daemon integration, or deployment is qualified by these tests. See [validation](VALIDATION.md).
 
-`handkite-anisette-doctor --cert FILE --key FILE` checks only the fixed hostname's client-info route through verified mutual TLS. It reports no certificate or client-info content. It cannot prove provisioning or signing.
+`handkite-anisette-doctor --cert FILE --key FILE` checks only the fixed hostname's client-info route through verified mutual TLS. `handkite-anisette-doctor --cert FILE --key FILE --headers` loads the fixed service account's ready state, requests fresh headers, discards their values, and reports only `anisette_headers=valid`. It does not reserve or provision. Both modes report no certificate, state, client-info, or header content.
+
+`handkite-anisette-provision-once --cert FILE --key FILE` is the explicit provisioning route. It validates the protected client identity before reserving the fixed Mac state location, then consumes that reservation through the Apple and sidecar exchange. Success reports only `anisette_provisioning=ready`; failure reports a fixed category. A failed or uncertain attempt remains reserved and cannot be retried or reset by this command. Do not run it until the final hostname, sidecar, proxy, client identity, and state custody are admitted. A successful header check is not proof of an authenticated Apple request or a signed runner; those consumers remain to be implemented and qualified.
 
 The separate `anisette_v3::apple` module parses supplied lookup XML into unapproved URL candidates. It checks HTTPS, DNS host syntax, port 443, and bounded XML structure without opening a connection. `ReviewedEndpointPolicy::production()` approves only the complete GrandSlam pair `https://gsa.apple.com/grandslam/MidService/startMachineProvisioning` and `https://gsa.apple.com/grandslam/MidService/finishMachineProvisioning`, using the protocol provenance in [validation](VALIDATION.md). No hostname suffix grants approval.
 
