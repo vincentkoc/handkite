@@ -56,8 +56,10 @@ independent observation of the attached device. Same-account changes after the
 read remain possible.
 
 The config also accepts an optional `wda_runner_bundle_id` string. When supplied,
-it must be at most 255 ASCII bytes, contain at least three nonempty dot-separated
-components of letters, digits, or hyphens, and end exactly in `.xctrunner`.
+it must be at most 255 ASCII bytes and contain at least two nonempty prefix
+components of letters, digits, or hyphens before `.xctrunner`. An installed
+runner may append one dot and a ten-character uppercase letter/digit team suffix.
+No other suffix is accepted.
 Omit it for existing read-only service use; `null` and malformed IDs are rejected.
 Keep the actual ID only in the protected host config. The library API
 `install_config::load_protected_config` returns the binding and optional ID
