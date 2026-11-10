@@ -168,6 +168,8 @@ failed write, length, body read, decode, or reply validation. Decode failures
 append fixed format/cause labels and, for schema failures, a fixed envelope
 presence class. No reply data or field names are printed; stderr stays empty.
 No alternate config, root, socket, or device arguments are accepted.
+Extra reply metadata is ignored. Known fields retain exact string-type,
+duplicate, error-presence, and success-result checks before identity comparison.
 
 Lock acquisition can create the fixed `runtime/handkite.lock` file in an existing
 protected layout. The diagnostic creates no directories and performs no service,

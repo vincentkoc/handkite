@@ -40,6 +40,170 @@ async fn only_one_getvalue_is_sent_and_exact_string_is_preserved() {
 }
 
 #[tokio::test]
+async fn protocol_reply_accepts_metadata_and_optional_exact_success() {
+    for extra in [
+        "<key>SyntheticMetadata</key><string>fixture</string>",
+        "<key>Result</key><string>Success</string>",
+        "<key>SyntheticMetadata</key><dict><key>Error</key><string>nested</string><key>Result</key><false/></dict>",
+        "<key>SyntheticMetadata</key><array><integer>1</integer><dict><key>nested</key><true/></dict></array>",
+        "<key>SyntheticMetadata</key><string>first</string><key>SyntheticMetadata</key><dict><key>nested</key><string>second</string></dict>",
+        "<key>Result</key><string>Success</string><key>SyntheticMetadata</key><string>fixture</string>",
+    ] {
+        let body = format!(
+            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>TEST-device </string>{extra}</dict></plist>"
+        );
+        assert_eq!(
+            reply(body.as_bytes(), body.len()).await,
+            Ok("TEST-device ".into())
+        );
+    }
+}
+
+#[tokio::test]
+async fn protocol_reply_rejects_dates_without_string_coercion() {
+    for content in [
+        "<key>Request</key><string>GetValue</string><key>Value</key><date>2026-01-01T00:00:00Z</date>",
+        "<key>Request</key><date>2026-01-01T00:00:00Z</date><key>Value</key><string>test-device</string>",
+        "<key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string><key>Result</key><date>2026-01-01T00:00:00Z</date>",
+    ] {
+        let body = format!("<plist><dict>{content}</dict></plist>");
+        assert_eq!(
+            reply(body.as_bytes(), body.len()).await,
+            Err(LockdownQueryFailure::ReplyValidation)
+        );
+    }
+}
+
+#[tokio::test]
+async fn required_fields_reject_every_nonstring_value_kind() {
+    for node in [
+        "<integer>0</integer>",
+        "<real>1.5</real>",
+        "<true/>",
+        "<data>AA==</data>",
+        "<array/>",
+        "<dict/>",
+    ] {
+        for content in [
+            format!("<key>Request</key>{node}<key>Value</key><string>test-device</string>"),
+            format!("<key>Request</key><string>GetValue</string><key>Value</key>{node}"),
+        ] {
+            let body = format!("<plist><dict>{content}</dict></plist>");
+            assert_eq!(
+                reply(body.as_bytes(), body.len()).await,
+                Err(LockdownQueryFailure::ReplyValidation)
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn any_error_presence_rejects_even_with_success_result() {
+    for node in [
+        "<string/>",
+        "<string>fixture</string>",
+        "<integer>0</integer>",
+        "<real>0</real>",
+        "<false/>",
+        "<data/>",
+        "<array/>",
+        "<dict/>",
+        "<date>2026-01-01T00:00:00Z</date>",
+        "<dict><key>None</key><string/></dict>",
+    ] {
+        let body = format!(
+            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string><key>Result</key><string>Success</string><key>Error</key>{node}</dict></plist>"
+        );
+        assert_eq!(
+            reply(body.as_bytes(), body.len()).await,
+            Err(LockdownQueryFailure::ReplyValidation)
+        );
+    }
+}
+
+#[tokio::test]
+async fn present_result_requires_exact_string_success() {
+    for node in [
+        "<string/>",
+        "<string>Failure</string>",
+        "<string>success</string>",
+        "<string>Success </string>",
+        "<integer>0</integer>",
+        "<real>0</real>",
+        "<true/>",
+        "<data/>",
+        "<array/>",
+        "<dict/>",
+        "<dict><key>None</key><string/></dict>",
+    ] {
+        let body = format!(
+            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string><key>Result</key>{node}</dict></plist>"
+        );
+        assert_eq!(
+            reply(body.as_bytes(), body.len()).await,
+            Err(LockdownQueryFailure::ReplyValidation)
+        );
+    }
+}
+
+#[tokio::test]
+async fn ignored_metadata_still_requires_bounded_valid_xml_plist_values() {
+    for (extra, cause) in [
+        (
+            "<key>SyntheticMetadata</key><dict><integer>1</integer><string>fixture</string></dict>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+        (
+            "<key>SyntheticMetadata</key><array><dict><false/><string>fixture</string></dict></array>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+        (
+            "<key>SyntheticMetadata</key><dict><date>2026-01-01T00:00:00Z</date><string>fixture</string></dict>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+        (
+            "<key>SyntheticMetadata</key><integer>invalid</integer>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+        (
+            "<key>SyntheticMetadata</key><unexpected/>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+        (
+            "<key>SyntheticMetadata</key><string>first</string><key>SyntheticMetadata</key><integer>invalid</integer>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+        (
+            "<key>SyntheticMetadata</key><array>",
+            PlistDecodeFailure::XmlPreflight,
+        ),
+        (
+            "<key>SyntheticMetadata</key><string><![CDATA[fixture]]></string>",
+            PlistDecodeFailure::XmlPreflight,
+        ),
+    ] {
+        let body = format!(
+            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string>{extra}</dict></plist>"
+        );
+        assert_eq!(
+            reply(body.as_bytes(), body.len()).await,
+            Err(LockdownQueryFailure::PlistDecode(cause))
+        );
+    }
+    let body = format!(
+        "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string><key>SyntheticMetadata</key>{}<string>fixture</string>{}</dict></plist>",
+        "<array>".repeat(17),
+        "</array>".repeat(17)
+    );
+    assert_eq!(
+        reply(body.as_bytes(), body.len()).await,
+        Err(LockdownQueryFailure::PlistDecode(
+            PlistDecodeFailure::XmlPreflight
+        ))
+    );
+}
+
+#[tokio::test]
 async fn missing_nonstring_error_duplicate_and_malformed_replies_fail_closed() {
     for (content, envelope) in [
         (
@@ -49,14 +213,6 @@ async fn missing_nonstring_error_duplicate_and_malformed_replies_fail_closed() {
         (
             "<key>Value</key><string>test-device</string>",
             ReplyEnvelope::None,
-        ),
-        (
-            "<key>Request</key><string>GetValue</string><key>Value</key><integer>9</integer>",
-            ReplyEnvelope::None,
-        ),
-        (
-            "<key>Request</key><string>GetValue</string><key>Error</key><string>DeviceLocked</string><key>Value</key><string>test-device</string>",
-            ReplyEnvelope::Error,
         ),
         (
             "<key>Request</key><string>GetValue</string><key>Value</key><string>other</string><key>Value</key><string>test-device</string>",
@@ -74,6 +230,8 @@ async fn missing_nonstring_error_duplicate_and_malformed_replies_fail_closed() {
     for content in [
         "<key>Request</key><string>Other</string><key>Value</key><string>test-device</string>",
         "<key>Request</key><string>GetValue</string><key>Value</key><string/>",
+        "<key>Request</key><string>GetValue</string><key>Value</key><integer>9</integer>",
+        "<key>Request</key><string>GetValue</string><key>Error</key><string>DeviceLocked</string><key>Value</key><string>test-device</string>",
     ] {
         let body = format!("<plist><dict>{content}</dict></plist>");
         assert_eq!(
@@ -191,8 +349,9 @@ async fn schema_envelopes_report_only_fixed_presence_classes() {
                 ));
             }
         }
+        // Missing Value keeps this a schema rejection even when extras are ignored.
         let body = format!(
-            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string>{fields}</dict></plist>"
+            "<plist><dict><key>Request</key><string>GetValue</string>{fields}</dict></plist>"
         );
         assert_eq!(
             reply(body.as_bytes(), body.len()).await,
@@ -212,9 +371,23 @@ async fn schema_envelopes_report_only_fixed_presence_classes() {
 
 #[tokio::test]
 async fn failure_only_value_inspection_cannot_accept_duplicate_reply_fields() {
-    for duplicate in [
-        "<key>Value</key><string>test-device</string>",
-        "<key>Request</key><string>GetValue</string>",
+    for (duplicate, envelope) in [
+        (
+            "<key>Value</key><string>test-device</string>",
+            ReplyEnvelope::None,
+        ),
+        (
+            "<key>Request</key><string>GetValue</string>",
+            ReplyEnvelope::None,
+        ),
+        (
+            "<key>Error</key><dict/><key>Error</key><string/>",
+            ReplyEnvelope::Error,
+        ),
+        (
+            "<key>Result</key><string>Success</string><key>Result</key><string>Success</string>",
+            ReplyEnvelope::Result,
+        ),
     ] {
         let body = format!(
             "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string>{duplicate}</dict></plist>"
@@ -223,7 +396,7 @@ async fn failure_only_value_inspection_cannot_accept_duplicate_reply_fields() {
         assert_eq!(
             reply(body.as_bytes(), body.len()).await,
             Err(LockdownQueryFailure::PlistDecode(
-                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::None)
+                PlistDecodeFailure::XmlReplySchema(envelope)
             ))
         );
     }

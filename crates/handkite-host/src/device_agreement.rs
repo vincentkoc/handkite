@@ -63,7 +63,7 @@ impl LockdownQueryFailure {
     }
 }
 
-/// Classification after strict decoding has already rejected the reply.
+/// Fixed classification of rejected reply decoding or plist structure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlistDecodeFailure {
     BinaryFormat,
@@ -323,18 +323,21 @@ fn check_deadline(deadline: tokio::time::Instant) -> Result<(), ObservationFailu
 mod lockdown {
     use super::{LockdownQueryFailure, PlistDecodeFailure, ReplyEnvelope};
     use crate::usb::plist_wire;
-    use serde::Deserialize;
+    use serde::{Deserialize, de::IgnoredAny};
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
     const MAX_REPLY_BYTES: usize = 4096;
 
     #[derive(Deserialize)]
-    #[serde(deny_unknown_fields)]
     struct Reply {
         #[serde(rename = "Request")]
-        request: String,
+        request: plist::Value,
         #[serde(rename = "Value")]
-        value: String,
+        value: plist::Value,
+        #[serde(rename = "Error")]
+        error: Option<IgnoredAny>,
+        #[serde(rename = "Result")]
+        result: Option<plist::Value>,
     }
 
     pub(super) async fn unique_id(
@@ -371,13 +374,28 @@ mod lockdown {
             .map_err(|_| LockdownQueryFailure::ResponseRead)?;
         let reply: Reply = plist_wire::decode(&body, MAX_REPLY_BYTES)
             .map_err(|_| LockdownQueryFailure::PlistDecode(classify_rejection(&body)))?;
-        if reply.request != "GetValue" || reply.value.is_empty() {
+        let value = reply
+            .value
+            .as_string()
+            .filter(|value| !value.is_empty())
+            .ok_or(LockdownQueryFailure::ReplyValidation)?;
+        if reply.request.as_string() != Some("GetValue")
+            || reply.error.is_some()
+            || reply
+                .result
+                .as_ref()
+                .is_some_and(|result| result.as_string() != Some("Success"))
+        {
             return Err(LockdownQueryFailure::ReplyValidation);
         }
-        Ok(reply.value)
+        // IgnoredAny can skip invalid dictionary keys. Validate the bounded
+        // value tree, but never use it to replace the duplicate-aware Reply.
+        plist::Value::from_reader_xml(body.as_slice())
+            .map_err(|_| LockdownQueryFailure::PlistDecode(PlistDecodeFailure::XmlPlistParse))?;
+        Ok(value.to_owned())
     }
 
-    // Called only after the unchanged strict decoder rejects. This can never
+    // Called only after direct Reply deserialization rejects. This can never
     // supply a Reply or turn a malformed/schema-invalid response into success.
     fn classify_rejection(body: &[u8]) -> PlistDecodeFailure {
         if body.starts_with(b"bplist00") {
