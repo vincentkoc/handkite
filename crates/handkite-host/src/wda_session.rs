@@ -127,11 +127,39 @@ where
     owned_transaction(wda, admit, action).await
 }
 
+/// Retain the exact created session ID for one caller-owned close after the
+/// settings transaction has finished. A failed creation yields no close target.
+pub async fn with_owned_session_idle_settings_receipt<T, E, F, Fut>(
+    wda: &UsbWda,
+    admit: impl FnMut() -> Result<(), ()>,
+    action: F,
+) -> Result<(String, IdleSettingsOutcome<T, E>), OwnedSessionError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    owned_transaction_with_receipt(wda, admit, action).await
+}
+
 async fn owned_transaction<T, E, F, Fut>(
     wda: &impl WdaRequest,
     admit: impl FnMut() -> Result<(), ()>,
     action: F,
 ) -> Result<IdleSettingsOutcome<T, E>, OwnedSessionError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    owned_transaction_with_receipt(wda, admit, action)
+        .await
+        .map(|(_, outcome)| outcome)
+}
+
+async fn owned_transaction_with_receipt<T, E, F, Fut>(
+    wda: &impl WdaRequest,
+    admit: impl FnMut() -> Result<(), ()>,
+    action: F,
+) -> Result<(String, IdleSettingsOutcome<T, E>), OwnedSessionError>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<T, E>>,
@@ -142,7 +170,8 @@ where
         session: &session,
         stopped: Cell::new(false),
     };
-    Ok(wda_settings::transaction(&guarded, &session, || action(session.clone())).await)
+    let outcome = wda_settings::transaction(&guarded, &session, || action(session.clone())).await;
+    Ok((session, outcome))
 }
 
 async fn create_session(
@@ -655,6 +684,49 @@ mod tests {
             );
             assert_eq!(fake.current.get(), "owned-session");
         }
+    }
+
+    #[tokio::test]
+    async fn transaction_receipt_identifies_the_created_session_after_action_failure() {
+        let fake = Fake::ready();
+        let (session, outcome) = owned_transaction_with_receipt(
+            &fake,
+            || Ok(()),
+            |session| {
+                assert_eq!(session, "owned-session");
+                async { Err::<(), _>("action failed") }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(session, "owned-session");
+        assert_eq!(outcome.action, IdleAction::Completed(Err("action failed")));
+        assert_eq!(outcome.restoration, Restoration::Verified);
+        assert_eq!(fake.posts().len(), 3);
+        assert!(
+            fake.requests
+                .borrow()
+                .iter()
+                .all(|(method, _)| method != "DELETE")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_creation_returns_no_session_receipt_or_action() {
+        let fake = Fake::new(Err(WdaError::TimedOutAfterSent));
+        let action_ran = Cell::new(false);
+        let result = owned_transaction_with_receipt(
+            &fake,
+            || Ok(()),
+            |_| async {
+                action_ran.set(true);
+                Ok::<(), ()>(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(OwnedSessionError::CreationUnknown)));
+        assert!(!action_ran.get());
+        assert_eq!(fake.posts(), ["/session"]);
     }
 
     #[tokio::test]
