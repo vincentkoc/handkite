@@ -14,6 +14,7 @@ SPEC.loader.exec_module(verify)
 
 TEAM = "ABCDE12345"
 UDID = "a" * 40
+MODERN_UDID = "00008120-00123456789A1234"
 RUNNER = "com.example.Runner.xctrunner"
 CERT = "b" * 40
 
@@ -33,6 +34,17 @@ def fixture(directory: str) -> tuple[Path, Path, Path]:
 
 
 class VerifyTests(unittest.TestCase):
+    def test_udid_accepts_legacy_and_modern_forms_only(self):
+        self.assertIsNotNone(verify.UDID.fullmatch(UDID))
+        self.assertIsNotNone(verify.UDID.fullmatch(MODERN_UDID))
+        for invalid in (
+            "a" * 39,
+            "00008120-00123456789A123",
+            "00008120-00123456789A12345",
+            "00008120_00123456789A1234",
+        ):
+            self.assertIsNone(verify.UDID.fullmatch(invalid))
+
     def test_exact_runner_and_xctestrun_are_required(self):
         with tempfile.TemporaryDirectory() as directory:
             output, app, run = fixture(directory)
@@ -64,7 +76,7 @@ class VerifyTests(unittest.TestCase):
             }
             fields = {
                 "TeamIdentifier": [TEAM],
-                "ProvisionedDevices": [UDID],
+                "ProvisionedDevices": [MODERN_UDID],
                 "ExpirationDate": datetime.now(timezone.utc) + timedelta(days=1),
                 "DeveloperCertificates": [cert],
                 "Entitlements": entitlements,
@@ -74,14 +86,14 @@ class VerifyTests(unittest.TestCase):
                 return plistlib.dumps(fields if arguments[0] == "/usr/bin/security" else entitlements)
 
             with mock.patch.object(verify, "tool", side_effect=command):
-                verify.profile(app, TEAM, UDID, RUNNER, digest)
+                verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
                 fields["ProvisionedDevices"] = ["other"]
                 with self.assertRaisesRegex(ValueError, "profile_identity_mismatch"):
-                    verify.profile(app, TEAM, UDID, RUNNER, digest)
-                fields["ProvisionedDevices"] = [UDID]
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                fields["ProvisionedDevices"] = [MODERN_UDID]
                 fields["ExpirationDate"] = datetime.now(timezone.utc) - timedelta(days=1)
                 with self.assertRaisesRegex(ValueError, "profile_expired"):
-                    verify.profile(app, TEAM, UDID, RUNNER, digest)
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
 
     def test_runner_identity_rejects_before_any_signature_check(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -102,9 +114,9 @@ class VerifyTests(unittest.TestCase):
                 mock.patch.object(verify, "leaf_sha1", return_value=CERT),
                 mock.patch.object(verify, "profile") as profile,
             ):
-                runner_hash, run_hash = verify.verify(output, TEAM, UDID, RUNNER, CERT)
+                runner_hash, run_hash = verify.verify(output, TEAM, MODERN_UDID, RUNNER, CERT)
             self.assertEqual(signer.call_count, 2)
-            profile.assert_called_once_with(app, TEAM, UDID, RUNNER, CERT)
+            profile.assert_called_once_with(app, TEAM, MODERN_UDID, RUNNER, CERT)
             self.assertEqual(len(runner_hash), 64)
             self.assertEqual(run_hash, verify.hash_file(run))
 

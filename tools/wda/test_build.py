@@ -10,6 +10,7 @@ SPEC = importlib.util.spec_from_file_location("wda_build", Path(__file__).with_n
 assert SPEC and SPEC.loader
 build = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(build)
+MODERN_UDID = "00008120-00123456789A1234"
 
 
 def project_fixture():
@@ -35,6 +36,17 @@ def project_fixture():
 
 
 class BuildTests(unittest.TestCase):
+    def test_udid_accepts_legacy_and_modern_forms_only(self):
+        self.assertIsNotNone(build.UDID.fullmatch("a" * 40))
+        self.assertIsNotNone(build.UDID.fullmatch(MODERN_UDID))
+        for invalid in (
+            "a" * 39,
+            "00008120-00123456789A123",
+            "00008120-00123456789A12345",
+            "00008120_00123456789A1234",
+        ):
+            self.assertIsNone(build.UDID.fullmatch(invalid))
+
     def test_patch_changes_only_two_pinned_ios_configs(self):
         data = project_fixture()
         with mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()):
@@ -74,9 +86,10 @@ class BuildTests(unittest.TestCase):
                 }),
                 mock.patch.object(build.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
             ):
-                build.build(Path("/source"), output, "ABCDE12345", "a" * 40, "com.example.Runner", False)
+                build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID, "com.example.Runner", False)
             command = run.call_args.args[0]
             self.assertEqual(command[:3], ["/usr/bin/xcodebuild", "clean", "build-for-testing"])
+            self.assertIn(f"platform=iOS,id={MODERN_UDID}", command)
             self.assertNotIn("-allowProvisioningUpdates", command)
             self.assertNotIn("-allowProvisioningDeviceRegistration", command)
             self.assertNotIn("PRODUCT_BUNDLE_IDENTIFIER=com.example.Runner", command)

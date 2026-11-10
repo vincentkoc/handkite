@@ -9,7 +9,7 @@ python3 tools/wda/build.py \
   --source /absolute/pinned/WebDriverAgent \
   --output /absolute/private/wda-build \
   --team ABCDE12345 \
-  --udid <udid> \
+  --udid 00008120-00123456789A1234 \
   --bundle-id com.example.HandkiteRunner
 ```
 
@@ -23,7 +23,7 @@ After the build, obtain the exact expected runner bundle ID and an independently
 python3 tools/wda/verify.py \
   --output /absolute/private/wda-build \
   --team ABCDE12345 \
-  --udid <udid> \
+  --udid 00008120-00123456789A1234 \
   --runner-id com.example.HandkiteRunner.xctrunner \
   --certificate-sha1 0000000000000000000000000000000000000000
 ```

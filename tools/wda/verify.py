@@ -12,7 +12,7 @@ import tempfile
 
 
 TEAM = re.compile(r"[A-Z0-9]{10}\Z")
-UDID = re.compile(r"[0-9a-fA-F]{40}\Z")
+UDID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})\Z")
 SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 RUNNER_ID = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.xctrunner(?:\.[A-Z0-9]{10})?\Z")
 MAX_PROFILE_BYTES = 1024 * 1024

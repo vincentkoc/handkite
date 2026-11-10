@@ -17,7 +17,7 @@ PROJECT = Path("WebDriverAgent.xcodeproj/project.pbxproj")
 IOS_CONFIGS = ("EEF988321C486604005CA669", "EEF988331C486604005CA669")
 ORIGINAL_BUNDLE = "PRODUCT_BUNDLE_IDENTIFIER = com.facebook.WebDriverAgentRunner;"
 TEAM = re.compile(r"[A-Z0-9]{10}\Z")
-UDID = re.compile(r"[0-9a-fA-F]{40}\Z")
+UDID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})\Z")
 BUNDLE = re.compile(r"[A-Za-z0-9]+(?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9]+(?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\Z")
 
 
