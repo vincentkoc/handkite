@@ -475,6 +475,7 @@ dependencies = [
  "handkite-core",
  "idevice",
  "libc",
+ "plist",
  "quick-xml",
  "rcgen",
  "reqwest",

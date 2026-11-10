@@ -3,6 +3,7 @@
 mod account_home;
 pub mod anisette_v3;
 pub mod current_selection;
+pub mod device_agreement;
 pub mod device_health;
 pub mod file_gate;
 pub mod host_config;
