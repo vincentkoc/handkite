@@ -230,10 +230,9 @@ impl Drop for WdaAdapter {
                     eprintln!("handkite: owned session close unproven");
                 }
             }
-            if self.runtime.block_on(tokio::time::timeout(
-                Duration::from_secs(5),
-                runner.abort_and_join(),
-            )) != Ok(Ok(()))
+            if self.runtime.block_on(async {
+                tokio::time::timeout(Duration::from_secs(5), runner.abort_and_join()).await
+            }) != Ok(Ok(()))
             {
                 eprintln!("handkite: owned runner host task termination unproven");
             }

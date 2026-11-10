@@ -1,6 +1,6 @@
 //! One explicitly admitted WDA session creation, never adoption or renewal.
 
-use crate::wda_action::WdaRequest;
+use crate::wda_action::{WdaRequest, valid_session_id};
 use crate::wda_http::HttpResponse;
 use crate::wda_settings::{self, IdleSettingsOutcome};
 use crate::wda_transport::{UsbWda, WdaError};
@@ -36,7 +36,15 @@ pub async fn close_owned_session(wda: &UsbWda, session: &str) -> SessionClose {
 }
 
 async fn close_session(wda: &impl WdaRequest, session: &str) -> SessionClose {
-    if wda_settings::validate_session(wda, session).await.is_err() {
+    if !valid_session_id(session) {
+        return SessionClose::Refused;
+    }
+    let guarded = OwnedRequests {
+        wda,
+        session,
+        stopped: Cell::new(false),
+    };
+    if guarded.validate().await.is_err() {
         return SessionClose::Refused;
     }
     let result = wda
@@ -431,6 +439,45 @@ mod tests {
             let fake = Fake::ready();
             fake.current.set("owned-session");
             assert_eq!(close_session(&fake, session).await, SessionClose::Refused);
+            assert!(
+                fake.requests
+                    .borrow()
+                    .iter()
+                    .all(|(method, _)| method != "DELETE")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_session_envelopes_refuse_close_before_delete() {
+        for (request, reply) in [
+            (1, json!({"value":{"ready":true}})),
+            (
+                1,
+                json!({"sessionId":"owned-session","value":{"ready":true,"sessionId":"replacement"}}),
+            ),
+            (2, json!({"value":{}})),
+            (
+                2,
+                json!({"sessionId":"owned-session","value":{"sessionId":"replacement"}}),
+            ),
+            (
+                2,
+                json!({"sessionId":"owned-session","value":{},"error":"failed"}),
+            ),
+            (
+                2,
+                json!({"sessionId":"owned-session","value":{},"status":1}),
+            ),
+        ] {
+            let fake = Fake::ready();
+            fake.current.set("owned-session");
+            *fake.response_override.borrow_mut() = Some((request, Ok(response(reply))));
+            assert_eq!(
+                close_session(&fake, "owned-session").await,
+                SessionClose::Refused
+            );
+            assert_eq!(fake.requests.borrow().len(), request);
             assert!(
                 fake.requests
                     .borrow()
