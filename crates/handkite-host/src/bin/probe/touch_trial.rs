@@ -190,7 +190,15 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
                     return Err(TrialError::Refused(RefusalReason::SessionUnproven));
                 }
                 blocking_trial(move || {
-                    let mut live = Live::new(expected.clone()).map_err(TrialError::Refused)?;
+                    let input_owner = Arc::clone(&worker_owner);
+                    let input_liveness = worker_liveness.clone();
+                    let input_admission: Arc<dyn Fn() -> bool + Send + Sync> =
+                        Arc::new(move || {
+                            !input_liveness.is_finished() && input_owner.validate_current().is_ok()
+                        });
+                    let mut live =
+                        Live::new_with_admission(expected.clone(), Some(input_admission))
+                            .map_err(TrialError::Refused)?;
                     let owns = || {
                         !worker_liveness.is_finished() && worker_owner.validate_current().is_ok()
                     };
@@ -779,9 +787,17 @@ struct Live {
 
 impl Live {
     fn new(expected: HardwareId) -> Result<Self, RefusalReason> {
+        Self::new_with_admission(expected, None)
+    }
+
+    fn new_with_admission(
+        expected: HardwareId,
+        input_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Result<Self, RefusalReason> {
         Ok(Self {
             adapter: WdaAdapter::new(expected.clone()).map_err(|_| RefusalReason::CaptureFailed)?,
-            wda: UsbWda::new(PinnedUsb::new(expected.clone())),
+            wda: UsbWda::new(PinnedUsb::new(expected.clone()))
+                .with_write_admission(input_admission),
             expected,
             runtime: tokio::runtime::Builder::new_current_thread()
                 .enable_all()

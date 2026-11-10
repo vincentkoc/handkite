@@ -50,7 +50,7 @@ impl UsbWda {
     }
 
     /// Retain input ownership checks through asynchronous connect and socket polls.
-    pub(crate) fn with_write_admission(
+    pub fn with_write_admission(
         mut self,
         admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     ) -> Self {
