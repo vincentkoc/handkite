@@ -1,5 +1,7 @@
 use handkite_core::protocol::DeviceBinding;
-use handkite_core::unlock::{AttemptGate, GateError, UnlockOutcome, UnlockPolicy, unlock_once};
+use handkite_core::unlock::{
+    AttemptGate, BackendError, GateError, UnlockError, UnlockOutcome, UnlockPolicy, unlock_once,
+};
 use handkite_host::file_gate::FileAttemptGate;
 use handkite_host::pin_backend::NativePasscodeBackend;
 use handkite_host::pin_input;
@@ -11,11 +13,19 @@ use handkite_host::wda_settings::{
 use handkite_host::wda_transport::UsbWda;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy)]
+enum WorkerError {
+    Unlock(UnlockError),
+    Initialization,
+    GateAccess,
+    Join,
+}
+
 pub(super) fn run(
     binding: DeviceBinding,
     gate: FileAttemptGate,
     supervised: bool,
-) -> Result<(), &'static str> {
+) -> Result<(), String> {
     admitted(gate, |gate| {
         // The gate check precedes secret input and every possible settings POST.
         let code =
@@ -37,13 +47,13 @@ pub(super) fn run(
             let outcome = with_temporary_idle_settings(&wda, &session, || async move {
                 // Keep the synchronous backend runtimes entirely on this worker.
                 tokio::task::spawn_blocking(move || {
-                    let mut gate = worker_gate.lock().map_err(|_| ())?;
+                    let mut gate = worker_gate.lock().map_err(|_| WorkerError::GateAccess)?;
                     let mut backend = NativePasscodeBackend::new_for_session(
                         binding.usb_id.clone(),
                         supervised,
                         &worker_session,
                     )
-                    .map_err(|_| ())?;
+                    .map_err(|_| WorkerError::Initialization)?;
                     unlock_once(
                         &mut backend,
                         &mut *gate,
@@ -52,27 +62,36 @@ pub(super) fn run(
                         &code,
                         UnlockPolicy::default(),
                     )
-                    .map_err(|_| ())
+                    .map_err(WorkerError::Unlock)
                 })
                 .await
-                .map_err(|_| ())?
+                .map_err(|_| WorkerError::Join)?
             })
             .await;
             Ok::<_, &'static str>(outcome)
         })?;
-        let mut gate = gate.lock().map_err(|_| "unlock_idle=unknown")?;
+        // Diagnose worker failure before touching a possibly poisoned gate mutex.
+        if let Some(error) = failure(&outcome) {
+            return Err(error);
+        }
+        let mut gate = gate
+            .lock()
+            .map_err(|_| diagnostic(&outcome, "gate_access"))?;
         let result = finish(&mut gate, outcome)?;
         println!("unlock_idle={result}");
         Ok(())
     })
 }
 
-fn admitted<G: AttemptGate, T>(
+fn admitted<G: AttemptGate, T, E: From<&'static str>>(
     gate: G,
-    work: impl FnOnce(G) -> Result<T, &'static str>,
-) -> Result<T, &'static str> {
-    if gate.is_disabled().map_err(|_| "unlock_idle=refused")? {
-        return Err("unlock_idle=disabled");
+    work: impl FnOnce(G) -> Result<T, E>,
+) -> Result<T, E> {
+    if gate
+        .is_disabled()
+        .map_err(|_| E::from("unlock_idle=refused"))?
+    {
+        return Err(E::from("unlock_idle=disabled"));
     }
     work(gate)
 }
@@ -106,21 +125,86 @@ impl<G: AttemptGate> AttemptGate for DeferredGate<G> {
 
 fn finish<G: AttemptGate>(
     gate: &mut DeferredGate<G>,
-    outcome: IdleSettingsOutcome<UnlockOutcome, ()>,
-) -> Result<&'static str, &'static str> {
-    if outcome.restoration != Restoration::Verified {
-        return Err("unlock_idle=unknown");
+    outcome: IdleSettingsOutcome<UnlockOutcome, WorkerError>,
+) -> Result<&'static str, String> {
+    if let Some(error) = failure(&outcome) {
+        return Err(error);
     }
     match outcome.action {
         IdleAction::Completed(Ok(UnlockOutcome::CodeSubmitted)) if gate.clear_requested => {
-            gate.inner.clear().map_err(|_| "unlock_idle=unknown")?;
+            gate.inner
+                .clear()
+                .map_err(|_| diagnostic(&outcome, "gate_clear_failed"))?;
             Ok("code_submitted")
         }
         IdleAction::Completed(Ok(UnlockOutcome::AlreadyUnlocked)) if !gate.clear_requested => {
             Ok("already_unlocked")
         }
-        _ => Err("unlock_idle=unknown"),
+        _ => Err(diagnostic(&outcome, "clear_request_unproven")),
     }
+}
+
+fn failure(outcome: &IdleSettingsOutcome<UnlockOutcome, WorkerError>) -> Option<String> {
+    let reason = if matches!(outcome.restoration, Restoration::Unproven(_))
+        || (outcome.restoration == Restoration::NotNeeded
+            && !matches!(outcome.action, IdleAction::NotRun(_)))
+    {
+        "restoration_unproven"
+    } else {
+        match outcome.action {
+            IdleAction::Completed(Ok(_)) => return None,
+            _ => action_reason(&outcome.action).0,
+        }
+    };
+    Some(diagnostic(outcome, reason))
+}
+
+fn diagnostic(
+    outcome: &IdleSettingsOutcome<UnlockOutcome, WorkerError>,
+    reason: &'static str,
+) -> String {
+    let (action, index) = action_reason(&outcome.action);
+    let restoration = match outcome.restoration {
+        Restoration::Verified => "verified",
+        Restoration::NotNeeded => "not_needed",
+        Restoration::Unproven(_) => "unproven",
+    };
+    let mut line =
+        format!("unlock_idle=unknown reason={reason} action={action} restoration={restoration}");
+    if let Some(index) = index {
+        line.push_str(&format!(" first_unconfirmed_index={index}"));
+    }
+    line
+}
+
+fn action_reason(action: &IdleAction<UnlockOutcome, WorkerError>) -> (&'static str, Option<u8>) {
+    let reason = match action {
+        IdleAction::NotRun(_) => "settings_not_run",
+        IdleAction::Completed(Ok(UnlockOutcome::CodeSubmitted)) => "code_submitted",
+        IdleAction::Completed(Ok(UnlockOutcome::AlreadyUnlocked)) => "already_unlocked",
+        IdleAction::Completed(Err(WorkerError::Initialization)) => "backend_initialization",
+        IdleAction::Completed(Err(WorkerError::GateAccess)) => "gate_access",
+        IdleAction::Completed(Err(WorkerError::Join)) => "worker_join",
+        IdleAction::Completed(Err(WorkerError::Unlock(error))) => match error {
+            UnlockError::Disabled => "disabled",
+            UnlockError::DeviceMismatch => "device_mismatch",
+            UnlockError::ManualRequired => "manual_required",
+            UnlockError::NoKeypad => "no_keypad",
+            UnlockError::UnreadableProgress => "unreadable_progress",
+            UnlockError::LengthMismatch { .. } => "length_mismatch",
+            UnlockError::ResidualInput => "residual_input",
+            UnlockError::Incomplete {
+                digit: index @ 1..=6,
+            } => return ("incomplete", Some(*index as u8)),
+            UnlockError::Incomplete { .. } => "incomplete_index_unproven",
+            UnlockError::UnlockedBeforeLastDigit => "unlocked_before_last_digit",
+            UnlockError::WrongOrUncertain => "wrong_or_uncertain",
+            UnlockError::Backend(BackendError::Disconnected) => "backend_disconnected",
+            UnlockError::Backend(BackendError::Unavailable) => "backend_unavailable",
+            UnlockError::Gate => "gate_unproven",
+        },
+    };
+    (reason, None)
 }
 
 #[cfg(test)]
@@ -171,6 +255,157 @@ mod tests {
     }
 
     #[test]
+    fn typed_worker_and_unlock_failures_emit_only_allowlisted_classes() {
+        let cases = [
+            (WorkerError::Initialization, "backend_initialization"),
+            (WorkerError::GateAccess, "gate_access"),
+            (WorkerError::Join, "worker_join"),
+            (WorkerError::Unlock(UnlockError::Disabled), "disabled"),
+            (
+                WorkerError::Unlock(UnlockError::DeviceMismatch),
+                "device_mismatch",
+            ),
+            (
+                WorkerError::Unlock(UnlockError::ManualRequired),
+                "manual_required",
+            ),
+            (WorkerError::Unlock(UnlockError::NoKeypad), "no_keypad"),
+            (
+                WorkerError::Unlock(UnlockError::UnreadableProgress),
+                "unreadable_progress",
+            ),
+            (
+                WorkerError::Unlock(UnlockError::LengthMismatch {
+                    observed_total: u32::MAX,
+                }),
+                "length_mismatch",
+            ),
+            (
+                WorkerError::Unlock(UnlockError::ResidualInput),
+                "residual_input",
+            ),
+            (
+                WorkerError::Unlock(UnlockError::UnlockedBeforeLastDigit),
+                "unlocked_before_last_digit",
+            ),
+            (
+                WorkerError::Unlock(UnlockError::WrongOrUncertain),
+                "wrong_or_uncertain",
+            ),
+            (
+                WorkerError::Unlock(UnlockError::Backend(BackendError::Disconnected)),
+                "backend_disconnected",
+            ),
+            (
+                WorkerError::Unlock(UnlockError::Backend(BackendError::Unavailable)),
+                "backend_unavailable",
+            ),
+            (WorkerError::Unlock(UnlockError::Gate), "gate_unproven"),
+        ];
+        for (error, token) in cases {
+            let mut gate = DeferredGate::new(Gate::default());
+            gate.mark_uncertain().unwrap();
+            let result = finish(
+                &mut gate,
+                IdleSettingsOutcome {
+                    action: IdleAction::Completed(Err(error)),
+                    restoration: Restoration::Verified,
+                },
+            );
+            assert_eq!(
+                result,
+                Err(format!(
+                    "unlock_idle=unknown reason={token} action={token} restoration=verified"
+                ))
+            );
+            assert!(gate.inner.disabled);
+            assert_eq!(gate.inner.clears, 0);
+        }
+    }
+
+    #[test]
+    fn incomplete_reports_only_bounded_unconfirmed_position_and_restore_precedence() {
+        for digit in [0, 1, 2, 3, 4, 5, 6, 7, u32::MAX] {
+            for restoration in [
+                Restoration::Verified,
+                Restoration::Unproven(SettingsError::ReadUnproven),
+            ] {
+                let mut gate = DeferredGate::new(Gate::default());
+                gate.mark_uncertain().unwrap();
+                let output = finish(
+                    &mut gate,
+                    IdleSettingsOutcome {
+                        action: IdleAction::Completed(Err(WorkerError::Unlock(
+                            UnlockError::Incomplete { digit },
+                        ))),
+                        restoration,
+                    },
+                )
+                .unwrap_err();
+                let bounded = (1..=6).contains(&digit);
+                let action = if bounded {
+                    "incomplete"
+                } else {
+                    "incomplete_index_unproven"
+                };
+                let verified = restoration == Restoration::Verified;
+                let reason = if verified {
+                    action
+                } else {
+                    "restoration_unproven"
+                };
+                let restore = if verified { "verified" } else { "unproven" };
+                let suffix = if bounded {
+                    format!(" first_unconfirmed_index={digit}")
+                } else {
+                    String::new()
+                };
+                assert_eq!(
+                    output,
+                    format!(
+                        "unlock_idle=unknown reason={reason} action={action} restoration={restore}{suffix}"
+                    )
+                );
+                assert!(gate.inner.disabled);
+                assert_eq!(gate.inner.clears, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn settings_not_run_and_unverified_restore_cannot_report_success_or_clear() {
+        for restoration in [
+            Restoration::NotNeeded,
+            Restoration::Verified,
+            Restoration::Unproven(SettingsError::WriteUnproven),
+        ] {
+            let mut gate = DeferredGate::new(Gate::default());
+            gate.mark_uncertain().unwrap();
+            let output = finish(
+                &mut gate,
+                IdleSettingsOutcome {
+                    action: IdleAction::NotRun(SettingsError::SessionUnproven),
+                    restoration,
+                },
+            )
+            .unwrap_err();
+            let (reason, restore) = match restoration {
+                Restoration::Verified => ("settings_not_run", "verified"),
+                Restoration::NotNeeded => ("settings_not_run", "not_needed"),
+                Restoration::Unproven(_) => ("restoration_unproven", "unproven"),
+            };
+            assert_eq!(
+                output,
+                format!(
+                    "unlock_idle=unknown reason={reason} action=settings_not_run restoration={restore}"
+                )
+            );
+            assert!(gate.inner.disabled);
+            assert_eq!(gate.inner.clears, 0);
+        }
+    }
+
+    #[test]
     fn only_submitted_code_with_verified_restore_commits_deferred_clear() {
         for restoration in [
             Restoration::Verified,
@@ -191,7 +426,7 @@ mod tests {
                         action: IdleAction::Completed(if submitted {
                             Ok(UnlockOutcome::CodeSubmitted)
                         } else {
-                            Err(())
+                            Err(WorkerError::Unlock(UnlockError::Incomplete { digit: 1 }))
                         }),
                         restoration,
                     },
@@ -211,9 +446,32 @@ mod tests {
                     restoration: Restoration::Verified,
                 }
             ),
-            Err("unlock_idle=unknown")
+            Err("unlock_idle=unknown reason=clear_request_unproven action=code_submitted restoration=verified".into())
         );
         assert_eq!(gate.inner.clears, 0);
+    }
+
+    #[test]
+    fn gate_clear_failure_is_fixed_unknown_after_verified_restoration() {
+        struct FailingClear;
+        impl AttemptGate for FailingClear {
+            fn is_disabled(&self) -> Result<bool, GateError> {
+                Ok(true)
+            }
+            fn mark_uncertain(&mut self) -> Result<(), GateError> {
+                Ok(())
+            }
+            fn clear(&mut self) -> Result<(), GateError> {
+                Err(GateError)
+            }
+        }
+        let mut gate = DeferredGate::new(FailingClear);
+        gate.clear().unwrap();
+        assert_eq!(finish(&mut gate, IdleSettingsOutcome {
+            action: IdleAction::Completed(Ok(UnlockOutcome::CodeSubmitted)),
+            restoration: Restoration::Verified,
+        }), Err("unlock_idle=unknown reason=gate_clear_failed action=code_submitted restoration=verified".into()));
+        assert!(gate.is_disabled().unwrap());
     }
 
     #[test]
@@ -293,7 +551,7 @@ mod tests {
                 let result = finish(
                     &mut gate,
                     IdleSettingsOutcome {
-                        action: IdleAction::Completed(result.map_err(|_| ())),
+                        action: IdleAction::Completed(result.map_err(WorkerError::Unlock)),
                         restoration,
                     },
                 );
@@ -317,6 +575,16 @@ mod tests {
         })
         .await;
         assert!(joined.is_err());
+        assert_eq!(
+            failure(&IdleSettingsOutcome {
+                action: IdleAction::Completed(Err(WorkerError::Join)),
+                restoration: Restoration::Verified,
+            }),
+            Some(
+                "unlock_idle=unknown reason=worker_join action=worker_join restoration=verified"
+                    .into()
+            )
+        );
         assert!(gate.is_poisoned());
         let poisoned = gate.lock().err().unwrap().into_inner();
         assert!(poisoned.inner.disabled);

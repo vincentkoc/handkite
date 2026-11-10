@@ -36,7 +36,7 @@ fn run() -> Result<(), String> {
         return Err("PIN attempts disabled; owner inspection required".into());
     }
     if temporary_idle_settings {
-        return idle::run(binding, gate, supervised_visibility_fallback).map_err(str::to_owned);
+        return idle::run(binding, gate, supervised_visibility_fallback);
     }
     let code = pin_input::read_once(std::io::stdin().lock()).map_err(str::to_owned)?;
     let mut backend = NativePasscodeBackend::new_with_supervised_visibility_fallback(

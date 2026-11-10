@@ -252,6 +252,9 @@ transaction session; a completed code submission can clear its own marker only
 after verified restoration. Failure never clears a marked gate or retries input.
 Do not cancel the bracket. This variant is offline-tested only and does not
 qualify live PIN entry; omitting the flag preserves the default unlock path.
+Failures report fixed action/restoration categories. An incomplete result can
+include only the first unconfirmed position from 1 through 6, never a PIN value
+or proof of physical delivery. A marked gate remains disabled on failure.
 
 ## Anisette
 
