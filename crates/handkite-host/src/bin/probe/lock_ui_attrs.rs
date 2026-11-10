@@ -7,7 +7,7 @@ use handkite_host::{host_config, native_lock, pin_screen};
 use quick_xml::events::Event;
 use serde_json::Value;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const SPRINGBOARD: &str = "com.apple.springboard";
 const SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
@@ -165,6 +165,43 @@ pub(super) fn with_locked_xml<T>(
     let mut live = Live::new(expected).map_err(Refusal::message)?;
     inspect_with(&mut live, |xml| parse(xml).map_err(|_| Refusal::Capture))
         .map_err(Refusal::message)
+}
+
+pub(super) struct LockedXml {
+    pub xml: String,
+    pub session: String,
+    pub started: Instant,
+    pub finished: Instant,
+}
+
+pub(super) fn capture_with_hittable(expected: HardwareId) -> Result<LockedXml, ()> {
+    let mut live = Live::new(expected).map_err(|_| ())?;
+    capture_hittable_xml(&mut live).map_err(|_| ())
+}
+
+fn capture_hittable_xml(device: &mut impl ReadDevice) -> Result<LockedXml, Refusal> {
+    device.identity()?;
+    native_locked(device.native())?;
+    let session_id = session(device)?;
+    wda_locked(device)?;
+    let started = Instant::now();
+    let path = format!(
+        "/session/{session_id}/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,customActions,nativeFrame"
+    );
+    let source = device.get(&path)?;
+    let xml = source["value"].as_str().ok_or(Refusal::Capture)?.to_owned();
+    wda_locked(device)?;
+    if session(device)? != session_id {
+        return Err(Refusal::Session);
+    }
+    native_locked(device.native())?;
+    device.identity()?;
+    Ok(LockedXml {
+        xml,
+        session: session_id,
+        started,
+        finished: Instant::now(),
+    })
 }
 
 fn inspect_with<T>(
@@ -726,6 +763,71 @@ mod tests {
             assert_eq!(path, expected);
             result
         }
+    }
+
+    #[test]
+    fn hittable_capture_uses_only_guarded_gets_and_retains_attribute() {
+        const PATH: &str = "/session/fixture-session/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,customActions,nativeFrame";
+        let fake = || {
+            let mut fake = Fake::new();
+            fake.steps[6] = Step::Get(PATH, Ok(json!({"value":tree(CANCEL)})));
+            fake
+        };
+        let mut device = fake();
+        let capture = capture_hittable_xml(&mut device).unwrap();
+        assert_eq!(capture.xml, tree(CANCEL));
+        assert_eq!(capture.session, "fixture-session");
+        assert!(capture.finished >= capture.started);
+        assert!(device.steps.is_empty());
+        assert_eq!(device.calls, 13);
+        for index in [0, 12] {
+            let mut device = fake();
+            device.steps[index] = Step::Identity(Err(Refusal::Identity));
+            assert_eq!(
+                capture_hittable_xml(&mut device).err(),
+                Some(Refusal::Identity)
+            );
+            assert_eq!(device.calls, index + 1);
+        }
+        for index in [1, 11] {
+            let mut device = fake();
+            device.steps[index] = Step::Native(NativeLock {
+                state: LockState::Locked,
+                unlocked_since_boot: Some(false),
+            });
+            assert_eq!(
+                capture_hittable_xml(&mut device).err(),
+                Some(Refusal::FirstUnlock)
+            );
+            assert_eq!(device.calls, index + 1);
+        }
+        for index in [4, 7] {
+            let mut device = fake();
+            device.steps[index] = Step::Get("/wda/locked", Ok(json!({"value":false})));
+            assert_eq!(
+                capture_hittable_xml(&mut device).err(),
+                Some(Refusal::WdaLock)
+            );
+            assert_eq!(device.calls, index + 1);
+        }
+        let mut device = fake();
+        device.steps[9] = Step::Get(
+            "/status",
+            Ok(json!({"sessionId":"replacement","value":{"ready":true}})),
+        );
+        device.steps[10] = Step::Get("/session/replacement", Ok(json!({"value":{}})));
+        assert_eq!(
+            capture_hittable_xml(&mut device).err(),
+            Some(Refusal::Session)
+        );
+        assert_eq!(device.calls, 11);
+        let mut device = fake();
+        device.steps[6] = Step::Get(PATH, Err(Refusal::Capture));
+        assert_eq!(
+            capture_hittable_xml(&mut device).err(),
+            Some(Refusal::Capture)
+        );
+        assert_eq!(device.calls, 7);
     }
 
     #[test]

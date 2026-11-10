@@ -14,6 +14,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+#[path = "probe/assistive_attrs.rs"]
+mod assistive_attrs;
 #[path = "probe/cancel_trial.rs"]
 mod cancel_trial;
 #[path = "probe/clock_attrs.rs"]
@@ -35,6 +37,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "assistive-attrs") {
+        if let Err(error) = assistive_attrs::command(&args[1..]) {
+            eprintln!("assistive_attrs={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "pin-field-compare") {
         if let Err(error) = pin_field_compare::command(&args[1..]) {
             eprintln!("pin_field_compare={error}");

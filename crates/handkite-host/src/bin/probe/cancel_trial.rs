@@ -583,7 +583,7 @@ fn parse_cancel(capture: &LockedCapture, supervised: bool) -> Result<Evidence, C
     })
 }
 
-fn competing_control(kind: &[u8]) -> bool {
+pub(super) fn competing_control(kind: &[u8]) -> bool {
     matches!(
         kind,
         b"XCUIElementTypeButton"

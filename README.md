@@ -209,6 +209,18 @@ control flow only; live touch delivery and PIN entry remain unqualified.
 
 ## PIN stop gate
 
+`handkite-probe assistive-attrs --config PRIVATE_FILE` is read-only. Two distinct
+fresh XML captures retain `hittable` and require the same pinned existing session,
+native/WDA lock after prior unlock, and an empty six-digit SpringBoard keypad
+without alerts. An exact, unique in-app AssistiveTouch Button or Other must have
+explicit true visible/enabled/hittable flags and stable in-screen bounds, at least
+eight accessibility points from every key, the field, Cancel, Emergency, and other
+recognized controls. Missing competitor bounds refuse even for hidden controls.
+Output is limited to fixed categories and the target rectangle normalized to
+0-1000 screen units. XML is not saved or printed; no screenshots, input, settings,
+PIN credential, or stop-marker operations occur. This diagnostic does not prove
+pixel appearance or authorize a tap. The Cancel trial guard is unchanged.
+
 `handkite-probe pin-field-compare --config PRIVATE_FILE` is read-only. It compares
 the source's empty six-digit field with one direct secure-field lookup and one
 value-attribute GET, requiring the same pinned existing session, native/WDA lock,
