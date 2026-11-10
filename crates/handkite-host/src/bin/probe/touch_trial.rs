@@ -1,7 +1,7 @@
 use handkite_core::controller::{DeviceAdapter, RawObservation};
 use handkite_core::protocol::{Action, HardwareId, LockState, Point};
 use handkite_host::usb::PinnedUsb;
-use handkite_host::wda_action::WdaActions;
+use handkite_host::wda_action::{CoordinateTapError, WdaActions};
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_http::HttpResponse;
 use handkite_host::wda_settings::{
@@ -38,6 +38,14 @@ enum RefusalReason {
 enum TrialError {
     Refused(RefusalReason),
     Unknown,
+    CoordinateUnknown(CoordinateUnknown),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CoordinateUnknown {
+    Http404,
+    ReceiptUnproven,
+    PostconditionUnproven,
 }
 
 impl TrialError {
@@ -64,6 +72,13 @@ impl TrialError {
             }
             Self::Refused(RefusalReason::GeometryMismatch) => "refused reason=geometry_mismatch",
             Self::Unknown => "unknown",
+            Self::CoordinateUnknown(CoordinateUnknown::Http404) => "unknown reason=http_404",
+            Self::CoordinateUnknown(CoordinateUnknown::ReceiptUnproven) => {
+                "unknown reason=receipt_unproven"
+            }
+            Self::CoordinateUnknown(CoordinateUnknown::PostconditionUnproven) => {
+                "unknown reason=postcondition_unproven"
+            }
         }
     }
 }
@@ -75,6 +90,13 @@ enum Transport {
 }
 
 impl Transport {
+    fn unknown(self, reason: CoordinateUnknown) -> TrialError {
+        match self {
+            Self::W3c => TrialError::Unknown,
+            Self::Coordinate => TrialError::CoordinateUnknown(reason),
+        }
+    }
+
     fn name(self) -> &'static str {
         match self {
             Self::W3c => "w3c",
@@ -177,7 +199,12 @@ struct Snapshot {
 trait TrialDevice {
     fn capture(&mut self) -> Result<Snapshot, RefusalReason>;
     fn now_ms(&self) -> Result<u64, ()>;
-    fn tap(&mut self, transport: Transport, at: Point, fresh_until: Instant) -> Result<(), ()>;
+    fn tap(
+        &mut self,
+        transport: Transport,
+        at: Point,
+        fresh_until: Instant,
+    ) -> Result<(), CoordinateTapError>;
 }
 
 struct SessionBound<'a, D> {
@@ -198,7 +225,12 @@ impl<D: TrialDevice> TrialDevice for SessionBound<'_, D> {
         self.device.now_ms()
     }
 
-    fn tap(&mut self, transport: Transport, at: Point, fresh_until: Instant) -> Result<(), ()> {
+    fn tap(
+        &mut self,
+        transport: Transport,
+        at: Point,
+        fresh_until: Instant,
+    ) -> Result<(), CoordinateTapError> {
         self.device.tap(transport, at, fresh_until)
     }
 }
@@ -228,13 +260,20 @@ fn run(
         .map_err(|_| TrialError::Refused(RefusalReason::FreshnessUnproven))?;
     let receipt = device.tap(transport, second.center(), current.fresh_until);
     // Even unknown delivery receives one read-only postcheck, never another input.
-    let after = device.capture().map_err(|_| TrialError::Unknown)?;
-    validate(&after, expected, device.now_ms(), true).map_err(|_| TrialError::Unknown)?;
-    if after.session != current.session
-        || after.observation.window.started_unix_ms < input_started
-        || receipt.is_err()
+    let after = device.capture();
+    // Keep the receipt category even when the sole postcapture also fails.
+    receipt.map_err(|error| {
+        transport.unknown(match error {
+            CoordinateTapError::Http404 => CoordinateUnknown::Http404,
+            CoordinateTapError::ReceiptUnproven => CoordinateUnknown::ReceiptUnproven,
+        })
+    })?;
+    let postcondition = transport.unknown(CoordinateUnknown::PostconditionUnproven);
+    let after = after.map_err(|_| postcondition)?;
+    validate(&after, expected, device.now_ms(), true).map_err(|_| postcondition)?;
+    if after.session != current.session || after.observation.window.started_unix_ms < input_started
     {
-        return Err(TrialError::Unknown);
+        return Err(postcondition);
     }
     Ok(())
 }
@@ -710,19 +749,26 @@ impl TrialDevice for Live {
             .map_err(|_| ())
     }
 
-    fn tap(&mut self, transport: Transport, at: Point, fresh_until: Instant) -> Result<(), ()> {
+    fn tap(
+        &mut self,
+        transport: Transport,
+        at: Point,
+        fresh_until: Instant,
+    ) -> Result<(), CoordinateTapError> {
         let wda = self.wda.with_write_deadline(fresh_until);
         let receipt = match transport {
             Transport::W3c => self
                 .runtime
-                .block_on(self.actions.execute_existing(&wda, &Action::Tap { at })),
-            Transport::Coordinate => self.runtime.block_on(self.actions.tap_existing(&wda, at)),
-        }
-        .map_err(|_| ())?;
+                .block_on(self.actions.execute_existing(&wda, &Action::Tap { at }))
+                .map_err(|_| CoordinateTapError::ReceiptUnproven),
+            Transport::Coordinate => self
+                .runtime
+                .block_on(self.actions.tap_existing_diagnostic(&wda, at)),
+        }?;
         if receipt.accepted == Some(true) {
             Ok(())
         } else {
-            Err(())
+            Err(CoordinateTapError::ReceiptUnproven)
         }
     }
 }
@@ -841,7 +887,7 @@ mod tests {
     struct Fixture {
         captures: VecDeque<Result<Snapshot, RefusalReason>>,
         taps: Vec<(Transport, Point, Instant)>,
-        receipt: Result<(), ()>,
+        receipt: Result<(), CoordinateTapError>,
         now: u64,
         age: u64,
     }
@@ -880,7 +926,12 @@ mod tests {
         fn now_ms(&self) -> Result<u64, ()> {
             Ok(self.now)
         }
-        fn tap(&mut self, transport: Transport, at: Point, fresh_until: Instant) -> Result<(), ()> {
+        fn tap(
+            &mut self,
+            transport: Transport,
+            at: Point,
+            fresh_until: Instant,
+        ) -> Result<(), CoordinateTapError> {
             assert!(fresh_until > Instant::now());
             assert!(self.taps.is_empty(), "second input or transport fallback");
             self.taps.push((transport, at, fresh_until));
@@ -938,7 +989,7 @@ mod tests {
                 assert_eq!(
                     run_bound(&mut fixture, transport, "fixture-session"),
                     if changed {
-                        Err(TrialError::Unknown)
+                        Err(transport.unknown(CoordinateUnknown::PostconditionUnproven))
                     } else {
                         Ok(())
                     }
@@ -960,6 +1011,13 @@ mod tests {
             for result in [
                 Ok(()),
                 Err(TrialError::Unknown),
+                Err(TrialError::CoordinateUnknown(CoordinateUnknown::Http404)),
+                Err(TrialError::CoordinateUnknown(
+                    CoordinateUnknown::ReceiptUnproven,
+                )),
+                Err(TrialError::CoordinateUnknown(
+                    CoordinateUnknown::PostconditionUnproven,
+                )),
                 Err(TrialError::Refused(RefusalReason::SessionUnproven)),
             ] {
                 let expected = if restoration == Restoration::Verified {
@@ -1217,7 +1275,10 @@ mod tests {
                     } else {
                         xml.clone()
                     };
-                    assert_eq!(fixture.run(transport), Err(TrialError::Unknown));
+                    assert_eq!(
+                        fixture.run(transport),
+                        Err(transport.unknown(CoordinateUnknown::PostconditionUnproven))
+                    );
                     assert_eq!(fixture.taps.len(), 1);
                     assert!(fixture.captures.is_empty());
                 }
@@ -1394,25 +1455,68 @@ mod tests {
             for mutate in mutations {
                 let mut fixture = Fixture::new();
                 mutate(fixture.captures[2].as_mut().unwrap());
-                assert_eq!(fixture.run(transport), Err(TrialError::Unknown));
+                assert_eq!(
+                    fixture.run(transport),
+                    Err(transport.unknown(CoordinateUnknown::PostconditionUnproven))
+                );
                 assert_eq!(fixture.taps.len(), 1);
                 assert!(fixture.captures.is_empty());
             }
         }
         let mut fixture = Fixture::new();
         fixture.captures[2] = Err(RefusalReason::CaptureFailed);
-        assert_eq!(fixture.run(Transport::Coordinate), Err(TrialError::Unknown));
+        assert_eq!(
+            fixture.run(Transport::Coordinate),
+            Err(TrialError::CoordinateUnknown(
+                CoordinateUnknown::PostconditionUnproven
+            ))
+        );
         assert_eq!(fixture.taps.len(), 1);
     }
 
     #[test]
-    fn unknown_receipt_still_observes_once_without_fallback() {
+    fn unknown_receipt_keeps_its_fixed_category_after_exactly_one_postcheck() {
         for transport in [Transport::W3c, Transport::Coordinate] {
-            let mut fixture = Fixture::new();
-            fixture.receipt = Err(());
-            assert_eq!(fixture.run(transport), Err(TrialError::Unknown));
-            assert_eq!(fixture.taps.len(), 1);
-            assert!(fixture.captures.is_empty());
+            for (receipt, reason, output) in [
+                (
+                    CoordinateTapError::Http404,
+                    CoordinateUnknown::Http404,
+                    "touch_trial=unknown reason=http_404",
+                ),
+                (
+                    CoordinateTapError::ReceiptUnproven,
+                    CoordinateUnknown::ReceiptUnproven,
+                    "touch_trial=unknown reason=receipt_unproven",
+                ),
+            ] {
+                for post in 0..3 {
+                    let mut fixture = Fixture::new();
+                    fixture.receipt = Err(receipt);
+                    match post {
+                        0 => {}
+                        1 => fixture.captures[2] = Err(RefusalReason::CaptureFailed),
+                        _ => {
+                            fixture.captures[2]
+                                .as_mut()
+                                .unwrap()
+                                .observation
+                                .accessibility_tree = tree(false)
+                        }
+                    }
+                    let error = fixture.run(transport).unwrap_err();
+                    assert_eq!(error, transport.unknown(reason));
+                    assert_eq!(
+                        format!("touch_trial={}", error.message()),
+                        if transport == Transport::Coordinate {
+                            output
+                        } else {
+                            "touch_trial=unknown"
+                        }
+                    );
+                    assert_eq!(fixture.taps.len(), 1);
+                    assert!(fixture.captures.is_empty());
+                }
+            }
         }
     }
 
@@ -1429,11 +1533,16 @@ mod tests {
                         assert_eq!(format!("touch_trial={}", error.message()), output);
                         assert!(fixture.taps.is_empty());
                     } else {
-                        assert_eq!(error, TrialError::Unknown);
                         assert_eq!(
-                            format!("touch_trial={}", error.message()),
-                            "touch_trial=unknown"
+                            error,
+                            transport.unknown(CoordinateUnknown::PostconditionUnproven)
                         );
+                        let expected = if transport == Transport::Coordinate {
+                            "touch_trial=unknown reason=postcondition_unproven"
+                        } else {
+                            "touch_trial=unknown"
+                        };
+                        assert_eq!(format!("touch_trial={}", error.message()), expected);
                         assert_eq!(fixture.taps.len(), 1);
                     }
                     assert_eq!(fixture.captures.len(), 2 - position);

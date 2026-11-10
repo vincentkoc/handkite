@@ -34,6 +34,12 @@ pub struct WdaActions {
     session: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CoordinateTapError {
+    Http404,
+    ReceiptUnproven,
+}
+
 impl WdaActions {
     pub(crate) fn bound_to_existing(session: &str) -> Result<Self, AdapterError> {
         if !valid_session_id(session) {
@@ -109,6 +115,19 @@ impl WdaActions {
         Self::tap_on(wda, session, at).await
     }
 
+    /// Fixed diagnostic categories only; HTTP 404 does not establish its cause.
+    pub async fn tap_existing_diagnostic(
+        &self,
+        wda: &UsbWda,
+        at: Point,
+    ) -> Result<TransportReceipt, CoordinateTapError> {
+        let session = self
+            .session
+            .as_deref()
+            .ok_or(CoordinateTapError::ReceiptUnproven)?;
+        Self::tap_on_diagnostic(wda, session, at).await
+    }
+
     pub(crate) async fn tap_with_existing_session(
         &mut self,
         wda: &impl WdaRequest,
@@ -125,14 +144,27 @@ impl WdaActions {
         session: &str,
         at: Point,
     ) -> Result<TransportReceipt, AdapterError> {
-        let body = coordinate_tap_payload(at)?;
+        Self::tap_on_diagnostic(wda, session, at)
+            .await
+            .map_err(|_| AdapterError)
+    }
+
+    async fn tap_on_diagnostic(
+        wda: &impl WdaRequest,
+        session: &str,
+        at: Point,
+    ) -> Result<TransportReceipt, CoordinateTapError> {
+        let body = coordinate_tap_payload(at).map_err(|_| CoordinateTapError::ReceiptUnproven)?;
         let path = format!("/session/{session}/wda/tap");
-        let body = serde_json::to_vec(&body).map_err(|_| AdapterError)?;
+        let body = serde_json::to_vec(&body).map_err(|_| CoordinateTapError::ReceiptUnproven)?;
         let response = wda
             .request("POST", &path, &body, Duration::from_secs(30))
             .await
-            .map_err(|_| AdapterError)?;
-        response_ok(response)?;
+            .map_err(|_| CoordinateTapError::ReceiptUnproven)?;
+        if response.status == 404 {
+            return Err(CoordinateTapError::Http404);
+        }
+        response_ok(response).map_err(|_| CoordinateTapError::ReceiptUnproven)?;
         Ok(TransportReceipt {
             accepted: Some(true),
             action_kind: "tap".into(),
@@ -336,6 +368,67 @@ mod tests {
                 json!({"value": null}),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn coordinate_diagnostic_classifies_status_without_exposing_body_or_retrying() {
+        let at = Point { x: 80.0, y: 340.0 };
+        for (response, expected) in [
+            (
+                Ok(HttpResponse {
+                    status: 404,
+                    body: b"fixture-private-response".to_vec(),
+                }),
+                CoordinateTapError::Http404,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 500,
+                    body: b"fixture-private-response".to_vec(),
+                }),
+                CoordinateTapError::ReceiptUnproven,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"fixture-private-response".to_vec(),
+                }),
+                CoordinateTapError::ReceiptUnproven,
+            ),
+            (
+                Ok(HttpResponse {
+                    status: 200,
+                    body: br#"{"value":{"error":"fixture-private-error"}}"#.to_vec(),
+                }),
+                CoordinateTapError::ReceiptUnproven,
+            ),
+            (
+                Err(WdaError::ExpiredBeforeSend),
+                CoordinateTapError::ReceiptUnproven,
+            ),
+            (
+                Err(WdaError::AfterSent),
+                CoordinateTapError::ReceiptUnproven,
+            ),
+            (
+                Err(WdaError::TimedOutAfterSent),
+                CoordinateTapError::ReceiptUnproven,
+            ),
+        ] {
+            let mut wda = Script::new(vec![Step {
+                method: "POST",
+                path: "/session/fixture-session/wda/tap",
+                response,
+            }]);
+            wda.1 = Some(json!({"x":80.0,"y":340.0}));
+            assert_eq!(
+                WdaActions::tap_on_diagnostic(&wda, "fixture-session", at)
+                    .await
+                    .err(),
+                Some(expected)
+            );
+            wda.done();
+        }
     }
 
     #[tokio::test]

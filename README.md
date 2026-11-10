@@ -202,6 +202,15 @@ input, or an unknown result after dispatch. Lost acknowledgment remains unknown
 even if the postcheck succeeds. No screen content, identifiers, or captures are
 printed or retained.
 
+Coordinate trials retain fixed post-dispatch diagnostics: `http_404` reports only
+the HTTP status, `receipt_unproven` covers other unproven receipts, and
+`postcondition_unproven` means an accepted receipt lacked a proven postcondition.
+All three remain `unknown`; HTTP 404 does not establish a missing route or input
+delivery. Exactly one postcapture is attempted even on receipt failure, whose
+category takes precedence. W3C output is unchanged. The idle variant exposes
+these categories only after verified settings restoration; restoration failure
+keeps its existing unknown result.
+
 There is no automatic retry, transport fallback, app launch, session creation,
 PIN input, stop-marker change, or service installation. A separate invocation
 requires fresh operator judgment. Offline fixtures qualify this command's
