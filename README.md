@@ -143,7 +143,7 @@ contract and activation preconditions in [Mac release inputs](RELEASE.md).
 
 `ServiceLock::acquire` validates this layout, opens the runtime directory without following symlinks, and holds a nonblocking exclusive OS lock on a regular, single-link, owner-only mode-0600 file. The lock has one fixed name for the account's pinned-device service; device aliases cannot create separate ownership domains. The file is never truncated or removed, and process exit releases ownership without deleting state. Metadata and inode checks reject replaced locks or runtime directories. This is cooperative process ownership within the protected service account, not isolation from code already running as that account.
 
-Daemon startup now uses the layout and process lock, but no live installation is qualified. Layout validation creates no files; lock acquisition creates only the process lock in an existing runtime directory, and daemon startup binds its fixed socket. No startup step creates directories, config, releases, descriptors, or stop markers. The descriptor is outside launchd's automatically loaded directories. Signed builds, install/rollback commands, and launchd supervision remain pending. The existing `state/iphone/UNLOCK-DISABLED` gate keeps its current path, permission rules, and behavior; layout checks never open or migrate it.
+Daemon startup now uses the layout and process lock, but no live installation is qualified. Layout validation creates no files; lock acquisition creates only the process lock in an existing runtime directory, and daemon startup binds its fixed socket. No startup step creates directories, config, releases, descriptors, or stop markers. The descriptor is outside launchd's automatically loaded directories. Signed builds, release selection, rollback commands, and launchd supervision remain pending. The existing `state/iphone/UNLOCK-DISABLED` gate keeps its current path, permission rules, and behavior; layout checks never open or migrate it.
 
 ## Release verification diagnostic
 
@@ -155,6 +155,19 @@ It reports only `release_verify=pass`, `release_verify=reject`, or
 See the [input envelope and exit codes](RELEASE.md#release-verification-diagnostic).
 This diagnostic is excluded from the three-artifact release inventory. Its tests
 do not qualify a real signed stage, installation, or service activation.
+
+## Signed release publication
+
+`handkite-release-publish --stage /absolute/private-stage` uses the same
+protected stdin envelope as the verification diagnostic. Under the fixed
+installer lock, it copies the independently pinned signed artifacts into one
+new private stage, publishes one digest-named release and receipt, then
+revalidates the held pair. It never changes `releases/current` or starts a
+controller. A failed or uncertain publication leaves its residues untouched;
+there is no retry or cleanup. Output contains only a fixed status, phase, and
+whether a residue candidate exists. See the [publication command contract](RELEASE.md#release-publication-command).
+The CLI and underlying stages passed local fixtures only; no signed release
+has been published on the personal Mac.
 
 ## Device agreement diagnostic
 
