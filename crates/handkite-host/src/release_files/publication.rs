@@ -3,6 +3,19 @@
 use super::*;
 
 impl AnchoredRelease {
+    /// Only a checked selection transaction can advance this one parent baseline.
+    pub(crate) fn selection_parent_transition(
+        &mut self,
+        transition: &crate::selection_intent::macos::preparation::ParentChange,
+    ) -> Result<(), &'static str> {
+        crate::current_selection::parse_target(self.components.last().ok_or(UNSAFE)?.to_bytes())?;
+        let (parent, _) = self.publication_walk(None)?;
+        let index = self.directories.len() - 2;
+        transition.check(&self.directories[index].fingerprint, &parent)?;
+        self.directories[index].fingerprint = parent;
+        self.revalidate()
+    }
+
     pub(crate) fn publication_parent(&self) -> &File {
         &self.directories[self.directories.len() - 2].file
     }

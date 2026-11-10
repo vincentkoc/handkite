@@ -1,6 +1,8 @@
 use super::*;
 use crate::selection_intent::{self as intent, Intent, Observation};
 
+mod preparation;
+
 fn pair() -> (Fixture, Vec<u8>) {
     let fixture = Fixture::new();
     drop(run(fixture.stage(), |_, _| Ok(())).unwrap());

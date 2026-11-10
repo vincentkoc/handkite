@@ -1,4 +1,4 @@
-//! Bounded intent syntax and read-only present-state reconciliation, never authority.
+//! Bounded intent syntax, durable preparation, and present-state reconciliation.
 
 use crate::current_selection::{encode_target, parse_target};
 use crate::install_plan::{ManifestDigest, Operation};
@@ -20,7 +20,7 @@ struct LinkClaim {
 }
 
 /// Parsed claims only. Neither parsing nor encoding proves execution or evidence.
-/// A future writer must generate a unique transaction ID; this codec checks syntax.
+/// The preparation writer generates the transaction ID; this codec checks syntax.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Intent {
     operation: Operation,
@@ -212,6 +212,81 @@ pub fn inspect<'held, 'lock>(
     {
         let _ = (owner, intent, previous, destination);
         Err("selection recovery inspection requires macOS")
+    }
+}
+
+/// Fixed sibling journal name under the lock's anchored releases directory.
+pub const PENDING_JOURNAL: &str = ".selection-pending.json";
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PreparationFailure {
+    reason: &'static str,
+    residues: Vec<String>,
+}
+
+impl PreparationFailure {
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    /// Relative candidates only, including uncertain creates; never cleanup authority.
+    pub fn residue_candidates(&self) -> &[String] {
+        &self.residues
+    }
+}
+
+/// Retains the original lock, releases, current snapshot, candidate link and journal.
+/// Dropping it preserves every file. It cannot select a release or activate a job.
+pub struct PreparedSelection<'held, 'lock> {
+    #[cfg(target_os = "macos")]
+    inner: macos::preparation::Prepared<'held, 'lock>,
+    #[cfg(not(target_os = "macos"))]
+    _unsupported:
+        std::marker::PhantomData<(&'held mut PublishedRelease<'lock>, &'lock InstallerLock)>,
+}
+
+impl PreparedSelection<'_, '_> {
+    /// Recheck original custody and real signer policy; never adopt changed evidence.
+    pub fn revalidate(&mut self) -> Result<(), &'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.revalidate(
+                #[cfg(test)]
+                None,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err("selection preparation requires macOS")
+    }
+}
+
+/// Create one unique sibling link and one exclusive fixed canonical intent journal.
+/// Current must match the real previous release, or be absent for initial install.
+/// All errors preserve residues, with no retry, rollback, adoption, or cleanup.
+pub fn prepare<'held, 'lock>(
+    owner: &'lock InstallerLock,
+    operation: Operation,
+    previous: Option<&'held mut PublishedRelease<'lock>>,
+    destination: &'held mut PublishedRelease<'lock>,
+) -> Result<PreparedSelection<'held, 'lock>, PreparationFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::preparation::prepare(
+            owner,
+            operation,
+            previous,
+            destination,
+            #[cfg(test)]
+            &mut macos::preparation::Hooks::production(),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (owner, operation, previous, destination);
+        Err(PreparationFailure {
+            reason: "selection preparation requires macOS",
+            residues: Vec::new(),
+        })
     }
 }
 

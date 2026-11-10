@@ -153,11 +153,14 @@ fn rejects_noncanonical_raw_targets() {
 #[test]
 fn only_enoent_is_absence_and_metadata_policy_requires_owned_single_link() {
     let uid = unsafe { libc::geteuid() };
-    assert_eq!(link_metadata(-1, uid), Err(UNSAFE));
+    assert_eq!(link_metadata(-1, c"current", uid), Err(UNSAFE));
     let (_scratch, layout) = fixture(false);
     fs::write(layout.config_file(), b"fixture").unwrap();
     let file = File::open(layout.config_file()).unwrap();
-    assert_eq!(link_metadata(file.as_raw_fd(), uid), Err(UNSAFE));
+    assert_eq!(
+        link_metadata(file.as_raw_fd(), c"current", uid),
+        Err(UNSAFE)
+    );
     let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
     metadata.st_mode = libc::S_IFLNK | 0o777;
     metadata.st_uid = uid;

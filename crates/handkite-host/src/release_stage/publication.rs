@@ -46,6 +46,23 @@ pub struct PublishedRelease<'lock> {
 
 impl PublishedRelease<'_> {
     #[cfg(target_os = "macos")]
+    pub(crate) fn selection_parent(&self) -> &std::fs::File {
+        self.staged._destination.publication_parent()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn selection_parent_transition(
+        &mut self,
+        transition: &crate::selection_intent::macos::preparation::ParentChange,
+    ) -> Result<(), &'static str> {
+        self.staged._owner.revalidate()?;
+        self.staged
+            ._destination
+            .selection_parent_transition(transition)?;
+        self.revalidate_custody()
+    }
+
+    #[cfg(target_os = "macos")]
     pub(crate) fn matches_owner_and_digest(
         &self,
         owner: &InstallerLock,

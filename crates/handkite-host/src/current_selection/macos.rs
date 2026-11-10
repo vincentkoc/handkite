@@ -2,9 +2,9 @@ use super::{ManifestDigest, ServiceLayout, parse_target};
 use crate::release_files::{
     Fingerprint, components, directory_matches, directory_metadata, open_at,
 };
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
 use std::fs::File;
-use std::os::fd::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::fs::MetadataExt;
 
 const UNSAFE: &str = "unsafe or changed current-release selection";
@@ -131,12 +131,16 @@ fn link_policy(metadata: &libc::stat, uid: u32) -> Result<LinkFingerprint, &'sta
     })
 }
 
-fn link_metadata(parent: RawFd, uid: u32) -> Result<Option<LinkFingerprint>, &'static str> {
+fn link_metadata(
+    parent: RawFd,
+    name: &CStr,
+    uid: u32,
+) -> Result<Option<LinkFingerprint>, &'static str> {
     let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
     if unsafe {
         libc::fstatat(
             parent,
-            c"current".as_ptr(),
+            name.as_ptr(),
             metadata.as_mut_ptr(),
             libc::AT_SYMLINK_NOFOLLOW,
         )
@@ -155,6 +159,80 @@ fn link_metadata(parent: RawFd, uid: u32) -> Result<Option<LinkFingerprint>, &'s
 struct Observation {
     fingerprint: LinkFingerprint,
     manifest: ManifestDigest,
+}
+
+/// A retained symlink inode and exact target; the destination is never followed.
+pub(crate) struct RetainedLink {
+    file: File,
+    name: CString,
+    observation: Observation,
+}
+
+impl RetainedLink {
+    pub(crate) fn open(
+        parent: &File,
+        name: CString,
+        manifest: ManifestDigest,
+    ) -> Result<Self, &'static str> {
+        let uid = unsafe { libc::geteuid() };
+        let observation = observe(
+            parent,
+            &name,
+            uid,
+            #[cfg(test)]
+            &mut None,
+        )?
+        .ok_or(UNSAFE)?;
+        if observation.manifest != manifest {
+            return Err(UNSAFE);
+        }
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                // Darwin rejects O_NOFOLLOW combined with O_SYMLINK. O_SYMLINK
+                // opens the link itself; fstat below refuses every other type.
+                libc::O_RDONLY | libc::O_SYMLINK | libc::O_NONBLOCK | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(UNSAFE);
+        }
+        let value = Self {
+            file: unsafe { File::from_raw_fd(fd) },
+            name,
+            observation,
+        };
+        value.check(parent)?;
+        Ok(value)
+    }
+
+    pub(crate) fn identity(&self) -> (i32, u64) {
+        (
+            self.observation.fingerprint.device,
+            self.observation.fingerprint.inode,
+        )
+    }
+
+    pub(crate) fn check(&self, parent: &File) -> Result<(), &'static str> {
+        let uid = unsafe { libc::geteuid() };
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(self.file.as_raw_fd(), metadata.as_mut_ptr()) } != 0
+            || link_policy(&unsafe { metadata.assume_init() }, uid)? != self.observation.fingerprint
+            || observe(
+                parent,
+                &self.name,
+                uid,
+                #[cfg(test)]
+                &mut None,
+            )?
+            .as_ref()
+                != Some(&self.observation)
+        {
+            return Err(UNSAFE);
+        }
+        Ok(())
+    }
 }
 
 /// Exact link observation plus retained parent identity; never destination trust.
@@ -196,6 +274,7 @@ impl Snapshot {
             let parent_before = directory_policy(&fresh, self.held.uid, true, true)?;
             let before = observe(
                 self.held.directory()?,
+                c"current",
                 self.held.uid,
                 #[cfg(test)]
                 &mut hook,
@@ -206,6 +285,7 @@ impl Snapshot {
             }
             let after = observe(
                 &fresh,
+                c"current",
                 self.held.uid,
                 #[cfg(test)]
                 &mut hook,
@@ -236,10 +316,11 @@ type Hook<'a> = &'a mut dyn FnMut(InspectionPoint);
 
 fn observe(
     parent: &File,
+    name: &CStr,
     uid: u32,
     #[cfg(test)] hook: &mut Option<Hook<'_>>,
 ) -> Result<Option<Observation>, &'static str> {
-    let Some(before) = link_metadata(parent.as_raw_fd(), uid)? else {
+    let Some(before) = link_metadata(parent.as_raw_fd(), name, uid)? else {
         return Ok(None);
     };
     #[cfg(test)]
@@ -251,7 +332,7 @@ fn observe(
     let size = unsafe {
         libc::readlinkat(
             parent.as_raw_fd(),
-            c"current".as_ptr(),
+            name.as_ptr(),
             target.as_mut_ptr().cast(),
             target.len(),
         )
@@ -263,7 +344,7 @@ fn observe(
     if let Some(hook) = hook.as_mut() {
         hook(InspectionPoint::AfterReadlink);
     }
-    if link_metadata(parent.as_raw_fd(), uid)?.as_ref() != Some(&before) {
+    if link_metadata(parent.as_raw_fd(), name, uid)?.as_ref() != Some(&before) {
         return Err(UNSAFE);
     }
     Ok(Some(Observation {
@@ -295,6 +376,7 @@ fn capture(
         let held = Releases::open(layout)?;
         let before = observe(
             held.directory()?,
+            c"current",
             held.uid,
             #[cfg(test)]
             &mut hook,
@@ -306,6 +388,7 @@ fn capture(
         let fresh = held.revalidate()?;
         let after = observe(
             &fresh,
+            c"current",
             held.uid,
             #[cfg(test)]
             &mut hook,

@@ -1,6 +1,8 @@
 use super::*;
 use crate::current_selection::macos::Snapshot;
 
+pub(crate) mod preparation;
+
 const MISMATCH: &str = "selection intent release or lock mismatch";
 
 #[cfg(test)]
