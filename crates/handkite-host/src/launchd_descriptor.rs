@@ -11,8 +11,6 @@ use std::path::Path;
 /// and ownership before activation. Rendering grants none of that authority.
 pub fn render(layout: &ServiceLayout) -> Result<String, &'static str> {
     let program = xml_path(&layout.current_release_executable())?;
-    let config = xml_path(&layout.config_file())?;
-    let runtime = xml_path(&layout.runtime_directory())?;
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
@@ -24,10 +22,7 @@ pub fn render(layout: &ServiceLayout) -> Result<String, &'static str> {
   <key>ProgramArguments</key>
   <array>
     <string>{program}</string>
-    <string>--config</string>
-    <string>{config}</string>
-    <string>--socket-dir</string>
-    <string>{runtime}</string>
+    <string>--owned-wda</string>
   </array>
   <key>ProcessType</key>
   <string>Background</string>
@@ -120,10 +115,7 @@ mod tests {
                 "Program": "/fixture/account/Library/Application Support/Handkite/releases/current/handkited",
                 "ProgramArguments": [
                     "/fixture/account/Library/Application Support/Handkite/releases/current/handkited",
-                    "--config",
-                    "/fixture/account/Library/Application Support/Handkite/config/host.json",
-                    "--socket-dir",
-                    "/fixture/account/Library/Application Support/Handkite/runtime"
+                    "--owned-wda"
                 ],
                 "ProcessType": "Background",
                 "RunAtLoad": true,
@@ -158,13 +150,7 @@ mod tests {
             );
             assert_eq!(
                 parsed["ProgramArguments"],
-                serde_json::json!([
-                    layout.current_release_executable(),
-                    "--config",
-                    layout.config_file(),
-                    "--socket-dir",
-                    layout.runtime_directory()
-                ])
+                serde_json::json!([layout.current_release_executable(), "--owned-wda"])
             );
             assert_eq!(parsed.as_object().unwrap().len(), 8);
         }
