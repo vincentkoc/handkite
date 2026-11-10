@@ -214,3 +214,21 @@ fn bounded_xml_rejects_duplicate_fields_binary_dtd_depth_and_extra_roots() {
         .unwrap();
     assert!(plist_wire::decode::<plist::Value>(&binary, MAX_MUX_BYTES).is_err());
 }
+
+#[test]
+fn mixed_xml_content_in_enumerated_serial_number_is_rejected() {
+    for serial in [
+        "test-device<![CDATA[other]]>",
+        "<![CDATA[other]]>test-device",
+        "test-<![CDATA[other]]>device",
+        "test-device&amp;",
+        "test-device&#45;",
+        "test-device&#x2D;",
+        "test-&amp;device",
+    ] {
+        let body = format!(
+            "<plist><dict><key>DeviceList</key><array><dict><key>DeviceID</key><integer>37</integer><key>Properties</key><dict><key>ConnectionType</key><string>USB</string><key>SerialNumber</key><string>{serial}</string></dict></dict></array></dict></plist>"
+        );
+        assert!(plist_wire::decode::<Inventory>(body.as_bytes(), MAX_MUX_BYTES).is_err());
+    }
+}

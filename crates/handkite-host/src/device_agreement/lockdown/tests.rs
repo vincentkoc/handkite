@@ -53,3 +53,21 @@ async fn missing_nonstring_error_duplicate_and_malformed_replies_fail_closed() {
         assert_eq!(reply(body, length).await, Err(UNAVAILABLE));
     }
 }
+
+#[tokio::test]
+async fn mixed_xml_content_in_lockdown_value_is_rejected() {
+    for value in [
+        "test-device<![CDATA[other]]>",
+        "<![CDATA[other]]>test-device",
+        "test-<![CDATA[other]]>device",
+        "test-device&amp;",
+        "test-device&#45;",
+        "test-device&#x2D;",
+        "test-&amp;device",
+    ] {
+        let body = format!(
+            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>{value}</string></dict></plist>"
+        );
+        assert_eq!(reply(body.as_bytes(), body.len()).await, Err(UNAVAILABLE));
+    }
+}

@@ -49,7 +49,9 @@ pub(crate) fn decode<T: DeserializeOwned>(body: &[u8], max: usize) -> Result<T, 
             {
                 return Err(());
             }
-            Event::GeneralRef(_) if depth == 0 => return Err(()),
+            // The pinned plist parser can skip these inside strings. Never let
+            // deserialization silently change a peer-reported identity.
+            Event::CData(_) | Event::GeneralRef(_) => return Err(()),
             Event::PI(_) => return Err(()),
             Event::Eof => break,
             _ => {}
