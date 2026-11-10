@@ -50,7 +50,7 @@ fn check_reports_only_health_and_never_serves() {
                     assert_eq!(id.as_str(), "fixture-usb");
                     health
                 },
-                |_| panic!("check must not initialize or serve the daemon"),
+                |_, _| panic!("check must not initialize or serve the daemon"),
                 &mut output,
             )
             .unwrap();
@@ -94,7 +94,7 @@ fn every_readiness_failure_returns_one_without_serving() {
             run(
                 &check_args(config.path()),
                 |_| health,
-                |_| panic!("failed check must not serve"),
+                |_, _| panic!("failed check must not serve"),
                 &mut output,
             )
             .unwrap(),
@@ -112,7 +112,7 @@ fn rejected_before_device_access(args: &[OsString]) -> String {
     let error = run(
         args,
         |_| panic!("invalid input must not inspect a device"),
-        |_| panic!("invalid input must not serve"),
+        |_, _| panic!("invalid input must not serve"),
         &mut output,
     )
     .unwrap_err();
@@ -189,8 +189,9 @@ fn normal_daemon_mode_uses_only_fixed_service_paths() {
         let code = run(
             &args,
             |_| panic!("normal daemon startup does not run a separate preflight"),
-            |resolved| {
+            |resolved, mode| {
                 assert_eq!(resolved, layout);
+                assert_eq!(mode, DaemonMode::Borrowed);
                 Ok(())
             },
             &mut output,
@@ -198,6 +199,32 @@ fn normal_daemon_mode_uses_only_fixed_service_paths() {
         .unwrap();
         assert_eq!(code, 0);
         assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn owned_daemon_requires_one_explicit_flag_and_fixed_paths() {
+    let layout = ServiceLayout::current_account().unwrap();
+    let mut output = Vec::new();
+    assert_eq!(
+        run(
+            &["--owned-wda".into()],
+            |_| panic!("owned startup must not run a separate preflight"),
+            |resolved, mode| {
+                assert_eq!(resolved, layout);
+                assert_eq!(mode, DaemonMode::Owned);
+                Ok(())
+            },
+            &mut output,
+        ),
+        Ok(0)
+    );
+    assert!(output.is_empty());
+    for args in [
+        vec!["--owned-wda".into(), "--owned-wda".into()],
+        vec!["--owned-wda".into(), "--config".into()],
+    ] {
+        assert_eq!(rejected_before_device_access(&args), USAGE);
     }
 }
 
