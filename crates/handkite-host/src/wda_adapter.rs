@@ -99,6 +99,18 @@ impl WdaAdapter {
         Ok(())
     }
 
+    fn capture_checked(
+        &self,
+        source_path: &str,
+    ) -> Result<(RawObservation, Instant), AdapterError> {
+        self.validate_owned()?;
+        let captured =
+            self.runtime
+                .block_on(Self::capture(&self.usb, &self.expected, source_path))?;
+        self.validate_owned()?;
+        Ok(captured)
+    }
+
     async fn capture(
         usb: &PinnedUsb,
         expected: &HardwareId,
@@ -160,16 +172,14 @@ impl WdaAdapter {
     /// The monotonic completion anchor bounds later diagnostic input freshness.
     /// Ordinary controller observations continue to use the smaller projection.
     pub fn observe_with_attributes(&mut self) -> Result<(RawObservation, Instant), AdapterError> {
-        self.runtime
-            .block_on(Self::capture(&self.usb, &self.expected, ATTRIBUTE_SOURCE))
+        self.capture_checked(ATTRIBUTE_SOURCE)
     }
 
     /// Paired diagnostic capture with the PIN parser's visible/enabled attributes.
     pub fn observe_pin_with_attributes(
         &mut self,
     ) -> Result<(RawObservation, Instant), AdapterError> {
-        self.runtime
-            .block_on(Self::capture(&self.usb, &self.expected, PIN_SOURCE))
+        self.capture_checked(PIN_SOURCE)
     }
 }
 
@@ -183,13 +193,8 @@ impl DeviceAdapter for WdaAdapter {
     }
 
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
-        self.validate_owned()?;
-        let observation = self
-            .runtime
-            .block_on(Self::capture(&self.usb, &self.expected, SCREEN_SOURCE))
-            .map(|(observation, _)| observation)?;
-        self.validate_owned()?;
-        Ok(observation)
+        self.capture_checked(SCREEN_SOURCE)
+            .map(|(observation, _)| observation)
     }
 
     fn execute(
