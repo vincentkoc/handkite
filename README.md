@@ -304,6 +304,14 @@ Failures report fixed action/restoration categories. An incomplete result can
 include only the first unconfirmed position from 1 through 6, never a PIN value
 or proof of physical delivery. A marked gate remains disabled on failure.
 
+In the session-bound variant, the first snapshot after the first digit tap also
+reads the secure field directly once. Both six-digit counts must agree before
+another input can proceed. A disagreement reports fixed `progress_mismatch`
+action/reason categories, retains the stop marker, and stops without selecting
+either count or retrying. Read/session failure also stops. Later snapshots and
+default/unbound backends retain their existing behavior; matching sequential
+reads do not establish physical delivery or an atomic snapshot.
+
 With both `--temporary-idle-settings` and `--supervised-visibility-fallback`,
 an explicitly hidden keypad requires fresh locked zero-of-six evidence before one
 session-validated wake event. The event retains the prepared view's original

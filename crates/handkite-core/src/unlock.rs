@@ -30,6 +30,7 @@ impl PasscodeScreen {
 pub enum BackendError {
     Disconnected,
     Unavailable,
+    ProgressMismatch,
 }
 
 pub trait PasscodeBackend {

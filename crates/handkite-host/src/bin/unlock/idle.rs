@@ -201,6 +201,7 @@ fn action_reason(action: &IdleAction<UnlockOutcome, WorkerError>) -> (&'static s
             UnlockError::WrongOrUncertain => "wrong_or_uncertain",
             UnlockError::Backend(BackendError::Disconnected) => "backend_disconnected",
             UnlockError::Backend(BackendError::Unavailable) => "backend_unavailable",
+            UnlockError::Backend(BackendError::ProgressMismatch) => "progress_mismatch",
             UnlockError::Gate => "gate_unproven",
         },
     };
@@ -301,6 +302,10 @@ mod tests {
                 "backend_unavailable",
             ),
             (WorkerError::Unlock(UnlockError::Gate), "gate_unproven"),
+            (
+                WorkerError::Unlock(UnlockError::Backend(BackendError::ProgressMismatch)),
+                "progress_mismatch",
+            ),
         ];
         for (error, token) in cases {
             let mut gate = DeferredGate::new(Gate::default());

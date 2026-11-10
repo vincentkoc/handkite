@@ -1,5 +1,5 @@
-use handkite_core::passcode::PasscodeProgress;
 use handkite_core::protocol::{HardwareId, LockState};
+use handkite_host::pin_field::{self, QUERY, valid_id};
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_http::HttpResponse;
 use handkite_host::wda_settings::validated_active_session;
@@ -10,7 +10,6 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 const SOURCE: &str = "source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
-const QUERY: &[u8] = br#"{"using":"class name","value":"XCUIElementTypeSecureTextField"}"#;
 const MAX_ELAPSED_MS: u128 = 60_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -77,61 +76,26 @@ impl Comparison {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Envelope<T> {
-    value: T,
-    #[serde(rename = "sessionId")]
-    session: Option<String>,
-    status: Option<u16>,
-}
-
 fn value<T: serde::de::DeserializeOwned>(
     response: HttpResponse,
     session: &str,
 ) -> Result<T, Refusal> {
-    if response.status != 200 || response.body.len() > 4 * 1024 * 1024 {
-        return Err(Refusal::Response);
-    }
-    let parsed: Envelope<T> =
-        serde_json::from_slice(&response.body).map_err(|_| Refusal::Response)?;
-    if parsed.status.is_some_and(|status| status != 0) {
-        return Err(Refusal::Response);
-    }
-    if parsed.session.as_deref().is_some_and(|id| id != session) {
-        return Err(Refusal::Session);
-    }
-    Ok(parsed.value)
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Element {
-    #[serde(rename = "ELEMENT")]
-    legacy: Option<String>,
-    #[serde(rename = "element-6066-11e4-a52e-4f735466cecf")]
-    w3c: Option<String>,
+    pin_field::value(response, session).map_err(Into::into)
 }
 
 fn single_element(response: HttpResponse, session: &str) -> Result<String, Refusal> {
-    let mut elements: Vec<Element> = value(response, session)?;
-    if elements.len() != 1 {
-        return Err(Refusal::Element);
-    }
-    let element = elements.pop().ok_or(Refusal::Element)?;
-    let id = match (element.legacy, element.w3c) {
-        (Some(left), Some(right)) if left == right => left,
-        (Some(id), None) | (None, Some(id)) => id,
-        _ => return Err(Refusal::Element),
-    };
-    if !valid_id(&id) {
-        return Err(Refusal::Element);
-    }
-    Ok(id)
+    pin_field::single_element(response, session).map_err(Into::into)
 }
 
-fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+impl From<pin_field::FieldError> for Refusal {
+    fn from(error: pin_field::FieldError) -> Self {
+        match error {
+            pin_field::FieldError::Response => Self::Response,
+            pin_field::FieldError::Session => Self::Session,
+            pin_field::FieldError::Element => Self::Element,
+            pin_field::FieldError::Progress => Self::Progress,
+        }
+    }
 }
 
 fn source_empty(response: HttpResponse, session: &str) -> Result<(), Refusal> {
@@ -152,12 +116,7 @@ fn source_empty(response: HttpResponse, session: &str) -> Result<(), Refusal> {
 }
 
 fn count(raw: &str) -> Result<u32, Refusal> {
-    if raw.len() > 256 {
-        return Err(Refusal::Progress);
-    }
-    PasscodeProgress::parse(raw, 6)
-        .map(|progress| progress.entered)
-        .map_err(|_| Refusal::Progress)
+    pin_field::count(raw).map_err(Into::into)
 }
 
 fn inspect(device: &mut impl ReadDevice) -> Result<Comparison, Refusal> {

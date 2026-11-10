@@ -48,6 +48,10 @@ impl WdaActions {
         self.session.as_deref() == Some(expected)
     }
 
+    pub(crate) fn prepared_session(&self) -> Option<&str> {
+        self.session.as_deref()
+    }
+
     pub async fn prepare_existing(&mut self, wda: &UsbWda) -> Result<(), AdapterError> {
         self.validate_existing(wda).await
     }

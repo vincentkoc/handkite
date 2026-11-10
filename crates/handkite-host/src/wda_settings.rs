@@ -293,7 +293,10 @@ async fn response<T: serde::de::DeserializeOwned>(
     Ok(result)
 }
 
-async fn validate_session(wda: &impl WdaRequest, session: &str) -> Result<(), SettingsError> {
+pub(crate) async fn validate_session(
+    wda: &impl WdaRequest,
+    session: &str,
+) -> Result<(), SettingsError> {
     if session.is_empty()
         || session.len() > 128
         || !session

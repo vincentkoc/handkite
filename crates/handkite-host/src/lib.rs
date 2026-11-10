@@ -16,6 +16,7 @@ pub mod local_socket;
 pub mod mcp;
 pub mod native_lock;
 pub mod pin_backend;
+pub mod pin_field;
 pub mod pin_input;
 pub mod pin_screen;
 #[cfg(target_os = "macos")]

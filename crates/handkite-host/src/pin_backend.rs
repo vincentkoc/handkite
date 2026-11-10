@@ -1,4 +1,5 @@
 use crate::native_lock;
+use crate::pin_field;
 use crate::pin_screen::{self, ParsedPasscodeView};
 use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
@@ -19,6 +20,15 @@ struct PreparedPinView {
     empty_locked: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum ProgressCheck {
+    Disabled,
+    BeforeFirst,
+    Pending,
+    Complete,
+    Failed,
+}
+
 pub struct NativePasscodeBackend {
     expected: HardwareId,
     usb: PinnedUsb,
@@ -29,6 +39,7 @@ pub struct NativePasscodeBackend {
     supervised_visibility_fallback: bool,
     session_bound: bool,
     awaiting_first_digit: bool,
+    progress_check: ProgressCheck,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +81,7 @@ impl NativePasscodeBackend {
             supervised_visibility_fallback,
             session_bound: false,
             awaiting_first_digit: false,
+            progress_check: ProgressCheck::Disabled,
         })
     }
 
@@ -87,6 +99,7 @@ impl NativePasscodeBackend {
         )?;
         backend.actions = actions;
         backend.session_bound = true;
+        backend.progress_check = ProgressCheck::BeforeFirst;
         Ok(backend)
     }
 
@@ -121,10 +134,41 @@ impl NativePasscodeBackend {
         dispatch: impl FnOnce(&mut Self, &Action, Instant) -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
         let prepared = self.last_view.take().ok_or(BackendError::Unavailable)?;
-        if now >= prepared.fresh_until {
+        if now >= prepared.fresh_until
+            || matches!(
+                self.progress_check,
+                ProgressCheck::Pending | ProgressCheck::Failed
+            )
+        {
             return Err(BackendError::Unavailable);
         }
         dispatch(self, action, prepared.fresh_until)
+    }
+
+    fn press_digit_with(
+        &mut self,
+        digit: u8,
+        dispatch: impl FnOnce(&mut Self, &Action) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        if matches!(
+            self.progress_check,
+            ProgressCheck::Pending | ProgressCheck::Failed
+        ) {
+            return Err(BackendError::Unavailable);
+        }
+        let at = self
+            .last_view
+            .as_ref()
+            .and_then(|prepared| prepared.view.keypad.as_ref())
+            .and_then(|keys| keys.get(usize::from(digit)))
+            .copied()
+            .ok_or(BackendError::Unavailable)?;
+        self.awaiting_first_digit = false;
+        let result = dispatch(self, &Action::Tap { at });
+        if self.progress_check == ProgressCheck::BeforeFirst {
+            self.progress_check = ProgressCheck::Pending;
+        }
+        result
     }
 
     fn wake_hidden_with(
@@ -184,6 +228,35 @@ fn empty_locked(screen: &PasscodeScreen, view: &ParsedPasscodeView, expected: &H
             })
 }
 
+fn compare_progress(
+    screen: &PasscodeScreen,
+    view: &ParsedPasscodeView,
+    direct: u32,
+) -> Result<(), BackendError> {
+    if screen.native_lock != LockState::Locked
+        || screen.visible_lock != LockState::Locked
+        || screen.wda_lock != LockState::Locked
+        || screen.before_first_unlock
+        || screen.trust_prompt
+        || view.has_alert
+        || !screen.keypad_ready
+        || !view.layout_valid
+        || view.keypad.is_none()
+    {
+        return Err(BackendError::Unavailable);
+    }
+    let source = pin_field::count(
+        view.secure_field_value
+            .as_deref()
+            .ok_or(BackendError::Unavailable)?,
+    )
+    .map_err(|_| BackendError::Unavailable)?;
+    if source != direct {
+        return Err(BackendError::ProgressMismatch);
+    }
+    Ok(())
+}
+
 fn wda_error(error: WdaError) -> BackendError {
     match error {
         WdaError::Usb(_) => BackendError::Disconnected,
@@ -235,10 +308,18 @@ impl NativePasscodeBackend {
         now: impl FnOnce() -> Instant,
     ) -> Result<PasscodeScreen, BackendError> {
         self.last_view = None;
+        if self.progress_check == ProgressCheck::Failed {
+            return Err(BackendError::Unavailable);
+        }
+        let comparing = self.progress_check == ProgressCheck::Pending;
         let fresh_until = started
             .checked_add(PIN_VIEW_BUDGET)
             .ok_or(BackendError::Unavailable)?;
-        let (screen, view) = capture(self, started)?;
+        let captured = capture(self, started);
+        if comparing {
+            self.progress_check = ProgressCheck::Failed;
+        }
+        let (screen, view) = captured?;
         if now() >= fresh_until {
             return Err(BackendError::Unavailable);
         }
@@ -251,6 +332,9 @@ impl NativePasscodeBackend {
             fresh_until,
             empty_locked,
         });
+        if comparing {
+            self.progress_check = ProgressCheck::Complete;
+        }
         Ok(screen)
     }
 
@@ -270,6 +354,19 @@ impl NativePasscodeBackend {
         });
         let source = response_value(source.map_err(wda_error)?)?;
         let reported_lock = response_value(reported_lock.map_err(wda_error)?)?;
+        let direct = if self.progress_check == ProgressCheck::Pending {
+            let session = self
+                .actions
+                .prepared_session()
+                .ok_or(BackendError::Unavailable)?;
+            Some(
+                self.runtime
+                    .block_on(pin_field::read(&wda, session))
+                    .map_err(|_| BackendError::Unavailable)?,
+            )
+        } else {
+            None
+        };
         if self.session_bound {
             self.runtime
                 .block_on(self.actions.prepare_existing(&wda))
@@ -313,6 +410,9 @@ impl NativePasscodeBackend {
             before_first_unlock: native.unlocked_since_boot != Some(true),
             trust_prompt: parsed.has_alert,
         };
+        if let Some(direct) = direct {
+            compare_progress(&screen, &parsed, direct)?;
+        }
         Ok((screen, parsed))
     }
 }
@@ -323,6 +423,12 @@ impl PasscodeBackend for NativePasscodeBackend {
     }
 
     fn show_keypad(&mut self) -> Result<(), BackendError> {
+        if matches!(
+            self.progress_check,
+            ProgressCheck::Pending | ProgressCheck::Failed
+        ) {
+            return Err(BackendError::Unavailable);
+        }
         if self.supervised_visibility_fallback && self.session_bound {
             if self.last_view.as_ref().is_some_and(|prepared| {
                 prepared.empty_locked
@@ -396,15 +502,7 @@ impl PasscodeBackend for NativePasscodeBackend {
     }
 
     fn press_digit(&mut self, digit: u8) -> Result<(), BackendError> {
-        let at = self
-            .last_view
-            .as_ref()
-            .and_then(|prepared| prepared.view.keypad.as_ref())
-            .and_then(|keys| keys.get(usize::from(digit)))
-            .copied()
-            .ok_or(BackendError::Unavailable)?;
-        self.awaiting_first_digit = false;
-        self.request_action(&Action::Tap { at })
+        self.press_digit_with(digit, Self::request_action)
     }
 
     fn delete_digit(&mut self) -> Result<(), BackendError> {
@@ -489,6 +587,205 @@ mod tests {
             "fixture-session",
         )
         .unwrap()
+    }
+
+    fn progress_capture(entered: u32) -> (PasscodeScreen, ParsedPasscodeView) {
+        let (mut screen, mut view) = keypad_capture(false);
+        let value = format!("{entered} of 6 digits");
+        screen.secure_field_value = Some(value.clone());
+        view.secure_field_value = Some(value);
+        (screen, view)
+    }
+
+    #[test]
+    fn first_digit_comparison_runs_once_only_for_the_bound_backend() {
+        for bound in [false, true] {
+            let mut backend = if bound { bound_backend() } else { backend() };
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(progress_capture(0)), || start)
+                .unwrap();
+            let mut reads = 0;
+            for entered in 1..=2 {
+                backend
+                    .press_digit_with(0, |backend, action| {
+                        backend.request_action_with(action, start, |_, _, _| Ok(()))
+                    })
+                    .unwrap();
+                backend
+                    .snapshot_with(
+                        start,
+                        |backend, _| {
+                            let (screen, view) = progress_capture(entered);
+                            if backend.progress_check == ProgressCheck::Pending {
+                                reads += 1;
+                                compare_progress(&screen, &view, entered)?;
+                            }
+                            Ok((screen, view))
+                        },
+                        || start,
+                    )
+                    .unwrap();
+            }
+            assert_eq!(reads, usize::from(bound));
+            assert_eq!(
+                backend.progress_check,
+                if bound {
+                    ProgressCheck::Complete
+                } else {
+                    ProgressCheck::Disabled
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn failed_comparison_consumes_the_snapshot_and_blocks_every_later_input() {
+        for direct in [Ok(1), Err(BackendError::Unavailable)] {
+            let mut backend = bound_backend();
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(progress_capture(0)), || start)
+                .unwrap();
+            backend
+                .press_digit_with(0, |backend, action| {
+                    backend.request_action_with(action, start, |_, _, _| Ok(()))
+                })
+                .unwrap();
+            let mut reads = 0;
+            let result = backend.snapshot_with(
+                start,
+                |_, _| {
+                    reads += 1;
+                    let (screen, view) = progress_capture(0);
+                    compare_progress(&screen, &view, direct?)?;
+                    Ok((screen, view))
+                },
+                || start,
+            );
+            assert_eq!(
+                result.err(),
+                Some(if direct.is_ok() {
+                    BackendError::ProgressMismatch
+                } else {
+                    BackendError::Unavailable
+                })
+            );
+            assert_eq!(reads, 1);
+            assert!(backend.last_view.is_none());
+            assert_eq!(backend.progress_check, ProgressCheck::Failed);
+            assert_eq!(
+                backend.press_digit_with(0, |_, _| panic!("no next digit")),
+                Err(BackendError::Unavailable)
+            );
+            assert!(
+                backend
+                    .snapshot_with(start, |_, _| panic!("no repeat comparison"), || start)
+                    .is_err()
+            );
+            assert_eq!(backend.show_keypad(), Err(BackendError::Unavailable));
+        }
+    }
+
+    #[test]
+    fn comparison_failure_keeps_the_marked_gate_and_stops_before_digit_two() {
+        use handkite_core::passcode::Passcode;
+        use handkite_core::protocol::{DeviceBinding, DeviceKey};
+        use handkite_core::unlock::{
+            AttemptGate, GateError, UnlockError, UnlockPolicy, unlock_once,
+        };
+        struct Harness {
+            backend: NativePasscodeBackend,
+            start: Instant,
+            taps: usize,
+            reads: usize,
+        }
+        impl PasscodeBackend for Harness {
+            fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError> {
+                let reads = &mut self.reads;
+                self.backend.snapshot_with(
+                    self.start,
+                    |backend, _| {
+                        let (screen, view) = progress_capture(0);
+                        if backend.progress_check == ProgressCheck::Pending {
+                            *reads += 1;
+                            compare_progress(&screen, &view, 1)?;
+                        }
+                        Ok((screen, view))
+                    },
+                    || self.start,
+                )
+            }
+            fn show_keypad(&mut self) -> Result<(), BackendError> {
+                self.backend.show_keypad()
+            }
+            fn press_digit(&mut self, digit: u8) -> Result<(), BackendError> {
+                let taps = &mut self.taps;
+                let start = self.start;
+                self.backend.press_digit_with(digit, |backend, action| {
+                    backend.request_action_with(action, start, |_, _, _| {
+                        *taps += 1;
+                        Ok(())
+                    })
+                })
+            }
+            fn delete_digit(&mut self) -> Result<(), BackendError> {
+                panic!("no deletion")
+            }
+        }
+        #[derive(Default)]
+        struct Gate {
+            marked: bool,
+        }
+        impl AttemptGate for Gate {
+            fn is_disabled(&self) -> Result<bool, GateError> {
+                Ok(self.marked)
+            }
+            fn mark_uncertain(&mut self) -> Result<(), GateError> {
+                self.marked = true;
+                Ok(())
+            }
+            fn clear(&mut self) -> Result<(), GateError> {
+                panic!("mismatch cannot clear")
+            }
+        }
+        let mut harness = Harness {
+            backend: bound_backend(),
+            start: Instant::now(),
+            taps: 0,
+            reads: 0,
+        };
+        let mut gate = Gate::default();
+        let binding = DeviceBinding {
+            key: DeviceKey::new("iphone").unwrap(),
+            usb_id: HardwareId::new("fixture-phone").unwrap(),
+        };
+        let code = Passcode::new("0".repeat(6)).unwrap();
+        assert_eq!(
+            unlock_once(
+                &mut harness,
+                &mut gate,
+                &binding,
+                &binding.key,
+                &code,
+                UnlockPolicy::default()
+            ),
+            Err(UnlockError::Backend(BackendError::ProgressMismatch))
+        );
+        assert_eq!((harness.taps, harness.reads), (1, 1));
+        assert!(gate.marked);
+        assert_eq!(
+            unlock_once(
+                &mut harness,
+                &mut gate,
+                &binding,
+                &binding.key,
+                &code,
+                UnlockPolicy::default()
+            ),
+            Err(UnlockError::Disabled)
+        );
+        assert_eq!((harness.taps, harness.reads), (1, 1));
     }
 
     #[test]
