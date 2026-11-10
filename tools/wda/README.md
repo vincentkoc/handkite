@@ -19,6 +19,10 @@ The tool removes inherited `CPATH` from its Xcode child processes. Host include 
 
 Add `--allow-provisioning-updates` only when intentionally allowing Xcode to contact Apple and manage signing assets. The command does not enable automatic device registration. Team and UDID are passed to Xcode as process arguments on the trusted Mac; no PIN, Apple password, or token is accepted by this tool.
 
+If Xcode reports `errSecInternalComponent` while signing, inspect keychain access in the same macOS security session that will run the build. A read-only SSH keychain status cannot establish whether the active GUI session can use the private key. Check the GUI session before changing keychain access or retrying signing. An identity appearing in `security find-identity` does not prove its private key is usable.
+
+From a native Terminal in the intended Mac account, run `python3 -B tools/wda/keychain_status.py`. It disables keychain prompts only in that process and reports `locked`, `unlocked`, or `unavailable` without displaying the account or certificate. An `unlocked` result still does not prove that codesign may use a particular private key. A locked result from SSH describes only the SSH security session.
+
 After the build, obtain the exact expected runner bundle ID and an independently trusted signing-certificate SHA-1 fingerprint. The verifier requires those pins; it does not infer them from the generated files:
 
 ```sh
