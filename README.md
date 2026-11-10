@@ -233,6 +233,8 @@ is a read-only aid for a Cancel geometry refusal. It reuses the pinned locked
 capture and exact trial parser, printing only a fixed classification. A geometry
 failure from invalid competing bounds also identifies the first competitor using
 only `button`/`other_control` and `emergency`/`delete`/`other` classes.
+It also reports that competitor's `enabled` and `visible` categories as
+`true`/`false`/`missing`; these flags do not relax the bounds guard.
 A failure is reported at its first observation; `stable` requires two fresh,
 nonoverlapping captures with the same session and geometry. Other guards still
 refuse. It sends no input or settings writes and saves no screenshot or XML.
