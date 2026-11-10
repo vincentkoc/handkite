@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const REQUEST_FAILED: &str = "Apple provisioning HTTPS request failed";
 const RESPONSE_FAILED: &str = "Apple provisioning HTTPS response is invalid";
+const APPLE_ROOT_CA_DER: &[u8] = include_bytes!("client/apple-root-ca.der");
 
 /// Deliberately separate from the sidecar's client-certificate transport.
 pub(super) struct AppleClient {
@@ -22,9 +23,10 @@ pub(super) struct AppleResponse {
 
 impl AppleClient {
     pub fn new() -> Result<Self, &'static str> {
-        let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         Ok(Self {
-            http: builder(roots)?.build().map_err(|_| REQUEST_FAILED)?,
+            http: builder(production_roots()?)?
+                .build()
+                .map_err(|_| REQUEST_FAILED)?,
             #[cfg(test)]
             test_port: None,
         })
@@ -113,6 +115,14 @@ impl AppleClient {
         .await
         .map_err(|_| REQUEST_FAILED)?
     }
+}
+
+fn production_roots() -> Result<RootCertStore, &'static str> {
+    let mut roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    roots
+        .add(APPLE_ROOT_CA_DER.into())
+        .map_err(|_| REQUEST_FAILED)?;
+    Ok(roots)
 }
 
 fn builder(roots: RootCertStore) -> Result<reqwest::ClientBuilder, &'static str> {

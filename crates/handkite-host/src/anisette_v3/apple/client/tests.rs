@@ -81,7 +81,7 @@ impl TlsFixture {
         .unwrap();
         server.alpn_protocols = vec![b"http/1.1".to_vec()];
         if !trusted {
-            roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            roots = production_roots().unwrap();
         }
         Self {
             server: Arc::new(server),
@@ -199,6 +199,32 @@ impl TlsFixture {
         });
         (client, server)
     }
+}
+
+#[test]
+fn apple_root_asset_matches_the_official_certificate() {
+    assert_eq!(APPLE_ROOT_CA_DER.len(), 1215);
+    assert_eq!(
+        ring::digest::digest(&ring::digest::SHA256, APPLE_ROOT_CA_DER).as_ref(),
+        &[
+            0xb0, 0xb1, 0x73, 0x0e, 0xcb, 0xc7, 0xff, 0x45, 0x05, 0x14, 0x2c, 0x49, 0xf1, 0x29,
+            0x5e, 0x6e, 0xda, 0x6b, 0xca, 0xed, 0x7e, 0x2c, 0x68, 0xc5, 0xbe, 0x91, 0xb5, 0xa1,
+            0x10, 0x01, 0xf0, 0x24,
+        ]
+    );
+}
+
+#[test]
+fn production_roots_preserve_webpki_and_append_only_the_apple_anchor() {
+    let roots = production_roots().unwrap();
+    let baseline = webpki_roots::TLS_SERVER_ROOTS;
+    let mut apple = RootCertStore::empty();
+    apple.add(APPLE_ROOT_CA_DER.into()).unwrap();
+    assert_eq!(apple.len(), 1);
+    assert!(!baseline.contains(&apple.roots[0]));
+    assert_eq!(roots.len(), baseline.len() + 1);
+    assert_eq!(&roots.roots[..baseline.len()], baseline);
+    assert_eq!(roots.roots.last(), apple.roots.first());
 }
 
 #[tokio::test]
