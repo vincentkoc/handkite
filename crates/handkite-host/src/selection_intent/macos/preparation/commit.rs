@@ -17,6 +17,7 @@ pub(crate) enum Point {
 #[cfg(test)]
 pub(crate) struct Hooks<'a> {
     pub(crate) check: Option<Check<'a>>,
+    pub(crate) device: Option<crate::device_agreement::tests::Fake>,
     pub(crate) fault: Option<&'a mut dyn FnMut(Point) -> Result<(), &'static str>>,
     pub(crate) rename_error: Option<(i32, bool)>,
     pub(crate) sync_error: bool,
@@ -28,6 +29,7 @@ impl Hooks<'_> {
     pub(crate) fn production() -> Self {
         Self {
             check: None,
+            device: None,
             fault: None,
             rename_error: None,
             sync_error: false,
@@ -45,7 +47,7 @@ impl Hooks<'_> {
 
 pub(in crate::selection_intent) struct Committed<'held, 'lock> {
     owner: &'lock InstallerLock,
-    config: &'held mut RetainedConfig<'lock>,
+    agreement: DeviceAgreement<'lock>,
     previous: Option<&'held mut PublishedRelease<'lock>>,
     destination: &'held mut PublishedRelease<'lock>,
     selected: RetainedLink,
@@ -58,7 +60,7 @@ pub(in crate::selection_intent) struct Committed<'held, 'lock> {
 impl Committed<'_, '_> {
     fn custody(&mut self) -> Result<(), &'static str> {
         self.owner.revalidate()?;
-        self.config.revalidate_for_owner(self.owner)?;
+        self.agreement.revalidate_for_owner(self.owner)?;
         let parent = self.destination.selection_parent();
         self.inventory.check(parent)?;
         self.selected.check(parent)?;
@@ -85,7 +87,7 @@ impl Committed<'_, '_> {
         }
         self.destination.revalidate_custody()?;
         self.owner.revalidate()?;
-        self.config.revalidate_for_owner(self.owner)?;
+        self.agreement.revalidate_for_owner(self.owner)?;
         self.inventory.check(self.destination.selection_parent())
     }
 
@@ -173,7 +175,7 @@ fn known_refusal(error: &io::Error) -> bool {
     })
 }
 
-pub(crate) fn commit<'held, 'lock>(
+pub(crate) async fn commit<'held, 'lock>(
     prepared: PreparedSelection<'held, 'lock>,
     #[cfg(test)] hooks: &mut Hooks<'_>,
 ) -> Result<CommittedSelection<'held, 'lock>, CommitFailure> {
@@ -185,105 +187,140 @@ pub(crate) fn commit<'held, 'lock>(
         PENDING_JOURNAL.into(),
     ];
     let mut phase = CommitPhase::BeforeCommit;
-    let result = (|| {
+    let result = async {
         #[cfg(test)]
         hooks.at(Point::BeforePreflight)?;
         #[cfg(test)]
         prepared.revalidate(hooks.check.as_mut().map(|check| &mut **check as Check<'_>))?;
         #[cfg(not(test))]
         prepared.revalidate()?;
-        let before = BeforeRename::capture(
-            prepared.retained.destination.selection_parent(),
-            &prepared.link,
-            prepared.previous_link.as_ref(),
-        )?;
         #[cfg(test)]
-        hooks.at(Point::BeforeRename)?;
+        if let Some(transport) = hooks.device.take() {
+            crate::device_agreement::tests::reobserve(&mut prepared.agreement, transport).await?;
+        } else {
+            prepared.agreement.reobserve().await?;
+        }
+        #[cfg(not(test))]
+        prepared.agreement.reobserve().await?;
+        // Check every retained baseline after the await, before inventory or rename.
         prepared.custody()?;
-        checkpoint(&prepared.retained, prepared.config, Some(&prepared.link))?;
-        before.check(prepared.retained.destination.selection_parent())?;
-        #[cfg(test)]
-        hooks.at(Point::BeforeRenameCall)?;
-        if let Err(error) = rename(
-            prepared.retained.destination.selection_parent(),
-            &candidate,
-            prepared.previous_link.is_some(),
+        checkpoint(
+            &prepared.retained,
+            &mut prepared.agreement,
+            Some(&prepared.link),
+        )?;
+        finish_commit(
+            prepared,
+            candidate,
+            &mut phase,
             #[cfg(test)]
             hooks,
-        ) {
-            if !known_refusal(&error) {
-                phase = CommitPhase::UncertainCommit;
-            }
-            return Err("selection rename failed");
-        }
-        // Never let a later observation, signer or sync failure erase this boundary.
-        phase = CommitPhase::AfterCommit;
-        #[cfg(test)]
-        hooks.at(Point::Renamed)?;
-        let (change, inventory) =
-            before.finish(prepared.retained.destination.selection_parent())?;
-        prepared.link.rebind_after_rename(
-            prepared.retained.destination.selection_parent(),
-            c"current".into(),
-            &change,
-        )?;
-        if let Some(previous) = &mut prepared.previous_link {
-            previous.rebind_after_rename(
-                prepared.retained.destination.selection_parent(),
-                candidate.clone(),
-                &change,
-            )?;
-        }
-        prepared
-            .config
-            .revalidate_for_owner(prepared.retained.owner)?;
-        prepared.retained.owner.revalidate()?;
-        if let Some(previous) = &mut prepared.retained.previous {
-            previous.selection_parent_transition(&change)?;
-        }
-        prepared
-            .retained
-            .destination
-            .selection_parent_transition(&change)?;
-        let mut committed = Committed {
-            owner: prepared.retained.owner,
-            config: prepared.config,
-            previous: prepared.retained.previous,
-            destination: prepared.retained.destination,
-            selected: prepared.link,
-            previous_link: prepared.previous_link,
-            candidate,
-            journal: prepared.journal,
-            inventory,
-        };
-        committed.custody()?;
-        #[cfg(test)]
-        hooks.at(Point::BeforeSync)?;
-        #[cfg(test)]
-        if hooks.sync_error {
-            return Err("selection parent sync failed");
-        }
-        committed
-            .destination
-            .selection_parent()
-            .sync_all()
-            .map_err(|_| "selection parent sync failed")?;
-        #[cfg(test)]
-        hooks.at(Point::BeforeFinalVerify)?;
-        #[cfg(test)]
-        committed.revalidate(hooks.check.as_mut().map(|check| &mut **check as Check<'_>))?;
-        #[cfg(not(test))]
-        committed.revalidate()?;
-        #[cfg(test)]
-        hooks.at(Point::Complete)?;
-        committed.custody()?;
-        Ok(CommittedSelection { inner: committed })
-    })();
+        )
+    }
+    .await;
     result.map_err(|reason| CommitFailure {
         reason,
         phase,
         residues,
     })
+}
+
+// Inventory capture, rename, durability checks and returned custody never suspend.
+fn finish_commit<'held, 'lock>(
+    mut prepared: Prepared<'held, 'lock>,
+    candidate: CString,
+    phase: &mut CommitPhase,
+    #[cfg(test)] hooks: &mut Hooks<'_>,
+) -> Result<CommittedSelection<'held, 'lock>, &'static str> {
+    let before = BeforeRename::capture(
+        prepared.retained.destination.selection_parent(),
+        &prepared.link,
+        prepared.previous_link.as_ref(),
+    )?;
+    #[cfg(test)]
+    hooks.at(Point::BeforeRename)?;
+    prepared.custody()?;
+    checkpoint(
+        &prepared.retained,
+        &mut prepared.agreement,
+        Some(&prepared.link),
+    )?;
+    before.check(prepared.retained.destination.selection_parent())?;
+    #[cfg(test)]
+    hooks.at(Point::BeforeRenameCall)?;
+    if let Err(error) = rename(
+        prepared.retained.destination.selection_parent(),
+        &candidate,
+        prepared.previous_link.is_some(),
+        #[cfg(test)]
+        hooks,
+    ) {
+        if !known_refusal(&error) {
+            *phase = CommitPhase::UncertainCommit;
+        }
+        return Err("selection rename failed");
+    }
+    // Never let a later observation, signer or sync failure erase this boundary.
+    *phase = CommitPhase::AfterCommit;
+    #[cfg(test)]
+    hooks.at(Point::Renamed)?;
+    let (change, inventory) = before.finish(prepared.retained.destination.selection_parent())?;
+    prepared.link.rebind_after_rename(
+        prepared.retained.destination.selection_parent(),
+        c"current".into(),
+        &change,
+    )?;
+    if let Some(previous) = &mut prepared.previous_link {
+        previous.rebind_after_rename(
+            prepared.retained.destination.selection_parent(),
+            candidate.clone(),
+            &change,
+        )?;
+    }
+    prepared
+        .agreement
+        .revalidate_for_owner(prepared.retained.owner)?;
+    prepared.retained.owner.revalidate()?;
+    if let Some(previous) = &mut prepared.retained.previous {
+        previous.selection_parent_transition(&change)?;
+    }
+    prepared
+        .retained
+        .destination
+        .selection_parent_transition(&change)?;
+    let mut committed = Committed {
+        owner: prepared.retained.owner,
+        agreement: prepared.agreement,
+        previous: prepared.retained.previous,
+        destination: prepared.retained.destination,
+        selected: prepared.link,
+        previous_link: prepared.previous_link,
+        candidate,
+        journal: prepared.journal,
+        inventory,
+    };
+    committed.custody()?;
+    #[cfg(test)]
+    hooks.at(Point::BeforeSync)?;
+    #[cfg(test)]
+    if hooks.sync_error {
+        return Err("selection parent sync failed");
+    }
+    committed
+        .destination
+        .selection_parent()
+        .sync_all()
+        .map_err(|_| "selection parent sync failed")?;
+    #[cfg(test)]
+    hooks.at(Point::BeforeFinalVerify)?;
+    #[cfg(test)]
+    committed.revalidate(hooks.check.as_mut().map(|check| &mut **check as Check<'_>))?;
+    #[cfg(not(test))]
+    committed.revalidate()?;
+    #[cfg(test)]
+    hooks.at(Point::Complete)?;
+    committed.custody()?;
+    Ok(CommittedSelection { inner: committed })
 }
 
 #[cfg(test)]

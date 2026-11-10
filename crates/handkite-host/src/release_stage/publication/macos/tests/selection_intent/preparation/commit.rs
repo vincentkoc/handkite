@@ -2,7 +2,7 @@ use super::*;
 use crate::selection_intent::macos::preparation::commit::{self as transaction, Hooks, Point};
 use crate::selection_intent::{CommitFailure, CommitPhase, CommittedSelection};
 
-fn commit<'held, 'lock>(
+async fn commit<'held, 'lock>(
     value: PreparedSelection<'held, 'lock>,
     fault: &mut dyn FnMut(Point) -> Result<(), &'static str>,
     rename_error: Option<(i32, bool)>,
@@ -11,13 +11,14 @@ fn commit<'held, 'lock>(
     usize,
 ) {
     let mut hooks = Hooks {
+        device: Some(device::Fake::good()),
         check: Some(&mut check),
         fault: Some(fault),
         rename_error,
         sync_error: false,
         renames: 0,
     };
-    let result = transaction::commit(value, &mut hooks);
+    let result = transaction::commit(value, &mut hooks).await;
     (result, hooks.renames)
 }
 
@@ -25,25 +26,26 @@ fn fingerprint(path: &Path) -> Fingerprint {
     fs::symlink_metadata(path).unwrap().into()
 }
 
-#[test]
-fn initial_upgrade_and_rollback_move_exact_links_and_preserve_the_journal() {
+#[tokio::test]
+async fn initial_upgrade_and_rollback_move_exact_links_and_preserve_the_journal() {
     for operation in [
         Operation::InitialInstall,
         Operation::Upgrade,
         Operation::Rollback,
     ] {
         let (fixture, bytes) = setup(operation);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let prepared = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             operation,
             (operation != Operation::InitialInstall).then_some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
         let parent = fixture.layout().releases_directory();
         let current = parent.join("current");
@@ -57,7 +59,7 @@ fn initial_upgrade_and_rollback_move_exact_links_and_preserve_the_journal() {
             .into_iter()
             .filter(|(p, _)| p != &current)
             .collect();
-        let (result, renames) = commit(prepared, &mut |_| Ok(()), None);
+        let (result, renames) = commit(prepared, &mut |_| Ok(()), None).await;
         let mut committed = result.unwrap();
         assert_eq!(renames, 1);
         assert_eq!(
@@ -93,21 +95,22 @@ fn initial_upgrade_and_rollback_move_exact_links_and_preserve_the_journal() {
     }
 }
 
-#[test]
-fn drift_before_preflight_never_calls_rename_or_cleans_residues() {
+#[tokio::test]
+async fn drift_before_preflight_never_calls_rename_or_cleans_residues() {
     for mutation in 0..10 {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let prepared = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
         let parent = fixture.layout().releases_directory();
         let current = parent.join("current");
@@ -166,7 +169,8 @@ fn drift_before_preflight_never_calls_rename_or_cleans_residues() {
                 Ok(())
             },
             None,
-        );
+        )
+        .await;
         let error = result.err().unwrap();
         assert_eq!(
             error.phase(),
@@ -188,12 +192,12 @@ fn drift_before_preflight_never_calls_rename_or_cleans_residues() {
     }
 }
 
-#[test]
-fn checked_delta_rejects_unrelated_changes_and_moved_link_drift() {
+#[tokio::test]
+async fn checked_delta_rejects_unrelated_changes_and_moved_link_drift() {
     for point in [Point::BeforeRename, Point::Renamed] {
         for mutation in 0..5 {
             let (fixture, bytes) = setup(Operation::Upgrade);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let parent = fixture.layout().releases_directory();
             fs::write(parent.join("unrelated"), b"baseline").unwrap();
             // Open after the deliberate fixture addition to retain its parent baseline.
@@ -201,12 +205,13 @@ fn checked_delta_rejects_unrelated_changes_and_moved_link_drift() {
             let mut destination = open(&fixture.owner, &bytes);
             let prepared = prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
                 &mut |_| Ok(()),
             )
+            .await
             .unwrap();
             let (result, renames) = commit(
                 prepared,
@@ -233,7 +238,8 @@ fn checked_delta_rejects_unrelated_changes_and_moved_link_drift() {
                     Ok(())
                 },
                 None,
-            );
+            )
+            .await;
             let error = result.err().unwrap();
             assert_eq!(
                 error.phase(),
@@ -250,8 +256,8 @@ fn checked_delta_rejects_unrelated_changes_and_moved_link_drift() {
     }
 }
 
-#[test]
-fn committed_inventory_rejects_in_place_sibling_drift_without_a_new_baseline() {
+#[tokio::test]
+async fn committed_inventory_rejects_in_place_sibling_drift_without_a_new_baseline() {
     for point in [
         Some(Point::BeforeSync),
         Some(Point::BeforeFinalVerify),
@@ -264,17 +270,18 @@ fn committed_inventory_rejects_in_place_sibling_drift_without_a_new_baseline() {
             let unrelated = parent.join("unrelated");
             fs::write(&unrelated, b"baseline").unwrap();
             chmod(&unrelated, 0o600);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let prepared = prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
                 &mut |_| Ok(()),
             )
+            .await
             .unwrap();
             let journal = fingerprint(&parent.join(PENDING_JOURNAL));
             let mutate = || {
@@ -299,7 +306,8 @@ fn committed_inventory_rejects_in_place_sibling_drift_without_a_new_baseline() {
                     Ok(())
                 },
                 None,
-            );
+            )
+            .await;
             assert_eq!(renames, 1);
             if point.is_some() {
                 assert_eq!(result.err().unwrap().phase(), CommitPhase::AfterCommit);
@@ -324,22 +332,23 @@ fn committed_inventory_rejects_in_place_sibling_drift_without_a_new_baseline() {
     }
 }
 
-#[test]
-fn a_raced_current_link_file_or_directory_is_preserved_without_success() {
+#[tokio::test]
+async fn a_raced_current_link_file_or_directory_is_preserved_without_success() {
     for operation in [Operation::InitialInstall, Operation::Upgrade] {
         for kind in 0..3 {
             let (fixture, bytes) = setup(operation);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let prepared = prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 operation,
                 (operation != Operation::InitialInstall).then_some(&mut previous),
                 &mut destination,
                 &mut |_| Ok(()),
             )
+            .await
             .unwrap();
             let parent = fixture.layout().releases_directory();
             let current = parent.join("current");
@@ -364,7 +373,8 @@ fn a_raced_current_link_file_or_directory_is_preserved_without_success() {
                     Ok(())
                 },
                 None,
-            );
+            )
+            .await;
             let error = result.err().unwrap();
             assert_eq!(renames, 1);
             if operation == Operation::InitialInstall {
@@ -395,8 +405,8 @@ fn a_raced_current_link_file_or_directory_is_preserved_without_success() {
     }
 }
 
-#[test]
-fn rename_refusals_and_uncertain_errors_never_retry_or_infer_a_commit() {
+#[tokio::test]
+async fn rename_refusals_and_uncertain_errors_never_retry_or_infer_a_commit() {
     for operation in [Operation::InitialInstall, Operation::Upgrade] {
         for (errno, applied, phase) in [
             (libc::EEXIST, false, CommitPhase::BeforeCommit),
@@ -409,21 +419,22 @@ fn rename_refusals_and_uncertain_errors_never_retry_or_infer_a_commit() {
             (libc::EINTR, true, CommitPhase::UncertainCommit),
         ] {
             let (fixture, bytes) = setup(operation);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let prepared = prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 operation,
                 (operation != Operation::InitialInstall).then_some(&mut previous),
                 &mut destination,
                 &mut |_| Ok(()),
             )
+            .await
             .unwrap();
             let parent = fixture.layout().releases_directory();
             let journal = fingerprint(&parent.join(PENDING_JOURNAL));
-            let (result, renames) = commit(prepared, &mut |_| Ok(()), Some((errno, applied)));
+            let (result, renames) = commit(prepared, &mut |_| Ok(()), Some((errno, applied))).await;
             let error = result.err().unwrap();
             assert_eq!(error.phase(), phase);
             assert_eq!(renames, 1);
@@ -440,8 +451,8 @@ fn rename_refusals_and_uncertain_errors_never_retry_or_infer_a_commit() {
     }
 }
 
-#[test]
-fn every_failure_after_rename_is_after_commit_without_rollback_or_cleanup() {
+#[tokio::test]
+async fn every_failure_after_rename_is_after_commit_without_rollback_or_cleanup() {
     for point in [
         Point::Renamed,
         Point::BeforeSync,
@@ -449,17 +460,18 @@ fn every_failure_after_rename_is_after_commit_without_rollback_or_cleanup() {
         Point::Complete,
     ] {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let prepared = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
         let parent = fixture.layout().releases_directory();
         let journal = fingerprint(&parent.join(PENDING_JOURNAL));
@@ -473,7 +485,8 @@ fn every_failure_after_rename_is_after_commit_without_rollback_or_cleanup() {
                 }
             },
             None,
-        );
+        )
+        .await;
         assert_eq!(result.err().unwrap().phase(), CommitPhase::AfterCommit);
         assert_eq!(renames, 1);
         assert_eq!(
@@ -488,29 +501,34 @@ fn every_failure_after_rename_is_after_commit_without_rollback_or_cleanup() {
     }
 }
 
-#[test]
-fn directory_sync_failure_keeps_the_successful_swap_and_original_journal() {
+#[tokio::test]
+async fn directory_sync_failure_keeps_the_successful_swap_and_original_journal() {
     let (fixture, bytes) = setup(Operation::Upgrade);
-    let mut config = retain_config(&fixture.owner);
+    let agreement = device::observe(&fixture.owner).await;
     let mut previous = open(&fixture.owner, &fixture.bytes);
     let mut destination = open(&fixture.owner, &bytes);
     let prepared = prepare(
         &fixture.owner,
-        &mut config,
+        agreement,
         Operation::Upgrade,
         Some(&mut previous),
         &mut destination,
         &mut |_| Ok(()),
     )
+    .await
     .unwrap();
     let parent = fixture.layout().releases_directory();
     let journal = fingerprint(&parent.join(PENDING_JOURNAL));
     let mut hooks = Hooks {
+        device: Some(device::Fake::good()),
         check: Some(&mut check),
         sync_error: true,
         ..Hooks::production()
     };
-    let error = transaction::commit(prepared, &mut hooks).err().unwrap();
+    let error = transaction::commit(prepared, &mut hooks)
+        .await
+        .err()
+        .unwrap();
     assert_eq!(error.reason(), "selection parent sync failed");
     assert_eq!(error.phase(), CommitPhase::AfterCommit);
     assert_eq!(hooks.renames, 1);
@@ -525,25 +543,26 @@ fn directory_sync_failure_keeps_the_successful_swap_and_original_journal() {
     assert_eq!(fingerprint(&parent.join(PENDING_JOURNAL)), journal);
 }
 
-#[test]
-fn postcommit_signer_failure_and_final_drift_prevent_success() {
+#[tokio::test]
+async fn postcommit_signer_failure_and_final_drift_prevent_success() {
     for mutation in 0..6 {
         let (fixture, bytes) = setup(Operation::Upgrade);
         let parent = fixture.layout().releases_directory();
         if mutation == 5 {
             fs::write(parent.join("unrelated"), b"baseline").unwrap();
         }
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let prepared = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
         let mut calls = 0;
         let mut checker = |release: &mut PublishedRelease<'_>| {
@@ -578,10 +597,14 @@ fn postcommit_signer_failure_and_final_drift_prevent_success() {
             Ok(())
         };
         let mut hooks = Hooks {
+            device: Some(device::Fake::good()),
             check: Some(&mut checker),
             ..Hooks::production()
         };
-        let error = transaction::commit(prepared, &mut hooks).err().unwrap();
+        let error = transaction::commit(prepared, &mut hooks)
+            .await
+            .err()
+            .unwrap();
         assert_eq!(error.phase(), CommitPhase::AfterCommit);
         assert_eq!(hooks.renames, 1);
         assert_eq!(calls, 4);
@@ -593,23 +616,24 @@ fn postcommit_signer_failure_and_final_drift_prevent_success() {
     }
 }
 
-#[test]
-fn production_commit_and_committed_revalidation_still_require_real_signers() {
+#[tokio::test]
+async fn production_commit_and_committed_revalidation_still_require_real_signers() {
     for public_commit in [true, false] {
         let (fixture, bytes) = setup(Operation::InitialInstall);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut destination = open(&fixture.owner, &bytes);
         let prepared = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::InitialInstall,
             None,
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
         if public_commit {
-            let error = intent::commit(prepared).err().unwrap();
+            let error = intent::commit(prepared).await.err().unwrap();
             assert_eq!(error.phase(), CommitPhase::BeforeCommit);
             assert_eq!(
                 error.reason(),
@@ -617,7 +641,7 @@ fn production_commit_and_committed_revalidation_still_require_real_signers() {
             );
             assert!(fs::symlink_metadata(fixture.layout().current_release_selection()).is_err());
         } else {
-            let (result, _) = commit(prepared, &mut |_| Ok(()), None);
+            let (result, _) = commit(prepared, &mut |_| Ok(()), None).await;
             assert_eq!(
                 result.unwrap().revalidate(),
                 Err("artifact signature does not satisfy signer policy")
@@ -626,23 +650,24 @@ fn production_commit_and_committed_revalidation_still_require_real_signers() {
     }
 }
 
-#[test]
-fn committed_revalidation_keeps_its_original_links_journal_and_config() {
+#[tokio::test]
+async fn committed_revalidation_keeps_its_original_links_journal_and_config() {
     for mutation in 0..5 {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let prepared = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
-        let (result, _) = commit(prepared, &mut |_| Ok(()), None);
+        let (result, _) = commit(prepared, &mut |_| Ok(()), None).await;
         let mut value = result.unwrap();
         let parent = fixture.layout().releases_directory();
         let path = match mutation {

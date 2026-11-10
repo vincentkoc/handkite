@@ -66,7 +66,7 @@ fn unchanged(before: Vec<(std::path::PathBuf, Fingerprint)>) {
     }
 }
 
-struct Fake {
+pub(crate) struct Fake {
     routes: VecDeque<Result<Route, &'static str>>,
     reply: Result<String, LockdownFailure>,
     events: Rc<RefCell<Vec<&'static str>>>,
@@ -77,7 +77,7 @@ struct Fake {
 }
 
 impl Fake {
-    fn good() -> Self {
+    pub(crate) fn good() -> Self {
         Self {
             routes: [
                 Ok(Route::fixture("test-device", 7)),
@@ -91,6 +91,32 @@ impl Fake {
             delay_step: None,
             stall: false,
         }
+    }
+
+    pub(crate) fn disconnected() -> Self {
+        let mut value = Self::good();
+        value.routes[0] = Err("fixture disconnected");
+        value
+    }
+
+    pub(crate) fn changed_route() -> Self {
+        let mut value = Self::good();
+        value.routes[0] = Ok(Route::fixture("test-device", 8));
+        value
+    }
+
+    pub(crate) fn during_reply(mut self, hook: impl FnMut() + 'static) -> Self {
+        self.after_reply = Some(Box::new(hook));
+        self
+    }
+
+    pub(crate) fn stalled(mut self) -> Self {
+        self.stall = true;
+        self
+    }
+
+    pub(crate) fn events(&self) -> Rc<RefCell<Vec<&'static str>>> {
+        self.events.clone()
     }
 
     async fn wait(&self) {
@@ -525,4 +551,18 @@ async fn cancelled_initial_observation_leaves_no_handle_or_persistent_changes() 
         .revalidate()
         .unwrap();
     unchanged(before);
+}
+
+// Fixture entry points share the real acquisition and reobservation state machine.
+pub(crate) async fn observe(owner: &InstallerLock) -> DeviceAgreement<'_> {
+    DeviceAgreement::observe_with(owner, &expected(), &mut Fake::good())
+        .await
+        .unwrap()
+}
+
+pub(crate) fn reobserve<'a>(
+    agreement: &'a mut DeviceAgreement<'_>,
+    transport: Fake,
+) -> impl Future<Output = Result<(), &'static str>> + 'a {
+    agreement.reobserve_with(transport)
 }

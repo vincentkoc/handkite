@@ -6,8 +6,8 @@
 //! use handkite_host::selection_intent::{Intent, inspect};
 //! ```
 //!
-//! Mutation stays crate-private until production admission verifies stopped
-//! controllers and independently pinned connected-device agreement.
+//! Mutation stays crate-private until a production installer admits stopped
+//! controllers. Internal transactions consume independently pinned device agreement.
 //!
 //! ```compile_fail,E0603
 //! use handkite_host::selection_intent::prepare;
@@ -18,7 +18,7 @@
 //! ```
 
 use crate::current_selection::{encode_target, parse_target};
-use crate::install_config::RetainedConfig;
+use crate::device_agreement::DeviceAgreement;
 use crate::install_plan::{ManifestDigest, Operation};
 use crate::installer_lock::InstallerLock;
 use crate::release_stage::PublishedRelease;
@@ -253,21 +253,22 @@ impl PreparationFailure {
     }
 }
 
-/// Retains the original config, lock, releases, current snapshot, link and journal.
+/// Owns the device agreement and retains lock, releases, current, link and journal.
 /// Dropping it preserves every file. Only consuming `commit` can select a release.
 pub struct PreparedSelection<'held, 'lock> {
     #[cfg(target_os = "macos")]
     inner: macos::preparation::Prepared<'held, 'lock>,
     #[cfg(not(target_os = "macos"))]
     _unsupported: std::marker::PhantomData<(
-        &'held mut RetainedConfig<'lock>,
+        DeviceAgreement<'lock>,
         &'held mut PublishedRelease<'lock>,
         &'lock InstallerLock,
     )>,
 }
 
 impl PreparedSelection<'_, '_> {
-    /// Recheck original custody and real signer policy; never adopt changed evidence.
+    /// Recheck config, custody and real signer policy without device transport.
+    /// This does not refresh device presence or adopt changed evidence.
     pub fn revalidate(&mut self) -> Result<(), &'static str> {
         #[cfg(target_os = "macos")]
         {
@@ -283,14 +284,14 @@ impl PreparedSelection<'_, '_> {
 
 /// Create one unique sibling link and one exclusive fixed canonical intent journal.
 /// Current must match the real previous release, or be absent for initial install.
-/// Config and release handles must retain this exact lock. Config agreement is
-/// not a device observation or authority to select or activate a release.
+/// The consumed device agreement and release handles must retain this exact lock.
+/// Reobserve the original device after signer checks and before the first write.
 /// All errors preserve residues, with no retry, rollback, adoption, or cleanup.
-// No production caller exists until stopped-controller and device admission is implemented.
+// No production caller exists until stopped-controller admission is implemented.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn prepare<'held, 'lock>(
+pub(crate) async fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
-    config: &'held mut RetainedConfig<'lock>,
+    agreement: DeviceAgreement<'lock>,
     operation: Operation,
     previous: Option<&'held mut PublishedRelease<'lock>>,
     destination: &'held mut PublishedRelease<'lock>,
@@ -299,17 +300,18 @@ pub(crate) fn prepare<'held, 'lock>(
     {
         macos::preparation::prepare(
             owner,
-            config,
+            agreement,
             operation,
             previous,
             destination,
             #[cfg(test)]
             &mut macos::preparation::Hooks::production(),
         )
+        .await
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (owner, config, operation, previous, destination);
+        let _ = (owner, agreement, operation, previous, destination);
         Err(PreparationFailure {
             reason: "selection preparation requires macOS",
             residues: Vec::new(),
@@ -347,21 +349,22 @@ impl CommitFailure {
     }
 }
 
-/// Retains the selected link, any exchanged previous link, config, releases and lock.
+/// Owns the same device agreement with selected and exchanged links, releases and lock.
 /// This is bounded selection evidence, never activation or power-loss recovery proof.
 pub struct CommittedSelection<'held, 'lock> {
     #[cfg(target_os = "macos")]
     inner: macos::preparation::commit::Committed<'held, 'lock>,
     #[cfg(not(target_os = "macos"))]
     _unsupported: std::marker::PhantomData<(
-        &'held mut RetainedConfig<'lock>,
+        DeviceAgreement<'lock>,
         &'held mut PublishedRelease<'lock>,
         &'lock InstallerLock,
     )>,
 }
 
 impl CommittedSelection<'_, '_> {
-    /// Check the committed names and original retained evidence without rebaselining.
+    /// Check committed names, config, custody and signers without device transport.
+    /// This provides no post-commit device observation or replacement baseline.
     pub fn revalidate(&mut self) -> Result<(), &'static str> {
         #[cfg(target_os = "macos")]
         {
@@ -375,12 +378,13 @@ impl CommittedSelection<'_, '_> {
     }
 }
 
-/// Consume the prepared capability with its original paths, trust, config and lock.
+/// Consume the prepared capability with its original device agreement and custody.
+/// Reobserve before commit inventory capture; no await follows any mutation.
 /// Attempt at most one rename. Every failure consumes preparation and preserves files.
 /// No retry, rollback, journal removal, activation, or replacement evidence is accepted.
-// No production caller exists until stopped-controller and device admission is implemented.
+// No production caller exists until stopped-controller admission is implemented.
 #[cfg_attr(not(test), allow(dead_code))]
-pub(crate) fn commit<'held, 'lock>(
+pub(crate) async fn commit<'held, 'lock>(
     prepared: PreparedSelection<'held, 'lock>,
 ) -> Result<CommittedSelection<'held, 'lock>, CommitFailure> {
     #[cfg(target_os = "macos")]
@@ -390,6 +394,7 @@ pub(crate) fn commit<'held, 'lock>(
             #[cfg(test)]
             &mut macos::preparation::commit::Hooks::production(),
         )
+        .await
     }
     #[cfg(not(target_os = "macos"))]
     {

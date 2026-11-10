@@ -22,62 +22,67 @@ fn preserved(fixture: &Fixture) -> Vec<(std::path::PathBuf, Fingerprint)> {
         .collect()
 }
 
-fn no_preparation_entries(fixture: &Fixture) {
+pub(super) fn no_preparation_entries(fixture: &Fixture) {
     let parent = fixture.layout().releases_directory();
     assert!(fs::symlink_metadata(parent.join(CANDIDATE)).is_err());
     assert!(fs::symlink_metadata(parent.join(PENDING_JOURNAL)).is_err());
 }
 
-#[test]
-fn config_from_another_lock_refuses_public_preparation_without_mutation() {
+#[tokio::test]
+async fn config_from_another_lock_refuses_public_preparation_without_mutation() {
     let (fixture, bytes) = setup(Operation::Upgrade);
     let other = Fixture::new();
-    let mut config = retain_config(&other.owner);
+    let agreement = device::observe(&other.owner).await;
     let mut previous = open(&fixture.owner, &fixture.bytes);
     let mut destination = open(&fixture.owner, &bytes);
     let before = protected(&fixture);
     let other_before = other.protected();
     let error = intent::prepare(
         &fixture.owner,
-        &mut config,
+        agreement,
         Operation::Upgrade,
         Some(&mut previous),
         &mut destination,
     )
+    .await
     .err()
     .unwrap();
-    assert_eq!(
-        error.reason(),
-        "service configuration installer lock mismatch"
-    );
+    assert_eq!(error.reason(), "device agreement unavailable or changed");
     assert!(error.residue_candidates().is_empty());
     no_preparation_entries(&fixture);
     fixture.unchanged(before);
     other.unchanged(other_before);
-    config.revalidate().unwrap();
+    assert!(
+        device::observe(&other.owner)
+            .await
+            .revalidate_for_owner(&other.owner)
+            .is_ok()
+    );
 }
 
-#[test]
-fn already_changed_config_refuses_before_any_write_or_signer_check() {
+#[tokio::test]
+async fn already_changed_config_refuses_before_any_write_or_signer_check() {
     for mutation in 0..4 {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         change_config(&fixture, mutation);
         let before = protected(&fixture);
         let error = prep::prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut Hooks {
-                check: Some(&mut |_| panic!("changed config reached signer verification")),
+                device: Some(device::Fake::good()),
+                check: Some(&mut |_| panic!("changed agreement reached signer verification")),
                 fault: None,
                 nonce: Some([0x31; 16]),
             },
         )
+        .await
         .err()
         .unwrap();
         assert_eq!(error.reason(), "unsafe or changed service configuration");
@@ -87,8 +92,8 @@ fn already_changed_config_refuses_before_any_write_or_signer_check() {
     }
 }
 
-#[test]
-fn config_drift_at_each_preparation_boundary_preserves_protected_paths_and_residues() {
+#[tokio::test]
+async fn config_drift_at_each_preparation_boundary_preserves_protected_paths_and_residues() {
     for point in [
         Point::BeforeLink,
         Point::LinkCreated,
@@ -103,7 +108,7 @@ fn config_drift_at_each_preparation_boundary_preserves_protected_paths_and_resid
     ] {
         for mutation in 0..4 {
             let (fixture, bytes) = setup(Operation::Upgrade);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let before = preserved(&fixture);
@@ -111,7 +116,7 @@ fn config_drift_at_each_preparation_boundary_preserves_protected_paths_and_resid
             let parent_before = Fingerprint::from(fs::metadata(&parent).unwrap());
             let error = prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
@@ -122,6 +127,7 @@ fn config_drift_at_each_preparation_boundary_preserves_protected_paths_and_resid
                     Ok(())
                 },
             )
+            .await
             .err()
             .unwrap();
             assert_eq!(error.reason(), "unsafe or changed service configuration");
@@ -143,23 +149,24 @@ fn config_drift_at_each_preparation_boundary_preserves_protected_paths_and_resid
     }
 }
 
-#[test]
-fn config_drift_during_initial_or_final_signer_checks_refuses_preparation() {
+#[tokio::test]
+async fn config_drift_during_initial_or_final_signer_checks_refuses_preparation() {
     for change_at in 1..=4 {
         for mutation in 0..4 {
             let (fixture, bytes) = setup(Operation::Upgrade);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let before = preserved(&fixture);
             let mut calls = 0;
             let error = prep::prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
                 &mut Hooks {
+                    device: Some(device::Fake::good()),
                     check: Some(&mut |release| {
                         check(release)?;
                         calls += 1;
@@ -172,6 +179,7 @@ fn config_drift_during_initial_or_final_signer_checks_refuses_preparation() {
                     nonce: Some([0x31; 16]),
                 },
             )
+            .await
             .err()
             .unwrap();
             assert_eq!(error.reason(), "unsafe or changed service configuration");
@@ -188,22 +196,23 @@ fn config_drift_during_initial_or_final_signer_checks_refuses_preparation() {
     }
 }
 
-#[test]
-fn retained_preparation_rejects_config_drift_before_or_during_signer_checks() {
+#[tokio::test]
+async fn retained_preparation_rejects_config_drift_before_or_during_signer_checks() {
     for change_at in 0..=2 {
         for mutation in 0..4 {
             let (fixture, bytes) = setup(Operation::Upgrade);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let mut value = prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
                 &mut |_| Ok(()),
             )
+            .await
             .unwrap();
             let before = preserved(&fixture);
             let parent = fixture.layout().releases_directory();
@@ -232,7 +241,7 @@ fn retained_preparation_rejects_config_drift_before_or_during_signer_checks() {
             for _ in 0..2 {
                 assert_eq!(
                     prep::revalidate_for_test(&mut value, &mut |_| panic!(
-                        "config was rebaselined"
+                        "agreement was rebaselined"
                     )),
                     Err("unsafe or changed service configuration")
                 );

@@ -185,6 +185,19 @@ impl<'lock> DeviceAgreement<'lock> {
         }
     }
 
+    /// Recheck the original config and exact lock without device transport.
+    /// A poisoned observation is never reusable as retained selection evidence.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    pub(crate) fn revalidate_for_owner(
+        &mut self,
+        owner: &InstallerLock,
+    ) -> Result<(), &'static str> {
+        if self.poisoned || !std::ptr::eq(self.owner, owner) {
+            return Err(UNAVAILABLE);
+        }
+        self.config.revalidate_for_owner(owner)
+    }
+
     #[cfg(target_os = "macos")]
     async fn observe_with(
         owner: &'lock InstallerLock,
@@ -459,4 +472,4 @@ mod lockdown {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests;
+pub(crate) mod tests;

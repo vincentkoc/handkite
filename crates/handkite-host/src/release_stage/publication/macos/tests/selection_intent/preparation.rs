@@ -1,25 +1,14 @@
 use super::*;
-use crate::install_config::RetainedConfig;
+use crate::device_agreement::{DeviceAgreement, tests as device};
 use crate::install_plan::Operation;
 use crate::selection_intent::macos::preparation::{self as prep, Hooks, Point};
 use crate::selection_intent::{PENDING_JOURNAL, PreparationFailure, PreparedSelection};
-use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
 
 mod commit;
 mod config;
+mod device_admission;
 
 const CANDIDATE: &str = ".selection-31313131313131313131313131313131";
-
-fn retain_config(owner: &InstallerLock) -> RetainedConfig<'_> {
-    RetainedConfig::acquire(
-        owner,
-        &DeviceBinding {
-            key: DeviceKey::new("phone").unwrap(),
-            usb_id: HardwareId::new("test-device").unwrap(),
-        },
-    )
-    .unwrap()
-}
 
 fn setup(operation: Operation) -> (Fixture, Vec<u8>) {
     let (fixture, bytes) = pair();
@@ -31,9 +20,9 @@ fn setup(operation: Operation) -> (Fixture, Vec<u8>) {
     (fixture, bytes)
 }
 
-fn prepare<'held, 'lock>(
+async fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
-    config: &'held mut RetainedConfig<'lock>,
+    agreement: DeviceAgreement<'lock>,
     operation: Operation,
     previous: Option<&'held mut PublishedRelease<'lock>>,
     destination: &'held mut PublishedRelease<'lock>,
@@ -41,16 +30,18 @@ fn prepare<'held, 'lock>(
 ) -> Result<PreparedSelection<'held, 'lock>, PreparationFailure> {
     prep::prepare(
         owner,
-        config,
+        agreement,
         operation,
         previous,
         destination,
         &mut Hooks {
+            device: Some(device::Fake::good()),
             check: Some(&mut check),
             fault: Some(fault),
             nonce: Some([0x31; 16]),
         },
     )
+    .await
 }
 
 fn unchanged(fixture: &Fixture) -> Vec<(std::path::PathBuf, Fingerprint)> {
@@ -60,25 +51,27 @@ fn unchanged(fixture: &Fixture) -> Vec<(std::path::PathBuf, Fingerprint)> {
         .collect()
 }
 
-#[test]
-fn random_names_are_bounded_and_zero_id_never_creates_entries() {
+#[tokio::test]
+async fn random_names_are_bounded_and_zero_id_never_creates_entries() {
     let mut names = Vec::new();
     for nonce in [None, None, Some([0; 16])] {
         let (fixture, bytes) = setup(Operation::InitialInstall);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut destination = open(&fixture.owner, &bytes);
         let result = prep::prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::InitialInstall,
             None,
             &mut destination,
             &mut Hooks {
+                device: Some(device::Fake::good()),
                 check: Some(&mut check),
                 fault: None,
                 nonce,
             },
-        );
+        )
+        .await;
         if nonce.is_some() {
             assert!(result.err().unwrap().residue_candidates().is_empty());
         } else {
@@ -97,17 +90,17 @@ fn random_names_are_bounded_and_zero_id_never_creates_entries() {
     assert_ne!(names[0], names[1]);
 }
 
-#[test]
-fn changes_after_final_verification_still_prevent_a_prepared_handle() {
+#[tokio::test]
+async fn changes_after_final_verification_still_prevent_a_prepared_handle() {
     for mutation in 0..5 {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let parent = fixture.layout().releases_directory();
         let error = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
@@ -137,33 +130,35 @@ fn changes_after_final_verification_still_prevent_a_prepared_handle() {
                 Ok(())
             },
         )
+        .await
         .err()
         .unwrap();
         assert_eq!(error.residue_candidates().len(), 2);
     }
 }
 
-#[test]
-fn preparation_records_actual_links_and_retains_original_pairs_for_all_operations() {
+#[tokio::test]
+async fn preparation_records_actual_links_and_retains_original_pairs_for_all_operations() {
     for operation in [
         Operation::InitialInstall,
         Operation::Upgrade,
         Operation::Rollback,
     ] {
         let (fixture, bytes) = setup(operation);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let before = unchanged(&fixture);
         let original = fs::symlink_metadata(fixture.layout().current_release_selection()).ok();
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let mut value = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             operation,
             (operation != Operation::InitialInstall).then_some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
         let parent = fixture.layout().releases_directory();
         let link = fs::symlink_metadata(parent.join(CANDIDATE)).unwrap();
@@ -203,19 +198,20 @@ fn preparation_records_actual_links_and_retains_original_pairs_for_all_operation
     }
 }
 
-#[test]
-fn public_preparation_and_retained_revalidation_require_real_signers() {
+#[tokio::test]
+async fn public_preparation_and_retained_revalidation_require_real_signers() {
     let (fixture, bytes) = setup(Operation::Upgrade);
-    let mut config = retain_config(&fixture.owner);
+    let agreement = device::observe(&fixture.owner).await;
     let mut previous = open(&fixture.owner, &fixture.bytes);
     let mut destination = open(&fixture.owner, &bytes);
     let error = intent::prepare(
         &fixture.owner,
-        &mut config,
+        agreement,
         Operation::Upgrade,
         Some(&mut previous),
         &mut destination,
     )
+    .await
     .err()
     .unwrap();
     assert_eq!(
@@ -230,14 +226,16 @@ fn public_preparation_and_retained_revalidation_require_real_signers() {
             .join(PENDING_JOURNAL)
             .exists()
     );
+    let agreement = device::observe(&fixture.owner).await;
     let mut value = prepare(
         &fixture.owner,
-        &mut config,
+        agreement,
         Operation::Upgrade,
         Some(&mut previous),
         &mut destination,
         &mut |_| Ok(()),
     )
+    .await
     .unwrap();
     assert_eq!(
         value.revalidate(),
@@ -245,11 +243,11 @@ fn public_preparation_and_retained_revalidation_require_real_signers() {
     );
 }
 
-#[test]
-fn collisions_of_any_kind_are_preserved_without_new_selection_entries() {
+#[tokio::test]
+async fn collisions_of_any_kind_are_preserved_without_new_selection_entries() {
     for collision in 0..5 {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let parent = fixture.layout().releases_directory();
         let path = parent.join(if collision == 0 {
             CANDIDATE
@@ -271,12 +269,13 @@ fn collisions_of_any_kind_are_preserved_without_new_selection_entries() {
         let mut destination = open(&fixture.owner, &bytes);
         let error = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .err()
         .unwrap();
         assert!(error.residue_candidates().is_empty());
@@ -288,58 +287,71 @@ fn collisions_of_any_kind_are_preserved_without_new_selection_entries() {
     }
 }
 
-#[test]
-fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
+#[tokio::test]
+async fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
     for case in 0..5 {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let other = Fixture::new();
         let parent = fixture.layout().releases_directory();
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let result = match case {
-            0 => prepare(
-                &fixture.owner,
-                &mut config,
-                Operation::InitialInstall,
-                None,
-                &mut destination,
-                &mut |_| Ok(()),
-            ),
-            1 => prepare(
-                &fixture.owner,
-                &mut config,
-                Operation::Upgrade,
-                None,
-                &mut destination,
-                &mut |_| Ok(()),
-            ),
-            2 => prepare(
-                &other.owner,
-                &mut config,
-                Operation::Upgrade,
-                Some(&mut previous),
-                &mut destination,
-                &mut |_| Ok(()),
-            ),
-            3 => prepare(
-                &fixture.owner,
-                &mut config,
-                Operation::Rollback,
-                Some(&mut destination),
-                &mut previous,
-                &mut |_| Ok(()),
-            ),
-            _ => {
-                fs::remove_file(fixture.layout().current_release_selection()).unwrap();
+            0 => {
                 prepare(
                     &fixture.owner,
-                    &mut config,
+                    agreement,
+                    Operation::InitialInstall,
+                    None,
+                    &mut destination,
+                    &mut |_| Ok(()),
+                )
+                .await
+            }
+            1 => {
+                prepare(
+                    &fixture.owner,
+                    agreement,
+                    Operation::Upgrade,
+                    None,
+                    &mut destination,
+                    &mut |_| Ok(()),
+                )
+                .await
+            }
+            2 => {
+                prepare(
+                    &other.owner,
+                    agreement,
                     Operation::Upgrade,
                     Some(&mut previous),
                     &mut destination,
                     &mut |_| Ok(()),
                 )
+                .await
+            }
+            3 => {
+                prepare(
+                    &fixture.owner,
+                    agreement,
+                    Operation::Rollback,
+                    Some(&mut destination),
+                    &mut previous,
+                    &mut |_| Ok(()),
+                )
+                .await
+            }
+            _ => {
+                fs::remove_file(fixture.layout().current_release_selection()).unwrap();
+                prepare(
+                    &fixture.owner,
+                    agreement,
+                    Operation::Upgrade,
+                    Some(&mut previous),
+                    &mut destination,
+                    &mut |_| Ok(()),
+                )
+                .await
             }
         };
         assert!(result.err().unwrap().residue_candidates().is_empty());
@@ -348,8 +360,8 @@ fn wrong_operation_current_release_or_lock_never_creates_a_candidate() {
     }
 }
 
-#[test]
-fn every_failure_boundary_preserves_residues_and_the_original_selection() {
+#[tokio::test]
+async fn every_failure_boundary_preserves_residues_and_the_original_selection() {
     for point in [
         Point::BeforeLink,
         Point::LinkCreated,
@@ -363,13 +375,13 @@ fn every_failure_boundary_preserves_residues_and_the_original_selection() {
         Point::Complete,
     ] {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let before = unchanged(&fixture);
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let error = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
@@ -381,6 +393,7 @@ fn every_failure_boundary_preserves_residues_and_the_original_selection() {
                 }
             },
         )
+        .await
         .err()
         .unwrap();
         assert_eq!(error.reason(), "injected preparation stop");
@@ -397,17 +410,17 @@ fn every_failure_boundary_preserves_residues_and_the_original_selection() {
     }
 }
 
-#[test]
-fn checked_parent_transition_rejects_unrelated_entry_and_original_pair_changes() {
+#[tokio::test]
+async fn checked_parent_transition_rejects_unrelated_entry_and_original_pair_changes() {
     for point in [Point::LinkCreated, Point::JournalCreated] {
         for mutation in 0..4 {
             let (fixture, bytes) = setup(Operation::Upgrade);
-            let mut config = retain_config(&fixture.owner);
+            let agreement = device::observe(&fixture.owner).await;
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let error = prepare(
                 &fixture.owner,
-                &mut config,
+                agreement,
                 Operation::Upgrade,
                 Some(&mut previous),
                 &mut destination,
@@ -437,6 +450,7 @@ fn checked_parent_transition_rejects_unrelated_entry_and_original_pair_changes()
                     Ok(())
                 },
             )
+            .await
             .err()
             .unwrap();
             assert!(!error.residue_candidates().is_empty());
@@ -444,21 +458,22 @@ fn checked_parent_transition_rejects_unrelated_entry_and_original_pair_changes()
     }
 }
 
-#[test]
-fn retained_preparation_never_rebaselines_changed_files() {
+#[tokio::test]
+async fn retained_preparation_never_rebaselines_changed_files() {
     for mutation in 0..7 {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let mut value = prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut |_| Ok(()),
         )
+        .await
         .unwrap();
         let parent = fixture.layout().releases_directory();
         let journal = parent.join(PENDING_JOURNAL);
@@ -499,11 +514,11 @@ fn retained_preparation_never_rebaselines_changed_files() {
     }
 }
 
-#[test]
-fn final_signer_cannot_hide_changes_to_the_earlier_pair_or_journal() {
+#[tokio::test]
+async fn final_signer_cannot_hide_changes_to_the_earlier_pair_or_journal() {
     for journal_change in [false, true] {
         let (fixture, bytes) = setup(Operation::Upgrade);
-        let mut config = retain_config(&fixture.owner);
+        let agreement = device::observe(&fixture.owner).await;
         let mut previous = open(&fixture.owner, &fixture.bytes);
         let mut destination = open(&fixture.owner, &bytes);
         let mut calls = 0;
@@ -524,16 +539,18 @@ fn final_signer_cannot_hide_changes_to_the_earlier_pair_or_journal() {
         };
         let error = prep::prepare(
             &fixture.owner,
-            &mut config,
+            agreement,
             Operation::Upgrade,
             Some(&mut previous),
             &mut destination,
             &mut Hooks {
+                device: Some(device::Fake::good()),
                 check: Some(&mut checker),
                 fault: None,
                 nonce: Some([0x31; 16]),
             },
         )
+        .await
         .err()
         .unwrap();
         assert_eq!(calls, 4);
