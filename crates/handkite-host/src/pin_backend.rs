@@ -8,6 +8,7 @@ use handkite_core::controller::AdapterError;
 use handkite_core::passcode::PasscodeProgress;
 use handkite_core::protocol::{Action, HardwareId, LockState, Point, TransportReceipt};
 use handkite_core::unlock::{BackendError, PasscodeBackend, PasscodeScreen};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -45,7 +46,7 @@ pub struct NativePasscodeBackend {
     awaiting_first_digit: bool,
     progress_check: ProgressCheck,
     coordinate_pin_taps: bool,
-    input_admission: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+    input_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -124,7 +125,7 @@ impl NativePasscodeBackend {
         if !self.session_bound {
             return Err(BackendError::Unavailable);
         }
-        self.input_admission = Some(Box::new(admit));
+        self.input_admission = Some(Arc::new(admit));
         Ok(self)
     }
 
@@ -147,7 +148,9 @@ impl NativePasscodeBackend {
 
     fn request_action(&mut self, action: &Action) -> Result<(), BackendError> {
         self.request_action_with(action, Instant::now(), |backend, action, fresh_until| {
-            let wda = UsbWda::new(backend.usb.clone()).with_write_deadline(fresh_until);
+            let wda = UsbWda::new(backend.usb.clone())
+                .with_write_deadline(fresh_until)
+                .with_write_admission(backend.input_admission.clone());
             backend
                 .runtime
                 .block_on(async {
@@ -504,7 +507,9 @@ impl PasscodeBackend for NativePasscodeBackend {
             return self.wake_hidden_with(
                 Instant::now(),
                 |backend, fresh_until| {
-                    let wda = UsbWda::new(backend.usb.clone()).with_write_deadline(fresh_until);
+                    let wda = UsbWda::new(backend.usb.clone())
+                        .with_write_deadline(fresh_until)
+                        .with_write_admission(backend.input_admission.clone());
                     let wda = InputRequests {
                         wda: &wda,
                         admission: backend.input_admission.as_deref(),
@@ -539,7 +544,9 @@ impl PasscodeBackend for NativePasscodeBackend {
         let wda = UsbWda::new(self.usb.clone());
         if self.session_bound {
             let deadline = prepared.ok_or(BackendError::Unavailable)?.fresh_until;
-            let wda = wda.with_write_deadline(deadline);
+            let wda = wda
+                .with_write_deadline(deadline)
+                .with_write_admission(self.input_admission.clone());
             self.admit_input()?;
             let wda = InputRequests {
                 wda: &wda,

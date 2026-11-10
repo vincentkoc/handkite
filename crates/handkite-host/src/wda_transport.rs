@@ -2,6 +2,7 @@ use crate::usb::{PinnedUsb, UsbError};
 use crate::wda_http::{self, HttpError, HttpResponse};
 use std::future::{Future, poll_fn};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -23,6 +24,7 @@ pub enum WdaError {
 pub struct UsbWda {
     usb: PinnedUsb,
     write_deadline: Option<Instant>,
+    write_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
 }
 
 impl UsbWda {
@@ -30,6 +32,7 @@ impl UsbWda {
         Self {
             usb,
             write_deadline: None,
+            write_admission: None,
         }
     }
 
@@ -42,7 +45,17 @@ impl UsbWda {
                 self.write_deadline
                     .map_or(deadline, |old| old.min(deadline)),
             ),
+            write_admission: self.write_admission.clone(),
         }
+    }
+
+    /// Retain input ownership checks through asynchronous connect and socket polls.
+    pub(crate) fn with_write_admission(
+        mut self,
+        admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    ) -> Self {
+        self.write_admission = admission;
+        self
     }
 
     pub async fn request(
@@ -66,6 +79,7 @@ impl UsbWda {
             &request,
             deadline,
             self.write_deadline,
+            self.write_admission.as_deref().filter(|_| method != "GET"),
             Instant::now,
         )
         .await
@@ -77,18 +91,25 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     request: &[u8],
     deadline: Duration,
     write_deadline: Option<Instant>,
+    admission: Option<&(dyn Fn() -> bool + Send + Sync)>,
     now: impl Fn() -> Instant,
 ) -> Result<HttpResponse, WdaError> {
     let mut socket = connect.await?;
     tokio::time::timeout(deadline, async {
-        if let Some(expires) = write_deadline {
+        if write_deadline.is_some() || admission.is_some() {
             let mut sent = 0;
             while sent < request.len() {
                 // Check on every write poll, including after a pending socket wakes.
                 let count = poll_fn(|cx| {
-                    if now() >= expires {
+                    let expired = write_deadline.is_some_and(|expires| now() >= expires);
+                    let refused = admission.is_some_and(|admit| !admit());
+                    if expired || refused {
                         return Poll::Ready(Err(if sent == 0 {
-                            WdaError::ExpiredBeforeSend
+                            if expired {
+                                WdaError::ExpiredBeforeSend
+                            } else {
+                                WdaError::NotConnected
+                            }
                         } else {
                             WdaError::AfterSent
                         }));
@@ -110,9 +131,11 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
                 .await
                 .map_err(|_| WdaError::AfterSent)?;
         }
-        if let Some(expires) = write_deadline {
+        if write_deadline.is_some() || admission.is_some() {
             poll_fn(|cx| {
-                if now() >= expires {
+                if write_deadline.is_some_and(|expires| now() >= expires)
+                    || admission.is_some_and(|admit| !admit())
+                {
                     return Poll::Ready(Err(WdaError::AfterSent));
                 }
                 Pin::new(&mut socket)
@@ -149,6 +172,10 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 #[cfg(test)]
+#[path = "wda_transport/ownership_tests.rs"]
+mod ownership_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
@@ -177,6 +204,7 @@ mod tests {
                 &request,
                 Duration::from_secs(1),
                 Some(expires),
+                None,
                 || clock.get(),
             )
             .await;
@@ -254,6 +282,7 @@ mod tests {
                 b"POST / HTTP/1.1\r\n\r\n",
                 Duration::from_secs(1),
                 Some(expires),
+                None,
                 || clock.get(),
             )
             .await;
@@ -334,6 +363,7 @@ mod tests {
                     request,
                     Duration::from_secs(1),
                     Some(expires),
+                    None,
                     || clock.get(),
                 )
                 .await,
