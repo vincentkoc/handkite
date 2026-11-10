@@ -124,6 +124,8 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str, allo
         raise ValueError("bundle_id_invalid")
     if not output.is_absolute() or not output.parent.is_dir() or output.exists():
         raise ValueError("output_unavailable")
+    if output.resolve().is_relative_to(source.resolve()):
+        raise ValueError("output_overlaps_source")
     if not source_is_pinned(source):
         raise ValueError("source_unqualified")
     output.mkdir(mode=0o700)
