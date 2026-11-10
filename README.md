@@ -59,6 +59,22 @@ The CLI's `request` subcommand reads one JSON request from stdin and returns the
 
 Before each action, the daemon checks the existing WDA session on the pinned USB route and validates its session endpoint. It adopts that session on the first action and rejects absent, invalid, stale, or replacement sessions before sending input. It never creates or renews a WDA session. WDA ownership and session renewal remain external and unqualified; a replaced session requires an explicit daemon restart after owner inspection.
 
+The separate `wda_runner::OwnedWdaRunner` library can start one exact installed
+`.xctrunner` bundle through pinned `idevice` 0.1.68. It requires a callback from
+that launch's test plan, a still-live task and plan, and HTTP 200 with boolean
+`value.ready: true`. One absolute startup deadline covers discovery, a separately
+time-bounded InstallationProxy lookup, and readiness. Startup cancellation and
+handle Drop abort the owned host task; `abort_and_join` also observes completion.
+Callers must retain the handle inside an active Tokio runtime and establish
+exclusive device/WDA ownership before calling it.
+
+This module is offline-tested and is not connected to daemon startup. It neither
+installs a runner nor creates a WDA session. Readiness does not authenticate the
+HTTP endpoint as the new process, and host-task cancellation does not prove
+device-process termination. It returns fixed error categories, discards callback
+logs, and configures no logging subscriber; upstream `idevice` tracing must stay
+inside the caller's private boundary. Live startup and shutdown remain unqualified.
+
 Run `handkited --check --config /path/to/config.json` for a read-only preflight. It prints the same bounded JSON health flags and native lock state as `handkite-doctor`, with no USB identifier or screen contents. Exit codes are 0 for observation readiness, 1 for failed readiness, and 2 for invalid arguments, configuration, or reporting errors. The check does not bind or remove a socket, start WDA, create a WDA session, or send input. This is a candidate-only readiness check, not signed-install or independent WDA startup proof.
 
 The `--check` diagnostic retains its explicit arbitrary-file config route and
