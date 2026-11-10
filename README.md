@@ -92,9 +92,11 @@ unqualified.
 The daemon installs SIGTERM/SIGINT handlers before device startup. Each handler
 only sets a shutdown flag. The socket listener stops accepting new work within
 its 100 ms idle poll; partial requests have a ten-second absolute read budget
-and check the flag between reads. An already dispatched action is allowed to
-finish without replay. Owned runner startup can be cancelled before session
-creation. The staged launchd descriptor allows 180 seconds between SIGTERM and
+and check the flag between reads. Response writes share one 15-second deadline
+and stop if shutdown is requested; a client may therefore receive an incomplete
+reply after an action. An already dispatched action is never replayed. Owned
+runner startup can be cancelled before session creation. The staged launchd
+descriptor allows 180 seconds between SIGTERM and
 SIGKILL. These are offline-tested shutdown paths, not proof of a live device exit.
 
 Run `handkited --check --config /path/to/config.json` for a read-only preflight. It prints the same bounded JSON health flags and native lock state as `handkite-doctor`, with no USB identifier or screen contents. Exit codes are 0 for observation readiness, 1 for failed readiness, and 2 for invalid arguments, configuration, or reporting errors. The check does not bind or remove a socket, start WDA, create a WDA session, or send input. This is a candidate-only readiness check, not signed-install or independent WDA startup proof.
