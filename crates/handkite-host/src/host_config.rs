@@ -115,6 +115,7 @@ mod tests {
         assert_eq!(absent.wda_runner_bundle_id(), None);
         for bundle_id in [
             "com.example.WDA-Runner.xctrunner".to_owned(),
+            "com.example.WDA-Runner.xctrunner.ABCDE12345".to_owned(),
             format!("com.{}.xctrunner", "a".repeat(241)),
         ] {
             let bytes = serde_json::to_vec(&serde_json::json!({
@@ -145,6 +146,8 @@ mod tests {
             serde_json::json!("com.example/xctrunner"),
             serde_json::json!("com.example.xctrunner "),
             serde_json::json!("com.example.XCTRunner"),
+            serde_json::json!("com.example.xctrunner.abcde12345"),
+            serde_json::json!("com.example.xctrunner.ABCDE12345.extra"),
             serde_json::json!("com.ex\u{00e4}mple.xctrunner"),
             serde_json::json!(format!("com.{}.xctrunner", "a".repeat(242))),
         ] {
