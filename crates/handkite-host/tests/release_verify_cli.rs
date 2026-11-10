@@ -1,3 +1,4 @@
+#[cfg(target_os = "macos")]
 use std::io::{Seek, SeekFrom, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -43,6 +44,7 @@ fn refuses_an_open_pipe_without_waiting_for_eof() {
     assert!(output.stderr.is_empty());
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn production_verifier_rejection_has_only_fixed_output() {
     let mut input = tempfile::NamedTempFile::new().unwrap();
@@ -57,4 +59,36 @@ fn production_verifier_rejection_has_only_fixed_output() {
     assert_eq!(output.status.code(), Some(1));
     assert_eq!(output.stdout, b"release_verify=reject\n");
     assert!(output.stderr.is_empty());
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn rejects_write_acl_before_reading_private_mode_input() {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut input = tempfile::NamedTempFile::new().unwrap();
+    write!(input, "{}\n{}\nnot-json", "a".repeat(64), "b".repeat(40)).unwrap();
+    input.seek(SeekFrom::Start(0)).unwrap();
+    handkite_host::release_verify::check_private_input_acl(input.as_file()).unwrap();
+    assert!(
+        Command::new("/bin/chmod")
+            .args(["+a", "everyone allow write"])
+            .arg(input.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let metadata = input.as_file().metadata().unwrap();
+    assert_eq!(metadata.mode() & 0o7777, 0o600);
+    assert_eq!(metadata.nlink(), 1);
+    let output = command()
+        .args(["--stage", "/stage"])
+        .stdin(input.as_file().try_clone().unwrap())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(output.stdout, b"release_verify=invalid\n");
+    assert!(output.stderr.is_empty());
+    // The cloned stdin descriptor shares this offset, proving no input was read.
+    assert_eq!(input.stream_position().unwrap(), 0);
 }

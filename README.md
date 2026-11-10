@@ -148,8 +148,9 @@ Daemon startup now uses the layout and process lock, but no live installation is
 
 `handkite-release-verify --stage /absolute/private-stage` reads independently
 supplied pins and exact canonical manifest bytes from a bounded private regular
-stdin file, then calls the production stage verifier once. It reports only
-`release_verify=pass`, `release_verify=reject`, or `release_verify=invalid`.
+stdin file with an empty ACL, then calls the production stage verifier once.
+It reports only `release_verify=pass`, `release_verify=reject`, or
+`release_verify=invalid`.
 See the [input envelope and exit codes](RELEASE.md#release-verification-diagnostic).
 This diagnostic is excluded from the three-artifact release inventory. Its tests
 do not qualify a real signed stage, installation, or service activation.

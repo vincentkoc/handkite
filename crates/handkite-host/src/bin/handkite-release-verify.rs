@@ -63,6 +63,7 @@ fn read_input(input: &mut File) -> Option<Vec<u8>> {
     {
         return None;
     }
+    release_verify::check_private_input_acl(input).ok()?;
     let mut bytes = Vec::new();
     input
         .take((MAX_INPUT_BYTES + 1) as u64)
@@ -138,6 +139,7 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom};
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
+    #[cfg(target_os = "macos")]
     use std::os::unix::fs::PermissionsExt;
     use tempfile::NamedTempFile;
 
@@ -236,6 +238,7 @@ mod tests {
         assert!(envelope(&payload(&vec![b'x'; MAX_MANIFEST_BYTES + 1])).is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn admits_private_regular_file_and_rejects_unsafe_modes() {
         let bytes = payload(b"{}");
@@ -260,6 +263,7 @@ mod tests {
         assert!(read_input(file.as_file_mut()).is_none());
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn checks_file_size_before_reading() {
         for bytes in [payload(b""), payload(&vec![b'x'; MAX_MANIFEST_BYTES + 1])] {
@@ -272,6 +276,7 @@ mod tests {
         assert_eq!(read_input(file.as_file_mut()).unwrap(), bytes);
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn calls_verifier_once_with_unchanged_inputs() {
         let raw_stage = b"/private/../stage//\xff";
@@ -319,6 +324,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn fixed_reports_discard_verifier_errors() {
         let mut file = input(&payload(b"{}"));
@@ -336,5 +342,20 @@ mod tests {
             Outcome::Invalid.report(),
             (2, b"release_verify=invalid\n".as_slice())
         );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn unsupported_acl_check_rejects_before_reading_or_verifying() {
+        let mut file = input(&payload(b"{}"));
+        assert_eq!(
+            run(
+                args(&["--stage", "/stage"]),
+                file.as_file_mut(),
+                |_, _, _, _| panic!("unexpected verification")
+            ),
+            Outcome::Invalid
+        );
+        assert_eq!(file.stream_position().unwrap(), 0);
     }
 }

@@ -2,6 +2,23 @@
 
 use std::path::Path;
 
+/// Require an empty ACL on a held input file, failing closed outside macOS.
+///
+/// This checks only ACL metadata; callers must separately validate the file's
+/// type, owner, mode, link count, and size. It does not establish trust in bytes.
+pub fn check_private_input_acl(input: &std::fs::File) -> Result<(), &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        crate::release_files::check_acl(input.as_raw_fd(), true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = input;
+        Err("private input ACL verification requires macOS")
+    }
+}
+
 /// Check an existing private stage against the exact supplied canonical bytes.
 ///
 /// Obtain `expected_manifest_sha256` and the exact signer certificate SHA1 from
