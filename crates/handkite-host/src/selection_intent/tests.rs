@@ -1,5 +1,24 @@
 use super::*;
 
+#[cfg(not(target_os = "macos"))]
+#[test]
+fn commit_fails_closed_on_unsupported_platforms() {
+    let prepared = PreparedSelection {
+        _unsupported: std::marker::PhantomData,
+    };
+    let failure = commit(prepared).err().unwrap();
+    assert_eq!(failure.reason(), "selection commit requires macOS");
+    assert_eq!(failure.phase(), CommitPhase::BeforeCommit);
+    assert!(failure.residue_candidates().is_empty());
+    let mut committed = CommittedSelection {
+        _unsupported: std::marker::PhantomData,
+    };
+    assert_eq!(
+        committed.revalidate(),
+        Err("selection commit requires macOS")
+    );
+}
+
 fn wire(operation: WireOperation) -> WireIntent {
     WireIntent {
         version: 1,

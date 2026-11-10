@@ -97,7 +97,7 @@ fn directory_policy(
     Ok(fingerprint)
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct LinkFingerprint {
     device: libc::dev_t,
     inode: libc::ino_t,
@@ -169,6 +169,10 @@ pub(crate) struct RetainedLink {
 }
 
 impl RetainedLink {
+    pub(crate) fn name(&self) -> &CStr {
+        &self.name
+    }
+
     pub(crate) fn open(
         parent: &File,
         name: CString,
@@ -233,6 +237,39 @@ impl RetainedLink {
         }
         Ok(())
     }
+
+    /// Rebind only a moved inode proven by the transaction's exact parent delta.
+    pub(crate) fn rebind_after_rename(
+        &mut self,
+        parent: &File,
+        name: CString,
+        change: &crate::selection_intent::macos::preparation::ParentChange,
+    ) -> Result<(), &'static str> {
+        let changed = change.link_change(&self.name, &name, self.identity())?;
+        let mut expected = self.observation.fingerprint.clone();
+        expected.changed = changed;
+        let uid = unsafe { libc::geteuid() };
+        let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(self.file.as_raw_fd(), metadata.as_mut_ptr()) } != 0
+            || link_policy(&unsafe { metadata.assume_init() }, uid)? != expected
+        {
+            return Err(UNSAFE);
+        }
+        let observed = observe(
+            parent,
+            &name,
+            uid,
+            #[cfg(test)]
+            &mut None,
+        )?
+        .ok_or(UNSAFE)?;
+        if observed.fingerprint != expected || observed.manifest != self.observation.manifest {
+            return Err(UNSAFE);
+        }
+        self.name = name;
+        self.observation = observed;
+        self.check(parent)
+    }
 }
 
 /// Exact link observation plus retained parent identity; never destination trust.
@@ -242,6 +279,21 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    /// Retain the original current inode, comparing the entire original snapshot.
+    pub(crate) fn retain_current(&self) -> Result<Option<RetainedLink>, &'static str> {
+        self.reobserve_unchanged()?;
+        let Some(original) = &self.observation else {
+            return Ok(None);
+        };
+        let link =
+            RetainedLink::open(self.held.directory()?, c"current".into(), original.manifest)?;
+        if link.observation != *original {
+            return Err(UNSAFE);
+        }
+        self.reobserve_unchanged()?;
+        Ok(Some(link))
+    }
+
     pub(crate) fn selected_link_identity(&self) -> Option<(i32, u64)> {
         self.observation
             .as_ref()

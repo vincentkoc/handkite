@@ -5,6 +5,7 @@ use crate::selection_intent::macos::preparation::{self as prep, Hooks, Point};
 use crate::selection_intent::{PENDING_JOURNAL, PreparationFailure, PreparedSelection};
 use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
 
+mod commit;
 mod config;
 
 const CANDIDATE: &str = ".selection-31313131313131313131313131313131";

@@ -1,4 +1,4 @@
-//! Bounded intent syntax, durable preparation, and present-state reconciliation.
+//! Bounded intent syntax, retained selection transactions, and reconciliation.
 
 use crate::current_selection::{encode_target, parse_target};
 use crate::install_config::RetainedConfig;
@@ -237,7 +237,7 @@ impl PreparationFailure {
 }
 
 /// Retains the original config, lock, releases, current snapshot, link and journal.
-/// Dropping it preserves every file. It cannot select a release or activate a job.
+/// Dropping it preserves every file. Only consuming `commit` can select a release.
 pub struct PreparedSelection<'held, 'lock> {
     #[cfg(target_os = "macos")]
     inner: macos::preparation::Prepared<'held, 'lock>,
@@ -293,6 +293,89 @@ pub fn prepare<'held, 'lock>(
         let _ = (owner, config, operation, previous, destination);
         Err(PreparationFailure {
             reason: "selection preparation requires macOS",
+            residues: Vec::new(),
+        })
+    }
+}
+
+/// The commit point is the single candidate-to-current exclusive rename or swap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CommitPhase {
+    BeforeCommit,
+    AfterCommit,
+    UncertainCommit,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct CommitFailure {
+    reason: &'static str,
+    phase: CommitPhase,
+    residues: Vec<String>,
+}
+
+impl CommitFailure {
+    pub fn reason(&self) -> &'static str {
+        self.reason
+    }
+
+    pub fn phase(&self) -> CommitPhase {
+        self.phase
+    }
+
+    /// Relative diagnostic candidates only, never ownership or cleanup authority.
+    pub fn residue_candidates(&self) -> &[String] {
+        &self.residues
+    }
+}
+
+/// Retains the selected link, any exchanged previous link, config, releases and lock.
+/// This is bounded selection evidence, never activation or power-loss recovery proof.
+pub struct CommittedSelection<'held, 'lock> {
+    #[cfg(target_os = "macos")]
+    inner: macos::preparation::commit::Committed<'held, 'lock>,
+    #[cfg(not(target_os = "macos"))]
+    _unsupported: std::marker::PhantomData<(
+        &'held mut RetainedConfig<'lock>,
+        &'held mut PublishedRelease<'lock>,
+        &'lock InstallerLock,
+    )>,
+}
+
+impl CommittedSelection<'_, '_> {
+    /// Check the committed names and original retained evidence without rebaselining.
+    pub fn revalidate(&mut self) -> Result<(), &'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.revalidate(
+                #[cfg(test)]
+                None,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err("selection commit requires macOS")
+    }
+}
+
+/// Consume the prepared capability with its original paths, trust, config and lock.
+/// Attempt at most one rename. Every failure consumes preparation and preserves files.
+/// No retry, rollback, journal removal, activation, or replacement evidence is accepted.
+pub fn commit<'held, 'lock>(
+    prepared: PreparedSelection<'held, 'lock>,
+) -> Result<CommittedSelection<'held, 'lock>, CommitFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::preparation::commit::commit(
+            prepared,
+            #[cfg(test)]
+            &mut macos::preparation::commit::Hooks::production(),
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = prepared;
+        Err(CommitFailure {
+            reason: "selection commit requires macOS",
+            phase: CommitPhase::BeforeCommit,
             residues: Vec::new(),
         })
     }

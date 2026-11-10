@@ -8,6 +8,7 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 
+pub(crate) mod commit;
 mod journal;
 mod parent_change;
 use journal::Journal;
@@ -63,6 +64,7 @@ pub(in crate::selection_intent) struct Prepared<'held, 'lock> {
     config: &'held mut RetainedConfig<'lock>,
     retained: Retained<'held, 'lock>,
     link: RetainedLink,
+    previous_link: Option<RetainedLink>,
     journal: Journal,
 }
 
@@ -70,6 +72,9 @@ impl Prepared<'_, '_> {
     fn custody(&self) -> Result<(), &'static str> {
         self.link
             .check(self.retained.destination.selection_parent())?;
+        if let Some(previous) = &self.previous_link {
+            previous.check(self.retained.destination.selection_parent())?;
+        }
         self.journal
             .check(self.retained.destination.selection_parent())
     }
@@ -149,6 +154,7 @@ pub(crate) fn prepare<'held, 'lock>(
             return Err(MISMATCH);
         }
         let snapshot = Snapshot::capture(owner.layout())?;
+        let previous_link = snapshot.retain_current()?;
         let previous_claim = match (
             operation,
             &previous,
@@ -337,6 +343,7 @@ pub(crate) fn prepare<'held, 'lock>(
             config,
             retained,
             link,
+            previous_link,
             journal,
         };
         value.custody()?;
