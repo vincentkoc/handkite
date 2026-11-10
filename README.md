@@ -198,6 +198,9 @@ See the [diagnostic contract](RELEASE.md#device-agreement-diagnostic).
 
 ## MCP bridge
 
+The disabled [OpenClaw connection recipe](OPENCLAW.md) records the selected
+runtime, restricted client route, agent scope, and live acceptance gates.
+
 `handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
 
 `handkite-mcp --service` derives the device key from the protected fixed host
