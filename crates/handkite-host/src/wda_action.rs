@@ -109,6 +109,17 @@ impl WdaActions {
         Self::tap_on(wda, session, at).await
     }
 
+    pub(crate) async fn tap_with_existing_session(
+        &mut self,
+        wda: &impl WdaRequest,
+        at: Point,
+    ) -> Result<TransportReceipt, AdapterError> {
+        // This route requires an already bound session; never adopt one here.
+        self.session.as_ref().ok_or(AdapterError)?;
+        self.validate_existing(wda).await?;
+        Self::tap_on(wda, self.session.as_deref().ok_or(AdapterError)?, at).await
+    }
+
     async fn tap_on(
         wda: &impl WdaRequest,
         session: &str,
@@ -325,6 +336,59 @@ mod tests {
                 json!({"value": null}),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn bound_coordinate_tap_validates_session_and_never_falls_back() {
+        let at = Point { x: 80.0, y: 340.0 };
+        let wda = Script::new(vec![]);
+        assert!(
+            WdaActions::default()
+                .tap_with_existing_session(&wda, at)
+                .await
+                .is_err()
+        );
+        wda.done();
+        for steps in [
+            vec![status(json!("different-valid-session"))],
+            vec![
+                status(json!("fixture-session")),
+                response("GET", "/session/fixture-session", 404, json!({"value":{}})),
+            ],
+        ] {
+            let wda = Script::new(steps);
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert!(actions.tap_with_existing_session(&wda, at).await.is_err());
+            wda.done();
+        }
+        for failure in [
+            None,
+            Some(WdaError::ExpiredBeforeSend),
+            Some(WdaError::AfterSent),
+            Some(WdaError::TimedOutAfterSent),
+        ] {
+            let mut post = response(
+                "POST",
+                "/session/fixture-session/wda/tap/0",
+                200,
+                json!({"value":null}),
+            );
+            if let Some(error) = failure {
+                post.response = Err(error);
+            }
+            let mut wda = Script::new(vec![
+                status(json!("fixture-session")),
+                response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+                post,
+            ]);
+            wda.1 = Some(json!({"x":80.0,"y":340.0}));
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert_eq!(
+                actions.tap_with_existing_session(&wda, at).await.is_err(),
+                failure.is_some()
+            );
+            wda.done();
+        }
     }
 
     #[tokio::test]

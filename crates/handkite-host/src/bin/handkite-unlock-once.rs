@@ -17,10 +17,11 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
-    let (supervised_visibility_fallback, temporary_idle_settings) = flags(&args)?;
+    let (supervised_visibility_fallback, temporary_idle_settings, coordinate_pin_taps) =
+        flags(&args)?;
     if args[1] != "--config" {
         return Err(
-            "usage: handkite-unlock-once --config FILE [--supervised-visibility-fallback] [--temporary-idle-settings]".into(),
+            "usage: handkite-unlock-once --config FILE [--supervised-visibility-fallback] [--temporary-idle-settings] [--coordinate-pin-taps]".into(),
         );
     }
     let binding = host_config::load(Path::new(&args[2])).map_err(str::to_owned)?;
@@ -36,7 +37,12 @@ fn run() -> Result<(), String> {
         return Err("PIN attempts disabled; owner inspection required".into());
     }
     if temporary_idle_settings {
-        return idle::run(binding, gate, supervised_visibility_fallback);
+        return idle::run(
+            binding,
+            gate,
+            supervised_visibility_fallback,
+            coordinate_pin_taps,
+        );
     }
     let code = pin_input::read_once(std::io::stdin().lock()).map_err(str::to_owned)?;
     let mut backend = NativePasscodeBackend::new_with_supervised_visibility_fallback(
@@ -63,20 +69,25 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
-fn flags(args: &[String]) -> Result<(bool, bool), String> {
+fn flags(args: &[String]) -> Result<(bool, bool, bool), String> {
     if args.len() < 3 {
         return Err("invalid_arguments".into());
     }
     let mut supervised = false;
     let mut temporary = false;
+    let mut coordinate = false;
     for arg in &args[3..] {
         match arg.as_str() {
             "--supervised-visibility-fallback" if !supervised => supervised = true,
             "--temporary-idle-settings" if !temporary => temporary = true,
+            "--coordinate-pin-taps" if !coordinate => coordinate = true,
             _ => return Err("invalid_arguments".into()),
         }
     }
-    Ok((supervised, temporary))
+    if coordinate && !(supervised && temporary) {
+        return Err("invalid_arguments".into());
+    }
+    Ok((supervised, temporary, coordinate))
 }
 
 #[cfg(test)]
@@ -86,14 +97,40 @@ mod tests {
     #[test]
     fn temporary_settings_are_explicit_and_duplicate_flags_refuse() {
         let base = vec!["unlock".into(), "--config".into(), "private".into()];
-        assert_eq!(flags(&base), Ok((false, false)));
+        assert_eq!(flags(&base), Ok((false, false, false)));
         let mut args = base;
         args.push("--temporary-idle-settings".into());
-        assert_eq!(flags(&args), Ok((false, true)));
+        assert_eq!(flags(&args), Ok((false, true, false)));
         args.push("--supervised-visibility-fallback".into());
-        assert_eq!(flags(&args), Ok((true, true)));
+        assert_eq!(flags(&args), Ok((true, true, false)));
         args.push("--temporary-idle-settings".into());
         assert!(flags(&args).is_err());
         assert!(flags(&[]).is_err());
+    }
+
+    #[test]
+    fn coordinate_flag_requires_both_opt_ins_and_refuses_duplicates() {
+        for supervised in [false, true] {
+            for temporary in [false, true] {
+                let mut args = vec![
+                    "unlock".into(),
+                    "--config".into(),
+                    "private".into(),
+                    "--coordinate-pin-taps".into(),
+                ];
+                if supervised {
+                    args.push("--supervised-visibility-fallback".into());
+                }
+                if temporary {
+                    args.push("--temporary-idle-settings".into());
+                }
+                assert_eq!(flags(&args).is_ok(), supervised && temporary);
+                if supervised && temporary {
+                    assert_eq!(flags(&args), Ok((true, true, true)));
+                }
+                args.push("--coordinate-pin-taps".into());
+                assert_eq!(flags(&args), Err("invalid_arguments".into()));
+            }
+        }
     }
 }

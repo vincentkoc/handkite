@@ -25,6 +25,7 @@ pub(super) fn run(
     binding: DeviceBinding,
     gate: FileAttemptGate,
     supervised: bool,
+    coordinate_pin_taps: bool,
 ) -> Result<(), String> {
     admitted(gate, |gate| {
         // The gate check precedes secret input and every possible settings POST.
@@ -54,6 +55,11 @@ pub(super) fn run(
                         &worker_session,
                     )
                     .map_err(|_| WorkerError::Initialization)?;
+                    if coordinate_pin_taps {
+                        backend = backend
+                            .with_coordinate_pin_taps()
+                            .map_err(|_| WorkerError::Initialization)?;
+                    }
                     unlock_once(
                         &mut backend,
                         &mut *gate,

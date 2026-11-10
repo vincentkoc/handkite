@@ -2,10 +2,11 @@ use crate::native_lock;
 use crate::pin_field;
 use crate::pin_screen::{self, ParsedPasscodeView};
 use crate::usb::PinnedUsb;
-use crate::wda_action::WdaActions;
+use crate::wda_action::{WdaActions, WdaRequest};
 use crate::wda_transport::{UsbWda, WdaError};
+use handkite_core::controller::AdapterError;
 use handkite_core::passcode::PasscodeProgress;
-use handkite_core::protocol::{Action, HardwareId, LockState, Point};
+use handkite_core::protocol::{Action, HardwareId, LockState, Point, TransportReceipt};
 use handkite_core::unlock::{BackendError, PasscodeBackend, PasscodeScreen};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -40,6 +41,7 @@ pub struct NativePasscodeBackend {
     session_bound: bool,
     awaiting_first_digit: bool,
     progress_check: ProgressCheck,
+    coordinate_pin_taps: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -82,6 +84,7 @@ impl NativePasscodeBackend {
             session_bound: false,
             awaiting_first_digit: false,
             progress_check: ProgressCheck::Disabled,
+            coordinate_pin_taps: false,
         })
     }
 
@@ -107,6 +110,15 @@ impl NativePasscodeBackend {
         self.last_diagnostics
     }
 
+    /// Coordinate PIN taps are available only inside the supervised session bracket.
+    pub fn with_coordinate_pin_taps(mut self) -> Result<Self, BackendError> {
+        if !self.session_bound || !self.supervised_visibility_fallback {
+            return Err(BackendError::Unavailable);
+        }
+        self.coordinate_pin_taps = true;
+        Ok(self)
+    }
+
     fn request_action(&mut self, action: &Action) -> Result<(), BackendError> {
         self.request_action_with(action, Instant::now(), |backend, action, fresh_until| {
             let wda = UsbWda::new(backend.usb.clone()).with_write_deadline(fresh_until);
@@ -114,10 +126,13 @@ impl NativePasscodeBackend {
                 .runtime
                 .block_on(async {
                     if backend.session_bound {
-                        backend
-                            .actions
-                            .execute_with_existing_session(&wda, action)
-                            .await
+                        bound_action(
+                            &mut backend.actions,
+                            &wda,
+                            action,
+                            backend.coordinate_pin_taps,
+                        )
+                        .await
                     } else {
                         backend.actions.execute_existing(&wda, action).await
                     }
@@ -202,6 +217,22 @@ impl NativePasscodeBackend {
             return Err(BackendError::Unavailable);
         }
         Ok(())
+    }
+}
+
+async fn bound_action(
+    actions: &mut WdaActions,
+    wda: &impl WdaRequest,
+    action: &Action,
+    coordinate_pin_taps: bool,
+) -> Result<TransportReceipt, AdapterError> {
+    if coordinate_pin_taps {
+        let Action::Tap { at } = action else {
+            return Err(AdapterError);
+        };
+        actions.tap_with_existing_session(wda, *at).await
+    } else {
+        actions.execute_with_existing_session(wda, action).await
     }
 }
 
@@ -598,6 +629,151 @@ mod tests {
     }
 
     #[test]
+    fn coordinate_selection_requires_a_supervised_bound_backend() {
+        assert!(backend().with_coordinate_pin_taps().is_err());
+        assert!(
+            NativePasscodeBackend::new_with_supervised_visibility_fallback(
+                HardwareId::new("fixture-phone").unwrap(),
+                true
+            )
+            .unwrap()
+            .with_coordinate_pin_taps()
+            .is_err()
+        );
+        assert!(
+            NativePasscodeBackend::new_for_session(
+                HardwareId::new("fixture-phone").unwrap(),
+                false,
+                "fixture-session"
+            )
+            .unwrap()
+            .with_coordinate_pin_taps()
+            .is_err()
+        );
+        assert!(!bound_backend().coordinate_pin_taps);
+        assert!(
+            bound_backend()
+                .with_coordinate_pin_taps()
+                .unwrap()
+                .coordinate_pin_taps
+        );
+    }
+
+    #[test]
+    fn all_six_digit_taps_keep_the_selected_route_geometry_and_first_comparison() {
+        use crate::wda_http::HttpResponse;
+        use serde_json::{Value, json};
+        use std::cell::Cell;
+        struct Fake {
+            coordinate: bool,
+            calls: Cell<usize>,
+            at: Cell<Point>,
+        }
+        impl WdaRequest for Fake {
+            async fn request(
+                &self,
+                method: &str,
+                path: &str,
+                body: &[u8],
+                _: Duration,
+            ) -> Result<HttpResponse, WdaError> {
+                let call = self.calls.get();
+                self.calls.set(call + 1);
+                let value = match call % 3 {
+                    0 => {
+                        assert_eq!((method, path), ("GET", "/status"));
+                        assert!(body.is_empty());
+                        json!({"sessionId":"fixture-session","value":{"ready":true}})
+                    }
+                    1 => {
+                        assert_eq!((method, path), ("GET", "/session/fixture-session"));
+                        assert!(body.is_empty());
+                        json!({"value":{}})
+                    }
+                    _ => {
+                        let endpoint = if self.coordinate {
+                            "/session/fixture-session/wda/tap/0"
+                        } else {
+                            "/session/fixture-session/actions"
+                        };
+                        assert_eq!((method, path), ("POST", endpoint));
+                        let body: Value = serde_json::from_slice(body).unwrap();
+                        let at = self.at.get();
+                        if self.coordinate {
+                            assert_eq!(body, json!({"x":at.x,"y":at.y}));
+                        } else {
+                            let movement = &body["actions"][0]["actions"][0];
+                            assert_eq!(movement["x"], at.x);
+                            assert_eq!(movement["y"], at.y);
+                        }
+                        json!({"value":null})
+                    }
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&value).unwrap(),
+                })
+            }
+        }
+        for coordinate in [false, true] {
+            let mut backend = bound_backend();
+            if coordinate {
+                backend = backend.with_coordinate_pin_taps().unwrap();
+            }
+            let fake = Fake {
+                coordinate,
+                calls: Cell::new(0),
+                at: Cell::new(Point { x: 0.0, y: 0.0 }),
+            };
+            let start = Instant::now();
+            let mut comparisons = 0;
+            for entered in 0..6 {
+                backend
+                    .snapshot_with(
+                        start,
+                        |backend, _| {
+                            let (screen, view) = progress_capture(entered);
+                            if backend.progress_check == ProgressCheck::Pending {
+                                comparisons += 1;
+                                compare_progress(&screen, &view, entered)?;
+                            }
+                            Ok((screen, view))
+                        },
+                        || start,
+                    )
+                    .unwrap();
+                let digit = entered as u8;
+                fake.at.set(
+                    backend.last_view.as_ref().unwrap().view.keypad.unwrap()[usize::from(digit)],
+                );
+                backend
+                    .press_digit_with(digit, |backend, action| {
+                        backend.request_action_with(action, start, |backend, action, expires| {
+                            assert_eq!(expires, start + PIN_VIEW_BUDGET);
+                            backend
+                                .runtime
+                                .block_on(bound_action(
+                                    &mut backend.actions,
+                                    &fake,
+                                    action,
+                                    backend.coordinate_pin_taps,
+                                ))
+                                .map(|_| ())
+                                .map_err(|_| BackendError::Unavailable)
+                        })
+                    })
+                    .unwrap();
+                assert!(backend.last_view.is_none());
+            }
+            assert_eq!(fake.calls.get(), 18);
+            assert_eq!(comparisons, 1);
+            assert_eq!(backend.progress_check, ProgressCheck::Complete);
+            assert_eq!(backend.delete_digit(), Err(BackendError::Unavailable));
+            assert_eq!(fake.calls.get(), 18);
+        }
+    }
+
+    #[test]
     fn first_digit_comparison_runs_once_only_for_the_bound_backend() {
         for bound in [false, true] {
             let mut backend = if bound { bound_backend() } else { backend() };
@@ -749,43 +925,49 @@ mod tests {
                 panic!("mismatch cannot clear")
             }
         }
-        let mut harness = Harness {
-            backend: bound_backend(),
-            start: Instant::now(),
-            taps: 0,
-            reads: 0,
-        };
-        let mut gate = Gate::default();
-        let binding = DeviceBinding {
-            key: DeviceKey::new("iphone").unwrap(),
-            usb_id: HardwareId::new("fixture-phone").unwrap(),
-        };
-        let code = Passcode::new("0".repeat(6)).unwrap();
-        assert_eq!(
-            unlock_once(
-                &mut harness,
-                &mut gate,
-                &binding,
-                &binding.key,
-                &code,
-                UnlockPolicy::default()
-            ),
-            Err(UnlockError::Backend(BackendError::ProgressMismatch))
-        );
-        assert_eq!((harness.taps, harness.reads), (1, 1));
-        assert!(gate.marked);
-        assert_eq!(
-            unlock_once(
-                &mut harness,
-                &mut gate,
-                &binding,
-                &binding.key,
-                &code,
-                UnlockPolicy::default()
-            ),
-            Err(UnlockError::Disabled)
-        );
-        assert_eq!((harness.taps, harness.reads), (1, 1));
+        for coordinate in [false, true] {
+            let mut harness = Harness {
+                backend: if coordinate {
+                    bound_backend().with_coordinate_pin_taps().unwrap()
+                } else {
+                    bound_backend()
+                },
+                start: Instant::now(),
+                taps: 0,
+                reads: 0,
+            };
+            let mut gate = Gate::default();
+            let binding = DeviceBinding {
+                key: DeviceKey::new("iphone").unwrap(),
+                usb_id: HardwareId::new("fixture-phone").unwrap(),
+            };
+            let code = Passcode::new("0".repeat(6)).unwrap();
+            assert_eq!(
+                unlock_once(
+                    &mut harness,
+                    &mut gate,
+                    &binding,
+                    &binding.key,
+                    &code,
+                    UnlockPolicy::default()
+                ),
+                Err(UnlockError::Backend(BackendError::ProgressMismatch))
+            );
+            assert_eq!((harness.taps, harness.reads), (1, 1));
+            assert!(gate.marked);
+            assert_eq!(
+                unlock_once(
+                    &mut harness,
+                    &mut gate,
+                    &binding,
+                    &binding.key,
+                    &code,
+                    UnlockPolicy::default()
+                ),
+                Err(UnlockError::Disabled)
+            );
+            assert_eq!((harness.taps, harness.reads), (1, 1));
+        }
     }
 
     #[test]
@@ -1120,86 +1302,98 @@ mod tests {
 
     #[test]
     fn dispatch_consumes_view_and_preserves_original_deadline_on_every_result() {
-        for action in [
-            Action::Tap {
-                at: Point { x: 80.0, y: 340.0 },
-            },
-            Action::Tap {
-                at: Point { x: 280.0, y: 640.0 },
-            },
-            keypad_swipe((400.0, 800.0)).unwrap(),
-        ] {
-            for result in [
-                Ok(()),
-                Err(BackendError::Unavailable),
-                Err(BackendError::Disconnected),
+        for coordinate in [false, true] {
+            for action in [
+                Action::Tap {
+                    at: Point { x: 80.0, y: 340.0 },
+                },
+                Action::Tap {
+                    at: Point { x: 280.0, y: 640.0 },
+                },
+                keypad_swipe((400.0, 800.0)).unwrap(),
             ] {
-                let mut backend = backend();
-                let started = Instant::now();
-                backend
-                    .snapshot_with(
-                        started,
-                        |_, _| Ok(capture()),
-                        || started + Duration::from_secs(4),
-                    )
-                    .unwrap();
-                let mut dispatches = 0;
-                assert_eq!(
-                    backend.request_action_with(
-                        &action,
-                        started + Duration::from_millis(4_500),
-                        |backend, sent, fresh_until| {
-                            assert!(backend.last_view.is_none());
-                            assert!(std::ptr::eq(sent, &action));
-                            assert_eq!(fresh_until, started + PIN_VIEW_BUDGET);
-                            dispatches += 1;
-                            result
-                        },
-                    ),
-                    result
-                );
-                assert_eq!(dispatches, 1);
-                assert!(backend.last_view.is_none());
-                assert_eq!(
-                    backend.request_action_with(&action, started, |_, _, _| {
-                        panic!("consumed input cannot be retried")
-                    }),
-                    Err(BackendError::Unavailable)
-                );
+                for result in [
+                    Ok(()),
+                    Err(BackendError::Unavailable),
+                    Err(BackendError::Disconnected),
+                ] {
+                    let mut backend = if coordinate {
+                        bound_backend().with_coordinate_pin_taps().unwrap()
+                    } else {
+                        backend()
+                    };
+                    let started = Instant::now();
+                    backend
+                        .snapshot_with(
+                            started,
+                            |_, _| Ok(capture()),
+                            || started + Duration::from_secs(4),
+                        )
+                        .unwrap();
+                    let mut dispatches = 0;
+                    assert_eq!(
+                        backend.request_action_with(
+                            &action,
+                            started + Duration::from_millis(4_500),
+                            |backend, sent, fresh_until| {
+                                assert!(backend.last_view.is_none());
+                                assert!(std::ptr::eq(sent, &action));
+                                assert_eq!(fresh_until, started + PIN_VIEW_BUDGET);
+                                dispatches += 1;
+                                result
+                            },
+                        ),
+                        result
+                    );
+                    assert_eq!(dispatches, 1);
+                    assert!(backend.last_view.is_none());
+                    assert_eq!(
+                        backend.request_action_with(&action, started, |_, _, _| {
+                            panic!("consumed input cannot be retried")
+                        }),
+                        Err(BackendError::Unavailable)
+                    );
+                }
             }
         }
     }
 
     #[test]
     fn missing_or_expired_view_never_dispatches() {
-        let action = Action::Tap {
-            at: Point { x: 80.0, y: 340.0 },
-        };
-        let mut backend = backend();
-        let started = Instant::now();
-        assert_eq!(
-            backend.request_action_with(&action, started, |_, _, _| panic!("missing view")),
-            Err(BackendError::Unavailable)
-        );
-        for elapsed in [
-            PIN_VIEW_BUDGET - Duration::from_nanos(1),
-            PIN_VIEW_BUDGET,
-            PIN_VIEW_BUDGET + Duration::from_nanos(1),
-        ] {
-            prepare(&mut backend, started);
-            let mut dispatches = 0;
-            let result = backend.request_action_with(&action, started + elapsed, |_, _, _| {
-                dispatches += 1;
-                Ok(())
-            });
-            if elapsed < PIN_VIEW_BUDGET {
-                assert_eq!(result, Ok(()));
-                assert_eq!(dispatches, 1);
+        for coordinate in [false, true] {
+            let action = Action::Tap {
+                at: Point { x: 80.0, y: 340.0 },
+            };
+            let mut backend = if coordinate {
+                bound_backend().with_coordinate_pin_taps().unwrap()
             } else {
-                assert_eq!(result, Err(BackendError::Unavailable));
-                assert_eq!(dispatches, 0);
+                backend()
+            };
+            let started = Instant::now();
+            assert_eq!(
+                backend.request_action_with(&action, started, |_, _, _| panic!("missing view")),
+                Err(BackendError::Unavailable)
+            );
+            for elapsed in [
+                PIN_VIEW_BUDGET - Duration::from_nanos(1),
+                PIN_VIEW_BUDGET,
+                PIN_VIEW_BUDGET + Duration::from_nanos(1),
+            ] {
+                prepare(&mut backend, started);
+                let mut dispatches = 0;
+                let result = backend.request_action_with(&action, started + elapsed, |_, _, _| {
+                    dispatches += 1;
+                    Ok(())
+                });
+                if elapsed < PIN_VIEW_BUDGET {
+                    assert_eq!(result, Ok(()));
+                    assert_eq!(dispatches, 1);
+                } else {
+                    assert_eq!(result, Err(BackendError::Unavailable));
+                    assert_eq!(dispatches, 0);
+                }
+                assert!(backend.last_view.is_none());
             }
-            assert!(backend.last_view.is_none());
         }
     }
 
