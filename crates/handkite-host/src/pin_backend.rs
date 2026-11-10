@@ -692,7 +692,7 @@ mod tests {
                     }
                     _ => {
                         let endpoint = if self.coordinate {
-                            "/session/fixture-session/wda/tap/0"
+                            "/session/fixture-session/wda/tap"
                         } else {
                             "/session/fixture-session/actions"
                         };

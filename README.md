@@ -326,13 +326,15 @@ reads do not establish physical delivery or an atomic snapshot.
 
 `--coordinate-pin-taps` is an additional explicit opt-in and requires both
 `--temporary-idle-settings` and `--supervised-visibility-fallback`. It selects the
-legacy WDA `/wda/tap/0` coordinate endpoint for all six digit taps, validating the
+WDA 6+ `/wda/tap` coordinate endpoint for all six digit taps, validating the
 exact bound session before each single POST. Key centers and the original
 five-second prepared-view write deadline are unchanged. There is no W3C fallback
 or retry. Stop-gate ordering, first-digit comparison, and settings restoration
 remain in force. The default transport remains W3C. This path is live-unqualified;
 deployed endpoint compatibility must first be checked with a separately authorized
-harmless Clock coordinate trial. It does not authorize another PIN attempt.
+harmless Clock coordinate trial. The route follows the
+[WDA 6.0.0 source](https://github.com/appium/WebDriverAgent/blob/v6.0.0/WebDriverAgentLib/Commands/FBElementCommands.m#L114);
+older routes are not retried. It does not authorize another PIN attempt.
 
 With both `--temporary-idle-settings` and `--supervised-visibility-fallback`,
 an explicitly hidden keypad requires fresh locked zero-of-six evidence before one

@@ -126,7 +126,7 @@ impl WdaActions {
         at: Point,
     ) -> Result<TransportReceipt, AdapterError> {
         let body = coordinate_tap_payload(at)?;
-        let path = format!("/session/{session}/wda/tap/0");
+        let path = format!("/session/{session}/wda/tap");
         let body = serde_json::to_vec(&body).map_err(|_| AdapterError)?;
         let response = wda
             .request("POST", &path, &body, Duration::from_secs(30))
@@ -369,7 +369,7 @@ mod tests {
         ] {
             let mut post = response(
                 "POST",
-                "/session/fixture-session/wda/tap/0",
+                "/session/fixture-session/wda/tap",
                 200,
                 json!({"value":null}),
             );
@@ -664,7 +664,7 @@ mod tests {
         for coordinate in [false, true] {
             for lost in [false, true] {
                 let path = if coordinate {
-                    "/session/fixture-session/wda/tap/0"
+                    "/session/fixture-session/wda/tap"
                 } else {
                     "/session/fixture-session/actions"
                 };
