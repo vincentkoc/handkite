@@ -9,6 +9,9 @@ use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
 
+#[path = "handkited/signals.rs"]
+mod signals;
+
 const USAGE: &str = "usage: handkited | handkited --owned-wda | handkited --check --config FILE | handkited --config SERVICE_CONFIG --socket-dir SERVICE_RUNTIME";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -67,7 +70,11 @@ fn run(
 }
 
 fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
+    let _signals = signals::ShutdownSignals::install().map_err(str::to_owned)?;
     let owner = ServiceLock::acquire(layout).map_err(|_| "cannot acquire service ownership")?;
+    if signals::requested() {
+        return Ok(());
+    }
     match mode {
         DaemonMode::Borrowed => {
             load_before_serving(owner.layout(), install_config::load_protected, |binding| {
@@ -77,6 +84,9 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
                             .map_err(|_| "cannot bind protected socket".into())
                     },
                     |listener| {
+                        if signals::requested() {
+                            return Ok(());
+                        }
                         let adapter = WdaAdapter::new(binding.usb_id.clone())
                             .map_err(|_| "cannot initialize pinned WDA adapter")?;
                         serve_adapter(binding, adapter, listener)
@@ -97,6 +107,9 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
                         .map_err(|_| "cannot bind protected socket".into())
                 },
                 |listener| {
+                    if signals::requested() {
+                        return Ok(());
+                    }
                     let adapter = WdaAdapter::new_owned(binding.usb_id.clone(), runner_id)
                         .map_err(|_| "cannot start owned WDA runner and session")?;
                     serve_adapter(binding, adapter, listener)
@@ -120,12 +133,18 @@ fn serve_adapter(
 ) -> Result<(), String> {
     let key = binding.key.clone();
     let controller = Controller::new(binding, adapter, 5000, 5000);
+    if signals::requested() {
+        return Ok(());
+    }
     controller
         .observe(&key)
         .map_err(|_| "pinned device is not ready")?;
+    if signals::requested() {
+        return Ok(());
+    }
     eprintln!("handkited ready");
     listener
-        .serve(&controller)
+        .serve_until(&controller, signals::requested)
         .map_err(|_| "local socket failed".into())
 }
 
