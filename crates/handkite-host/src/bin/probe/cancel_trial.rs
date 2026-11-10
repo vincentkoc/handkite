@@ -87,15 +87,46 @@ pub(super) fn command(args: &[String]) -> Result<(), &'static str> {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+enum CompetitorKind {
+    Button,
+    OtherControl,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum NameClass {
+    Emergency,
+    Delete,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum GeometryClass {
     ProtectedCountInvalid,
     OverlapKeyOrField,
     OverlapOtherControl,
-    CompetitorBoundsInvalid,
+    CompetitorBoundsInvalid(CompetitorKind, NameClass),
     Stable,
 }
 
 impl GeometryClass {
+    fn invalid_competitor(kind: &[u8], name: Option<&str>, label: Option<&str>) -> Self {
+        let kind = if kind == b"XCUIElementTypeButton" {
+            CompetitorKind::Button
+        } else {
+            CompetitorKind::OtherControl
+        };
+        let names = [name, label];
+        let name = match (
+            names.contains(&Some("Emergency")),
+            names.contains(&Some("Delete")),
+        ) {
+            (true, false) => NameClass::Emergency,
+            (false, true) => NameClass::Delete,
+            _ => NameClass::Other,
+        };
+        Self::CompetitorBoundsInvalid(kind, name)
+    }
+
     fn line(self) -> &'static str {
         match self {
             Self::ProtectedCountInvalid => {
@@ -107,8 +138,23 @@ impl GeometryClass {
             Self::OverlapOtherControl => {
                 "cancel_geometry=observed classification=overlap_other_control"
             }
-            Self::CompetitorBoundsInvalid => {
-                "cancel_geometry=observed classification=competitor_bounds_invalid"
+            Self::CompetitorBoundsInvalid(CompetitorKind::Button, NameClass::Emergency) => {
+                "cancel_geometry=observed classification=competitor_bounds_invalid kind=button name_class=emergency"
+            }
+            Self::CompetitorBoundsInvalid(CompetitorKind::Button, NameClass::Delete) => {
+                "cancel_geometry=observed classification=competitor_bounds_invalid kind=button name_class=delete"
+            }
+            Self::CompetitorBoundsInvalid(CompetitorKind::Button, NameClass::Other) => {
+                "cancel_geometry=observed classification=competitor_bounds_invalid kind=button name_class=other"
+            }
+            Self::CompetitorBoundsInvalid(CompetitorKind::OtherControl, NameClass::Emergency) => {
+                "cancel_geometry=observed classification=competitor_bounds_invalid kind=other_control name_class=emergency"
+            }
+            Self::CompetitorBoundsInvalid(CompetitorKind::OtherControl, NameClass::Delete) => {
+                "cancel_geometry=observed classification=competitor_bounds_invalid kind=other_control name_class=delete"
+            }
+            Self::CompetitorBoundsInvalid(CompetitorKind::OtherControl, NameClass::Other) => {
+                "cancel_geometry=observed classification=competitor_bounds_invalid kind=other_control name_class=other"
             }
             Self::Stable => "cancel_geometry=observed classification=stable",
         }
@@ -441,7 +487,11 @@ fn parse_cancel(capture: &LockedCapture, supervised: bool) -> Result<Evidence, C
                 // Missing or malformed bounds fail closed rather than hiding an overlap.
                 if inside && !is_cancel && competing_control(kind.as_ref()) {
                     competing.push(Rect::read(rect, screen).map_err(|_| {
-                        CancelFailure::classified(GeometryClass::CompetitorBoundsInvalid)
+                        CancelFailure::classified(GeometryClass::invalid_competitor(
+                            kind.as_ref(),
+                            name.as_deref(),
+                            label.as_deref(),
+                        ))
                     })?);
                 }
                 if matches!(
@@ -722,7 +772,7 @@ mod tests {
                     CANCEL,
                     &format!("{CANCEL}{}", extra.replace("width=\"100\"", "")),
                 ),
-                GeometryClass::CompetitorBoundsInvalid,
+                GeometryClass::CompetitorBoundsInvalid(CompetitorKind::Button, NameClass::Other),
             ),
         ] {
             for n in 0..2 {
@@ -746,6 +796,45 @@ mod tests {
             classify_rectangles(Rect([0.0, 0.0, 1.0, 1.0]), &[], &[]),
             GeometryClass::ProtectedCountInvalid
         );
+    }
+
+    #[test]
+    fn first_invalid_competitor_has_only_fixed_kind_and_name_classes() {
+        for (kind, kind_token) in [("Button", "button"), ("Switch", "other_control")] {
+            for (attrs, name_token) in [
+                (r#"name="Emergency""#, "emergency"),
+                (r#"label="Delete""#, "delete"),
+                (r#"name="private-canary" label="private-label""#, "other"),
+                (r#"name="Emergency" label="Delete""#, "other"),
+            ] {
+                let first = format!(
+                    r#"<XCUIElementType{kind} {attrs} visible="false" enabled="true" x="20" y="700" height="40"/>"#
+                );
+                let later = r#"<XCUIElementTypeButton name="Delete" x="bad"/>"#;
+                for n in 0..2 {
+                    let mut fake = Fake::new();
+                    fake.at(n).raw.accessibility_tree =
+                        keypad().replace(CANCEL, &format!("{CANCEL}{first}{later}"));
+                    let class = inspect_geometry(&mut fake, &id(), true).unwrap();
+                    assert_eq!(
+                        class.line(),
+                        format!(
+                            "cancel_geometry=observed classification=competitor_bounds_invalid kind={kind_token} name_class={name_token}"
+                        )
+                    );
+                    for private in ["private-canary", "private-label", "700", "40", "<", SESSION] {
+                        assert!(!class.line().contains(private));
+                    }
+                    assert_eq!(fake.count, n + 1);
+                    assert!(fake.taps.is_empty());
+                    let mut trial = Fake::new();
+                    trial.at(n).raw.accessibility_tree =
+                        keypad().replace(CANCEL, &format!("{CANCEL}{first}{later}"));
+                    assert_eq!(run(&mut trial, &id(), SESSION, true), Err(Error::Geometry));
+                    assert!(trial.taps.is_empty());
+                }
+            }
+        }
     }
 
     #[test]
@@ -812,8 +901,8 @@ mod tests {
             (GeometryClass::OverlapKeyOrField, "overlap_key_or_field"),
             (GeometryClass::OverlapOtherControl, "overlap_other_control"),
             (
-                GeometryClass::CompetitorBoundsInvalid,
-                "competitor_bounds_invalid",
+                GeometryClass::CompetitorBoundsInvalid(CompetitorKind::Button, NameClass::Other),
+                "competitor_bounds_invalid kind=button name_class=other",
             ),
             (GeometryClass::Stable, "stable"),
         ] {

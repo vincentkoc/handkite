@@ -231,7 +231,9 @@ Cancel delivery or PIN entry.
 `handkite-probe cancel-geometry --config PRIVATE_FILE --supervised-hidden-cancel`
 is a read-only aid for a Cancel geometry refusal. It reuses the pinned locked
 capture and exact trial parser, printing only a fixed classification. A geometry
-failure is reported at its first observation; `stable` requires two fresh,
+failure from invalid competing bounds also identifies the first competitor using
+only `button`/`other_control` and `emergency`/`delete`/`other` classes.
+A failure is reported at its first observation; `stable` requires two fresh,
 nonoverlapping captures with the same session and geometry. Other guards still
 refuse. It sends no input or settings writes and saves no screenshot or XML.
 The classification does not authorize a tap or relax any trial guard.
