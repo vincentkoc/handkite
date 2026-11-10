@@ -71,6 +71,22 @@ pub(crate) async fn fixture_provider() -> (AppleProvisioningProvider, JoinHandle
     (provider, server)
 }
 
+pub(crate) async fn fixture_empty_policy(
+    context: AppleProvisioningContext,
+) -> Result<AppleProvisioningProvider, &'static str> {
+    let (client, server) = TlsFixture::new("provision.example.test", true, false)
+        .serve(vec![], false)
+        .await;
+    let result = AppleProvisioningProvider::discover_with(
+        client,
+        ReviewedEndpointPolicy { pairs: &[] },
+        context,
+    )
+    .await;
+    assert!(server.await.unwrap().is_empty());
+    result
+}
+
 #[tokio::test]
 async fn approved_lookup_precedes_one_use_start_and_finish() {
     let (mut provider, server) = fixture_provider().await;
@@ -128,9 +144,9 @@ async fn start_and_finish_close_keep_alive_connections_without_pooling() {
 }
 
 #[tokio::test]
-async fn empty_production_policy_and_unapproved_lookup_fail_before_provisioning() {
+async fn empty_policy_and_unapproved_lookup_fail_before_provisioning() {
     assert_eq!(
-        AppleProvisioningProvider::discover(context()).await.err(),
+        fixture_empty_policy(context()).await.err(),
         Some("Apple provisioning destinations are not approved")
     );
     let (client, server) = TlsFixture::new("provision.example.test", true, false)
@@ -227,7 +243,10 @@ async fn callback_cancellation_consumes_start_or_finish_before_await() {
 #[tokio::test]
 async fn dropped_unpolled_callback_and_invalid_order_are_consumed() {
     for finish in [false, true] {
-        let mut provider = provider(AppleClient::new().unwrap());
+        let (client, server) = TlsFixture::new("provision.example.test", true, false)
+            .serve(vec![], false)
+            .await;
+        let mut provider = provider(client);
         if finish {
             drop(provider.finish("Yg=="));
         } else {
@@ -235,6 +254,7 @@ async fn dropped_unpolled_callback_and_invalid_order_are_consumed() {
         }
         assert!(provider.start().await.is_err());
         assert!(provider.finish("Yg==").await.is_err());
+        assert!(server.await.unwrap().is_empty());
     }
 }
 
@@ -248,8 +268,12 @@ async fn malformed_start_and_invalid_cpim_cannot_retry() {
     assert!(failed.start().await.is_err());
     assert!(failed.finish("Yg==").await.is_err());
     assert_eq!(server.await.unwrap().len(), 1);
-    let mut invalid = provider(AppleClient::new().unwrap());
+    let (client, server) = TlsFixture::new("provision.example.test", true, false)
+        .serve(vec![], false)
+        .await;
+    let mut invalid = provider(client);
     invalid.stage = Stage::Started;
     assert!(invalid.finish("invalid").await.is_err());
     assert!(invalid.finish("Yg==").await.is_err());
+    assert!(server.await.unwrap().is_empty());
 }

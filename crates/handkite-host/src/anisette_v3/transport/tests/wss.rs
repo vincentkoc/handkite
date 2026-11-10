@@ -170,7 +170,7 @@ async fn wss_composes_with_approved_apple_https_callbacks() {
 }
 
 #[tokio::test]
-async fn production_apple_policy_rejects_before_sidecar_connection() {
+async fn empty_apple_policy_rejects_before_sidecar_connection() {
     let fixture = TlsFixture::new("anisette.example.invalid", true, true);
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
@@ -190,7 +190,11 @@ async fn production_apple_policy_rejects_before_sidecar_connection() {
             .unwrap(),
     );
     assert!(matches!(
-        client.provision_apple(context).await,
+        client
+            .provision_apple_with_discovery(crate::anisette_v3::apple::fixture_empty_policy(
+                context
+            ))
+            .await,
         Err("Apple provisioning destinations are not approved")
     ));
     assert!(

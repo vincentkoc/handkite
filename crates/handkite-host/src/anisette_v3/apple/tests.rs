@@ -45,6 +45,35 @@ fn lookup_candidates_do_not_grant_production_approval() {
 }
 
 #[test]
+fn production_policy_accepts_only_the_reviewed_grandslam_pair() {
+    const START: &str = "https://gsa.apple.com/grandslam/MidService/startMachineProvisioning";
+    const FINISH: &str = "https://gsa.apple.com/grandslam/MidService/finishMachineProvisioning";
+    let policy = ReviewedEndpointPolicy::production();
+    let candidates = LookupCandidates::parse(200, lookup(START, FINISH).as_bytes()).unwrap();
+    let approved = policy.approve(&candidates).unwrap();
+    assert_eq!(approved.start(), START);
+    assert_eq!(approved.finish(), FINISH);
+    for (start, finish) in [
+        (FINISH.to_owned(), START.to_owned()),
+        (format!("{START}?other=1"), FINISH.to_owned()),
+        (START.to_owned(), format!("{FINISH}/")),
+        (
+            START.replace("gsa.apple.com", "gsas.apple.com"),
+            FINISH.to_owned(),
+        ),
+        (
+            START.to_owned(),
+            FINISH.replace("gsa.apple.com", "gsa.apple.com.example.test"),
+        ),
+        (START.replace("MidService", "GsService2"), FINISH.to_owned()),
+        (START.to_owned(), FINISH.replace("MidService", "midservice")),
+    ] {
+        let candidates = LookupCandidates::parse(200, lookup(&start, &finish).as_bytes()).unwrap();
+        assert!(policy.approve(&candidates).is_err());
+    }
+}
+
+#[test]
 fn reviewed_policy_matches_the_complete_pair() {
     let policy = ReviewedEndpointPolicy {
         pairs: &[(START, FINISH)],

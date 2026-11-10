@@ -15,7 +15,7 @@ mod provider;
 pub use context::{AppleProvisioningContext, ProvisioningIdentifier};
 pub use provider::AppleProvisioningProvider;
 #[cfg(test)]
-pub(crate) use provider::tests::fixture_provider;
+pub(crate) use provider::tests::{fixture_empty_policy, fixture_provider};
 
 const MAX_LOOKUP_BYTES: usize = 64 * 1024;
 const MAX_URL_BYTES: usize = 4096;
@@ -128,9 +128,14 @@ pub struct ReviewedEndpointPolicy {
 }
 
 impl ReviewedEndpointPolicy {
-    /// No Apple provisioning destination has been reviewed for production yet.
+    /// Exact GrandSlam pair recorded in the protocol provenance in VALIDATION.md.
     pub fn production() -> Self {
-        Self { pairs: &[] }
+        Self {
+            pairs: &[(
+                "https://gsa.apple.com/grandslam/MidService/startMachineProvisioning",
+                "https://gsa.apple.com/grandslam/MidService/finishMachineProvisioning",
+            )],
+        }
     }
 
     pub fn approve(

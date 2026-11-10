@@ -177,12 +177,21 @@ impl AnisetteClient {
     }
 
     /// Lookup and exact endpoint approval complete before opening the sidecar WSS.
-    /// The production policy currently rejects this operation before any network IO.
     pub async fn provision_apple(
         &self,
         context: super::apple::AppleProvisioningContext,
     ) -> Result<MacosProvisionedState, &'static str> {
-        let mut provider = super::apple::AppleProvisioningProvider::discover(context).await?;
+        self.provision_apple_with_discovery(super::apple::AppleProvisioningProvider::discover(
+            context,
+        ))
+        .await
+    }
+
+    async fn provision_apple_with_discovery(
+        &self,
+        discovery: impl Future<Output = Result<super::apple::AppleProvisioningProvider, &'static str>>,
+    ) -> Result<MacosProvisionedState, &'static str> {
+        let mut provider = discovery.await?;
         self.provision(*provider.identifier().as_bytes(), &mut provider)
             .await
     }
