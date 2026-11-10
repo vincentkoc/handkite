@@ -12,6 +12,7 @@ use handkite_core::protocol::{
     Action, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, ScreenImage,
     TransportReceipt,
 };
+use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=visible,accessible,focused,enabled,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
@@ -46,32 +47,58 @@ impl WdaAdapter {
     /// Start one configured XCTest runner and create one exact WDA session.
     /// The caller must first obtain exclusive device and WDA ownership.
     /// The multi-thread runtime continues driving XCTest while the socket server is idle.
-    pub fn new_owned(expected: HardwareId, runner_bundle_id: &str) -> Result<Self, AdapterError> {
+    pub fn new_owned(
+        expected: HardwareId,
+        runner_bundle_id: &str,
+        should_stop: impl Fn() -> bool,
+    ) -> Result<Self, AdapterError> {
+        if should_stop() {
+            return Err(AdapterError);
+        }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
             .map_err(|_| AdapterError)?;
         let usb = PinnedUsb::new(expected.clone());
-        let runner = runtime
-            .block_on(OwnedWdaRunner::start(
-                usb.clone(),
-                runner_bundle_id,
-                Duration::from_secs(120),
-            ))
-            .map_err(|_| AdapterError)?;
-        let session = runtime
-            .block_on(create_owned_session(&UsbWda::new(usb.clone()), || Ok(())))
-            .map_err(|_| AdapterError)?;
-        let actions = WdaActions::bound_to_existing(&session)?;
-        Ok(Self {
+        let runner = runtime.block_on(run_until_shutdown(
+            async {
+                OwnedWdaRunner::start(usb.clone(), runner_bundle_id, Duration::from_secs(120))
+                    .await
+                    .map_err(|_| AdapterError)
+            },
+            &should_stop,
+        ));
+        let runner = match runner {
+            Ok(runner) => runner,
+            Err(error) => {
+                runtime.shutdown_timeout(Duration::from_secs(5));
+                return Err(error);
+            }
+        };
+        let mut adapter = Self {
             expected,
             usb,
             runtime: Some(runtime),
-            actions,
+            actions: WdaActions::default(),
             owned_runner: Some(runner),
-            owned_session: Some(session),
-        })
+            owned_session: None,
+        };
+        let session = adapter
+            .runtime
+            .as_ref()
+            .expect("adapter runtime")
+            .block_on(create_owned_session(
+                &UsbWda::new(adapter.usb.clone()),
+                || if should_stop() { Err(()) } else { Ok(()) },
+            ))
+            .map_err(|_| AdapterError)?;
+        adapter.owned_session = Some(session.clone());
+        adapter.actions = WdaActions::bound_to_existing(&session)?;
+        if should_stop() {
+            return Err(AdapterError);
+        }
+        Ok(adapter)
     }
 
     fn validate_owned(&self) -> Result<(), AdapterError> {
@@ -187,6 +214,20 @@ impl WdaAdapter {
     }
 }
 
+async fn run_until_shutdown<T>(
+    work: impl Future<Output = Result<T, AdapterError>>,
+    should_stop: &impl Fn() -> bool,
+) -> Result<T, AdapterError> {
+    tokio::select! {
+        result = work => result,
+        _ = async {
+            while !should_stop() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        } => Err(AdapterError),
+    }
+}
+
 impl DeviceAdapter for WdaAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
         self.validate_owned()?;
@@ -282,6 +323,45 @@ fn classify_lock(app: &str, tree: &str, reported: Option<bool>) -> LockState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shutdown_cancels_pending_runner_startup() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+
+        struct Mark(Arc<AtomicBool>);
+        impl Drop for Mark {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let signal = stop.clone();
+        let setter = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            signal.store(true, Ordering::Release);
+        });
+        let work = async {
+            let _guard = Mark(dropped.clone());
+            std::future::pending::<Result<(), AdapterError>>().await
+        };
+        assert_eq!(
+            run_until_shutdown(work, &|| stop.load(Ordering::Acquire)).await,
+            Err(AdapterError)
+        );
+        setter.await.unwrap();
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn preexisting_shutdown_refuses_owned_startup_before_device_access() {
+        let expected = HardwareId::new("fixture-device").unwrap();
+        assert!(WdaAdapter::new_owned(expected, "com.example.xctrunner", || true).is_err());
+    }
 
     #[test]
     fn visible_lock_overrides_a_stale_wda_flag() {

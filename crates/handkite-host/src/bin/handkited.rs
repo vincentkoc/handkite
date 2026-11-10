@@ -110,8 +110,12 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
                     if signals::requested() {
                         return Ok(());
                     }
-                    let adapter = WdaAdapter::new_owned(binding.usb_id.clone(), runner_id)
-                        .map_err(|_| "cannot start owned WDA runner and session")?;
+                    let adapter = WdaAdapter::new_owned(
+                        binding.usb_id.clone(),
+                        runner_id,
+                        signals::requested,
+                    )
+                    .map_err(|_| "cannot start owned WDA runner and session")?;
                     serve_adapter(binding, adapter, listener)
                 },
             )
