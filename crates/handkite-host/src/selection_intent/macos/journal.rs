@@ -1,6 +1,8 @@
 use super::*;
-use crate::release_files::{check_acl, open_at};
+use crate::release_files::{Fingerprint, check_acl, open_at};
+use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 
 fn policy(file: &File, mode: u32, size: usize) -> Result<Fingerprint, &'static str> {

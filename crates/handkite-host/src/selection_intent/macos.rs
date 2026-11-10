@@ -1,9 +1,13 @@
 use super::*;
 use crate::current_selection::macos::Snapshot;
+use std::ffi::CStr;
 
+mod journal;
 pub(crate) mod preparation;
 
 const MISMATCH: &str = "selection intent release or lock mismatch";
+const UNSAFE: &str = "unsafe or changed selection preparation";
+const JOURNAL: &CStr = c".selection-pending.json";
 
 #[cfg(test)]
 pub(crate) type Check<'a> =

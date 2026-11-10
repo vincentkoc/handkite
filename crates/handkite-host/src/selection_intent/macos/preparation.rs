@@ -9,14 +9,10 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 
 pub(crate) mod commit;
-mod journal;
 mod parent_change;
 use journal::Journal;
 use parent_change::BeforeChange;
 pub(crate) use parent_change::ParentChange;
-
-const UNSAFE: &str = "unsafe or changed selection preparation";
-const JOURNAL: &CStr = c".selection-pending.json";
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
