@@ -144,6 +144,16 @@ contract and activation preconditions in [Mac release inputs](RELEASE.md).
 
 Daemon startup now uses the layout and process lock, but no live installation is qualified. Layout validation creates no files; lock acquisition creates only the process lock in an existing runtime directory, and daemon startup binds its fixed socket. No startup step creates directories, config, releases, descriptors, or stop markers. The descriptor is outside launchd's automatically loaded directories. Signed builds, install/rollback commands, and launchd supervision remain pending. The existing `state/iphone/UNLOCK-DISABLED` gate keeps its current path, permission rules, and behavior; layout checks never open or migrate it.
 
+## Release verification diagnostic
+
+`handkite-release-verify --stage /absolute/private-stage` reads independently
+supplied pins and exact canonical manifest bytes from a bounded private regular
+stdin file, then calls the production stage verifier once. It reports only
+`release_verify=pass`, `release_verify=reject`, or `release_verify=invalid`.
+See the [input envelope and exit codes](RELEASE.md#release-verification-diagnostic).
+This diagnostic is excluded from the three-artifact release inventory. Its tests
+do not qualify a real signed stage, installation, or service activation.
+
 ## MCP bridge
 
 `handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
