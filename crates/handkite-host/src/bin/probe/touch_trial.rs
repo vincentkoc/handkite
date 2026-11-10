@@ -173,9 +173,10 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
         let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120))
             .await
             .map_err(|_| "refused reason=runner_unavailable")?;
+        let liveness = runner.liveness();
         let wda = UsbWda::new(usb);
         let admit = || {
-            if runner.is_finished() || owner.validate_current().is_err() {
+            if liveness.is_finished() || owner.validate_current().is_err() {
                 Err(())
             } else {
                 Ok(())
@@ -183,14 +184,16 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
         };
         let action = |worker_session: String| {
             let worker_owner = Arc::clone(&owner);
-            let runner_ref = &runner;
+            let worker_liveness = liveness.clone();
             async move {
-                if runner_ref.is_finished() || worker_owner.validate_current().is_err() {
+                if worker_liveness.is_finished() || worker_owner.validate_current().is_err() {
                     return Err(TrialError::Refused(RefusalReason::SessionUnproven));
                 }
                 blocking_trial(move || {
                     let mut live = Live::new(expected.clone()).map_err(TrialError::Refused)?;
-                    let owns = || worker_owner.validate_current().is_ok();
+                    let owns = || {
+                        !worker_liveness.is_finished() && worker_owner.validate_current().is_ok()
+                    };
                     let mut bound = SessionBound {
                         device: &mut live,
                         session: &worker_session,
@@ -1141,6 +1144,40 @@ mod tests {
             );
             assert!(fixture.taps.is_empty());
         }
+    }
+
+    #[test]
+    fn runner_exit_after_clock_captures_prevents_tap() {
+        use std::cell::Cell;
+        let runner_alive = Cell::new(true);
+        let checks = Cell::new(0);
+        let admit = || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                // Both captures are allowed; the runner exits before the tap guard.
+                runner_alive.set(false);
+                true
+            } else {
+                runner_alive.get()
+            }
+        };
+        let mut fixture = Fixture::new();
+        let mut bound = SessionBound {
+            device: &mut fixture,
+            session: "fixture-session",
+            admission: Some(&admit),
+        };
+        assert_eq!(
+            run(
+                &mut bound,
+                &HardwareId::new("fixture-device").unwrap(),
+                Transport::W3c,
+            ),
+            Err(TrialError::Unknown)
+        );
+        assert_eq!(checks.get(), 4);
+        assert!(fixture.taps.is_empty());
+        assert_eq!(fixture.captures.len(), 1);
     }
 
     #[test]

@@ -30,6 +30,24 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(30)
 }
 
+#[tokio::test]
+async fn read_only_liveness_survives_handoff_to_blocking_worker() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let runner = OwnedWdaRunner::start_task(
+        |listener| live(listener, dropped.clone()),
+        || async { ready() },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    let liveness = runner.liveness();
+    let worker = tokio::task::spawn_blocking(move || liveness);
+    let liveness = worker.await.unwrap();
+    assert!(!liveness.is_finished());
+    runner.abort_and_join().await.unwrap();
+    assert!(liveness.is_finished());
+}
+
 #[tokio::test(start_paused = true)]
 async fn public_start_rejects_invalid_inputs_before_device_lookup() {
     let usb = PinnedUsb::new(HardwareId::new("test-device").unwrap());

@@ -14,7 +14,7 @@ use idevice::{IdeviceError, IdeviceService};
 use std::future::Future;
 use std::time::Duration;
 use tokio::sync::watch;
-use tokio::task::{JoinError, JoinHandle};
+use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 
 const MAX_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
@@ -42,6 +42,16 @@ pub enum RunnerError {
 #[must_use = "keep the handle alive for the lifetime of the XCTest task"]
 pub struct OwnedWdaRunner {
     task: Option<JoinHandle<Result<(), RunnerError>>>,
+}
+
+/// Read-only task liveness for a blocking action worker. It cannot cancel the runner.
+#[derive(Clone)]
+pub struct RunnerLiveness(AbortHandle);
+
+impl RunnerLiveness {
+    pub fn is_finished(&self) -> bool {
+        self.0.is_finished()
+    }
 }
 
 impl OwnedWdaRunner {
@@ -98,6 +108,10 @@ impl OwnedWdaRunner {
     /// A point-in-time host task observation; it is not an HTTP health check.
     pub fn is_finished(&self) -> bool {
         self.task.as_ref().is_none_or(JoinHandle::is_finished)
+    }
+
+    pub fn liveness(&self) -> RunnerLiveness {
+        RunnerLiveness(self.task.as_ref().expect("owned task").abort_handle())
     }
 
     /// Request cancellation and join the host task without detaching on cancellation.
