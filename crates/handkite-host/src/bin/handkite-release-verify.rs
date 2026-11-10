@@ -1,6 +1,6 @@
-use handkite_host::release_verify;
 #[cfg(test)]
 use handkite_host::release_manifest::MAX_MANIFEST_BYTES;
+use handkite_host::release_verify;
 use std::ffi::OsString;
 use std::fs::File;
 use std::io::{self, Write};
