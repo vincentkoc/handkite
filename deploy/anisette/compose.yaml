@@ -3,7 +3,8 @@ services:
     image: ghcr.io/fdkevin0/anisette-server-rs@sha256:2daafc9a0251416f25452ec561b3c2c1e9f2c9060e3e05b386fd6fe1cc1fd0ad
     command: ["--backend", "macos"]
     init: true
-    restart: unless-stopped
+    pull_policy: never
+    restart: "no"
     security_opt:
       - no-new-privileges:true
     ports:
