@@ -22,6 +22,37 @@ fn check_args(file: &Path) -> Vec<OsString> {
     vec!["--check".into(), "--config".into(), file.into()]
 }
 
+#[test]
+fn service_layout_check_does_not_inspect_or_serve_a_device() {
+    let mut output = Vec::new();
+    assert_eq!(
+        run_with_layout_check(
+            &["--check-service-layout".into()],
+            |_| panic!("layout check must not inspect a device"),
+            |_, _| panic!("layout check must not serve"),
+            |layout| {
+                assert_eq!(layout, &ServiceLayout::current_account().unwrap());
+                Ok(())
+            },
+            &mut output,
+        ),
+        Ok(0)
+    );
+    assert_eq!(output, b"service_layout=ready\n");
+    output.clear();
+    assert_eq!(
+        run_with_layout_check(
+            &["--check-service-layout".into()],
+            |_| panic!("failed layout check must not inspect a device"),
+            |_, _| panic!("failed layout check must not serve"),
+            |_| Err("protected service configuration unavailable".into()),
+            &mut output,
+        ),
+        Err("protected service configuration unavailable".into())
+    );
+    assert!(output.is_empty());
+}
+
 fn ready() -> DeviceHealth {
     DeviceHealth {
         usb_connected: true,

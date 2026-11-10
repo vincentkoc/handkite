@@ -12,7 +12,7 @@ use std::process::ExitCode;
 #[path = "handkited/signals.rs"]
 mod signals;
 
-const USAGE: &str = "usage: handkited | handkited --owned-wda | handkited --check --config FILE | handkited --config SERVICE_CONFIG --socket-dir SERVICE_RUNTIME";
+const USAGE: &str = "usage: handkited | handkited --owned-wda | handkited --check-service-layout | handkited --check --config FILE | handkited --config SERVICE_CONFIG --socket-dir SERVICE_RUNTIME";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DaemonMode {
@@ -40,9 +40,26 @@ fn run(
     args: &[OsString],
     inspect: impl FnOnce(HardwareId) -> device_health::DeviceHealth,
     serve: impl FnOnce(ServiceLayout, DaemonMode) -> Result<(), String>,
+    output: impl Write,
+) -> Result<u8, String> {
+    run_with_layout_check(args, inspect, serve, check_service_layout, output)
+}
+
+fn run_with_layout_check(
+    args: &[OsString],
+    inspect: impl FnOnce(HardwareId) -> device_health::DeviceHealth,
+    serve: impl FnOnce(ServiceLayout, DaemonMode) -> Result<(), String>,
+    check_layout: impl FnOnce(&ServiceLayout) -> Result<(), String>,
     mut output: impl Write,
 ) -> Result<u8, String> {
     let (mode, supplied_paths) = match args {
+        [flag] if flag == "--check-service-layout" => {
+            let layout =
+                ServiceLayout::current_account().map_err(|_| "service layout unavailable")?;
+            check_layout(&layout)?;
+            writeln!(output, "service_layout=ready").map_err(|_| "cannot write layout result")?;
+            return Ok(0);
+        }
         [check, flag, file] if check == "--check" && flag == "--config" => {
             let binding = host_config::load(Path::new(file)).map_err(str::to_owned)?;
             let health = inspect(binding.usb_id);
@@ -67,6 +84,18 @@ fn run(
     }
     serve(layout, mode)?;
     Ok(0)
+}
+
+fn check_service_layout(layout: &ServiceLayout) -> Result<(), String> {
+    layout
+        .validate_existing_directories()
+        .map_err(|_| "unsafe service layout")?;
+    let config = install_config::load_protected_config(layout)
+        .map_err(|_| "protected service configuration unavailable")?;
+    if config.wda_runner_bundle_id().is_none() {
+        return Err("owned service runner is unconfigured".into());
+    }
+    Ok(())
 }
 
 fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
