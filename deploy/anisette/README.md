@@ -2,6 +2,11 @@
 
 This bundle prepares a separate Anisette V3 sidecar for `anisette.example.invalid`. It has not been deployed. The domain must be registered, the target host chosen, and DNS and certificates established first.
 
+The pinned image digest currently resolves to both `linux/arm64` and
+`linux/amd64` manifests. `docker compose config --quiet` accepts this bundle
+with an absolute private data-directory value. These checks validate packaging
+syntax and registry metadata only; they do not start or qualify the sidecar.
+
 ## Boundaries
 
 - `compose.yaml` pins one upstream image digest, selects the macOS ADI backend, binds port 6969 to loopback only, and mounts a persistent private data directory. Do not put the Apple ID, phone PIN, pairing records, or screenshots in this volume or the sidecar environment.
