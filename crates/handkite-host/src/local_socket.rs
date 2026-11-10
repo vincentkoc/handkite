@@ -7,10 +7,12 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixDatagram, UnixListener, UnixStream};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
+const REQUEST_BUDGET: Duration = Duration::from_secs(10);
+const READ_POLL: Duration = Duration::from_millis(100);
 
 /// The listener cannot outlive the process lock that authorized its creation.
 pub struct ServiceListener<'a> {
@@ -212,13 +214,14 @@ fn handle_checked<A: DeviceAdapter>(
     controller: &Controller<A>,
     should_stop: &impl Fn() -> bool,
 ) -> io::Result<()> {
-    let request = read_request(stream);
+    let request = read_request_until(stream, should_stop, Instant::now() + REQUEST_BUDGET);
     if should_stop() {
         return Ok(());
     }
     let reply = match request {
         Ok(bytes) => match serde_json::from_slice::<Request>(&bytes) {
-            Ok(request) => dispatch(controller, request),
+            Ok(request) if !should_stop() => dispatch(controller, request),
+            Ok(_) => return Ok(()),
             Err(_) => Reply::Error {
                 code: "InvalidRequest".into(),
             },
@@ -239,11 +242,39 @@ fn write_reply(stream: &mut UnixStream, bytes: &[u8]) -> io::Result<()> {
     stream.write_all(b"\n")
 }
 
-fn read_request(stream: &mut UnixStream) -> io::Result<Vec<u8>> {
+fn read_request_until(
+    stream: &mut UnixStream,
+    should_stop: &impl Fn() -> bool,
+    deadline: Instant,
+) -> io::Result<Vec<u8>> {
     let mut input = Vec::with_capacity(1024);
     let mut chunk = [0_u8; 4096];
     loop {
-        let read = stream.read(&mut chunk)?;
+        if should_stop() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "service stopping",
+            ));
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "request timed out"));
+        }
+        stream.set_read_timeout(Some(remaining.min(READ_POLL)))?;
+        let read = match stream.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock
+                        | io::ErrorKind::TimedOut
+                        | io::ErrorKind::Interrupted
+                ) =>
+            {
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         if read == 0 {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
@@ -310,6 +341,46 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checks.get(), 2);
+    }
+
+    #[test]
+    fn partial_request_stops_promptly() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client.write_all(b"{").unwrap();
+        let stopped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = stopped.clone();
+        let setter = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            signal.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let started = Instant::now();
+        let result = read_request_until(
+            &mut server,
+            &|| stopped.load(std::sync::atomic::Ordering::Acquire),
+            started + Duration::from_secs(1),
+        );
+        setter.join().unwrap();
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::Interrupted);
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn trickling_client_cannot_extend_request_deadline() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let sender = std::thread::spawn(move || {
+            for _ in 0..6 {
+                std::thread::sleep(Duration::from_millis(20));
+                if client.write_all(b"x").is_err() {
+                    break;
+                }
+            }
+        });
+        let started = Instant::now();
+        let result =
+            read_request_until(&mut server, &|| false, started + Duration::from_millis(75));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_millis(300));
+        sender.join().unwrap();
     }
 
     #[test]
