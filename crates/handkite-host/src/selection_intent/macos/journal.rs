@@ -1,5 +1,6 @@
 use super::*;
 use crate::release_files::{Fingerprint, check_acl, open_at};
+use std::ffi::CString;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::os::fd::AsRawFd;
@@ -26,8 +27,18 @@ pub(super) fn check_writer(
     mode: u32,
     bytes: &[u8],
 ) -> Result<Fingerprint, &'static str> {
+    check_named(file, parent, JOURNAL, mode, bytes)
+}
+
+fn check_named(
+    file: &File,
+    parent: &File,
+    name: &CStr,
+    mode: u32,
+    bytes: &[u8],
+) -> Result<Fingerprint, &'static str> {
     let before = policy(file, mode, bytes.len())?;
-    let fresh = open_at(parent.as_raw_fd(), JOURNAL, false)?;
+    let fresh = open_at(parent.as_raw_fd(), name, false)?;
     for mut reader in [file, &fresh] {
         if policy(reader, mode, bytes.len())? != before {
             return Err(UNSAFE);
@@ -46,6 +57,7 @@ pub(super) fn check_writer(
 }
 
 pub(super) struct Journal {
+    name: CString,
     file: File,
     fingerprint: Fingerprint,
     bytes: Vec<u8>,
@@ -64,6 +76,7 @@ impl Journal {
             .map_err(|_| UNSAFE)?;
         let intent = Intent::parse(&bytes)?;
         let value = Self {
+            name: JOURNAL.into(),
             file,
             fingerprint,
             bytes,
@@ -81,6 +94,7 @@ impl Journal {
         drop(writer);
         let file = open_at(parent.as_raw_fd(), JOURNAL, false)?;
         let value = Self {
+            name: JOURNAL.into(),
             file,
             fingerprint,
             bytes,
@@ -90,9 +104,51 @@ impl Journal {
     }
 
     pub(super) fn check(&self, parent: &File) -> Result<(), &'static str> {
-        if check_writer(&self.file, parent, 0o400, &self.bytes)? != self.fingerprint {
+        if check_named(&self.file, parent, &self.name, 0o400, &self.bytes)? != self.fingerprint {
             return Err(UNSAFE);
         }
         Ok(())
+    }
+
+    pub(super) fn completion_name(&self) -> Result<CString, &'static str> {
+        let intent = Intent::parse(&self.bytes)?;
+        let transaction: String = intent
+            .transaction
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        CString::new(format!(".selection-completed-{transaction}.json")).map_err(|_| UNSAFE)
+    }
+
+    pub(super) fn identity(&self) -> Result<(i32, u64), &'static str> {
+        let metadata = self.file.metadata().map_err(|_| UNSAFE)?;
+        if Fingerprint::from(metadata.clone()) != self.fingerprint {
+            return Err(UNSAFE);
+        }
+        Ok((metadata.dev() as i32, metadata.ino()))
+    }
+
+    /// Only an exact checked move may advance this held journal's name and ctime.
+    pub(super) fn rebind_after_rename(
+        &mut self,
+        parent: &File,
+        name: CString,
+        change: &preparation::ParentChange,
+    ) -> Result<(), &'static str> {
+        let metadata = self.file.metadata().map_err(|_| UNSAFE)?;
+        let changed =
+            change.entry_change(&self.name, &name, (metadata.dev() as i32, metadata.ino()))?;
+        if changed != (metadata.ctime(), metadata.ctime_nsec()) {
+            return Err(UNSAFE);
+        }
+        let fingerprint = Fingerprint::from(metadata);
+        if !fingerprint.matches_after_rename(&self.fingerprint)
+            || check_named(&self.file, parent, &name, 0o400, &self.bytes)? != fingerprint
+        {
+            return Err(UNSAFE);
+        }
+        self.name = name;
+        self.fingerprint = fingerprint;
+        self.check(parent)
     }
 }

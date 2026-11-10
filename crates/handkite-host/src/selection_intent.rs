@@ -17,6 +17,14 @@
 //! use handkite_host::selection_intent::commit;
 //! ```
 //!
+//! ```compile_fail,E0603
+//! use handkite_host::selection_intent::retire;
+//! ```
+//!
+//! ```compile_fail,E0603
+//! use handkite_host::selection_intent::RetiredSelection;
+//! ```
+//!
 //! Retained pending-journal inspection remains an internal recovery prerequisite:
 //!
 //! ```compile_fail,E0603
@@ -460,6 +468,93 @@ pub(crate) async fn commit<'held, 'lock>(
         Err(CommitFailure {
             reason: "selection commit requires macOS",
             phase: CommitPhase::BeforeCommit,
+            residues: Vec::new(),
+        })
+    }
+}
+
+/// The boundary is the single exclusive pending-to-completed journal rename.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(any(not(test), not(target_os = "macos")), allow(dead_code))]
+pub(crate) enum RetirementPhase {
+    Before,
+    Applied,
+    Uncertain,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RetirementFailure {
+    reason: &'static str,
+    phase: RetirementPhase,
+    residues: Vec<String>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RetirementFailure {
+    pub(crate) fn reason(&self) -> &'static str {
+        self.reason
+    }
+    pub(crate) fn phase(&self) -> RetirementPhase {
+        self.phase
+    }
+    /// Relative candidates only, including uncertain names; never cleanup authority.
+    pub(crate) fn residue_candidates(&self) -> &[String] {
+        &self.residues
+    }
+}
+
+/// Retains the same lock, device agreement, releases, links and moved journal.
+/// No conversion back to commit authority or historical recovery proof exists.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) struct RetiredSelection<'held, 'lock> {
+    #[cfg(target_os = "macos")]
+    inner: macos::preparation::commit::Committed<'held, 'lock>,
+    #[cfg(not(target_os = "macos"))]
+    _unsupported: std::marker::PhantomData<(
+        DeviceAgreement<'lock>,
+        &'held mut PublishedRelease<'lock>,
+        &'lock InstallerLock,
+    )>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl RetiredSelection<'_, '_> {
+    pub(crate) fn revalidate(&mut self) -> Result<(), &'static str> {
+        #[cfg(target_os = "macos")]
+        {
+            self.inner.revalidate(
+                #[cfg(test)]
+                None,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
+        Err("selection journal retirement requires macOS")
+    }
+}
+
+/// Consume only a successful in-process commit, reobserve its original device,
+/// then rename its journal exactly once. No await follows the first mutation.
+/// Every failure preserves all resulting names without retry, repair or deletion.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) async fn retire<'held, 'lock>(
+    committed: CommittedSelection<'held, 'lock>,
+) -> Result<RetiredSelection<'held, 'lock>, RetirementFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::preparation::commit::retirement::retire(
+            committed,
+            #[cfg(test)]
+            &mut macos::preparation::commit::retirement::Hooks::production(),
+        )
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = committed;
+        Err(RetirementFailure {
+            reason: "selection journal retirement requires macOS",
+            phase: RetirementPhase::Before,
             residues: Vec::new(),
         })
     }

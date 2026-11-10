@@ -245,7 +245,7 @@ impl RetainedLink {
         name: CString,
         change: &crate::selection_intent::macos::preparation::ParentChange,
     ) -> Result<(), &'static str> {
-        let changed = change.link_change(&self.name, &name, self.identity())?;
+        let changed = change.entry_change(&self.name, &name, self.identity())?;
         let mut expected = self.observation.fingerprint.clone();
         expected.changed = changed;
         let uid = unsafe { libc::geteuid() };

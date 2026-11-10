@@ -31,6 +31,28 @@ async fn commit_fails_closed_on_unsupported_platforms() {
     );
 }
 
+#[cfg(not(target_os = "macos"))]
+#[tokio::test]
+async fn retirement_fails_closed_on_unsupported_platforms() {
+    let committed = CommittedSelection {
+        _unsupported: std::marker::PhantomData,
+    };
+    let failure = retire(committed).await.err().unwrap();
+    assert_eq!(
+        failure.reason(),
+        "selection journal retirement requires macOS"
+    );
+    assert_eq!(failure.phase(), RetirementPhase::Before);
+    assert!(failure.residue_candidates().is_empty());
+    let mut retired = RetiredSelection {
+        _unsupported: std::marker::PhantomData,
+    };
+    assert_eq!(
+        retired.revalidate(),
+        Err("selection journal retirement requires macOS")
+    );
+}
+
 fn wire(operation: WireOperation) -> WireIntent {
     WireIntent {
         version: 1,

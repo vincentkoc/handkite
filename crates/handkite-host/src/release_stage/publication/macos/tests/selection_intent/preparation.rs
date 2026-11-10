@@ -8,6 +8,7 @@ mod commit;
 mod config;
 mod device_admission;
 mod pending;
+mod retirement;
 
 const CANDIDATE: &str = ".selection-31313131313131313131313131313131";
 

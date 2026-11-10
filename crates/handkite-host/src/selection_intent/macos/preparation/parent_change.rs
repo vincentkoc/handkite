@@ -135,15 +135,15 @@ impl BeforeChange {
     }
 }
 
-/// Constructed only by checked single-entry creation or exact link rename deltas.
+/// Constructed only by checked creation, link selection, or journal retirement.
 pub(crate) struct ParentChange {
     before: Fingerprint,
     after: Fingerprint,
-    moved: Vec<LinkMove>,
+    moved: Vec<EntryMove>,
 }
 
 impl ParentChange {
-    pub(crate) fn link_change(
+    pub(crate) fn entry_change(
         &self,
         from: &CStr,
         to: &CStr,
@@ -168,7 +168,7 @@ impl ParentChange {
     }
 }
 
-struct LinkMove {
+struct EntryMove {
     from: CString,
     to: CString,
     identity: (i32, u64),
@@ -261,7 +261,7 @@ impl BeforeRename {
             if original != observed {
                 return Err(UNSAFE);
             }
-            let movement = LinkMove {
+            let movement = EntryMove {
                 from,
                 to,
                 identity: (observed.device, observed.inode),
@@ -289,5 +289,105 @@ impl BeforeRename {
             },
             inventory,
         ))
+    }
+}
+
+pub(super) struct BeforeRetirement {
+    inventory: RetainedInventory,
+    completion: CString,
+}
+
+impl BeforeRetirement {
+    pub(super) fn capture(
+        parent: &File,
+        journal: &Journal,
+        completion: CString,
+    ) -> Result<Self, &'static str> {
+        let fingerprint = metadata(parent)?;
+        let entries = entries(parent)?;
+        journal.check(parent)?;
+        let source = entries.get(JOURNAL.to_bytes()).ok_or(UNSAFE)?;
+        if (source.device, source.inode) != journal.identity()?
+            || source.mode & libc::S_IFMT != libc::S_IFREG
+            || entries.contains_key(completion.to_bytes())
+        {
+            return Err(UNSAFE);
+        }
+        let inventory = RetainedInventory {
+            fingerprint,
+            entries,
+        };
+        inventory.check(parent)?;
+        Ok(Self {
+            inventory,
+            completion,
+        })
+    }
+
+    pub(super) fn check(&self, parent: &File) -> Result<(), &'static str> {
+        self.inventory.check(parent)
+    }
+
+    /// The fixed source disappears, its exact inode appears once, and all other
+    /// entries retain their full metadata. Only the moved journal's ctime may vary.
+    pub(super) fn finish(
+        mut self,
+        parent: &File,
+    ) -> Result<(ParentChange, RetainedInventory), &'static str> {
+        let after = metadata(parent)?;
+        let mut current = entries(parent)?;
+        let mut original = self
+            .inventory
+            .entries
+            .remove(JOURNAL.to_bytes())
+            .ok_or(UNSAFE)?;
+        let observed = current.remove(self.completion.to_bytes()).ok_or(UNSAFE)?;
+        original.changed = observed.changed;
+        if original != observed
+            || current != self.inventory.entries
+            || !directory_matches(&after, &self.inventory.fingerprint, false)
+            || metadata(parent)? != after
+        {
+            return Err(UNSAFE);
+        }
+        let movement = EntryMove {
+            from: JOURNAL.into(),
+            to: self.completion,
+            identity: (observed.device, observed.inode),
+            changed: observed.changed,
+        };
+        current.insert(movement.to.to_bytes().to_vec(), observed);
+        let inventory = RetainedInventory {
+            fingerprint: after.clone(),
+            entries: current,
+        };
+        Ok((
+            ParentChange {
+                before: self.inventory.fingerprint,
+                after,
+                moved: vec![movement],
+            },
+            inventory,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inventory_refuses_to_truncate_after_4096_entries() {
+        let directory = tempfile::tempdir().unwrap();
+        let parent = File::open(directory.path()).unwrap();
+        for index in 0..4096 {
+            std::fs::write(directory.path().join(format!("entry-{index}")), b"").unwrap();
+        }
+        assert_eq!(entries(&parent).unwrap().len(), 4096);
+        std::fs::write(directory.path().join("one-too-many"), b"").unwrap();
+        assert_eq!(
+            entries(&parent).err(),
+            Some("selection releases inventory exceeds limit")
+        );
     }
 }

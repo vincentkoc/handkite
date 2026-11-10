@@ -2,6 +2,8 @@ use super::*;
 use crate::selection_intent::{CommitFailure, CommitPhase, CommittedSelection};
 use parent_change::{BeforeRename, RetainedInventory};
 
+pub(crate) mod retirement;
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Point {
