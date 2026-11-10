@@ -21,7 +21,7 @@ const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focu
 pub struct WdaAdapter {
     expected: HardwareId,
     usb: PinnedUsb,
-    runtime: tokio::runtime::Runtime,
+    runtime: Option<tokio::runtime::Runtime>,
     actions: WdaActions,
     owned_runner: Option<OwnedWdaRunner>,
     owned_session: Option<String>,
@@ -36,7 +36,7 @@ impl WdaAdapter {
         Ok(Self {
             usb: PinnedUsb::new(expected.clone()),
             expected,
-            runtime,
+            runtime: Some(runtime),
             actions: WdaActions::default(),
             owned_runner: None,
             owned_session: None,
@@ -67,7 +67,7 @@ impl WdaAdapter {
         Ok(Self {
             expected,
             usb,
-            runtime,
+            runtime: Some(runtime),
             actions,
             owned_runner: Some(runner),
             owned_session: Some(session),
@@ -87,6 +87,8 @@ impl WdaAdapter {
             return Err(AdapterError);
         }
         self.runtime
+            .as_ref()
+            .expect("adapter runtime")
             .block_on(validate_session(&UsbWda::new(self.usb.clone()), session))
             .map_err(|_| AdapterError)?;
         if self
@@ -104,9 +106,11 @@ impl WdaAdapter {
         source_path: &str,
     ) -> Result<(RawObservation, Instant), AdapterError> {
         self.validate_owned()?;
-        let captured =
-            self.runtime
-                .block_on(Self::capture(&self.usb, &self.expected, source_path))?;
+        let captured = self
+            .runtime
+            .as_ref()
+            .expect("adapter runtime")
+            .block_on(Self::capture(&self.usb, &self.expected, source_path))?;
         self.validate_owned()?;
         Ok(captured)
     }
@@ -187,6 +191,8 @@ impl DeviceAdapter for WdaAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
         self.validate_owned()?;
         self.runtime
+            .as_ref()
+            .expect("adapter runtime")
             .block_on(self.usb.provider())
             .map_err(|_| AdapterError)?;
         Ok((self.expected.clone(), self.expected.clone()))
@@ -206,6 +212,8 @@ impl DeviceAdapter for WdaAdapter {
         let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
         let receipt = self
             .runtime
+            .as_ref()
+            .expect("adapter runtime")
             .block_on(self.actions.execute_with_existing_session(&wda, action))?;
         self.validate_owned()?;
         Ok(receipt)
@@ -218,11 +226,12 @@ impl DeviceAdapter for WdaAdapter {
 
 impl Drop for WdaAdapter {
     fn drop(&mut self) {
+        let runtime = self.runtime.take().expect("adapter runtime");
         if let Some(runner) = self.owned_runner.take() {
             if let Some(session) = self.owned_session.take() {
                 if runner.is_finished() {
                     eprintln!("handkite: owned runner exited before session close");
-                } else if self.runtime.block_on(close_owned_session(
+                } else if runtime.block_on(close_owned_session(
                     &UsbWda::new(self.usb.clone()),
                     &session,
                 )) != SessionClose::Acknowledged
@@ -230,13 +239,14 @@ impl Drop for WdaAdapter {
                     eprintln!("handkite: owned session close unproven");
                 }
             }
-            if self.runtime.block_on(async {
+            if runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), runner.abort_and_join()).await
             }) != Ok(Ok(()))
             {
                 eprintln!("handkite: owned runner host task termination unproven");
             }
         }
+        runtime.shutdown_timeout(Duration::from_secs(5));
     }
 }
 
