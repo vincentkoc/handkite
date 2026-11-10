@@ -21,7 +21,12 @@ pub struct AdapterError;
 pub trait DeviceAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
-    fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError>;
+    /// The adapter must send no action bytes at or after this monotonic deadline.
+    fn execute(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError>;
     /// Query only the pinned device, without sending input or retrying the action.
     fn native_lock_state(&mut self) -> LockState {
         LockState::Uncertain
@@ -190,17 +195,33 @@ impl<A: DeviceAdapter> Controller<A> {
             inner.last = Some(fresh);
             return Err(ControllerError::LockedAction);
         }
-        inner.last = Some(fresh);
-
         let is_lock = matches!(&request.action, Action::Lock);
-        if inner
+        let finished_unix_ms = fresh.window.finished_unix_ms;
+        inner.last = Some(fresh);
+        let Some(lease) = inner
             .lease
             .as_ref()
-            .is_none_or(|lease| lease.expires_at <= Instant::now())
-        {
+            .filter(|lease| lease.expires_at > Instant::now())
+        else {
             return Err(ControllerError::InvalidLease);
-        }
-        let receipt = match inner.adapter.execute(&request.action) {
+        };
+        let observed_at = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ControllerError::StaleObservation)?
+            .as_millis() as u64;
+        let age = observed_at
+            .checked_sub(finished_unix_ms)
+            .ok_or(ControllerError::StaleObservation)?;
+        let remaining = self
+            .max_age_ms
+            .checked_sub(age)
+            .filter(|remaining| *remaining > 0)
+            .ok_or(ControllerError::StaleObservation)?;
+        let observation_deadline = Instant::now()
+            .checked_add(Duration::from_millis(remaining))
+            .ok_or(ControllerError::StaleObservation)?;
+        let send_deadline = observation_deadline.min(lease.expires_at);
+        let receipt = match inner.adapter.execute(&request.action, send_deadline) {
             Ok(receipt) => receipt,
             // An error can follow delivery. Keep checking the postcondition without replay.
             Err(_) if is_lock => TransportReceipt {

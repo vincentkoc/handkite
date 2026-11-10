@@ -15,6 +15,8 @@ struct FakeAdapter {
     native_lock: LockState,
     native_queries: usize,
     capture_wait_until: Option<Instant>,
+    send_deadline: Option<Instant>,
+    send_started: Option<Instant>,
 }
 
 impl FakeAdapter {
@@ -34,6 +36,8 @@ impl FakeAdapter {
             native_lock: LockState::Uncertain,
             native_queries: 0,
             capture_wait_until: None,
+            send_deadline: None,
+            send_started: None,
         }
     }
 }
@@ -83,7 +87,16 @@ impl DeviceAdapter for FakeAdapter {
         })
     }
 
-    fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
+    fn execute(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        if Instant::now() >= send_deadline {
+            return Err(AdapterError);
+        }
+        self.send_started = Some(Instant::now());
+        self.send_deadline = Some(send_deadline);
         self.actions += 1;
         if self.fail_after_action {
             self.fail_capture = true;
@@ -111,6 +124,65 @@ impl DeviceAdapter for FakeAdapter {
         self.native_queries += 1;
         self.native_lock
     }
+}
+
+#[test]
+fn action_send_deadline_is_bounded_by_lease_and_observation() {
+    let (first_controller, key) = controller();
+    let lease = first_controller
+        .acquire("agent".into(), Duration::from_secs(2))
+        .unwrap();
+    let lease_expires = first_controller
+        .inner
+        .lock()
+        .unwrap()
+        .lease
+        .as_ref()
+        .unwrap()
+        .expires_at;
+    first_controller
+        .act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key.clone(),
+                expected_revision: None,
+                action: Action::Home,
+            },
+        )
+        .unwrap();
+    assert!(
+        first_controller
+            .inner
+            .lock()
+            .unwrap()
+            .adapter
+            .send_deadline
+            .unwrap()
+            <= lease_expires
+    );
+
+    let (mut controller, key) = controller();
+    controller.max_age_ms = 1_000;
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    controller
+        .act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: None,
+                action: Action::Home,
+            },
+        )
+        .unwrap();
+    let inner = controller.inner.lock().unwrap();
+    assert!(
+        inner.adapter.send_deadline.unwrap()
+            <= inner.adapter.send_started.unwrap() + Duration::from_secs(1)
+    );
 }
 
 fn controller() -> (Controller<FakeAdapter>, DeviceKey) {

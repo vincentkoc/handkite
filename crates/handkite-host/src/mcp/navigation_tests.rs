@@ -12,7 +12,7 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::thread::{self, JoinHandle};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[derive(Default)]
 struct FakeState {
@@ -68,7 +68,14 @@ impl DeviceAdapter for FakeAdapter {
         })
     }
 
-    fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
+    fn execute(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        if Instant::now() >= send_deadline {
+            return Err(AdapterError);
+        }
         let mut state = self.0.lock().unwrap();
         state.actions.push(action.kind());
         state.app = Some(match action {

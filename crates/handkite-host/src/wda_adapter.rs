@@ -192,12 +192,16 @@ impl DeviceAdapter for WdaAdapter {
         Ok(observation)
     }
 
-    fn execute(&mut self, action: &Action) -> Result<TransportReceipt, AdapterError> {
+    fn execute(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
         self.validate_owned()?;
-        let receipt = self.runtime.block_on(
-            self.actions
-                .execute_with_existing_session(&UsbWda::new(self.usb.clone()), action),
-        )?;
+        let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
+        let receipt = self
+            .runtime
+            .block_on(self.actions.execute_with_existing_session(&wda, action))?;
         self.validate_owned()?;
         Ok(receipt)
     }
