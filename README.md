@@ -307,7 +307,9 @@ The default `touch-trial` command does not change idle settings.
 must be the fixed protected service config, with a configured runner ID. The
 probe acquires Handkite's service lock, starts one XCTest runner, creates one
 session, and checks the unlocked World Clock starting state twice on that exact
-session before one tap. It requires a confirmed Clock transition and verified
+session before one tap. Runner and service ownership are checked through USB
+connect and the tap write; a lost service lock during cleanup cannot confirm the
+trial. It requires a confirmed Clock transition and verified
 idle-settings restoration, then attempts one bounded close of that session and
 joins the runner. Uncertain cleanup is reported as unknown, without replay.
 It never reads a PIN or touches the stop marker. This route is offline-tested;
