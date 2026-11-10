@@ -15,6 +15,9 @@ const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focu
 const PIN_VIEW_BUDGET: Duration = Duration::from_secs(5);
 const SUPERVISED_WAKE_SETTLE: Duration = Duration::from_millis(1500);
 
+mod owned_input;
+use owned_input::InputRequests;
+
 struct PreparedPinView {
     view: ParsedPasscodeView,
     fresh_until: Instant,
@@ -42,6 +45,7 @@ pub struct NativePasscodeBackend {
     awaiting_first_digit: bool,
     progress_check: ProgressCheck,
     coordinate_pin_taps: bool,
+    input_admission: Option<Box<dyn Fn() -> bool + Send + Sync>>,
 }
 
 #[derive(Clone, Copy)]
@@ -85,6 +89,7 @@ impl NativePasscodeBackend {
             awaiting_first_digit: false,
             progress_check: ProgressCheck::Disabled,
             coordinate_pin_taps: false,
+            input_admission: None,
         })
     }
 
@@ -110,6 +115,27 @@ impl NativePasscodeBackend {
         self.last_diagnostics
     }
 
+    /// Recheck runner and service ownership at every session-bound input dispatch.
+    /// Do not include the PIN stop gate: this attempt marks it before digit input.
+    pub fn with_input_admission(
+        mut self,
+        admit: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<Self, BackendError> {
+        if !self.session_bound {
+            return Err(BackendError::Unavailable);
+        }
+        self.input_admission = Some(Box::new(admit));
+        Ok(self)
+    }
+
+    fn admit_input(&self) -> Result<(), BackendError> {
+        if self.input_admission.as_ref().is_some_and(|admit| !admit()) {
+            Err(BackendError::Unavailable)
+        } else {
+            Ok(())
+        }
+    }
+
     /// Coordinate PIN taps are available only inside the supervised session bracket.
     pub fn with_coordinate_pin_taps(mut self) -> Result<Self, BackendError> {
         if !self.session_bound || !self.supervised_visibility_fallback {
@@ -126,6 +152,10 @@ impl NativePasscodeBackend {
                 .runtime
                 .block_on(async {
                     if backend.session_bound {
+                        let wda = InputRequests {
+                            wda: &wda,
+                            admission: backend.input_admission.as_deref(),
+                        };
                         bound_action(
                             &mut backend.actions,
                             &wda,
@@ -157,6 +187,7 @@ impl NativePasscodeBackend {
         {
             return Err(BackendError::Unavailable);
         }
+        self.admit_input()?;
         dispatch(self, action, prepared.fresh_until)
     }
 
@@ -202,6 +233,7 @@ impl NativePasscodeBackend {
         {
             return Err(BackendError::Unavailable);
         }
+        self.admit_input()?;
         wake(self, prepared.fresh_until)?;
         settle(SUPERVISED_WAKE_SETTLE);
         // The core samples again before marking the gate. Keep the same zero-progress
@@ -473,6 +505,10 @@ impl PasscodeBackend for NativePasscodeBackend {
                 Instant::now(),
                 |backend, fresh_until| {
                     let wda = UsbWda::new(backend.usb.clone()).with_write_deadline(fresh_until);
+                    let wda = InputRequests {
+                        wda: &wda,
+                        admission: backend.input_admission.as_deref(),
+                    };
                     backend
                         .runtime
                         .block_on(backend.actions.wake_with_existing_session(&wda))
@@ -504,6 +540,11 @@ impl PasscodeBackend for NativePasscodeBackend {
         if self.session_bound {
             let deadline = prepared.ok_or(BackendError::Unavailable)?.fresh_until;
             let wda = wda.with_write_deadline(deadline);
+            self.admit_input()?;
+            let wda = InputRequests {
+                wda: &wda,
+                admission: self.input_admission.as_deref(),
+            };
             self.runtime
                 .block_on(self.actions.wake_with_existing_session(&wda))
                 .map_err(|_| BackendError::Unavailable)?;
@@ -618,6 +659,36 @@ mod tests {
             "fixture-session",
         )
         .unwrap()
+    }
+
+    #[test]
+    fn owned_input_admission_requires_a_bound_session_and_precedes_dispatch() {
+        assert!(backend().with_input_admission(|| true).is_err());
+        let mut backend = bound_backend().with_input_admission(|| false).unwrap();
+        let now = Instant::now();
+        prepare(&mut backend, now);
+        assert_eq!(
+            backend.request_action_with(
+                &Action::Tap {
+                    at: Point { x: 100.0, y: 200.0 },
+                },
+                now,
+                |_, _, _| panic!("lost ownership must precede dispatch"),
+            ),
+            Err(BackendError::Unavailable)
+        );
+        backend
+            .snapshot_with(now, |_, _| Ok(hidden_capture()), || now)
+            .unwrap();
+        assert_eq!(
+            backend.wake_hidden_with(
+                now,
+                |_, _| panic!("lost ownership must precede wake"),
+                |_| panic!("refused wake must not settle"),
+                |_| panic!("refused wake must not sample"),
+            ),
+            Err(BackendError::Unavailable)
+        );
     }
 
     fn progress_capture(entered: u32) -> (PasscodeScreen, ParsedPasscodeView) {
