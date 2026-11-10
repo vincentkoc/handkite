@@ -256,7 +256,7 @@ fn start_response(value: &str) -> String {
 
 fn finish_response(ptm: &str, tk: &str) -> String {
     response(&format!(
-        "<key>ptm</key><string>{ptm}</string><key>tk</key><string>{tk}</string>"
+        "<key>ptm</key><string>{ptm}</string><key>tk</key><string>{tk}</string><key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>"
     ))
 }
 
@@ -290,12 +290,8 @@ fn encoders_produce_the_required_request_dictionaries() {
 fn successful_responses_return_existing_typed_data() {
     let _: StartProvisioningData =
         parse_start_response(200, start_response("YQ==").as_bytes()).unwrap();
-    let _: EndProvisioningData = parse_finish_response(
-        200,
-        finish_response("Yg==", "Yw==").as_bytes(),
-        &[("x-apple-i-md-rinfo", b"17106176")],
-    )
-    .unwrap();
+    let _: EndProvisioningData =
+        parse_finish_response(200, finish_response("Yg==", "Yw==").as_bytes()).unwrap();
 }
 
 #[test]
@@ -304,12 +300,7 @@ fn response_requires_both_http_success_and_signed_zero_status() {
     for http_status in [0, 201, 301, 401, 500] {
         assert!(parse_start_response(http_status, body.as_bytes()).is_err());
         assert!(
-            parse_finish_response(
-                http_status,
-                finish_response("Yg==", "Yw==").as_bytes(),
-                &[(ROUTING_INFO_HEADER, b"1")]
-            )
-            .is_err()
+            parse_finish_response(http_status, finish_response("Yg==", "Yw==").as_bytes()).is_err()
         );
     }
     for status in [
@@ -324,9 +315,7 @@ fn response_requires_both_http_success_and_signed_zero_status() {
                 .is_err()
         );
         let finish = finish_response("Yg==", "Yw==").replace("<integer>0</integer>", status);
-        assert!(
-            parse_finish_response(200, finish.as_bytes(), &[(ROUTING_INFO_HEADER, b"1")]).is_err()
-        );
+        assert!(parse_finish_response(200, finish.as_bytes()).is_err());
     }
     for body in [
         body.replace(
@@ -337,9 +326,7 @@ fn response_requires_both_http_success_and_signed_zero_status() {
         body.replace("<key>Response</key>", "<key>WrongResponse</key>"),
     ] {
         assert!(parse_start_response(200, body.as_bytes()).is_err());
-        assert!(
-            parse_finish_response(200, body.as_bytes(), &[(ROUTING_INFO_HEADER, b"1")]).is_err()
-        );
+        assert!(parse_finish_response(200, body.as_bytes()).is_err());
     }
 }
 
@@ -365,14 +352,12 @@ fn response_rejects_duplicate_required_fields() {
     ] {
         assert!(parse_start_response(200, body.as_bytes()).is_err());
     }
-    for field in ["ptm", "tk"] {
+    for field in ["ptm", "tk", ROUTING_INFO_HEADER] {
         let body = finish_response("Yg==", "Yw==").replace(
             &format!("<key>{field}</key>"),
             &format!("<key>{field}</key><string>YQ==</string><key>{field}</key>"),
         );
-        assert!(
-            parse_finish_response(200, body.as_bytes(), &[(ROUTING_INFO_HEADER, b"1")]).is_err()
-        );
+        assert!(parse_finish_response(200, body.as_bytes()).is_err());
     }
 }
 
@@ -391,15 +376,12 @@ fn response_rejects_missing_or_wrong_binary_field_types() {
         response("<key>ptm</key><true/><key>tk</key><string>Yw==</string>"),
         response("<key>ptm</key><string>Yg==</string><key>tk</key><integer>1</integer>"),
     ] {
-        assert!(
-            parse_finish_response(200, body.as_bytes(), &[(ROUTING_INFO_HEADER, b"1")]).is_err()
-        );
+        assert!(parse_finish_response(200, body.as_bytes()).is_err());
     }
 }
 
 #[test]
 fn all_binary_fields_require_canonical_nonempty_bounded_base64() {
-    let headers = [(ROUTING_INFO_HEADER, b"1".as_slice())];
     for value in [
         "",
         "a",
@@ -412,123 +394,98 @@ fn all_binary_fields_require_canonical_nonempty_bounded_base64() {
     ] {
         assert!(encode_finish_request(value).is_err());
         assert!(parse_start_response(200, start_response(value).as_bytes()).is_err());
-        assert!(
-            parse_finish_response(200, finish_response(value, "YQ==").as_bytes(), &headers)
-                .is_err()
-        );
-        assert!(
-            parse_finish_response(200, finish_response("YQ==", value).as_bytes(), &headers)
-                .is_err()
-        );
+        assert!(parse_finish_response(200, finish_response(value, "YQ==").as_bytes()).is_err());
+        assert!(parse_finish_response(200, finish_response("YQ==", value).as_bytes()).is_err());
     }
     let maximum = STANDARD.encode(vec![0x61; MAX_CPIM_BYTES]);
     assert!(encode_finish_request(&maximum).is_ok());
     assert!(parse_start_response(200, start_response(&maximum).as_bytes()).is_ok());
-    assert!(
-        parse_finish_response(
-            200,
-            finish_response(&maximum, &maximum).as_bytes(),
-            &headers
-        )
-        .is_ok()
-    );
+    assert!(parse_finish_response(200, finish_response(&maximum, &maximum).as_bytes()).is_ok());
     let oversized = STANDARD.encode(vec![0x61; MAX_CPIM_BYTES + 1]);
     assert!(encode_finish_request(&oversized).is_err());
     assert!(parse_start_response(200, start_response(&oversized).as_bytes()).is_err());
-    assert!(
-        parse_finish_response(
-            200,
-            finish_response(&oversized, "YQ==").as_bytes(),
-            &headers
-        )
-        .is_err()
-    );
-    assert!(
-        parse_finish_response(
-            200,
-            finish_response("YQ==", &oversized).as_bytes(),
-            &headers
-        )
-        .is_err()
-    );
+    assert!(parse_finish_response(200, finish_response(&oversized, "YQ==").as_bytes()).is_err());
+    assert!(parse_finish_response(200, finish_response("YQ==", &oversized).as_bytes()).is_err());
 }
 
 #[test]
-fn routing_header_is_required_once_case_insensitively() {
-    assert_eq!(
-        extract_routing_info(&[
-            ("Content-Type", b"application/x-apple-plist"),
-            ("x-ApPlE-i-Md-RiNfO", b"17106176")
-        ])
-        .unwrap()
-        .value(),
-        17106176
-    );
-    assert!(extract_routing_info(&[]).is_err());
-    assert!(extract_routing_info(&[("Unrelated", b"1")]).is_err());
-    assert!(
-        extract_routing_info(&[(ROUTING_INFO_HEADER, b"1"), ("x-apple-i-md-rinfo", b"1")]).is_err()
-    );
-    assert!(
-        extract_routing_info(&[(ROUTING_INFO_HEADER, b"1"), (ROUTING_INFO_HEADER, b"2")]).is_err()
-    );
+fn routing_field_requires_exact_response_key() {
     let body = finish_response("Yg==", "Yw==");
-    assert!(parse_finish_response(200, body.as_bytes(), &[]).is_err());
-    assert!(
-        parse_finish_response(
-            200,
-            body.as_bytes(),
-            &[(ROUTING_INFO_HEADER, b"1"), ("x-apple-i-md-rinfo", b"1")]
-        )
-        .is_err()
-    );
-}
-
-#[test]
-fn routing_header_requires_positive_unsigned_decimal() {
-    for value in [
-        b"".as_slice(),
-        b"0",
-        b"-1",
-        b"+1",
-        b" 1",
-        b"1 ",
-        b"1\r\n",
-        b"1,1",
-        b"1.0",
-        b"18446744073709551616",
-        b"\xff",
-        b"000000000000000000001",
+    for invalid in [
+        body.replace("<key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>", ""),
+        body.replace("X-Apple-I-MD-RINFO", "x-apple-i-md-rinfo"),
+        body.replace(
+            "<key>Response</key>",
+            "<key>X-Apple-I-MD-RINFO</key><integer>17106176</integer><key>Response</key>",
+        ).replace("<key>tk</key><string>Yw==</string><key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>", "<key>tk</key><string>Yw==</string>"),
     ] {
-        assert!(extract_routing_info(&[(ROUTING_INFO_HEADER, value)]).is_err());
+        assert!(parse_finish_response(200, invalid.as_bytes()).is_err());
     }
-    assert_eq!(
-        extract_routing_info(&[(ROUTING_INFO_HEADER, b"18446744073709551615")])
-            .unwrap()
-            .value(),
-        u64::MAX
-    );
 }
 
 #[test]
-fn header_list_and_response_body_are_bounded() {
-    let many = vec![("Unrelated", b"1".as_slice()); MAX_HEADER_COUNT + 1];
-    assert!(extract_routing_info(&many).is_err());
-    let large = vec![b'a'; MAX_HEADER_BYTES];
-    assert!(extract_routing_info(&[(ROUTING_INFO_HEADER, b"1"), ("Unrelated", &large)]).is_err());
+fn routing_field_accepts_positive_u64_integer_or_strict_decimal_string() {
+    let body = finish_response("Yg==", "Yw==");
+    for value in [1, 17106176, i64::MAX as u64 + 1, u64::MAX] {
+        for tag in ["integer", "string"] {
+            let body = body.replace(
+                "<integer>17106176</integer>",
+                &format!("<{tag}>{value}</{tag}>"),
+            );
+            assert!(parse_finish_response(200, body.as_bytes()).is_ok());
+            let root = successful_response(200, body.as_bytes()).unwrap();
+            let routing = extract_routing_info(
+                root.field("Response")
+                    .unwrap()
+                    .field(ROUTING_INFO_HEADER)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(routing.value(), value);
+        }
+    }
+    for value in [
+        "<integer>0</integer>",
+        "<integer>-1</integer>",
+        "<integer>-9223372036854775809</integer>",
+        "<integer>18446744073709551616</integer>",
+        "<integer>340282366920938463463374607431768211455</integer>",
+        "<string></string>",
+        "<string>0</string>",
+        "<string>-1</string>",
+        "<string>+1</string>",
+        "<string> 1</string>",
+        "<string>1 </string>",
+        "<string>1\r\n</string>",
+        "<string>1,1</string>",
+        "<string>1.0</string>",
+        "<string>18446744073709551616</string>",
+        "<string>000000000000000000001</string>",
+        "<true/>",
+        "<dict/>",
+        "<array><integer>1</integer></array>",
+    ] {
+        let body = body.replace("<integer>17106176</integer>", value);
+        assert!(parse_finish_response(200, body.as_bytes()).is_err());
+    }
+}
+
+#[test]
+fn response_body_is_bounded() {
     let large = "a".repeat(MAX_RESPONSE_BYTES);
     let start = response(&format!(
         "<key>spim</key><string>YQ==</string><key>extra</key><string>{large}</string>"
     ));
     assert!(parse_start_response(200, start.as_bytes()).is_err());
-    let finish = response(&format!(
-        "<key>ptm</key><string>Yg==</string><key>tk</key><string>Yw==</string><key>extra</key><string>{large}</string>"
-    ));
-    assert!(parse_finish_response(200, finish.as_bytes(), &[(ROUTING_INFO_HEADER, b"1")]).is_err());
+    let finish = finish_response("Yg==", "Yw==").replace(
+        "<key>ptm</key>",
+        &format!("<key>extra</key><string>{large}</string><key>ptm</key>"),
+    );
+    assert!(parse_finish_response(200, finish.as_bytes()).is_err());
 }
 
 #[test]
-fn response_errors_discard_apple_and_header_detail() {
+fn response_errors_discard_apple_and_routing_detail() {
     let secret = "synthetic-sensitive-value";
     let body = start_response("YQ==").replace(
         "<integer>0</integer>",
@@ -538,8 +495,12 @@ fn response_errors_discard_apple_and_header_detail() {
         parse_start_response(200, body.as_bytes()).err(),
         Some(INVALID_RESPONSE)
     );
+    let body = finish_response("Yg==", "Yw==").replace(
+        "<integer>17106176</integer>",
+        &format!("<string>{secret}</string>"),
+    );
     assert_eq!(
-        extract_routing_info(&[(ROUTING_INFO_HEADER, secret.as_bytes())]).err(),
+        parse_finish_response(200, body.as_bytes()).err(),
         Some(INVALID_ROUTING)
     );
 }

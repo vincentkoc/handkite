@@ -129,13 +129,7 @@ impl ProvisioningDataProvider for AppleProvisioningProvider {
                 )
                 .await
                 .map_err(|_| ProvisioningDataError)?;
-            // HeaderMap::iter yields every value, preserving duplicate RINFO entries.
-            let headers: Vec<_> = response
-                .headers
-                .iter()
-                .map(|(name, value)| (name.as_str(), value.as_bytes()))
-                .collect();
-            parse_finish_response(200, &response.body, &headers).map_err(|_| ProvisioningDataError)
+            parse_finish_response(200, &response.body).map_err(|_| ProvisioningDataError)
         }
     }
 }

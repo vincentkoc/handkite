@@ -19,8 +19,10 @@ fn start_response() -> Vec<u8> {
 
 fn finish_response(routing: &str) -> Vec<u8> {
     response(
-        routing,
-        &successful("<key>ptm</key><string>Yw==</string><key>tk</key><string>ZA==</string>"),
+        "",
+        &successful(&format!(
+            "<key>ptm</key><string>Yw==</string><key>tk</key><string>ZA==</string>{routing}"
+        )),
     )
 }
 
@@ -52,7 +54,7 @@ pub(crate) async fn fixture_provider() -> (AppleProvisioningProvider, JoinHandle
                     &lookup(START, FINISH),
                 ),
                 start_response(),
-                finish_response("X-Apple-I-MD-RINFO: 17106176\r\n"),
+                finish_response("<key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>"),
             ],
             false,
         )
@@ -115,7 +117,7 @@ async fn start_and_finish_close_keep_alive_connections_without_pooling() {
     let (client, server) = TlsFixture::new("provision.example.test", true, false)
         .keep_alive(vec![
             start_response(),
-            finish_response("X-Apple-I-MD-RINFO: 17106176\r\n"),
+            finish_response("<key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>"),
         ])
         .await;
     let mut provider = provider(client);
@@ -157,12 +159,12 @@ async fn empty_production_policy_and_unapproved_lookup_fail_before_provisioning(
 }
 
 #[tokio::test]
-async fn finish_preserves_and_rejects_duplicate_routing_headers() {
+async fn finish_rejects_duplicate_routing_plist_fields() {
     let (client, server) = TlsFixture::new("provision.example.test", true, false)
         .serve(
             vec![
                 start_response(),
-                finish_response("X-Apple-I-MD-RINFO: 17106176\r\nx-apple-i-md-rinfo: 17106176\r\n"),
+                finish_response("<key>X-Apple-I-MD-RINFO</key><integer>17106176</integer><key>X-Apple-I-MD-RINFO</key><integer>17106176</integer>"),
             ],
             false,
         )
@@ -172,6 +174,29 @@ async fn finish_preserves_and_rejects_duplicate_routing_headers() {
     assert!(provider.finish("Yg==").await.is_err());
     assert!(provider.finish("Yg==").await.is_err());
     assert_eq!(server.await.unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn finish_uses_only_plist_routing_information() {
+    for routing in ["", "<key>X-Apple-I-MD-RINFO</key><string>17106176</string>"] {
+        let (client, server) = TlsFixture::new("provision.example.test", true, false)
+            .serve(
+                vec![
+                    start_response(),
+                    response(
+                        "X-Apple-I-MD-RINFO: 0\r\nx-apple-i-md-rinfo: 1\r\n",
+                        &successful(&format!("<key>ptm</key><string>Yw==</string><key>tk</key><string>ZA==</string>{routing}")),
+                    ),
+                ],
+                false,
+            )
+            .await;
+        let mut provider = provider(client);
+        provider.start().await.unwrap();
+        assert_eq!(provider.finish("Yg==").await.is_ok(), !routing.is_empty());
+        assert!(provider.finish("Yg==").await.is_err());
+        assert_eq!(server.await.unwrap().len(), 2);
+    }
 }
 
 #[tokio::test]

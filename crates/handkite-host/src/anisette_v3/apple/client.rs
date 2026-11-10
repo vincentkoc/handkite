@@ -1,9 +1,6 @@
 use super::{AppleProvisioningContext, MAX_HEADER_BYTES, MAX_HEADER_COUNT};
 use futures_util::StreamExt;
-use reqwest::{
-    Url,
-    header::{CONTENT_ENCODING, HeaderMap},
-};
+use reqwest::{Url, header::CONTENT_ENCODING};
 use rustls::{ClientConfig, RootCertStore};
 use std::{sync::Arc, time::Duration};
 use zeroize::Zeroizing;
@@ -21,7 +18,6 @@ pub(super) struct AppleClient {
 
 pub(super) struct AppleResponse {
     pub body: Zeroizing<Vec<u8>>,
-    pub headers: HeaderMap,
 }
 
 impl AppleClient {
@@ -103,7 +99,6 @@ impl AppleClient {
                     .filter(|bytes| *bytes <= MAX_HEADER_BYTES)
                     .ok_or(RESPONSE_FAILED)?;
             }
-            let headers = headers.clone();
             let mut stream = response.bytes_stream();
             let mut body = Zeroizing::new(Vec::new());
             while let Some(chunk) = stream.next().await {
@@ -113,7 +108,7 @@ impl AppleClient {
                 }
                 body.extend_from_slice(&chunk);
             }
-            Ok(AppleResponse { body, headers })
+            Ok(AppleResponse { body })
         })
         .await
         .map_err(|_| REQUEST_FAILED)?

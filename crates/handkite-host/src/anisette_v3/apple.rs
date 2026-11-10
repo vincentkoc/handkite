@@ -24,7 +24,7 @@ const MAX_HEADER_BYTES: usize = 16 * 1024;
 const MAX_HEADER_COUNT: usize = 128;
 const INVALID_LOOKUP: &str = "Apple provisioning lookup is invalid";
 const INVALID_RESPONSE: &str = "Apple provisioning response is invalid";
-const INVALID_ROUTING: &str = "Apple provisioning routing header is invalid";
+const INVALID_ROUTING: &str = "Apple provisioning routing information is invalid";
 
 /// Builds the empty start request. This does not send an Apple request.
 pub fn encode_start_request() -> Zeroizing<String> {
@@ -51,38 +51,29 @@ pub fn parse_start_response(
 pub fn parse_finish_response(
     http_status: u16,
     body: &[u8],
-    headers: &[(&str, &[u8])],
 ) -> Result<EndProvisioningData, &'static str> {
     let root = successful_response(http_status, body)?;
     let response = root.field("Response")?;
     let ptm = response.field("ptm")?.string()?;
     let tk = response.field("tk")?.string()?;
-    let routing_info = extract_routing_info(headers)?;
+    let routing_info = extract_routing_info(response.field(ROUTING_INFO_HEADER)?)?;
     EndProvisioningData::new(ptm.to_owned(), tk.to_owned(), routing_info)
 }
 
-/// Read the original header list before any duplicate joining or replacement.
-pub fn extract_routing_info(headers: &[(&str, &[u8])]) -> Result<RoutingInfo, &'static str> {
-    if headers.len() > MAX_HEADER_COUNT {
-        return Err(INVALID_ROUTING);
-    }
-    let mut bytes = 0usize;
-    let mut routing = None;
-    for (name, value) in headers {
-        bytes = bytes
-            .checked_add(name.len())
-            .and_then(|bytes| bytes.checked_add(value.len()))
-            .filter(|bytes| *bytes <= MAX_HEADER_BYTES)
-            .ok_or(INVALID_ROUTING)?;
-        if name.eq_ignore_ascii_case(ROUTING_INFO_HEADER) {
-            if routing.is_some() || value.len() > 20 {
+fn extract_routing_info(value: &plist::Value) -> Result<RoutingInfo, &'static str> {
+    match value {
+        plist::Value::Integer(value) => {
+            let value = u64::try_from(*value).map_err(|_| INVALID_ROUTING)?;
+            if value == 0 {
                 return Err(INVALID_ROUTING);
             }
-            let value = std::str::from_utf8(value).map_err(|_| INVALID_ROUTING)?;
-            routing = Some(RoutingInfo::parse_apple_header(value).map_err(|_| INVALID_ROUTING)?);
+            Ok(RoutingInfo(value))
         }
+        plist::Value::String(value) if value.len() <= 20 => {
+            RoutingInfo::parse_apple_header(value).map_err(|_| INVALID_ROUTING)
+        }
+        _ => Err(INVALID_ROUTING),
     }
-    routing.ok_or(INVALID_ROUTING)
 }
 
 fn successful_response(http_status: u16, body: &[u8]) -> Result<plist::Value, &'static str> {
