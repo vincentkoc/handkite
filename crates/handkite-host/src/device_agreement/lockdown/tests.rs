@@ -41,17 +41,34 @@ async fn only_one_getvalue_is_sent_and_exact_string_is_preserved() {
 
 #[tokio::test]
 async fn missing_nonstring_error_duplicate_and_malformed_replies_fail_closed() {
-    for content in [
-        "<key>Request</key><string>GetValue</string>",
-        "<key>Value</key><string>test-device</string>",
-        "<key>Request</key><string>GetValue</string><key>Value</key><integer>9</integer>",
-        "<key>Request</key><string>GetValue</string><key>Error</key><string>DeviceLocked</string><key>Value</key><string>test-device</string>",
-        "<key>Request</key><string>GetValue</string><key>Value</key><string>other</string><key>Value</key><string>test-device</string>",
+    for (content, envelope) in [
+        (
+            "<key>Request</key><string>GetValue</string>",
+            ReplyEnvelope::None,
+        ),
+        (
+            "<key>Value</key><string>test-device</string>",
+            ReplyEnvelope::None,
+        ),
+        (
+            "<key>Request</key><string>GetValue</string><key>Value</key><integer>9</integer>",
+            ReplyEnvelope::None,
+        ),
+        (
+            "<key>Request</key><string>GetValue</string><key>Error</key><string>DeviceLocked</string><key>Value</key><string>test-device</string>",
+            ReplyEnvelope::Error,
+        ),
+        (
+            "<key>Request</key><string>GetValue</string><key>Value</key><string>other</string><key>Value</key><string>test-device</string>",
+            ReplyEnvelope::None,
+        ),
     ] {
         let body = format!("<plist><dict>{content}</dict></plist>");
         assert_eq!(
             reply(body.as_bytes(), body.len()).await,
-            Err(LockdownQueryFailure::PlistDecode)
+            Err(LockdownQueryFailure::PlistDecode(
+                PlistDecodeFailure::XmlReplySchema(envelope)
+            ))
         );
     }
     for content in [
@@ -66,7 +83,9 @@ async fn missing_nonstring_error_duplicate_and_malformed_replies_fail_closed() {
     }
     assert_eq!(
         reply(b"bad", 3).await,
-        Err(LockdownQueryFailure::PlistDecode)
+        Err(LockdownQueryFailure::PlistDecode(
+            PlistDecodeFailure::OtherFormat
+        ))
     );
 }
 
@@ -86,7 +105,9 @@ async fn mixed_xml_content_in_lockdown_value_is_rejected() {
         );
         assert_eq!(
             reply(body.as_bytes(), body.len()).await,
-            Err(LockdownQueryFailure::PlistDecode)
+            Err(LockdownQueryFailure::PlistDecode(
+                PlistDecodeFailure::XmlPreflight
+            ))
         );
     }
 }
@@ -104,6 +125,106 @@ async fn response_length_rejects_truncated_headers_and_out_of_bounds_claims() {
         assert_eq!(
             reply(b"", claimed).await,
             Err(LockdownQueryFailure::ResponseLength)
+        );
+    }
+}
+
+#[tokio::test]
+async fn decode_causes_distinguish_format_preflight_and_plist_syntax() {
+    for (body, cause) in [
+        (
+            b"bplist00synthetic".as_slice(),
+            PlistDecodeFailure::BinaryFormat,
+        ),
+        (b"bplist01synthetic", PlistDecodeFailure::OtherFormat),
+        (b"not-xml", PlistDecodeFailure::OtherFormat),
+        (b" <plist><dict/></plist>", PlistDecodeFailure::OtherFormat),
+        (b"<plist><dict>", PlistDecodeFailure::XmlPreflight),
+        (b"<plist/><plist/>", PlistDecodeFailure::XmlPreflight),
+        (
+            b"<!DOCTYPE plist SYSTEM 'fixture'><plist><dict/></plist>",
+            PlistDecodeFailure::XmlPreflight,
+        ),
+        (
+            b"<plist><integer>not-an-integer</integer></plist>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+        (
+            b"<plist><unexpected/></plist>",
+            PlistDecodeFailure::XmlPlistParse,
+        ),
+    ] {
+        assert_eq!(
+            reply(body, body.len()).await,
+            Err(LockdownQueryFailure::PlistDecode(cause))
+        );
+    }
+    let deep = format!(
+        "<plist>{}<string>fixture</string>{}</plist>",
+        "<array>".repeat(17),
+        "</array>".repeat(17)
+    );
+    assert_eq!(
+        reply(deep.as_bytes(), deep.len()).await,
+        Err(LockdownQueryFailure::PlistDecode(
+            PlistDecodeFailure::XmlPreflight
+        ))
+    );
+}
+
+#[tokio::test]
+async fn schema_envelopes_report_only_fixed_presence_classes() {
+    for (bits, envelope) in [
+        (1, ReplyEnvelope::Error),
+        (2, ReplyEnvelope::Result),
+        (3, ReplyEnvelope::ErrorResult),
+        (4, ReplyEnvelope::Other),
+        (5, ReplyEnvelope::ErrorOther),
+        (6, ReplyEnvelope::ResultOther),
+        (7, ReplyEnvelope::ErrorResultOther),
+    ] {
+        let mut fields = String::new();
+        for (bit, key) in [(1, "Error"), (2, "Result"), (4, "SyntheticPrivateField")] {
+            if bits & bit != 0 {
+                fields.push_str(&format!(
+                    "<key>{key}</key><string>synthetic-private-value</string>"
+                ));
+            }
+        }
+        let body = format!(
+            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string>{fields}</dict></plist>"
+        );
+        assert_eq!(
+            reply(body.as_bytes(), body.len()).await,
+            Err(LockdownQueryFailure::PlistDecode(
+                PlistDecodeFailure::XmlReplySchema(envelope)
+            ))
+        );
+    }
+    let body = b"<plist><array><string>fixture</string></array></plist>";
+    assert_eq!(
+        reply(body, body.len()).await,
+        Err(LockdownQueryFailure::PlistDecode(
+            PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::NotDictionary)
+        ))
+    );
+}
+
+#[tokio::test]
+async fn failure_only_value_inspection_cannot_accept_duplicate_reply_fields() {
+    for duplicate in [
+        "<key>Value</key><string>test-device</string>",
+        "<key>Request</key><string>GetValue</string>",
+    ] {
+        let body = format!(
+            "<plist><dict><key>Request</key><string>GetValue</string><key>Value</key><string>test-device</string>{duplicate}</dict></plist>"
+        );
+        assert!(plist::Value::from_reader_xml(body.as_bytes()).is_ok());
+        assert_eq!(
+            reply(body.as_bytes(), body.len()).await,
+            Err(LockdownQueryFailure::PlistDecode(
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::None)
+            ))
         );
     }
 }

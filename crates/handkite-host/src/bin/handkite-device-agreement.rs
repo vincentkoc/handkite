@@ -1,5 +1,7 @@
 use handkite_host::{
-    device_agreement::{DeviceAgreement, ObservationFailure},
+    device_agreement::{
+        DeviceAgreement, LockdownQueryFailure, ObservationFailure, PlistDecodeFailure,
+    },
     install_config::{self, RetainedConfig},
     installer_lock::InstallerLock,
     service_layout::ServiceLayout,
@@ -80,14 +82,9 @@ fn observe_service() -> Result<(), FailureStage> {
 fn report(outcome: Outcome, output: &mut impl Write) -> u8 {
     let (code, result) = match outcome {
         Outcome::Pass => (0, output.write_all(b"device_agreement=pass\n")),
-        Outcome::Reject(FailureStage::Observation(ObservationFailure::LockdownQuery(query))) => (
-            1,
-            writeln!(
-                output,
-                "device_agreement=reject stage=lockdown_query substage={}",
-                query.substage()
-            ),
-        ),
+        Outcome::Reject(FailureStage::Observation(ObservationFailure::LockdownQuery(query))) => {
+            (1, report_query(query, output))
+        }
         Outcome::Reject(stage) => (
             1,
             writeln!(output, "device_agreement=reject stage={}", stage.label()),
@@ -97,6 +94,26 @@ fn report(outcome: Outcome, output: &mut impl Write) -> u8 {
         return 1;
     }
     code
+}
+
+fn report_query(query: LockdownQueryFailure, output: &mut impl Write) -> io::Result<()> {
+    write!(
+        output,
+        "device_agreement=reject stage=lockdown_query substage={}",
+        query.substage()
+    )?;
+    if let LockdownQueryFailure::PlistDecode(decode) = query {
+        write!(
+            output,
+            " format={} cause={}",
+            decode.format(),
+            decode.cause()
+        )?;
+        if let PlistDecodeFailure::XmlReplySchema(envelope) = decode {
+            write!(output, " envelope={}", envelope.label())?;
+        }
+    }
+    writeln!(output)
 }
 
 #[cfg(test)]
@@ -211,7 +228,6 @@ mod tests {
             (RequestWrite, "request_write"),
             (ResponseLength, "response_length"),
             (ResponseRead, "response_read"),
-            (PlistDecode, "plist_decode"),
             (ReplyValidation, "reply_validation"),
         ] {
             let mut calls = 0;
@@ -243,6 +259,90 @@ mod tests {
     fn output_failure_exits_nonzero() {
         for outcome in [Outcome::Pass, Outcome::Reject(FailureStage::Arguments)] {
             assert_eq!(report(outcome, &mut io::Cursor::new([0; 0])), 1);
+        }
+    }
+
+    #[test]
+    fn decode_failures_append_only_fixed_format_cause_and_envelope() {
+        use handkite_host::device_agreement::ReplyEnvelope;
+        let mut cases = vec![
+            (
+                PlistDecodeFailure::BinaryFormat,
+                "format=binary cause=binary_format",
+            ),
+            (
+                PlistDecodeFailure::OtherFormat,
+                "format=other cause=non_xml_prefix",
+            ),
+            (
+                PlistDecodeFailure::XmlPreflight,
+                "format=xml cause=xml_preflight",
+            ),
+            (
+                PlistDecodeFailure::XmlPlistParse,
+                "format=xml cause=plist_syntax",
+            ),
+        ];
+        cases.extend([
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::None),
+                "format=xml cause=reply_schema envelope=none",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::Error),
+                "format=xml cause=reply_schema envelope=error",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::Result),
+                "format=xml cause=reply_schema envelope=result",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::Other),
+                "format=xml cause=reply_schema envelope=other",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::ErrorResult),
+                "format=xml cause=reply_schema envelope=error_result",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::ErrorOther),
+                "format=xml cause=reply_schema envelope=error_other",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::ResultOther),
+                "format=xml cause=reply_schema envelope=result_other",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::ErrorResultOther),
+                "format=xml cause=reply_schema envelope=error_result_other",
+            ),
+            (
+                PlistDecodeFailure::XmlReplySchema(ReplyEnvelope::NotDictionary),
+                "format=xml cause=reply_schema envelope=not_dictionary",
+            ),
+        ]);
+        for (cause, labels) in cases {
+            let query = LockdownQueryFailure::PlistDecode(cause);
+            let stage = FailureStage::Observation(ObservationFailure::LockdownQuery(query));
+            let mut calls = 0;
+            let outcome = run(args(&["--service"]), || {
+                calls += 1;
+                Err(stage)
+            });
+            assert_eq!(calls, 1);
+            let mut output = Vec::new();
+            assert_eq!(report(outcome, &mut output), 1);
+            assert_eq!(
+                output,
+                format!(
+                    "device_agreement=reject stage=lockdown_query substage=plist_decode {labels}\n"
+                )
+                .as_bytes()
+            );
+            assert_eq!(
+                report(Outcome::Reject(stage), &mut io::Cursor::new([0; 0])),
+                1
+            );
         }
     }
 }

@@ -47,7 +47,7 @@ pub enum LockdownQueryFailure {
     RequestWrite,
     ResponseLength,
     ResponseRead,
-    PlistDecode,
+    PlistDecode(PlistDecodeFailure),
     ReplyValidation,
 }
 
@@ -57,8 +57,68 @@ impl LockdownQueryFailure {
             Self::RequestWrite => "request_write",
             Self::ResponseLength => "response_length",
             Self::ResponseRead => "response_read",
-            Self::PlistDecode => "plist_decode",
+            Self::PlistDecode(_) => "plist_decode",
             Self::ReplyValidation => "reply_validation",
+        }
+    }
+}
+
+/// Classification after strict decoding has already rejected the reply.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PlistDecodeFailure {
+    BinaryFormat,
+    OtherFormat,
+    XmlPreflight,
+    XmlPlistParse,
+    XmlReplySchema(ReplyEnvelope),
+}
+
+impl PlistDecodeFailure {
+    pub fn format(self) -> &'static str {
+        match self {
+            Self::BinaryFormat => "binary",
+            Self::OtherFormat => "other",
+            Self::XmlPreflight | Self::XmlPlistParse | Self::XmlReplySchema(_) => "xml",
+        }
+    }
+
+    pub fn cause(self) -> &'static str {
+        match self {
+            Self::BinaryFormat => "binary_format",
+            Self::OtherFormat => "non_xml_prefix",
+            Self::XmlPreflight => "xml_preflight",
+            Self::XmlPlistParse => "plist_syntax",
+            Self::XmlReplySchema(_) => "reply_schema",
+        }
+    }
+}
+
+/// Presence classes only. Keys and values are never retained in this type.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReplyEnvelope {
+    None,
+    Error,
+    Result,
+    Other,
+    ErrorResult,
+    ErrorOther,
+    ResultOther,
+    ErrorResultOther,
+    NotDictionary,
+}
+
+impl ReplyEnvelope {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Error => "error",
+            Self::Result => "result",
+            Self::Other => "other",
+            Self::ErrorResult => "error_result",
+            Self::ErrorOther => "error_other",
+            Self::ResultOther => "result_other",
+            Self::ErrorResultOther => "error_result_other",
+            Self::NotDictionary => "not_dictionary",
         }
     }
 }
@@ -261,7 +321,7 @@ fn check_deadline(deadline: tokio::time::Instant) -> Result<(), ObservationFailu
 
 #[cfg(any(target_os = "macos", test))]
 mod lockdown {
-    use super::LockdownQueryFailure;
+    use super::{LockdownQueryFailure, PlistDecodeFailure, ReplyEnvelope};
     use crate::usb::plist_wire;
     use serde::Deserialize;
     use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -310,11 +370,52 @@ mod lockdown {
             .await
             .map_err(|_| LockdownQueryFailure::ResponseRead)?;
         let reply: Reply = plist_wire::decode(&body, MAX_REPLY_BYTES)
-            .map_err(|_| LockdownQueryFailure::PlistDecode)?;
+            .map_err(|_| LockdownQueryFailure::PlistDecode(classify_rejection(&body)))?;
         if reply.request != "GetValue" || reply.value.is_empty() {
             return Err(LockdownQueryFailure::ReplyValidation);
         }
         Ok(reply.value)
+    }
+
+    // Called only after the unchanged strict decoder rejects. This can never
+    // supply a Reply or turn a malformed/schema-invalid response into success.
+    fn classify_rejection(body: &[u8]) -> PlistDecodeFailure {
+        if body.starts_with(b"bplist00") {
+            return PlistDecodeFailure::BinaryFormat;
+        }
+        if !body.starts_with(b"<") {
+            return PlistDecodeFailure::OtherFormat;
+        }
+        if plist_wire::preflight(body, MAX_REPLY_BYTES).is_err() {
+            return PlistDecodeFailure::XmlPreflight;
+        }
+        let value = match plist::Value::from_reader_xml(body) {
+            Ok(value) => value,
+            Err(_) => return PlistDecodeFailure::XmlPlistParse,
+        };
+        let envelope = match value.as_dictionary() {
+            None => ReplyEnvelope::NotDictionary,
+            Some(fields) => {
+                let other = fields
+                    .keys()
+                    .any(|key| !matches!(key.as_str(), "Request" | "Value" | "Error" | "Result"));
+                match (
+                    fields.contains_key("Error"),
+                    fields.contains_key("Result"),
+                    other,
+                ) {
+                    (false, false, false) => ReplyEnvelope::None,
+                    (true, false, false) => ReplyEnvelope::Error,
+                    (false, true, false) => ReplyEnvelope::Result,
+                    (false, false, true) => ReplyEnvelope::Other,
+                    (true, true, false) => ReplyEnvelope::ErrorResult,
+                    (true, false, true) => ReplyEnvelope::ErrorOther,
+                    (false, true, true) => ReplyEnvelope::ResultOther,
+                    (true, true, true) => ReplyEnvelope::ErrorResultOther,
+                }
+            }
+        };
+        PlistDecodeFailure::XmlReplySchema(envelope)
     }
 
     #[cfg(test)]

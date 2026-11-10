@@ -14,6 +14,11 @@ pub(crate) fn encode(value: plist::Dictionary) -> Result<Vec<u8>, ()> {
 }
 
 pub(crate) fn decode<T: DeserializeOwned>(body: &[u8], max: usize) -> Result<T, ()> {
+    preflight(body, max)?;
+    plist::from_reader_xml(body).map_err(|_| ())
+}
+
+pub(crate) fn preflight(body: &[u8], max: usize) -> Result<(), ()> {
     if body.is_empty() || body.len() > max || !body.starts_with(b"<") {
         return Err(());
     }
@@ -60,5 +65,5 @@ pub(crate) fn decode<T: DeserializeOwned>(body: &[u8], max: usize) -> Result<T, 
     if depth != 0 || roots != 1 {
         return Err(());
     }
-    plist::from_reader_xml(body).map_err(|_| ())
+    Ok(())
 }

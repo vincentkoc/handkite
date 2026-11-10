@@ -191,8 +191,12 @@ async fn missing_ambiguous_mismatching_and_replaced_routes_or_replies_fail() {
                 ObservationFailure::Identity
             }
             4 => {
-                transport.reply = Err(LockdownFailure::Query(LockdownQueryFailure::PlistDecode));
-                ObservationFailure::LockdownQuery(LockdownQueryFailure::PlistDecode)
+                transport.reply = Err(LockdownFailure::Query(LockdownQueryFailure::PlistDecode(
+                    PlistDecodeFailure::XmlPreflight,
+                )));
+                ObservationFailure::LockdownQuery(LockdownQueryFailure::PlistDecode(
+                    PlistDecodeFailure::XmlPreflight,
+                ))
             }
             5 => {
                 transport.routes[1] = Err("private fixture transport detail");
@@ -281,7 +285,7 @@ async fn query_substages_preserve_generic_reobservation_errors_and_poisoning() {
         LockdownQueryFailure::RequestWrite,
         LockdownQueryFailure::ResponseLength,
         LockdownQueryFailure::ResponseRead,
-        LockdownQueryFailure::PlistDecode,
+        LockdownQueryFailure::PlistDecode(PlistDecodeFailure::XmlPreflight),
         LockdownQueryFailure::ReplyValidation,
     ] {
         let (_scratch, layout) = fixture();
@@ -431,7 +435,11 @@ async fn shared_deadline_takes_precedence_over_each_transport_error() {
         transport.delay_step = Some(step);
         match step {
             1 => transport.routes[0] = Err("private fixture transport detail"),
-            2 => transport.reply = Err(LockdownFailure::Query(LockdownQueryFailure::PlistDecode)),
+            2 => {
+                transport.reply = Err(LockdownFailure::Query(LockdownQueryFailure::PlistDecode(
+                    PlistDecodeFailure::XmlPreflight,
+                )))
+            }
             _ => transport.routes[1] = Err("private fixture transport detail"),
         }
         assert_eq!(
