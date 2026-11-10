@@ -32,6 +32,21 @@ impl OwnedSessionError {
     }
 }
 
+/// Creates and validates one new session without changing settings or running input.
+/// Requires a reviewed handoff from every other WDA owner for the whole call.
+/// `admit` runs before preflight and immediately before the sole creation POST;
+/// unlock callers must check the PIN stop gate there.
+///
+/// Returns only the new receipt's exact ID after ready-status and session-endpoint
+/// validation. No request is retried, an uncertain receipt never falls back to
+/// discovery or adoption, and the session is retained for explicit owner handoff.
+pub async fn create_owned_session(
+    wda: &UsbWda,
+    admit: impl FnMut() -> Result<(), ()>,
+) -> Result<String, OwnedSessionError> {
+    create_session(wda, admit).await
+}
+
 /// Requires a reviewed handoff from every other WDA owner for the whole call.
 /// `admit` must check the PIN stop gate for unlock; it runs again immediately
 /// before the sole creation POST. Clock qualification needs no PIN or stop gate.
@@ -54,13 +69,26 @@ where
 
 async fn owned_transaction<T, E, F, Fut>(
     wda: &impl WdaRequest,
-    mut admit: impl FnMut() -> Result<(), ()>,
+    admit: impl FnMut() -> Result<(), ()>,
     action: F,
 ) -> Result<IdleSettingsOutcome<T, E>, OwnedSessionError>
 where
     F: FnOnce(String) -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
+    let session = create_session(wda, admit).await?;
+    let guarded = OwnedRequests {
+        wda,
+        session: &session,
+        stopped: Cell::new(false),
+    };
+    Ok(wda_settings::transaction(&guarded, &session, || action(session.clone())).await)
+}
+
+async fn create_session(
+    wda: &impl WdaRequest,
+    mut admit: impl FnMut() -> Result<(), ()>,
+) -> Result<String, OwnedSessionError> {
     admit().map_err(|_| OwnedSessionError::AdmissionRefused)?;
     let status = wda
         .request("GET", "/status", b"", DEADLINE)
@@ -94,7 +122,7 @@ where
         .validate()
         .await
         .map_err(|_| OwnedSessionError::SessionUnproven)?;
-    Ok(wda_settings::transaction(&guarded, session, || action(session.to_owned())).await)
+    Ok(session.to_owned())
 }
 
 #[derive(Deserialize)]
@@ -222,6 +250,7 @@ mod tests {
     struct Fake {
         requests: RefCell<Vec<(String, String)>>,
         create: RefCell<Option<Result<HttpResponse, WdaError>>>,
+        response_override: RefCell<Option<(usize, Result<HttpResponse, WdaError>)>>,
         current: Cell<&'static str>,
         settings: RefCell<Value>,
         drift_at_status: Option<usize>,
@@ -240,6 +269,7 @@ mod tests {
             Self {
                 requests: RefCell::new(Vec::new()),
                 create: RefCell::new(Some(receipt)),
+                response_override: RefCell::new(None),
                 current: Cell::new("prior-session"),
                 settings: RefCell::new(
                     json!({"waitForIdleTimeout":10,"animationCoolOffTimeout":2}),
@@ -277,6 +307,14 @@ mod tests {
             self.requests
                 .borrow_mut()
                 .push((method.into(), path.into()));
+            if self
+                .response_override
+                .borrow()
+                .as_ref()
+                .is_some_and(|(request, _)| *request == self.requests.borrow().len())
+            {
+                return self.response_override.borrow_mut().take().unwrap().1;
+            }
             match (method, path) {
                 ("GET", "/status") => {
                     self.status_reads.set(self.status_reads.get() + 1);
@@ -310,6 +348,111 @@ mod tests {
                 }
                 _ => panic!("unexpected request {method} {path}"),
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_creation_returns_exact_id_without_settings_or_action() {
+        for receipt in [
+            json!({"sessionId":"owned-session","value":{}}),
+            json!({"value":{"sessionId":"owned-session","capabilities":{}}}),
+            json!({"sessionId":"owned-session","value":{"sessionId":"owned-session"}}),
+        ] {
+            let fake = Fake::new(Ok(response(receipt)));
+            let checks = Cell::new(0);
+            let session = create_session(&fake, || {
+                assert_eq!(fake.requests.borrow().len(), checks.get());
+                checks.set(checks.get() + 1);
+                Ok(())
+            })
+            .await
+            .unwrap();
+            assert_eq!(session, "owned-session");
+            assert_eq!(checks.get(), 2);
+            assert_eq!(
+                *fake.requests.borrow(),
+                [
+                    ("GET".into(), "/status".into()),
+                    ("POST".into(), "/session".into()),
+                    ("GET".into(), "/status".into()),
+                    ("GET".into(), "/session/owned-session".into()),
+                ]
+            );
+            assert_eq!(
+                *fake.settings.borrow(),
+                json!({"waitForIdleTimeout":10,"animationCoolOffTimeout":2})
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_preflight_and_validation_failures_stop_at_failed_request() {
+        for (request, error) in [
+            (1, OwnedSessionError::PreflightUnproven),
+            (3, OwnedSessionError::SessionUnproven),
+            (4, OwnedSessionError::SessionUnproven),
+        ] {
+            for reply in [
+                Err(WdaError::NotConnected),
+                Ok(HttpResponse {
+                    status: 500,
+                    body: b"unprinted failure".to_vec(),
+                }),
+                Ok(HttpResponse {
+                    status: 200,
+                    body: b"malformed".to_vec(),
+                }),
+                Ok(response(
+                    json!({"sessionId":"owned-session","value":{"sessionId":"different"}}),
+                )),
+                Ok(response(
+                    json!({"sessionId":"owned-session","value":{"error":"failed"}}),
+                )),
+            ] {
+                let fake = Fake::ready();
+                *fake.response_override.borrow_mut() = Some((request, reply));
+                assert_eq!(create_session(&fake, || Ok(())).await, Err(error));
+                assert_eq!(fake.requests.borrow().len(), request);
+                assert_eq!(
+                    fake.posts(),
+                    if request == 1 {
+                        vec![]
+                    } else {
+                        vec!["/session"]
+                    }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn standalone_unready_or_drifted_session_is_never_adopted() {
+        for (request, reply, error) in [
+            (
+                1,
+                json!({"value":{"ready":false}}),
+                OwnedSessionError::PreflightUnproven,
+            ),
+            (
+                3,
+                json!({"sessionId":"owned-session","value":{"ready":false}}),
+                OwnedSessionError::SessionUnproven,
+            ),
+            (
+                3,
+                json!({"sessionId":"replacement","value":{"ready":true}}),
+                OwnedSessionError::SessionUnproven,
+            ),
+            (
+                4,
+                json!({"sessionId":"replacement","value":{}}),
+                OwnedSessionError::SessionUnproven,
+            ),
+        ] {
+            let fake = Fake::ready();
+            *fake.response_override.borrow_mut() = Some((request, Ok(response(reply))));
+            assert_eq!(create_session(&fake, || Ok(())).await, Err(error));
+            assert_eq!(fake.requests.borrow().len(), request);
         }
     }
 
@@ -363,7 +506,7 @@ mod tests {
             WdaError::NotConnected,
         ] {
             let fake = Fake::new(Err(error));
-            let result = owned_transaction(&fake, || Ok(()), |_| async { Err::<(), ()>(()) }).await;
+            let result = create_session(&fake, || Ok(())).await;
             assert_eq!(result, Err(OwnedSessionError::CreationUnknown));
             assert_eq!(
                 *fake.requests.borrow(),
@@ -389,7 +532,7 @@ mod tests {
             json!({"sessionId":"owned-session","status":13,"value":{}}),
         ] {
             let fake = Fake::new(Ok(response(receipt)));
-            let result = owned_transaction(&fake, || Ok(()), |_| async { Err::<(), ()>(()) }).await;
+            let result = create_session(&fake, || Ok(())).await;
             assert_eq!(result, Err(OwnedSessionError::CreationUnknown));
             assert_eq!(fake.requests.borrow().len(), 2);
         }
@@ -400,18 +543,14 @@ mod tests {
         for fail_on in [1, 2] {
             let fake = Fake::ready();
             let checks = Cell::new(0);
-            let result = owned_transaction(
-                &fake,
-                || {
-                    checks.set(checks.get() + 1);
-                    if checks.get() == fail_on {
-                        Err(())
-                    } else {
-                        Ok(())
-                    }
-                },
-                |_| async { Err::<(), ()>(()) },
-            )
+            let result = create_session(&fake, || {
+                checks.set(checks.get() + 1);
+                if checks.get() == fail_on {
+                    Err(())
+                } else {
+                    Ok(())
+                }
+            })
             .await;
             assert_eq!(result, Err(OwnedSessionError::AdmissionRefused));
             assert!(fake.posts().is_empty());
