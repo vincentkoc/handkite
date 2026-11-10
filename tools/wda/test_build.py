@@ -29,8 +29,12 @@ def project_fixture():
 
     original = build.ORIGINAL_BUNDLE
     return (
-        block(build.IOS_CONFIGS[0], original)
+        "\n" + block(build.IOS_CONFIGS[0], original)
         + block(build.IOS_CONFIGS[1], original)
+        + "\t\tCONFIG_LIST = { buildConfigurations = (\n"
+        + f"\t\t\t\t{build.IOS_CONFIGS[0]} /* Debug */,\n"
+        + f"\t\t\t\t{build.IOS_CONFIGS[1]} /* Release */,\n"
+        + "\t\t); };\n"
         + "\t\tOTHER /* tvOS */ = { PRODUCT_BUNDLE_IDENTIFIER = com.facebook.WebDriverAgentRunner; };\n"
     ).encode()
 

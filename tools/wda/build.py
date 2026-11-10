@@ -44,7 +44,7 @@ def patch_project(data: bytes, bundle_id: str) -> bytes:
     text = data.decode("utf-8")
     replacement = f"PRODUCT_BUNDLE_IDENTIFIER = {bundle_id};"
     for config in IOS_CONFIGS:
-        marker = f"\t\t{config} /* "
+        marker = f"\n\t\t{config} /* "
         start = text.find(marker)
         if start < 0 or text.find(marker, start + 1) >= 0:
             raise ValueError("runner_configuration_missing")
