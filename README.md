@@ -4,6 +4,10 @@ Handkite is a local-first control service for an explicitly selected iPhone. The
 
 The design specification is maintained outside this repository.
 
+Source and documentation use English. Run `python3 tools/check_source_text.py` to
+check tracked text for Han characters without displaying file contents. Runtime
+app labels and accessibility text remain data and may use any language.
+
 ## Local setup
 
 Handkite controls one explicitly selected iPhone over USB from the Mac it is
