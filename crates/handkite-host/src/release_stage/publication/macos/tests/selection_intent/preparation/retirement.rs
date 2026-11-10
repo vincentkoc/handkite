@@ -5,6 +5,9 @@ use crate::selection_intent::{
 };
 use retirement::{Hooks as RetirementHooks, Point as RetirementPoint};
 
+mod device;
+mod failures;
+
 const COMPLETED: &str = ".selection-completed-31313131313131313131313131313131.json";
 
 async fn committed<'held, 'lock>(
