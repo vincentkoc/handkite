@@ -212,6 +212,17 @@ establish exact argv only. Live sshd enforcement, host identity, key enrollment,
 account isolation, and agent acceptance remain unqualified. Account shell startup
 and server configuration, including `ForceCommand`, need separate review.
 
+`handkite-ssh-key --capabilities observation < bare-public-key` exposes that
+renderer as a read-only CLI. Capabilities are mandatory; `navigation` and
+`observation,navigation` are the only other accepted values. Stdin must contain
+the bare key with at most one final LF, followed by EOF. It reads at most 82 bytes
+and prints the single entry to stdout; failures emit fixed errors to stderr and
+exit 1 without echoing rejected data. It derives the effective account's layout
+without inspecting the installation and accepts no path, command, socket, or
+device override. It writes no files, enrolls no key, and is excluded from the
+three-artifact release inventory. Review the output and the actual SSH account
+policy separately before any enrollment.
+
 Acquire control explicitly before an action. The process holds the controller's random lease token internally for a fixed two-minute TTL; neither the token nor an owner override is exposed through MCP. Acquire never renews an existing lease. A competing session receives `Busy`. Release is explicit, with best-effort release again on EOF or input/output failure. A killed process relies on expiry. If the acquire response is lost, that process refuses further acquisition: close it and wait two minutes before starting a new session.
 
 Home and Clock return delivery receipt, observed effect, and optional post-action metadata. They do not return screenshots or accessibility content. A lost acknowledgment, unexpected reply, post-input identity mismatch, or oversized response reports unknown delivery with `receipt.accepted: null` and `effect: "unconfirmed"`. No action is automatically replayed. A stale revision requires a fresh authorized observation; an expired lease requires another explicit acquisition.
