@@ -1,0 +1,480 @@
+//! One explicitly admitted WDA session creation, never adoption or renewal.
+
+use crate::wda_action::WdaRequest;
+use crate::wda_http::HttpResponse;
+use crate::wda_settings::{self, IdleSettingsOutcome};
+use crate::wda_transport::{UsbWda, WdaError};
+use serde::Deserialize;
+use serde_json::Value;
+use std::cell::Cell;
+use std::future::Future;
+use std::time::Duration;
+
+const DEADLINE: Duration = Duration::from_secs(10);
+const CREATE: &[u8] = br#"{"capabilities":{"alwaysMatch":{}}}"#;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnedSessionError {
+    AdmissionRefused,
+    PreflightUnproven,
+    CreationUnknown,
+    SessionUnproven,
+}
+
+impl OwnedSessionError {
+    pub fn message(self) -> &'static str {
+        match self {
+            Self::AdmissionRefused => "refused reason=session_admission",
+            Self::PreflightUnproven => "refused reason=session_preflight",
+            Self::CreationUnknown => "unknown reason=session_creation_unproven",
+            Self::SessionUnproven => "unknown reason=owned_session_unproven",
+        }
+    }
+}
+
+/// Requires a reviewed handoff from every other WDA owner for the whole call.
+/// `admit` must check the PIN stop gate for unlock; it runs again immediately
+/// before the sole creation POST. Clock qualification needs no PIN or stop gate.
+///
+/// Only the new receipt's exact session is used. Temporary settings and the
+/// action are bound to it. No request is retried, no session is deleted, and a
+/// lost create receipt never falls back to discovery. The created session is
+/// retained for explicit owner handoff. Await completion to allow restoration.
+pub async fn with_owned_session_idle_settings<T, E, F, Fut>(
+    wda: &UsbWda,
+    admit: impl FnMut() -> Result<(), ()>,
+    action: F,
+) -> Result<IdleSettingsOutcome<T, E>, OwnedSessionError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    owned_transaction(wda, admit, action).await
+}
+
+async fn owned_transaction<T, E, F, Fut>(
+    wda: &impl WdaRequest,
+    mut admit: impl FnMut() -> Result<(), ()>,
+    action: F,
+) -> Result<IdleSettingsOutcome<T, E>, OwnedSessionError>
+where
+    F: FnOnce(String) -> Fut,
+    Fut: Future<Output = Result<T, E>>,
+{
+    admit().map_err(|_| OwnedSessionError::AdmissionRefused)?;
+    let status = wda
+        .request("GET", "/status", b"", DEADLINE)
+        .await
+        .map_err(|_| OwnedSessionError::PreflightUnproven)?;
+    let status = envelope(&status).map_err(|_| OwnedSessionError::PreflightUnproven)?;
+    if status.value["ready"] != true {
+        return Err(OwnedSessionError::PreflightUnproven);
+    }
+    let previous = status
+        .id()
+        .map_err(|_| OwnedSessionError::PreflightUnproven)?;
+    admit().map_err(|_| OwnedSessionError::AdmissionRefused)?;
+    let receipt = wda
+        .request("POST", "/session", CREATE, DEADLINE)
+        .await
+        .map_err(|_| OwnedSessionError::CreationUnknown)?;
+    let receipt = envelope(&receipt).map_err(|_| OwnedSessionError::CreationUnknown)?;
+    let session = receipt
+        .id()
+        .ok()
+        .flatten()
+        .filter(|id| Some(*id) != previous)
+        .ok_or(OwnedSessionError::CreationUnknown)?;
+    let guarded = OwnedRequests {
+        wda,
+        session,
+        stopped: Cell::new(false),
+    };
+    guarded
+        .validate()
+        .await
+        .map_err(|_| OwnedSessionError::SessionUnproven)?;
+    Ok(wda_settings::transaction(&guarded, session, || action(session.to_owned())).await)
+}
+
+#[derive(Deserialize)]
+struct Envelope {
+    #[serde(rename = "sessionId")]
+    session_id: Option<String>,
+    #[serde(default)]
+    error: Option<Value>,
+    status: Option<u16>,
+    value: Value,
+}
+
+impl Envelope {
+    fn id(&self) -> Result<Option<&str>, ()> {
+        let top = self.session_id.as_deref();
+        let nested = match self.value.get("sessionId") {
+            None => None,
+            Some(value) => Some(value.as_str().ok_or(())?),
+        };
+        if top.zip(nested).is_some_and(|(top, nested)| top != nested) {
+            return Err(());
+        }
+        let id = top.or(nested);
+        if id.is_some_and(|id| {
+            id.is_empty()
+                || id.len() > 128
+                || !id
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        }) {
+            return Err(());
+        }
+        Ok(id)
+    }
+}
+
+fn envelope(response: &HttpResponse) -> Result<Envelope, ()> {
+    if response.status != 200 {
+        return Err(());
+    }
+    let value: Envelope = serde_json::from_slice(&response.body).map_err(|_| ())?;
+    if value.error.is_some()
+        || value.status.is_some_and(|status| status != 0)
+        || !value.value.is_object()
+        || value.value.get("error").is_some()
+    {
+        return Err(());
+    }
+    value.id()?;
+    Ok(value)
+}
+
+struct OwnedRequests<'a, W> {
+    wda: &'a W,
+    session: &'a str,
+    stopped: Cell<bool>,
+}
+
+impl<W: WdaRequest> OwnedRequests<'_, W> {
+    async fn validate(&self) -> Result<(), WdaError> {
+        for path in ["/status".to_owned(), format!("/session/{}", self.session)] {
+            let response = self.wda.request("GET", &path, b"", DEADLINE).await?;
+            self.check(&path, &response)?;
+        }
+        Ok(())
+    }
+
+    fn check(&self, path: &str, response: &HttpResponse) -> Result<(), WdaError> {
+        let session_check = path == "/status" || path == format!("/session/{}", self.session);
+        let valid = if session_check {
+            envelope(response).is_ok_and(|result| {
+                result.id() == Ok(Some(self.session))
+                    && (path != "/status"
+                        || (result.session_id.as_deref() == Some(self.session)
+                            && result.value["ready"] == true))
+            })
+        } else {
+            // Missing/malformed settings receipts keep the bracket's existing
+            // restoration path. An explicit conflicting identity stops it.
+            match serde_json::from_slice::<Envelope>(&response.body) {
+                Ok(result) => result
+                    .id()
+                    .is_ok_and(|id| id.is_none_or(|id| id == self.session)),
+                Err(_) => true,
+            }
+        };
+        if !valid {
+            self.stopped.set(true);
+            return Err(WdaError::NotConnected);
+        }
+        Ok(())
+    }
+}
+
+impl<W: WdaRequest> WdaRequest for OwnedRequests<'_, W> {
+    async fn request(
+        &self,
+        method: &str,
+        path: &str,
+        body: &[u8],
+        deadline: Duration,
+    ) -> Result<HttpResponse, WdaError> {
+        if self.stopped.get() {
+            return Err(WdaError::NotConnected);
+        }
+        if method == "POST"
+            && let Err(error) = self.validate().await
+        {
+            self.stopped.set(true);
+            return Err(error);
+        }
+        let response = self.wda.request(method, path, body, deadline).await?;
+        self.check(path, &response)?;
+        Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::wda_settings::{IdleAction, Restoration};
+    use serde_json::json;
+    use std::cell::RefCell;
+
+    struct Fake {
+        requests: RefCell<Vec<(String, String)>>,
+        create: RefCell<Option<Result<HttpResponse, WdaError>>>,
+        current: Cell<&'static str>,
+        settings: RefCell<Value>,
+        drift_at_status: Option<usize>,
+        status_reads: Cell<usize>,
+    }
+
+    fn response(value: Value) -> HttpResponse {
+        HttpResponse {
+            status: 200,
+            body: serde_json::to_vec(&value).unwrap(),
+        }
+    }
+
+    impl Fake {
+        fn new(receipt: Result<HttpResponse, WdaError>) -> Self {
+            Self {
+                requests: RefCell::new(Vec::new()),
+                create: RefCell::new(Some(receipt)),
+                current: Cell::new("prior-session"),
+                settings: RefCell::new(
+                    json!({"waitForIdleTimeout":10,"animationCoolOffTimeout":2}),
+                ),
+                drift_at_status: None,
+                status_reads: Cell::new(0),
+            }
+        }
+
+        fn ready() -> Self {
+            Self::new(Ok(response(
+                json!({"sessionId":"owned-session","value":{"sessionId":"owned-session","capabilities":{}}}),
+            )))
+        }
+
+        fn posts(&self) -> Vec<String> {
+            self.requests
+                .borrow()
+                .iter()
+                .filter(|(method, _)| method == "POST")
+                .map(|(_, path)| path.clone())
+                .collect()
+        }
+    }
+
+    impl WdaRequest for Fake {
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            body: &[u8],
+            deadline: Duration,
+        ) -> Result<HttpResponse, WdaError> {
+            assert_eq!(deadline, DEADLINE);
+            self.requests
+                .borrow_mut()
+                .push((method.into(), path.into()));
+            match (method, path) {
+                ("GET", "/status") => {
+                    self.status_reads.set(self.status_reads.get() + 1);
+                    if self.drift_at_status == Some(self.status_reads.get()) {
+                        self.current.set("replacement");
+                    }
+                    Ok(response(
+                        json!({"sessionId":self.current.get(),"value":{"ready":true}}),
+                    ))
+                }
+                ("POST", "/session") => {
+                    assert_eq!(body, CREATE);
+                    self.current.set("owned-session");
+                    self.create
+                        .borrow_mut()
+                        .take()
+                        .expect("never retry creation")
+                }
+                ("GET", "/session/owned-session") => {
+                    Ok(response(json!({"sessionId":self.current.get(),"value":{}})))
+                }
+                ("GET", "/session/owned-session/appium/settings") => Ok(response(
+                    json!({"sessionId":self.current.get(),"value":self.settings.borrow().clone()}),
+                )),
+                ("POST", "/session/owned-session/appium/settings") => {
+                    *self.settings.borrow_mut() =
+                        serde_json::from_slice::<Value>(body).unwrap()["settings"].clone();
+                    Ok(response(
+                        json!({"sessionId":self.current.get(),"value":null}),
+                    ))
+                }
+                _ => panic!("unexpected request {method} {path}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn new_receipt_brackets_one_action_and_restores_new_session_only() {
+        for receipt in [
+            json!({"sessionId":"owned-session","value":{}}),
+            json!({"value":{"sessionId":"owned-session","capabilities":{}}}),
+            json!({"sessionId":"owned-session","value":{"sessionId":"owned-session"}}),
+        ] {
+            let fake = Fake::new(Ok(response(receipt)));
+            let actions = Cell::new(0);
+            let outcome = owned_transaction(
+                &fake,
+                || Ok(()),
+                |session| {
+                    assert_eq!(session, "owned-session");
+                    async {
+                        assert_eq!(fake.settings.borrow()["waitForIdleTimeout"], 1.0);
+                        actions.set(actions.get() + 1);
+                        Ok::<_, ()>(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(outcome.action, IdleAction::Completed(Ok(())));
+            assert_eq!(outcome.restoration, Restoration::Verified);
+            assert_eq!(actions.get(), 1);
+            assert_eq!(
+                *fake.settings.borrow(),
+                json!({"waitForIdleTimeout":10,"animationCoolOffTimeout":2})
+            );
+            assert_eq!(
+                fake.posts(),
+                [
+                    "/session",
+                    "/session/owned-session/appium/settings",
+                    "/session/owned-session/appium/settings"
+                ]
+            );
+            assert_eq!(fake.current.get(), "owned-session");
+        }
+    }
+
+    #[tokio::test]
+    async fn ambiguous_create_never_discovers_adopts_retries_or_runs_action() {
+        for error in [
+            WdaError::AfterSent,
+            WdaError::TimedOutAfterSent,
+            WdaError::NotConnected,
+        ] {
+            let fake = Fake::new(Err(error));
+            let result = owned_transaction(&fake, || Ok(()), |_| async { Err::<(), ()>(()) }).await;
+            assert_eq!(result, Err(OwnedSessionError::CreationUnknown));
+            assert_eq!(
+                *fake.requests.borrow(),
+                [
+                    ("GET".into(), "/status".into()),
+                    ("POST".into(), "/session".into())
+                ]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn conflicting_missing_invalid_and_reused_create_ids_refuse() {
+        for receipt in [
+            json!({"sessionId":"owned-session","value":{"sessionId":"different"}}),
+            json!({"sessionId":"owned-session","value":{"sessionId":42}}),
+            json!({"sessionId":"owned-session","value":{"sessionId":null}}),
+            json!({"value":{}}),
+            json!({"sessionId":"prior-session","value":{}}),
+            json!({"sessionId":"bad/id","value":{}}),
+            json!({"sessionId":"owned-session","value":{"error":"session not created"}}),
+            json!({"sessionId":"owned-session","error":"failed","value":{}}),
+            json!({"sessionId":"owned-session","status":13,"value":{}}),
+        ] {
+            let fake = Fake::new(Ok(response(receipt)));
+            let result = owned_transaction(&fake, || Ok(()), |_| async { Err::<(), ()>(()) }).await;
+            assert_eq!(result, Err(OwnedSessionError::CreationUnknown));
+            assert_eq!(fake.requests.borrow().len(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_or_failed_gate_prevents_creation_including_after_preflight() {
+        for fail_on in [1, 2] {
+            let fake = Fake::ready();
+            let checks = Cell::new(0);
+            let result = owned_transaction(
+                &fake,
+                || {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == fail_on {
+                        Err(())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| async { Err::<(), ()>(()) },
+            )
+            .await;
+            assert_eq!(result, Err(OwnedSessionError::AdmissionRefused));
+            assert!(fake.posts().is_empty());
+            assert_eq!(fake.requests.borrow().len(), fail_on - 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn drift_before_settings_or_action_latches_stop_without_restoration_post() {
+        // Each validation boundary from creation through the final pre-action read.
+        for status_read in 2..=6 {
+            let mut fake = Fake::ready();
+            fake.drift_at_status = Some(status_read);
+            let result = owned_transaction(&fake, || Ok(()), |_| async { Err::<(), ()>(()) }).await;
+            if status_read == 2 {
+                assert_eq!(result, Err(OwnedSessionError::SessionUnproven));
+            } else {
+                assert!(matches!(result.unwrap().action, IdleAction::NotRun(_)));
+            }
+            assert_eq!(fake.status_reads.get(), status_read);
+            assert_eq!(fake.posts().len(), if status_read == 6 { 2 } else { 1 });
+        }
+    }
+
+    #[tokio::test]
+    async fn drift_after_action_refuses_restore_instead_of_touching_replacement() {
+        let fake = Fake::ready();
+        let result = owned_transaction(
+            &fake,
+            || Ok(()),
+            |_| async {
+                fake.current.set("replacement");
+                Ok::<_, ()>(())
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.action, IdleAction::Completed(Ok(())));
+        assert!(matches!(result.restoration, Restoration::Unproven(_)));
+        assert_eq!(
+            fake.posts(),
+            ["/session", "/session/owned-session/appium/settings"]
+        );
+    }
+
+    #[test]
+    fn validation_requires_both_ready_status_and_exact_session_endpoint() {
+        let fake = Fake::ready();
+        for path in ["/status", "/session/owned-session"] {
+            for invalid in [
+                json!({"sessionId":"replacement","value":{"ready":true}}),
+                json!({"sessionId":"owned-session","value":{"sessionId":"replacement","ready":true}}),
+                json!({"value":{"ready":true}}),
+                json!({"sessionId":"owned-session","value":{"error":"failed","ready":true}}),
+            ] {
+                let guard = OwnedRequests {
+                    wda: &fake,
+                    session: "owned-session",
+                    stopped: Cell::new(false),
+                };
+                assert!(guard.check(path, &response(invalid)).is_err());
+                assert!(guard.stopped.get());
+            }
+        }
+    }
+}

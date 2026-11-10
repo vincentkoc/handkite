@@ -6,6 +6,7 @@ use handkite_host::file_gate::FileAttemptGate;
 use handkite_host::pin_backend::NativePasscodeBackend;
 use handkite_host::pin_input;
 use handkite_host::usb::PinnedUsb;
+use handkite_host::wda_session::with_owned_session_idle_settings;
 use handkite_host::wda_settings::{
     IdleAction, IdleSettingsOutcome, Restoration, validated_active_session,
     with_temporary_idle_settings,
@@ -26,6 +27,7 @@ pub(super) fn run(
     gate: FileAttemptGate,
     supervised: bool,
     coordinate_pin_taps: bool,
+    owned_session: bool,
 ) -> Result<(), String> {
     admitted(gate, |gate| {
         // The gate check precedes secret input and every possible settings POST.
@@ -41,11 +43,7 @@ pub(super) fn run(
             let usb = PinnedUsb::new(binding.usb_id.clone());
             usb.provider().await.map_err(|_| "unlock_idle=refused")?;
             let wda = UsbWda::new(usb);
-            let session = validated_active_session(&wda)
-                .await
-                .map_err(|_| "unlock_idle=refused")?;
-            let worker_session = session.clone();
-            let outcome = with_temporary_idle_settings(&wda, &session, || async move {
+            let action = |worker_session: String| async move {
                 // Keep the synchronous backend runtimes entirely on this worker.
                 tokio::task::spawn_blocking(move || {
                     let mut gate = worker_gate.lock().map_err(|_| WorkerError::GateAccess)?;
@@ -72,9 +70,28 @@ pub(super) fn run(
                 })
                 .await
                 .map_err(|_| WorkerError::Join)?
-            })
-            .await;
-            Ok::<_, &'static str>(outcome)
+            };
+            if owned_session {
+                with_owned_session_idle_settings(
+                    &wda,
+                    || {
+                        let gate = gate.lock().map_err(|_| ())?;
+                        if gate.is_disabled().map_err(|_| ())? {
+                            Err(())
+                        } else {
+                            Ok(())
+                        }
+                    },
+                    action,
+                )
+                .await
+                .map_err(|error| format!("unlock_idle={}", error.message()))
+            } else {
+                let session = validated_active_session(&wda)
+                    .await
+                    .map_err(|_| "unlock_idle=refused")?;
+                Ok(with_temporary_idle_settings(&wda, &session, || action(session.clone())).await)
+            }
         })?;
         // Diagnose worker failure before touching a possibly poisoned gate mutex.
         if let Some(error) = failure(&outcome) {

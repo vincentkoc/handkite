@@ -60,7 +60,35 @@ fn caller_state_directory_is_rejected_before_pin_input() {
         assert!(output.stdout.is_empty());
         assert_eq!(
             String::from_utf8(output.stderr).unwrap(),
-            "handkite-unlock-once: usage: handkite-unlock-once --config FILE [--supervised-visibility-fallback]\n"
+            "handkite-unlock-once: invalid_arguments\n"
+        );
+    }
+}
+
+#[test]
+fn owned_session_flags_refuse_before_config_state_or_input() {
+    for extra in [
+        vec!["--owned-wda-session"],
+        vec!["--owned-wda-session", "--temporary-idle-settings"],
+        vec!["--owned-wda-session", "--supervised-visibility-fallback"],
+        vec![
+            "--owned-wda-session",
+            "--temporary-idle-settings",
+            "--supervised-visibility-fallback",
+            "--owned-wda-session",
+        ],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_handkite-unlock-once"))
+            .args(["--config", "/unused/missing-owned-session-config"])
+            .args(extra)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            "handkite-unlock-once: invalid_arguments\n"
         );
     }
 }

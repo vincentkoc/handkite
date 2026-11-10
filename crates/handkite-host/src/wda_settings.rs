@@ -176,7 +176,7 @@ where
     transaction(wda, session, action).await
 }
 
-async fn transaction<T, E, F, Fut>(
+pub(crate) async fn transaction<T, E, F, Fut>(
     wda: &impl WdaRequest,
     session: &str,
     action: F,

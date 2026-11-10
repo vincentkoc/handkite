@@ -4,6 +4,7 @@ use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_action::{CoordinateTapError, WdaActions};
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_http::HttpResponse;
+use handkite_host::wda_session::with_owned_session_idle_settings;
 use handkite_host::wda_settings::{
     IdleAction, IdleSettingsOutcome, Restoration, with_temporary_idle_settings,
 };
@@ -131,7 +132,26 @@ fn options(args: &[String]) -> Result<(HardwareId, Transport), &'static str> {
 }
 
 pub(super) fn idle_command(args: &[String]) -> Result<(), &'static str> {
+    settings_command(args, false)
+}
+
+pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
+    settings_command(args, true)
+}
+
+fn settings_command(args: &[String], owned: bool) -> Result<(), &'static str> {
     let (expected, transport) = options(args)?;
+    if owned {
+        // Refuse session creation unless the harmless Clock starting state is
+        // already proven. The trial captures it twice again on the new session.
+        let mut preflight =
+            Live::new(expected.clone()).map_err(|reason| TrialError::Refused(reason).message())?;
+        let snapshot = preflight
+            .capture()
+            .map_err(|reason| TrialError::Refused(reason).message())?;
+        validate(&snapshot, &expected, preflight.now_ms(), false)
+            .map_err(|reason| TrialError::Refused(reason).message())?;
+    }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -142,14 +162,7 @@ pub(super) fn idle_command(args: &[String]) -> Result<(), &'static str> {
             .await
             .map_err(|_| "refused reason=identity_unproven")?;
         let wda = UsbWda::new(usb);
-        let response = wda
-            .request("GET", "/status", b"", Duration::from_secs(10))
-            .await
-            .map_err(|_| "refused reason=session_unproven")?;
-        let session =
-            session_from_response(response).map_err(|_| "refused reason=session_unproven")?;
-        let worker_session = session.clone();
-        let outcome = with_temporary_idle_settings(&wda, &session, || async move {
+        let action = |worker_session: String| async move {
             blocking_trial(move || {
                 // Both runtimes are constructed and dropped on the blocking thread.
                 let mut live = Live::new(expected.clone()).map_err(TrialError::Refused)?;
@@ -160,11 +173,28 @@ pub(super) fn idle_command(args: &[String]) -> Result<(), &'static str> {
                 run(&mut bound, &expected, transport)
             })
             .await
-        })
-        .await;
+        };
+        let outcome = if owned {
+            with_owned_session_idle_settings(&wda, || Ok(()), action)
+                .await
+                .map_err(|error| error.message())?
+        } else {
+            let response = wda
+                .request("GET", "/status", b"", Duration::from_secs(10))
+                .await
+                .map_err(|_| "refused reason=session_unproven")?;
+            let session =
+                session_from_response(response).map_err(|_| "refused reason=session_unproven")?;
+            with_temporary_idle_settings(&wda, &session, || action(session.clone())).await
+        };
         idle_result(outcome)
     })?;
-    println!("touch_trial_idle=confirmed transport={}", transport.name());
+    let command = if owned {
+        "touch_trial_owned_session"
+    } else {
+        "touch_trial_idle"
+    };
+    println!("{command}=confirmed transport={}", transport.name());
     Ok(())
 }
 
@@ -1606,6 +1636,7 @@ mod tests {
             let args = args.into_iter().map(str::to_owned).collect::<Vec<_>>();
             assert_eq!(command(&args), Err("invalid_arguments"));
             assert_eq!(idle_command(&args), Err("invalid_arguments"));
+            assert_eq!(owned_command(&args), Err("invalid_arguments"));
         }
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("config.json");

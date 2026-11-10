@@ -157,6 +157,15 @@ an unproven restoration or worker join reports unknown. There is no retry or
 fallback. This command is offline-tested only; live use is not yet qualified.
 The default `touch-trial` command does not change idle settings.
 
+`handkite-probe touch-trial-owned-session --config PRIVATE_FILE --transport coordinate`
+(or `w3c`) is the explicit no-PIN qualification route for a newly owned session.
+It first proves the unlocked World Clock starting state, then uses the same
+creation and settings helper as the opt-in unlock route below. It repeats the
+guarded Clock trial on that exact new session and requires verified restoration.
+It never reads a PIN or touches the stop marker. This route is offline-tested;
+live use is blocked until the baseline daemon that owns the WDA runner is
+quiesced through a reviewed handoff with exclusive ownership for the whole call.
+
 ## One-shot Clock touch diagnostic
 
 An explicitly supervised trial can run
@@ -324,6 +333,22 @@ qualify live PIN entry; omitting the flag preserves the default unlock path.
 Failures report fixed action/restoration categories. An incomplete result can
 include only the first unconfirmed position from 1 through 6, never a PIN value
 or proof of physical delivery. A marked gate remains disabled on failure.
+
+`--owned-wda-session` additionally requires `--temporary-idle-settings` and
+`--supervised-visibility-fallback`. After gate admission and again checking the
+gate immediately before its only session-creation POST, it accepts only an exact
+new receipt ID. Conflicting top-level/nested IDs, reused IDs, uncertain delivery,
+or failed status/session validation stop without adoption, renewal, or fallback.
+The settings bracket and PIN backend bind to that ID; observed session drift
+stops further settings writes. The new session is retained for explicit owner
+handoff, never automatically deleted. Session ownership still requires external
+exclusivity; WDA has no atomic lease, and process termination can prevent settings
+restoration. Existing defaults and stop-marker behavior are unchanged.
+
+Live admission remains blocked until the baseline daemon that owns the WDA runner
+is quiesced through a reviewed handoff, then the no-PIN Clock route above is
+qualified. Offline fixtures do not authorize another PIN attempt or clearing an
+existing marker.
 
 In the session-bound variant, the first snapshot after the first digit tap also
 reads the secure field directly once. Both six-digit counts must agree before
