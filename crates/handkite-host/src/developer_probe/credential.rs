@@ -35,12 +35,16 @@ impl DeveloperCredential {
         if bytes.len() as u64 != before.len()
             || after.dev() != before.dev()
             || after.ino() != before.ino()
+            || after.uid() != before.uid()
             || after.len() != before.len()
             || after.mode() != before.mode()
             || after.nlink() != before.nlink()
+            || after.ctime() != before.ctime()
+            || after.ctime_nsec() != before.ctime_nsec()
         {
             return Err(INVALID);
         }
+        crate::release_verify::check_private_input_acl(&file).map_err(|_| INVALID)?;
         Self::parse(&bytes)
     }
 
