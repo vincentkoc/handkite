@@ -7,9 +7,10 @@
 use crate::usb::PinnedUsb;
 use crate::wda_bundle::validate_runner_bundle_id;
 use crate::wda_http::HttpResponse;
-use crate::wda_transport::UsbWda;
+use crate::wda_transport::{UsbWda, WDA_PORT};
 use idevice::services::dvt::xctest::{TestConfig, XCUITestService, listener::XCUITestListener};
 use idevice::services::installation_proxy::InstallationProxyClient;
+use idevice::usbmuxd::errors::UsbmuxdError;
 use idevice::{IdeviceError, IdeviceService};
 use std::future::Future;
 use std::time::Duration;
@@ -20,6 +21,7 @@ use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 const MAX_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
+const VACANCY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 /// Fixed categories only: no upstream error, device identifier, or test log.
@@ -29,6 +31,8 @@ pub enum RunnerError {
     InvalidTimeout,
     LookupFailed,
     LookupTimedOut,
+    EndpointBusy,
+    EndpointUnproven,
     StartupTimedOut,
     RunnerExited,
     RunnerFailed,
@@ -81,6 +85,7 @@ impl OwnedWdaRunner {
                     TestConfig::from_installation_proxy(&mut proxy, runner_bundle_id, None)
                         .await
                         .map_err(|_| RunnerError::LookupFailed)?;
+                require_port_vacant(provider.connect(WDA_PORT), deadline).await?;
                 Ok((provider, config))
             },
             deadline,
@@ -238,6 +243,28 @@ async fn lookup_before_deadline<T>(
         return Err(RunnerError::LookupTimedOut);
     }
     result.map_err(|_| RunnerError::LookupTimedOut)?
+}
+
+async fn require_port_vacant<T>(
+    connect: impl Future<Output = Result<T, IdeviceError>>,
+    deadline: Instant,
+) -> Result<(), RunnerError> {
+    if Instant::now() >= deadline {
+        return Err(RunnerError::StartupTimedOut);
+    }
+    let check_deadline = deadline.min(Instant::now() + VACANCY_TIMEOUT);
+    let result = timeout_at(check_deadline, connect).await;
+    if Instant::now() >= deadline {
+        return Err(RunnerError::StartupTimedOut);
+    }
+    if Instant::now() >= check_deadline {
+        return Err(RunnerError::EndpointUnproven);
+    }
+    match result {
+        Ok(Err(IdeviceError::Usbmuxd(UsbmuxdError::ConnectionRefused))) => Ok(()),
+        Ok(Ok(_)) => Err(RunnerError::EndpointBusy),
+        _ => Err(RunnerError::EndpointUnproven),
+    }
 }
 
 fn strict_ready(response: &HttpResponse) -> bool {

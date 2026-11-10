@@ -31,6 +31,61 @@ fn deadline() -> Instant {
 }
 
 #[tokio::test]
+async fn only_explicit_usbmux_refusal_admits_vacant_endpoint() {
+    let deadline = deadline();
+    assert_eq!(
+        require_port_vacant(
+            async { Err::<(), _>(IdeviceError::Usbmuxd(UsbmuxdError::ConnectionRefused)) },
+            deadline,
+        )
+        .await,
+        Ok(())
+    );
+    assert_eq!(
+        require_port_vacant(async { Ok::<(), IdeviceError>(()) }, deadline).await,
+        Err(RunnerError::EndpointBusy)
+    );
+    for error in [
+        IdeviceError::Usbmuxd(UsbmuxdError::BadDevice),
+        IdeviceError::Socket(std::io::Error::from(std::io::ErrorKind::ConnectionRefused)),
+    ] {
+        assert_eq!(
+            require_port_vacant(async { Err::<(), _>(error) }, deadline).await,
+            Err(RunnerError::EndpointUnproven)
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn vacancy_timeout_and_expired_startup_refuse() {
+    assert_eq!(
+        require_port_vacant(pending::<Result<(), IdeviceError>>(), deadline()).await,
+        Err(RunnerError::EndpointUnproven)
+    );
+    for delay in [VACANCY_TIMEOUT, VACANCY_TIMEOUT + Duration::from_millis(1)] {
+        assert_eq!(
+            require_port_vacant(
+                async {
+                    sleep(delay).await;
+                    Err::<(), _>(IdeviceError::Usbmuxd(UsbmuxdError::ConnectionRefused))
+                },
+                deadline(),
+            )
+            .await,
+            Err(RunnerError::EndpointUnproven)
+        );
+    }
+    assert_eq!(
+        require_port_vacant(
+            async { Err::<(), _>(IdeviceError::Usbmuxd(UsbmuxdError::ConnectionRefused)) },
+            Instant::now(),
+        )
+        .await,
+        Err(RunnerError::StartupTimedOut)
+    );
+}
+
+#[tokio::test]
 async fn read_only_liveness_survives_handoff_to_blocking_worker() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let runner = OwnedWdaRunner::start_task(

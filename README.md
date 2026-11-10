@@ -310,6 +310,10 @@ joins the runner. Uncertain cleanup is reported as unknown, without replay.
 It never reads a PIN or touches the stop marker. This route is offline-tested;
 live use still requires a reviewed exclusive handoff from any other WDA owner,
 because Handkite's service lock does not exclude an external controller.
+Before launching XCTest, the owned runner accepts only an explicit refusal from
+the pinned device's WDA port as a point-in-time vacancy observation. A listening
+endpoint or uncertain connection refuses startup. Vacancy does not prevent a
+different controller from restarting or prove the new endpoint's ownership.
 
 ## One-shot Clock touch diagnostic
 

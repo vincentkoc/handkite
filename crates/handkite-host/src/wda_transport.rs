@@ -6,7 +6,7 @@ use std::task::Poll;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
-const WDA_PORT: u16 = 8100;
+pub(crate) const WDA_PORT: u16 = 8100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WIRE: usize = wda_http::MAX_BODY + 4 * 1024 * 1024;
 
