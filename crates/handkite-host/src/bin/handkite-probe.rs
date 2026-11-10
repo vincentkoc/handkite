@@ -14,6 +14,8 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 
+#[path = "probe/cancel_trial.rs"]
+mod cancel_trial;
 #[path = "probe/clock_attrs.rs"]
 mod clock_attrs;
 #[path = "probe/idle_settings.rs"]
@@ -31,6 +33,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "cancel-trial-idle") {
+        if let Err(error) = cancel_trial::command(&args[1..]) {
+            eprintln!("cancel_trial_idle={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "pin-geometry") {
         if let Err(error) = pin_geometry::command(&args[1..]) {
             eprintln!("pin_geometry={error}");

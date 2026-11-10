@@ -73,6 +73,38 @@ trait ReadDevice {
 }
 
 fn inspect(device: &mut impl ReadDevice, expected: &HardwareId) -> Result<Summary, Refusal> {
+    let capture = observe_locked(device, expected)?;
+    geometry(
+        &capture.raw.accessibility_tree,
+        &capture.raw.screenshot.bytes,
+    )
+}
+
+pub(super) struct LockedCapture {
+    pub raw: RawObservation,
+    pub session: String,
+    pub started: Instant,
+    pub finished: Instant,
+    pub fresh_until: Instant,
+}
+
+pub(super) struct LockedObserver(Live);
+
+impl LockedObserver {
+    pub fn new(expected: HardwareId) -> Result<Self, ()> {
+        Live::new(expected).map(Self).map_err(|_| ())
+    }
+
+    pub fn capture(&mut self) -> Result<LockedCapture, ()> {
+        let expected = self.0.expected.clone();
+        observe_locked(&mut self.0, &expected).map_err(|_| ())
+    }
+}
+
+fn observe_locked(
+    device: &mut impl ReadDevice,
+    expected: &HardwareId,
+) -> Result<LockedCapture, Refusal> {
     let before = device.status()?;
     check(&before, expected)?;
     let capture = device.capture()?;
@@ -101,7 +133,13 @@ fn inspect(device: &mut impl ReadDevice, expected: &HardwareId) -> Result<Summar
     {
         return Err(Refusal::Freshness);
     }
-    geometry(&raw.accessibility_tree, &raw.screenshot.bytes)
+    Ok(LockedCapture {
+        raw: capture.raw,
+        session: before.session,
+        started: capture.started,
+        finished: capture.finished,
+        fresh_until: capture.started + BUDGET,
+    })
 }
 
 fn check(status: &Status, expected: &HardwareId) -> Result<(), Refusal> {
@@ -183,6 +221,12 @@ fn geometry(xml: &str, png: &[u8]) -> Result<Summary, Refusal> {
         png: (image_width, image_height),
         centers,
     })
+}
+
+pub(super) fn keypad_geometry(xml: &str, png: &[u8]) -> Result<(u16, u16), ()> {
+    geometry(xml, png)
+        .map(|summary| summary.screen)
+        .map_err(|_| ())
 }
 
 fn origin_and_key_count(xml: &str) -> Result<(), Refusal> {

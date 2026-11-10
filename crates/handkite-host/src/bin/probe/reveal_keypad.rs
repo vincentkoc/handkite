@@ -236,6 +236,10 @@ fn validate(
     })
 }
 
+pub(super) fn normal_lock_size(xml: &str) -> Option<(f64, f64)> {
+    normal_lock_screen(xml).ok().map(|screen| screen.size)
+}
+
 fn normal_lock_screen(xml: &str) -> Result<NormalLockScreen, Refusal> {
     if xml.is_empty() || xml.len() > 2 * 1024 * 1024 {
         return Err(Refusal::Screen);

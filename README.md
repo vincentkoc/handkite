@@ -209,6 +209,25 @@ control flow only; live touch delivery and PIN entry remain unqualified.
 
 ## PIN stop gate
 
+`handkite-probe cancel-trial-idle --config PRIVATE_FILE --supervised-hidden-cancel`
+is a one-shot Cancel diagnostic, with no PIN or stop-marker access. Before use,
+the operator must visually confirm Cancel and six empty dots, and externally
+prove exclusive WDA ownership. Two distinct fresh paired captures must agree on
+the pinned existing session, locked SpringBoard, empty keypad, and Cancel geometry.
+Cancel must be enabled and separate from every digit, the field, and all other
+buttons and recognized controls. Competitors require valid bounds even when hidden or
+disabled; missing bounds refuse. An explicit false visibility attribute requires
+the supervision flag. Missing visibility always refuses. PNG header/aspect checks do not classify screenshot pixels.
+The command brackets one W3C tap with temporary idle settings and attempts exact
+restoration on every completed path. The second capture's original five-second
+deadline bounds the tap write. One postcapture must prove the same session still
+locked on the normal lock screen, with no keypad, field, or alert. Only accepted
+receipt, proven postcondition, and verified restoration produce
+`cancel_trial_idle=confirmed`; post-dispatch failures are `unknown`. There is no
+retry or fallback. Refusal sends no tap, but the settings bracket can still run.
+Process termination can prevent restoration. Offline fixtures do not qualify live
+Cancel delivery or PIN entry; this command has not been run live.
+
 `handkite-probe pin-geometry --config PRIVATE_FILE` is read-only. After pinned
 device, unchanged existing session, and native/WDA lock checks, it reports bounded
 screen/PNG dimensions and centers for keys 0-9 in permille (0-1000) of the screen.
