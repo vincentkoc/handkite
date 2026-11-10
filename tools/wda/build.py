@@ -99,6 +99,12 @@ def archive_source(source: Path, destination: Path) -> None:
             raise ValueError("source_archive_failed")
 
 
+def xcode_environment() -> dict[str, str]:
+    environment = os.environ.copy()
+    environment.pop("CPATH", None)
+    return environment
+
+
 def resolved_settings(project: Path, team: str, udid: str) -> dict[str, str]:
     command = [
         "/usr/bin/xcodebuild", "-showBuildSettings",
@@ -107,7 +113,7 @@ def resolved_settings(project: Path, team: str, udid: str) -> dict[str, str]:
         "-destination", f"platform=iOS,id={udid}",
         f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_STYLE=Automatic",
     ]
-    result = subprocess.run(command, capture_output=True, check=False)
+    result = subprocess.run(command, capture_output=True, check=False, env=xcode_environment())
     if result.returncode:
         raise ValueError("build_settings_unavailable")
     settings = {}
@@ -157,7 +163,10 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str, allo
     log = output / "build.log"
     fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as stream:
-        result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT, check=False)
+        result = subprocess.run(
+            command, stdout=stream, stderr=subprocess.STDOUT,
+            check=False, env=xcode_environment(),
+        )
     if result.returncode:
         raise ValueError("xcode_build_failed")
 

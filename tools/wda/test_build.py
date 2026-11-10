@@ -1,5 +1,6 @@
 import hashlib
 import importlib.util
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -40,6 +41,26 @@ def project_fixture():
 
 
 class BuildTests(unittest.TestCase):
+    def test_xcode_environment_removes_only_host_include_path(self):
+        with mock.patch.dict(os.environ, {"CPATH": "/usr/local/include", "TASK_MARKER": "kept"}):
+            environment = build.xcode_environment()
+            self.assertNotIn("CPATH", environment)
+            self.assertEqual(environment["TASK_MARKER"], "kept")
+            self.assertEqual(os.environ["CPATH"], "/usr/local/include")
+
+    def test_settings_probe_uses_clean_xcode_environment(self):
+        with (
+            mock.patch.dict(os.environ, {"CPATH": "/usr/local/include"}),
+            mock.patch.object(build.subprocess, "run", return_value=mock.Mock(
+                returncode=0, stdout=b"    PLATFORM_NAME = iphoneos\n",
+            )) as run,
+        ):
+            self.assertEqual(
+                build.resolved_settings(Path("/project"), "ABCDE12345", MODERN_UDID),
+                {"PLATFORM_NAME": "iphoneos"},
+            )
+        self.assertNotIn("CPATH", run.call_args.kwargs["env"])
+
     def test_udid_accepts_legacy_and_modern_forms_only(self):
         self.assertIsNotNone(build.UDID.fullmatch("a" * 40))
         self.assertIsNotNone(build.UDID.fullmatch(MODERN_UDID))
@@ -98,6 +119,7 @@ class BuildTests(unittest.TestCase):
             self.assertNotIn("-allowProvisioningDeviceRegistration", command)
             self.assertNotIn("PRODUCT_BUNDLE_IDENTIFIER=com.example.Runner", command)
             self.assertFalse(any(word in command for word in ("test-without-building", "install", "launch")))
+            self.assertNotIn("CPATH", run.call_args.kwargs["env"])
             self.assertEqual((output / "build.log").stat().st_mode & 0o777, 0o600)
 
     def test_mismatched_resolved_settings_prevent_build(self):
