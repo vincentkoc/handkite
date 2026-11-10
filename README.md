@@ -125,7 +125,8 @@ The library's `ServiceLayout::current_account()` derives fixed paths from the ef
 | Staged launchd descriptor | `launchd/com.handkite.host.plist` |
 
 The pure `launchd_descriptor::render` helper emits the intended supervised
-descriptor for this fixed selection path. It writes or loads nothing; current
+descriptor for this fixed selection path. Its sole daemon argument is
+`--owned-wda`, so activation requires a protected installed runner ID. It writes or loads nothing; current
 release selection and activation remain unimplemented. See the descriptor
 contract and activation preconditions in [Mac release inputs](RELEASE.md).
 
