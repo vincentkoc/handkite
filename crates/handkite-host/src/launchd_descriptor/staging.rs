@@ -33,7 +33,7 @@ impl StageFailure {
     }
 }
 
-/// Retains the staged bytes, filesystem anchors, and original protected inputs.
+/// Retains staged or reopened bytes, filesystem anchors, and protected inputs.
 /// This handle grants no release selection or service activation authority.
 pub struct StagedDescriptor<'held, 'lock> {
     #[cfg(target_os = "macos")]
@@ -58,6 +58,33 @@ impl StagedDescriptor<'_, '_> {
         }
         #[cfg(not(target_os = "macos"))]
         Err("service descriptor staging requires macOS")
+    }
+}
+
+/// Open only the existing fixed descriptor with the renderer's exact bytes.
+/// The directory must contain only that account-owned, single-link, ACL-free,
+/// mode-0400 file. Inputs must borrow this lock and config must include a runner ID.
+/// Nothing is created, repaired, selected, or activated. Reopening establishes
+/// current custody, not the file's staging history or an installed service.
+pub fn reopen_staged<'held, 'lock>(
+    owner: &'lock InstallerLock,
+    config: &'held mut RetainedConfig<'lock>,
+    release: &'held mut PublishedRelease<'lock>,
+) -> Result<StagedDescriptor<'held, 'lock>, &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::reopen_staged(
+            owner,
+            config,
+            release,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (owner, config, release);
+        Err("service descriptor reopening requires macOS")
     }
 }
 

@@ -1,7 +1,7 @@
 //! Fixed rendering and protected staging of the per-account service descriptor.
 
 pub(crate) mod staging;
-pub use staging::{StageFailure, StagePhase, StagedDescriptor, stage};
+pub use staging::{StageFailure, StagePhase, StagedDescriptor, reopen_staged, stage};
 
 use crate::service_layout::ServiceLayout;
 use std::path::Path;

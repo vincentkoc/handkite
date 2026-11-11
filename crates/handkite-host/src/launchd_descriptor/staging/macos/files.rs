@@ -24,7 +24,7 @@ pub(super) struct Anchors {
 }
 
 impl Anchors {
-    pub(super) fn open(layout: &ServiceLayout) -> Result<Self, &'static str> {
+    pub(super) fn open(layout: &ServiceLayout, expected: &[&CStr]) -> Result<Self, &'static str> {
         let mut parts = components(&layout.staged_launchd_descriptor())?;
         if parts.pop().as_deref() != Some(FINAL) {
             return Err(UNSAFE);
@@ -58,7 +58,7 @@ impl Anchors {
             directories,
             uid,
         };
-        value.check(&[])?;
+        value.check(expected)?;
         Ok(value)
     }
 
@@ -173,6 +173,18 @@ pub(super) struct Descriptor {
 }
 
 impl Descriptor {
+    pub(super) fn open(anchors: &Anchors, bytes: Box<[u8]>) -> Result<Self, &'static str> {
+        let file = open_at(anchors.parent().as_raw_fd(), FINAL, false)?;
+        let fingerprint = file_policy(&file, 0o400, bytes.len())?;
+        let value = Self {
+            file,
+            fingerprint,
+            bytes,
+        };
+        value.check(anchors, FINAL)?;
+        Ok(value)
+    }
+
     pub(super) fn check(&self, anchors: &Anchors, name: &CStr) -> Result<(), &'static str> {
         let current = open_at(anchors.parent().as_raw_fd(), name, false)?;
         for file in [&self.file, &current] {

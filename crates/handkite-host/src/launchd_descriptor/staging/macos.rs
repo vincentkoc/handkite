@@ -152,6 +152,38 @@ fn rename(parent: &File, temporary: &CStr, #[cfg(test)] hooks: &mut Hooks<'_>) -
     Ok(())
 }
 
+pub(crate) fn reopen_staged<'held, 'lock>(
+    owner: &'lock InstallerLock,
+    config: &'held mut RetainedConfig<'lock>,
+    release: &'held mut PublishedRelease<'lock>,
+    #[cfg(test)] mut check: Option<Check<'_>>,
+) -> Result<StagedDescriptor<'held, 'lock>, &'static str> {
+    let mut inputs = Inputs {
+        owner,
+        config,
+        release,
+    };
+    inputs.verify(
+        #[cfg(test)]
+        check.as_mut().map(|check| &mut **check as _),
+    )?;
+    let bytes = crate::launchd_descriptor::render(owner.layout())?
+        .into_bytes()
+        .into_boxed_slice();
+    let anchors = Anchors::open(owner.layout(), &[FINAL])?;
+    let descriptor = Descriptor::open(&anchors, bytes)?;
+    let mut value = Staged {
+        inputs,
+        anchors,
+        descriptor,
+    };
+    value.revalidate(
+        #[cfg(test)]
+        check,
+    )?;
+    Ok(StagedDescriptor { inner: value })
+}
+
 pub(crate) fn stage<'held, 'lock>(
     owner: &'lock InstallerLock,
     config: &'held mut RetainedConfig<'lock>,
@@ -174,7 +206,7 @@ pub(crate) fn stage<'held, 'lock>(
         let bytes = crate::launchd_descriptor::render(owner.layout())?
             .into_bytes()
             .into_boxed_slice();
-        let mut anchors = Anchors::open(owner.layout())?;
+        let mut anchors = Anchors::open(owner.layout(), &[])?;
         let temporary = name(
             #[cfg(test)]
             hooks,

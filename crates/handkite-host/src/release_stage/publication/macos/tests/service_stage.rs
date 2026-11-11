@@ -446,3 +446,360 @@ fn retained_inputs_drifting_before_rename_prevent_the_syscall() {
         assert!(!fixture.layout().staged_launchd_descriptor().exists());
     }
 }
+
+fn staged_inputs(fixture: &Fixture) -> (RetainedConfig<'_>, PublishedRelease<'_>) {
+    let mut published = run(fixture.stage(), |_, _| Ok(())).unwrap();
+    let mut config = config(fixture);
+    drop(
+        service::stage(
+            &fixture.owner,
+            &mut config,
+            &mut published,
+            &mut hooks(&mut |_, _| Ok(())),
+        )
+        .unwrap(),
+    );
+    (config, published)
+}
+
+fn descriptor_fingerprints(fixture: &Fixture) -> Vec<Option<Fingerprint>> {
+    let mut paths = vec![
+        directory(fixture),
+        fixture.layout().staged_launchd_descriptor(),
+        fixture.layout().process_lock(),
+        fixture.layout().releases_directory(),
+        fixture.directory(),
+        fixture.receipt(),
+    ];
+    paths.extend(NAMES.map(|name| fixture.directory().join(name.filename())));
+    paths
+        .into_iter()
+        .map(|path| fs::symlink_metadata(path).ok().map(Fingerprint::from))
+        .collect()
+}
+
+fn replace_descriptor(fixture: &Fixture, parent: bool) {
+    let path = fixture.layout().staged_launchd_descriptor();
+    let bytes = fs::read(&path).unwrap();
+    if parent {
+        let dir = directory(fixture);
+        fs::rename(&dir, dir.with_extension("held")).unwrap();
+        fs::create_dir(&dir).unwrap();
+        chmod(&dir, 0o700);
+    } else {
+        fs::rename(&path, fixture._home.path().join("held-descriptor")).unwrap();
+    }
+    fs::write(&path, bytes).unwrap();
+    chmod(&path, 0o400);
+}
+
+#[test]
+fn reopening_after_drop_preserves_exact_file_and_protected_inputs() {
+    let fixture = fixture();
+    let (mut config, mut published) = staged_inputs(&fixture);
+    let before = descriptor_fingerprints(&fixture);
+    let protected = fixture.protected();
+    let bytes = fs::read(fixture.layout().staged_launchd_descriptor()).unwrap();
+    let mut seen = Vec::new();
+    let mut descriptor = service::reopen_staged(
+        &fixture.owner,
+        &mut config,
+        &mut published,
+        Some(&mut |name, path| {
+            seen.push((name, path.to_owned()));
+            Ok(())
+        }),
+    )
+    .unwrap();
+    let expected = NAMES.map(|name| (name, fixture.directory().join(name.filename())));
+    assert_eq!(seen, [expected.clone(), expected].concat());
+    service::revalidate(&mut descriptor, &mut |_, _| Ok(())).unwrap();
+    service::revalidate(&mut descriptor, &mut |_, _| Ok(())).unwrap();
+    drop(descriptor);
+    assert_eq!(before, descriptor_fingerprints(&fixture));
+    fixture.unchanged(protected);
+    assert_eq!(
+        bytes,
+        fs::read(fixture.layout().staged_launchd_descriptor()).unwrap()
+    );
+    let mut check = |_, _: &Path| Ok(());
+    let mut hooks = hooks(&mut check);
+    let error = service::stage(&fixture.owner, &mut config, &mut published, &mut hooks)
+        .err()
+        .unwrap();
+    assert_eq!(error.phase(), StagePhase::BeforeRename);
+    assert!(!error.has_residue());
+    assert_eq!(hooks.renames, 0);
+    assert_eq!(before, descriptor_fingerprints(&fixture));
+}
+
+fn change_descriptor(fixture: &Fixture, variant: usize) {
+    let path = fixture.layout().staged_launchd_descriptor();
+    let dir = directory(fixture);
+    match variant {
+        0 => fs::remove_file(&path).unwrap(),
+        1 => fs::write(dir.join("extra"), b"preserved").unwrap(),
+        2 => {
+            fs::remove_file(&path).unwrap();
+            symlink("missing", &path).unwrap();
+        }
+        3 => fs::hard_link(&path, fixture._home.path().join("linked-descriptor")).unwrap(),
+        4 => chmod(&path, 0o600),
+        5 => acl(&path),
+        6 => {
+            let mut bytes = fs::read(&path).unwrap();
+            bytes[0] = b'!';
+            chmod(&path, 0o600);
+            fs::write(&path, bytes).unwrap();
+            chmod(&path, 0o400);
+        }
+        7 => chmod(&dir, 0o755),
+        8 => acl(&dir),
+        9 => {
+            let held = dir.with_extension("held");
+            fs::rename(&dir, &held).unwrap();
+            symlink(held, &dir).unwrap();
+        }
+        10 => fs::rename(&dir, dir.with_extension("held")).unwrap(),
+        _ => {
+            fs::remove_file(&path).unwrap();
+            fs::create_dir(&path).unwrap();
+            chmod(&path, 0o400);
+        }
+    }
+}
+
+#[test]
+fn reopening_refuses_missing_extra_linked_unsafe_or_inexact_descriptor() {
+    for variant in 0..12 {
+        let fixture = fixture();
+        let (mut config, mut published) = staged_inputs(&fixture);
+        change_descriptor(&fixture, variant);
+        let before = descriptor_fingerprints(&fixture);
+        let protected = fixture.protected();
+        assert!(
+            service::reopen_staged(
+                &fixture.owner,
+                &mut config,
+                &mut published,
+                Some(&mut |_, _| Ok(())),
+            )
+            .is_err(),
+            "variant {variant}"
+        );
+        assert_eq!(before, descriptor_fingerprints(&fixture));
+        fixture.unchanged(protected);
+    }
+}
+
+#[test]
+fn reopened_handle_refuses_inventory_file_and_directory_policy_drift() {
+    for variant in 0..12 {
+        let fixture = fixture();
+        let (mut config, mut published) = staged_inputs(&fixture);
+        let mut descriptor = service::reopen_staged(
+            &fixture.owner,
+            &mut config,
+            &mut published,
+            Some(&mut |_, _| Ok(())),
+        )
+        .unwrap();
+        change_descriptor(&fixture, variant);
+        let before = descriptor_fingerprints(&fixture);
+        let protected = fixture.protected();
+        assert!(service::revalidate(&mut descriptor, &mut |_, _| Ok(())).is_err());
+        assert!(service::revalidate(&mut descriptor, &mut |_, _| Ok(())).is_err());
+        assert_eq!(before, descriptor_fingerprints(&fixture));
+        fixture.unchanged(protected);
+    }
+}
+
+#[test]
+fn reopening_requires_runner_and_the_same_config_and_release_lock() {
+    let fixture = fixture();
+    let (config, mut published) = staged_inputs(&fixture);
+    drop(config);
+    fs::write(fixture.layout().config_file(), CONFIG).unwrap();
+    let mut config = self::config(&fixture);
+    let before = descriptor_fingerprints(&fixture);
+    let protected = fixture.protected();
+    assert_eq!(
+        service::reopen_staged(
+            &fixture.owner,
+            &mut config,
+            &mut published,
+            Some(&mut |_, _| panic!("missing runner must reject before signer")),
+        )
+        .err(),
+        Some("configured runner ID required")
+    );
+
+    let other = self::fixture();
+    let (mut other_config, mut other_published) = staged_inputs(&other);
+    let other_before = descriptor_fingerprints(&other);
+    let other_protected = other.protected();
+    assert_eq!(
+        service::reopen_staged(
+            &other.owner,
+            &mut other_config,
+            &mut published,
+            Some(&mut |_, _| panic!("wrong release owner must reject before signer")),
+        )
+        .err(),
+        Some("published release installer lock mismatch")
+    );
+    assert!(
+        service::reopen_staged(
+            &other.owner,
+            &mut config,
+            &mut other_published,
+            Some(&mut |_, _| panic!("wrong config owner must reject before signer")),
+        )
+        .is_err()
+    );
+    assert_eq!(before, descriptor_fingerprints(&fixture));
+    assert_eq!(other_before, descriptor_fingerprints(&other));
+    fixture.unchanged(protected);
+    other.unchanged(other_protected);
+}
+
+#[test]
+fn reopening_and_retained_checks_refuse_signer_failure_without_writes() {
+    for fail_at in [1, 4] {
+        let fixture = fixture();
+        let (mut config, mut published) = staged_inputs(&fixture);
+        let before = descriptor_fingerprints(&fixture);
+        let protected = fixture.protected();
+        let mut calls = 0;
+        assert_eq!(
+            service::reopen_staged(
+                &fixture.owner,
+                &mut config,
+                &mut published,
+                Some(&mut |_, _| {
+                    calls += 1;
+                    if calls == fail_at {
+                        Err("synthetic signer failure")
+                    } else {
+                        Ok(())
+                    }
+                }),
+            )
+            .err(),
+            Some("synthetic signer failure")
+        );
+        assert_eq!(calls, fail_at);
+        let mut descriptor = service::reopen_staged(
+            &fixture.owner,
+            &mut config,
+            &mut published,
+            Some(&mut |_, _| Ok(())),
+        )
+        .unwrap();
+        assert_eq!(
+            service::revalidate(&mut descriptor, &mut |_, _| Err("synthetic signer failure")),
+            Err("synthetic signer failure")
+        );
+        assert_eq!(before, descriptor_fingerprints(&fixture));
+        fixture.unchanged(protected);
+    }
+}
+
+#[test]
+fn replacement_during_reopening_is_not_admitted() {
+    for parent in [false, true] {
+        let fixture = fixture();
+        let (mut config, mut published) = staged_inputs(&fixture);
+        let protected = fixture.protected();
+        let mut calls = 0;
+        let mut replaced = None;
+        assert!(
+            service::reopen_staged(
+                &fixture.owner,
+                &mut config,
+                &mut published,
+                Some(&mut |_, _| {
+                    calls += 1;
+                    if calls == 4 {
+                        replace_descriptor(&fixture, parent);
+                        replaced = Some(descriptor_fingerprints(&fixture));
+                    }
+                    Ok(())
+                }),
+            )
+            .is_err()
+        );
+        assert_eq!(replaced.unwrap(), descriptor_fingerprints(&fixture));
+        fixture.unchanged(protected);
+    }
+}
+
+#[test]
+fn reopened_handle_rejects_replacement_before_or_during_revalidation() {
+    for (parent, during) in [(false, false), (true, false), (false, true), (true, true)] {
+        let fixture = fixture();
+        let (mut config, mut published) = staged_inputs(&fixture);
+        let protected = fixture.protected();
+        let mut descriptor = service::reopen_staged(
+            &fixture.owner,
+            &mut config,
+            &mut published,
+            Some(&mut |_, _| Ok(())),
+        )
+        .unwrap();
+        if !during {
+            replace_descriptor(&fixture, parent);
+        }
+        let mut calls = 0;
+        assert!(
+            service::revalidate(&mut descriptor, &mut |_, _| {
+                calls += 1;
+                if during && calls == 1 {
+                    replace_descriptor(&fixture, parent);
+                }
+                Ok(())
+            })
+            .is_err()
+        );
+        let replaced = descriptor_fingerprints(&fixture);
+        assert!(service::revalidate(&mut descriptor, &mut |_, _| Ok(())).is_err());
+        assert_eq!(replaced, descriptor_fingerprints(&fixture));
+        fixture.unchanged(protected);
+    }
+}
+
+#[test]
+fn reopened_handle_preserves_original_config_lock_and_release_baselines() {
+    for variant in 0..3 {
+        let fixture = fixture();
+        let (mut config, mut published) = staged_inputs(&fixture);
+        let mut descriptor = service::reopen_staged(
+            &fixture.owner,
+            &mut config,
+            &mut published,
+            Some(&mut |_, _| Ok(())),
+        )
+        .unwrap();
+        match variant {
+            0 => fs::write(fixture.layout().config_file(), CONFIG).unwrap(),
+            1 => {
+                let path = fixture.layout().process_lock();
+                fs::rename(&path, fixture._home.path().join("held-lock")).unwrap();
+                fs::write(&path, b"").unwrap();
+                chmod(&path, 0o600);
+            }
+            _ => {
+                let path = fixture.directory().join("handkited");
+                chmod(&path, 0o700);
+                fs::write(&path, b"changed").unwrap();
+                chmod(&path, 0o500);
+            }
+        }
+        let before = descriptor_fingerprints(&fixture);
+        let protected = fixture.protected();
+        assert!(service::revalidate(&mut descriptor, &mut |_, _| Ok(())).is_err());
+        assert!(service::revalidate(&mut descriptor, &mut |_, _| Ok(())).is_err());
+        assert_eq!(before, descriptor_fingerprints(&fixture));
+        fixture.unchanged(protected);
+    }
+}
