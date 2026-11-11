@@ -6,7 +6,7 @@ use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_action::{CoordinateTapError, WdaActions};
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_http::HttpResponse;
-use handkite_host::wda_runner::OwnedWdaRunner;
+use handkite_host::wda_runner::{OwnedWdaRunner, RunnerError};
 use handkite_host::wda_session::{
     OwnedSessionError, SessionClose, close_owned_session, with_owned_session_idle_settings_receipt,
 };
@@ -117,7 +117,7 @@ impl Transport {
 enum ReceiptFailure {
     Trial(TrialError),
     Session(OwnedSessionError),
-    RunnerUnavailable,
+    Runner(RunnerError),
     SettingsUnproven,
     RestorationUnproven,
     SessionCloseRefused,
@@ -133,7 +133,20 @@ impl ReceiptFailure {
         let message = match self {
             Self::Trial(error) => error.message(),
             Self::Session(error) => error.message(),
-            Self::RunnerUnavailable => return "runner_unavailable",
+            Self::Runner(error) => {
+                return match error {
+                    RunnerError::InvalidBundleId => "runner_invalid_bundle_id",
+                    RunnerError::InvalidTimeout => "runner_invalid_timeout",
+                    RunnerError::LookupFailed => "runner_lookup_failed",
+                    RunnerError::LookupTimedOut => "runner_lookup_timed_out",
+                    RunnerError::EndpointBusy => "runner_endpoint_busy",
+                    RunnerError::EndpointUnproven => "runner_endpoint_unproven",
+                    RunnerError::StartupTimedOut => "runner_startup_timed_out",
+                    RunnerError::RunnerExited => "runner_exited",
+                    RunnerError::RunnerFailed => "runner_failed",
+                    RunnerError::TaskFailed => "runner_task_failed",
+                };
+            }
             Self::SettingsUnproven => return "settings_unproven",
             Self::RestorationUnproven => return "restoration_unproven",
             Self::SessionCloseRefused => return "session_close_refused",
@@ -337,10 +350,9 @@ fn owned_trial(args: &[String], receipts: &mut OwnedReceipts) -> Result<Transpor
         let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120)).await;
         receipts.runner_startup.finish(
             started,
-            if runner.is_ok() {
-                StepOutcome::Complete
-            } else {
-                StepOutcome::Failed(ReceiptFailure::RunnerUnavailable)
+            match &runner {
+                Ok(_) => StepOutcome::Complete,
+                Err(error) => StepOutcome::Failed(ReceiptFailure::Runner(*error)),
             },
         );
         let runner = runner.map_err(|_| "refused reason=runner_unavailable")?;
@@ -1566,6 +1578,36 @@ mod tests {
         assert!(output.contains(
             "touch_trial_owned_step=session_close elapsed_us=none outcome=skipped reason=none\n"
         ));
+    }
+
+    #[test]
+    fn runner_startup_receipt_preserves_only_fixed_failure_categories() {
+        let failures = [
+            (RunnerError::InvalidBundleId, "runner_invalid_bundle_id"),
+            (RunnerError::InvalidTimeout, "runner_invalid_timeout"),
+            (RunnerError::LookupFailed, "runner_lookup_failed"),
+            (RunnerError::LookupTimedOut, "runner_lookup_timed_out"),
+            (RunnerError::EndpointBusy, "runner_endpoint_busy"),
+            (RunnerError::EndpointUnproven, "runner_endpoint_unproven"),
+            (RunnerError::StartupTimedOut, "runner_startup_timed_out"),
+            (RunnerError::RunnerExited, "runner_exited"),
+            (RunnerError::RunnerFailed, "runner_failed"),
+            (RunnerError::TaskFailed, "runner_task_failed"),
+        ];
+        for (error, reason) in failures {
+            let report = OwnedReceipts {
+                runner_startup: StepReceipt {
+                    elapsed: Some(Duration::from_micros(1)),
+                    outcome: StepOutcome::Failed(ReceiptFailure::Runner(error)),
+                },
+                ..OwnedReceipts::default()
+            };
+            let output = report.render();
+            assert!(output.contains(&format!(
+                "touch_trial_owned_step=runner_startup elapsed_us=1 outcome=failed reason={reason}\n"
+            )));
+            assert_eq!(output.lines().count(), 9);
+        }
     }
 
     #[test]

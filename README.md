@@ -377,7 +377,10 @@ steps and must not be added to them. Total excludes receipt formatting/output.
 Skipped steps have no duration. Lost worker receipts are `unavailable`; a capture
 after an uncertain tap receipt is `observed_unvalidated`, never proof of the
 Clock transition. Fixed failure reasons contain no device/session identifiers,
-paths, screen content, coordinates, or credentials. `complete` describes only
+paths, screen content, coordinates, or credentials. Runner startup reports a
+fixed lookup, endpoint, timeout, exit, or task failure category instead of
+collapsing every failure into `runner_unavailable`. These categories do not
+identify a UI Automation prompt or pairing state. `complete` describes only
 that step; confirmation still requires the existing final checks. No latency or
 live reliability claim follows from the offline fixtures.
 
