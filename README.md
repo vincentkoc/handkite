@@ -324,6 +324,25 @@ the pinned device's WDA port as a point-in-time vacancy observation. A listening
 endpoint or uncertain connection refuses startup. Vacancy does not prevent a
 different controller from restarting or prove the new endpoint's ownership.
 
+`controller_process::observe` is a separate read-only macOS diagnostic for one
+privately pinned PID. It compares effective UID, wall-clock and monotonic process
+start times, executable path, and executable Mach-O UUID. Two complete samples
+must agree before returning `Match` or `Mismatch`; disappearance during a sample,
+permissions, malformed responses, zombies, and unsupported platforms return
+`Unknown`. `Absent` requires two initial PID lookups returning ESRCH and means
+only that PID was absent at those observations. Each complete sample brackets
+the path read with start-time, UID, and executable metadata checks. There are at
+most ten native reads, without process enumeration, argv, environment, signals,
+subprocesses, or executable-file access.
+
+These are advisory observations, not an atomic process handle. Same-value ABA
+changes and changes after the final read remain possible. A UUID/path match is
+not code-signature or byte-integrity proof; for an interpreter it identifies the
+executable, not a script or its arguments. No result establishes that a controller
+is stopped, excludes restart or another PID, identifies a launch supervisor, or
+permits selection, activation, or WDA ownership. Independent pins remain private
+and are never generated from the process being compared by the production API.
+
 After cleanup, the owned Clock route emits nine fixed-field timing receipts to
 stderr before its unchanged terminal status. Monotonic `elapsed_us` covers runner
 startup, the session/settings transaction, both preflights, tap, the sole

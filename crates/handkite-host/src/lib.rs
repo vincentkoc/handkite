@@ -2,6 +2,7 @@
 
 mod account_home;
 pub mod anisette_v3;
+pub mod controller_process;
 pub mod current_selection;
 pub mod developer_probe;
 pub mod device_agreement;
