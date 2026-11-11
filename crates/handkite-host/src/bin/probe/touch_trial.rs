@@ -1517,7 +1517,9 @@ mod tests {
         };
         assert_eq!(
             transaction_receipt(&outcome),
-            StepOutcome::Failed(ReceiptFailure::Trial(failed.unwrap_err()))
+            StepOutcome::Failed(ReceiptFailure::Trial(TrialError::CoordinateUnknown(
+                CoordinateUnknown::Http404
+            )))
         );
         assert_eq!(idle_result(outcome), Err("unknown reason=http_404"));
     }
