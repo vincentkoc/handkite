@@ -43,7 +43,9 @@ pub(super) fn read_binding(input: &mut File) -> Option<DeviceBinding> {
 }
 
 fn parse(bytes: &[u8]) -> Option<DeviceBinding> {
-    if bytes.len() as u64 > MAX_INPUT_BYTES {
+    if bytes.len() as u64 > MAX_INPUT_BYTES
+        || bytes.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{')
+    {
         return None;
     }
     let input: PinnedInput = serde_json::from_slice(bytes).ok()?;
@@ -92,6 +94,7 @@ mod tests {
         for bytes in [
             b"".as_slice(),
             b"[]",
+            br#"[1,"phone","test-device"]"#,
             b"null",
             b"{}",
             br#"{"device_key":"phone","usb_id":"test-device"}"#,
