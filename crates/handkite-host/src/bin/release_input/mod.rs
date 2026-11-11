@@ -10,6 +10,7 @@ use std::path::PathBuf;
 const HEADER_BYTES: usize = 65 + 41;
 const MAX_INPUT_BYTES: usize = HEADER_BYTES + MAX_MANIFEST_BYTES;
 
+#[allow(dead_code)] // Fixed-layout consumers share the envelope without a source path.
 pub(super) fn stage_arg(mut args: impl Iterator<Item = OsString>) -> Option<PathBuf> {
     if args.next()?.as_os_str() != "--stage" {
         return None;
