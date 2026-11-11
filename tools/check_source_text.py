@@ -25,32 +25,39 @@ def has_han(value: str) -> bool:
 def main() -> int:
     root = Path(__file__).resolve().parent.parent
     result = subprocess.run(
-        ["git", "-C", str(root), "ls-files", "-z"],
+        ["git", "-C", str(root), "ls-files", "--stage", "-z"],
         check=True,
         capture_output=True,
     )
     checked = 0
     violations = []
-    for name in result.stdout.split(b"\0"):
-        if not name:
+    for entry in result.stdout.split(b"\0"):
+        if not entry:
             continue
+        metadata, name = entry.split(b"\t", 1)
+        mode, object_id, stage = metadata.split(b" ")
         relative = Path(name.decode("utf-8"))
-        if has_han(relative.as_posix()):
+        if stage != b"0" or has_han(relative.as_posix()):
             violations.append(relative)
             continue
         if relative.suffix not in TEXT_SUFFIXES and relative.name not in TEXT_NAMES:
             continue
         path = root / relative
-        if path.is_symlink():
+        if mode not in (b"100644", b"100755") or path.is_symlink():
             violations.append(relative)
             continue
         checked += 1
         try:
+            staged = subprocess.run(
+                ["git", "-C", str(root), "cat-file", "blob", object_id.decode("ascii")],
+                check=True,
+                capture_output=True,
+            ).stdout.decode("utf-8")
             content = path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
+        except (UnicodeDecodeError, OSError, subprocess.CalledProcessError):
             violations.append(relative)
             continue
-        if has_han(content):
+        if has_han(staged) or has_han(content):
             violations.append(relative)
     for path in violations:
         print(f"source_han=found path={path}")
