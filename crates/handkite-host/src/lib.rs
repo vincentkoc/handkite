@@ -24,6 +24,7 @@ pub mod pin_screen;
 #[cfg(target_os = "macos")]
 mod release_files;
 pub mod release_manifest;
+pub mod release_package;
 pub mod release_signer;
 pub mod release_stage;
 pub mod release_verify;

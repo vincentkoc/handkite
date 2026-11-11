@@ -239,7 +239,7 @@ impl ReleaseManifest {
 // Derived struct deserializers also accept JSON arrays. Require objects before
 // delegating field checks, preserving duplicate-field detection during parsing.
 #[derive(Debug)]
-struct JsonObject<T>(T);
+pub(crate) struct JsonObject<T>(pub(crate) T);
 
 impl<'de, T: Deserialize<'de>> Deserialize<'de> for JsonObject<T> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
