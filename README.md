@@ -332,6 +332,20 @@ the pinned device's WDA port as a point-in-time vacancy observation. A listening
 endpoint or uncertain connection refuses startup. Vacancy does not prevent a
 different controller from restarting or prove the new endpoint's ownership.
 
+`handkite-probe touch-trial-owned-auto-clock --config SERVICE_CONFIG --transport w3c`
+is an additional explicit no-PIN route for the same exclusive handoff. Leave
+the phone manually unlocked; **do not prepare World Clock first**. The runner
+and its exact session must be ready before the probe sends one guarded Clock
+launch request. If iOS asks to enable UI Automation, the operator must approve
+that prompt; the probe neither enters a PIN nor infers approval from a generic
+startup failure. An uncertain launch receipt stops before any tap. After an
+acknowledged launch, fresh captures must prove either World Clock or Stopwatch
+selected, then verify that same starting tab twice before one tap of the other
+tab and one postcheck. An alarm, timer, overlay, locked phone, session drift, or
+unsupported layout refuses the tap. Both routes share settings restoration,
+exact-session close, runner join, and uncertain-cleanup behavior. The auto
+route has offline fixture proof only and is not a qualified live handoff.
+
 `controller_process::observe` is a separate read-only macOS diagnostic for one
 privately pinned PID. It compares effective UID, wall-clock and monotonic process
 start times, executable path, and executable Mach-O UUID. Two complete samples
@@ -367,9 +381,10 @@ Stdout contains only `controller_process=match` (exit 0), `mismatch` or `absent`
 stderr carries no diagnostic details. No PID, path, UID, UUID, or timestamps are
 printed. A match establishes only the stated comparison, never handoff admission.
 
-After cleanup, the owned Clock route emits nine fixed-field timing receipts to
-stderr before its unchanged terminal status. Monotonic `elapsed_us` covers runner
-startup, the session/settings transaction, both preflights, tap, the sole
+After cleanup, the owned Clock routes emit eleven fixed-field timing receipts to
+stderr before their terminal status. Monotonic `elapsed_us` covers runner
+startup, the session/settings transaction, an optional Clock launch and tab
+detection, both preflights, tap, the sole
 postcheck, exact-session close, runner join (including the final ownership
 check), and total invocation work. The transaction includes session creation,
 settings, the Clock trial, and restoration; its time overlaps the four Clock

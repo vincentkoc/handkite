@@ -124,6 +124,7 @@ enum ReceiptFailure {
     Trial(TrialError),
     Session(OwnedSessionError),
     Runner(RunnerError),
+    LaunchUnproven,
     SettingsUnproven,
     RestorationUnproven,
     SessionCloseRefused,
@@ -153,6 +154,7 @@ impl ReceiptFailure {
                     RunnerError::TaskFailed => "runner_task_failed",
                 };
             }
+            Self::LaunchUnproven => return "launch_unproven",
             Self::SettingsUnproven => return "settings_unproven",
             Self::RestorationUnproven => return "restoration_unproven",
             Self::SessionCloseRefused => return "session_close_refused",
@@ -209,6 +211,8 @@ impl StepReceipt {
 
 #[derive(Default)]
 struct ClockReceipts {
+    clock_launch: StepReceipt,
+    tab_detection: StepReceipt,
     preflight_1: StepReceipt,
     preflight_2: StepReceipt,
     tap: StepReceipt,
@@ -222,6 +226,8 @@ impl ClockReceipts {
             outcome: StepOutcome::Unavailable,
         };
         Self {
+            clock_launch: lost,
+            tab_detection: lost,
             preflight_1: lost,
             preflight_2: lost,
             tap: lost,
@@ -249,6 +255,8 @@ impl OwnedReceipts {
                 "session_settings_transaction",
                 &self.session_settings_transaction,
             ),
+            ("clock_launch", &self.clock.clock_launch),
+            ("tab_detection", &self.clock.tab_detection),
             ("preflight_1", &self.clock.preflight_1),
             ("preflight_2", &self.clock.preflight_2),
             ("tap", &self.clock.tap),
@@ -308,9 +316,17 @@ pub(super) fn idle_command(args: &[String]) -> Result<(), &'static str> {
 }
 
 pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
+    owned_command_mode(args, false)
+}
+
+pub(super) fn owned_auto_clock_command(args: &[String]) -> Result<(), &'static str> {
+    owned_command_mode(args, true)
+}
+
+fn owned_command_mode(args: &[String], auto_clock: bool) -> Result<(), &'static str> {
     let started = Instant::now();
     let mut receipts = OwnedReceipts::default();
-    let result = owned_trial(args, &mut receipts);
+    let result = owned_trial(args, &mut receipts, auto_clock);
     receipts.total.finish(
         started,
         match result {
@@ -321,14 +337,20 @@ pub(super) fn owned_command(args: &[String]) -> Result<(), &'static str> {
     // No formatting or output while the trial or its cleanup is in progress.
     eprint!("{}", receipts.render());
     let transport = result?;
-    println!(
-        "touch_trial_owned_session=confirmed transport={}",
-        transport.name()
-    );
+    let label = if auto_clock {
+        "touch_trial_owned_auto_clock"
+    } else {
+        "touch_trial_owned_session"
+    };
+    println!("{label}=confirmed transport={}", transport.name());
     Ok(())
 }
 
-fn owned_trial(args: &[String], receipts: &mut OwnedReceipts) -> Result<Transport, &'static str> {
+fn owned_trial(
+    args: &[String],
+    receipts: &mut OwnedReceipts,
+    auto_clock: bool,
+) -> Result<Transport, &'static str> {
     let (path, transport) = option_syntax(args)?;
     let layout = ServiceLayout::current_account().map_err(|_| "refused reason=service_layout")?;
     if path != layout.config_file() {
@@ -401,7 +423,11 @@ fn owned_trial(args: &[String], receipts: &mut OwnedReceipts) -> Result<Transpor
                             session: &worker_session,
                             admission: Some(&owns),
                         };
-                        run_recorded(&mut bound, &expected, transport, &mut clock)
+                        if auto_clock {
+                            run_auto_recorded(&mut bound, &expected, transport, &mut clock)
+                        } else {
+                            run_recorded(&mut bound, &expected, transport, &mut clock)
+                        }
                     })();
                     Ok((result, clock))
                 })
@@ -572,6 +598,7 @@ struct Snapshot {
 trait TrialDevice {
     fn capture(&mut self) -> Result<Snapshot, RefusalReason>;
     fn now_ms(&self) -> Result<u64, ()>;
+    fn launch_clock(&mut self, session: &str) -> Result<(), TrialError>;
     fn tap(
         &mut self,
         transport: Transport,
@@ -600,6 +627,17 @@ impl<D: TrialDevice> TrialDevice for SessionBound<'_, D> {
 
     fn now_ms(&self) -> Result<u64, ()> {
         self.device.now_ms()
+    }
+
+    fn launch_clock(&mut self, session: &str) -> Result<(), TrialError> {
+        if session != self.session || self.admission.is_some_and(|admit| !admit()) {
+            return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+        }
+        let result = self.device.launch_clock(session);
+        if self.admission.is_some_and(|admit| !admit()) {
+            return Err(TrialError::Unknown);
+        }
+        result
     }
 
     fn tap(
@@ -636,6 +674,83 @@ fn run_recorded(
         InitialTab::WorldClock,
         receipts,
     )
+}
+
+fn run_auto_recorded(
+    device: &mut impl TrialDevice,
+    expected: &HardwareId,
+    transport: Transport,
+    receipts: &mut ClockReceipts,
+) -> Result<(), TrialError> {
+    let started = Instant::now();
+    let session = device
+        .capture()
+        .map_err(TrialError::Refused)
+        .and_then(|snapshot| {
+            if snapshot.observation.connected_usb != *expected
+                || snapshot.observation.wda_target != *expected
+            {
+                return Err(TrialError::Refused(RefusalReason::IdentityUnproven));
+            }
+            require_native_unlocked(snapshot.native).map_err(TrialError::Refused)?;
+            match snapshot.observation.state.lock {
+                LockState::Unlocked => {}
+                LockState::Locked => return Err(TrialError::Refused(RefusalReason::WdaLocked)),
+                LockState::Uncertain => {
+                    return Err(TrialError::Refused(RefusalReason::WdaLockUnproven));
+                }
+            }
+            if !snapshot.observation.state.wda_ready {
+                return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+            }
+            Ok(snapshot.session)
+        });
+    let launch = session.and_then(|session| device.launch_clock(&session));
+    receipts.clock_launch.finish(
+        started,
+        match launch {
+            Ok(()) => StepOutcome::Complete,
+            Err(TrialError::Unknown | TrialError::CoordinateUnknown(_)) => {
+                StepOutcome::Failed(ReceiptFailure::LaunchUnproven)
+            }
+            Err(error) => StepOutcome::Failed(ReceiptFailure::Trial(error)),
+        },
+    );
+    launch?;
+    let started = Instant::now();
+    let detected = device
+        .capture()
+        .map_err(TrialError::Refused)
+        .and_then(|snapshot| {
+            let world = validate_from(
+                &snapshot,
+                expected,
+                device.now_ms(),
+                false,
+                InitialTab::WorldClock,
+            );
+            if world.is_ok() {
+                return Ok(InitialTab::WorldClock);
+            }
+            validate_from(
+                &snapshot,
+                expected,
+                device.now_ms(),
+                false,
+                InitialTab::Stopwatch,
+            )
+            .map(|_| InitialTab::Stopwatch)
+            .map_err(|_| TrialError::Refused(world.unwrap_err()))
+        });
+    receipts.tab_detection.finish(
+        started,
+        match detected {
+            Ok(_) => StepOutcome::Complete,
+            Err(error) => StepOutcome::Failed(ReceiptFailure::Trial(error)),
+        },
+    );
+    let initial = detected?;
+    run_recorded_from(device, expected, transport, initial, receipts)
 }
 
 fn run_recorded_from(
@@ -1209,6 +1324,39 @@ impl TrialDevice for Live {
             .map_err(|_| ())
     }
 
+    fn launch_clock(&mut self, session: &str) -> Result<(), TrialError> {
+        self.adapter
+            .identities()
+            .map_err(|_| TrialError::Refused(RefusalReason::IdentityUnproven))?;
+        require_native_unlocked(native_lock::query(&self.expected).state)
+            .map_err(TrialError::Refused)?;
+        if self.status().map_err(TrialError::Refused)? != session {
+            return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+        }
+        self.runtime
+            .block_on(self.actions.prepare_existing(&self.wda))
+            .map_err(|_| TrialError::Refused(RefusalReason::SessionUnproven))?;
+        if !self.actions.prepared_session_matches(session) {
+            return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+        }
+        let receipt = self
+            .runtime
+            .block_on(self.actions.execute_existing(
+                &self.wda,
+                &Action::LaunchApp {
+                    bundle_id: CLOCK.into(),
+                },
+            ))
+            .map_err(|_| TrialError::Unknown)?;
+        if receipt.accepted != Some(true) || receipt.action_kind != "launch_app" {
+            return Err(TrialError::Unknown);
+        }
+        if self.status().map_err(|_| TrialError::Unknown)? != session {
+            return Err(TrialError::Unknown);
+        }
+        Ok(())
+    }
+
     fn tap(
         &mut self,
         transport: Transport,
@@ -1346,6 +1494,8 @@ mod tests {
 
     struct Fixture {
         captures: VecDeque<Result<Snapshot, RefusalReason>>,
+        launches: Vec<String>,
+        launch_result: Result<(), TrialError>,
         taps: Vec<(Transport, Point, Instant)>,
         receipt: Result<(), CoordinateTapError>,
         now: u64,
@@ -1361,6 +1511,8 @@ mod tests {
                     Ok(snapshot(true, 300)),
                 ]
                 .into(),
+                launches: Vec::new(),
+                launch_result: Ok(()),
                 taps: Vec::new(),
                 receipt: Ok(()),
                 now: 0,
@@ -1385,6 +1537,10 @@ mod tests {
         }
         fn now_ms(&self) -> Result<u64, ()> {
             Ok(self.now)
+        }
+        fn launch_clock(&mut self, session: &str) -> Result<(), TrialError> {
+            self.launches.push(session.to_owned());
+            self.launch_result
         }
         fn tap(
             &mut self,
@@ -1455,6 +1611,163 @@ mod tests {
         assert!(fixture.captures.is_empty());
         assert_eq!(receipts.tap.outcome, StepOutcome::Complete);
         assert_eq!(receipts.postcheck.outcome, StepOutcome::Complete);
+    }
+
+    #[test]
+    fn auto_clock_launches_once_then_proves_either_tab_transition() {
+        for initial_stopwatch in [false, true] {
+            let mut fixture = Fixture::new();
+            let mut before_launch = snapshot(false, 50);
+            before_launch.observation.state.foreground_app = Some("com.example.other".into());
+            fixture.captures = [
+                Ok(before_launch),
+                Ok(snapshot(initial_stopwatch, 100)),
+                Ok(snapshot(initial_stopwatch, 200)),
+                Ok(snapshot(initial_stopwatch, 300)),
+                Ok(snapshot(!initial_stopwatch, 400)),
+            ]
+            .into();
+            let mut receipts = ClockReceipts::default();
+            assert_eq!(
+                run_auto_recorded(
+                    &mut fixture,
+                    &HardwareId::new("fixture-device").unwrap(),
+                    Transport::W3c,
+                    &mut receipts,
+                ),
+                Ok(())
+            );
+            assert_eq!(fixture.launches, ["fixture-session"]);
+            assert_eq!(fixture.taps.len(), 1);
+            assert_eq!(
+                fixture.taps[0].1,
+                if initial_stopwatch {
+                    Point { x: 50.0, y: 740.0 }
+                } else {
+                    Point { x: 250.0, y: 740.0 }
+                }
+            );
+            assert_eq!(receipts.clock_launch.outcome, StepOutcome::Complete);
+            assert_eq!(receipts.tab_detection.outcome, StepOutcome::Complete);
+            assert_eq!(receipts.tap.outcome, StepOutcome::Complete);
+            assert_eq!(receipts.postcheck.outcome, StepOutcome::Complete);
+        }
+    }
+
+    #[test]
+    fn auto_clock_unknown_launch_or_lost_admission_never_taps() {
+        let expected = HardwareId::new("fixture-device").unwrap();
+        let mut fixture = Fixture::new();
+        fixture.captures = [Ok(snapshot(false, 50))].into();
+        fixture.launch_result = Err(TrialError::Unknown);
+        let mut receipts = ClockReceipts::default();
+        assert_eq!(
+            run_auto_recorded(&mut fixture, &expected, Transport::W3c, &mut receipts),
+            Err(TrialError::Unknown)
+        );
+        assert_eq!(fixture.launches, ["fixture-session"]);
+        assert!(fixture.taps.is_empty());
+        assert_eq!(
+            receipts.clock_launch.outcome,
+            StepOutcome::Failed(ReceiptFailure::LaunchUnproven)
+        );
+        assert_eq!(receipts.tab_detection.outcome, StepOutcome::Skipped);
+
+        let mut fixture = Fixture::new();
+        fixture.captures = [Ok(snapshot(false, 50))].into();
+        let calls = std::cell::Cell::new(0);
+        let admit = || {
+            calls.set(calls.get() + 1);
+            calls.get() < 3
+        };
+        let mut bound = SessionBound {
+            device: &mut fixture,
+            session: "fixture-session",
+            admission: Some(&admit),
+        };
+        let mut receipts = ClockReceipts::default();
+        assert_eq!(
+            run_auto_recorded(&mut bound, &expected, Transport::W3c, &mut receipts),
+            Err(TrialError::Unknown)
+        );
+        assert_eq!(fixture.launches, ["fixture-session"]);
+        assert!(fixture.taps.is_empty());
+        assert_eq!(
+            receipts.clock_launch.outcome,
+            StepOutcome::Failed(ReceiptFailure::LaunchUnproven)
+        );
+    }
+
+    #[test]
+    fn auto_clock_refuses_locked_or_changed_session_before_launch() {
+        let expected = HardwareId::new("fixture-device").unwrap();
+        for changed_session in [false, true] {
+            let mut fixture = Fixture::new();
+            let mut initial = snapshot(false, 50);
+            if changed_session {
+                initial.session = "other-session".into();
+            } else {
+                initial.native = LockState::Locked;
+            }
+            fixture.captures = [Ok(initial)].into();
+            let mut bound = SessionBound {
+                device: &mut fixture,
+                session: "fixture-session",
+                admission: None,
+            };
+            let mut receipts = ClockReceipts::default();
+            let result = run_auto_recorded(&mut bound, &expected, Transport::W3c, &mut receipts);
+            assert_eq!(
+                result,
+                Err(TrialError::Refused(if changed_session {
+                    RefusalReason::SessionUnproven
+                } else {
+                    RefusalReason::NativeLocked
+                }))
+            );
+            assert!(fixture.launches.is_empty());
+            assert!(fixture.taps.is_empty());
+        }
+        for (lock, ready, expected_reason) in [
+            (LockState::Locked, true, RefusalReason::WdaLocked),
+            (LockState::Uncertain, true, RefusalReason::WdaLockUnproven),
+            (LockState::Unlocked, false, RefusalReason::SessionUnproven),
+        ] {
+            let mut fixture = Fixture::new();
+            let mut initial = snapshot(false, 50);
+            initial.observation.state.lock = lock;
+            initial.observation.state.wda_ready = ready;
+            fixture.captures = [Ok(initial)].into();
+            let mut receipts = ClockReceipts::default();
+            assert_eq!(
+                run_auto_recorded(&mut fixture, &expected, Transport::W3c, &mut receipts),
+                Err(TrialError::Refused(expected_reason))
+            );
+            assert!(fixture.launches.is_empty());
+            assert!(fixture.taps.is_empty());
+        }
+    }
+
+    #[test]
+    fn auto_clock_unexpected_tab_refuses_after_launch_without_tap() {
+        let expected = HardwareId::new("fixture-device").unwrap();
+        let mut fixture = Fixture::new();
+        let mut unsupported = snapshot(false, 100);
+        unsupported.observation.accessibility_tree = tree(false)
+            .replace("selected=\"true\"", "selected=\"false\"")
+            .replace(
+                "name=\"World Clock\" visible=\"true\"",
+                "name=\"World Clock\" visible=\"false\"",
+            );
+        fixture.captures = [Ok(snapshot(false, 50)), Ok(unsupported)].into();
+        let mut receipts = ClockReceipts::default();
+        assert!(run_auto_recorded(&mut fixture, &expected, Transport::W3c, &mut receipts).is_err());
+        assert_eq!(fixture.launches, ["fixture-session"]);
+        assert!(fixture.taps.is_empty());
+        assert!(matches!(
+            receipts.tab_detection.outcome,
+            StepOutcome::Failed(_)
+        ));
     }
 
     #[test]
@@ -1611,7 +1924,7 @@ mod tests {
         };
         report.clock.preflight_1.elapsed = Some(Duration::from_micros(123));
         let output = report.render();
-        assert_eq!(output.lines().count(), 9);
+        assert_eq!(output.lines().count(), 11);
         assert!(output.contains("touch_trial_owned_step=preflight_1 elapsed_us=123 outcome=failed reason=identity_unproven\n"));
         assert!(
             output.contains(
@@ -1632,7 +1945,7 @@ mod tests {
             output
                 .matches("outcome=unavailable reason=worker_unproven")
                 .count(),
-            4
+            6
         );
         assert!(output.contains(
             "touch_trial_owned_step=session_close elapsed_us=none outcome=skipped reason=none\n"
@@ -1665,7 +1978,7 @@ mod tests {
             assert!(output.contains(&format!(
                 "touch_trial_owned_step=runner_startup elapsed_us=1 outcome=failed reason={reason}\n"
             )));
-            assert_eq!(output.lines().count(), 9);
+            assert_eq!(output.lines().count(), 11);
         }
     }
 
@@ -2421,6 +2734,7 @@ mod tests {
             assert_eq!(command(&args), Err("invalid_arguments"));
             assert_eq!(idle_command(&args), Err("invalid_arguments"));
             assert_eq!(owned_command(&args), Err("invalid_arguments"));
+            assert_eq!(owned_auto_clock_command(&args), Err("invalid_arguments"));
         }
         let directory = tempfile::tempdir().unwrap();
         let config = directory.path().join("config.json");
