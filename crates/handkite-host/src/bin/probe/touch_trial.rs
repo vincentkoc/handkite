@@ -97,6 +97,12 @@ enum Transport {
     Coordinate,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InitialTab {
+    WorldClock,
+    Stopwatch,
+}
+
 impl Transport {
     fn unknown(self, reason: CoordinateUnknown) -> TrialError {
         match self {
@@ -623,17 +629,33 @@ fn run_recorded(
     transport: Transport,
     receipts: &mut ClockReceipts,
 ) -> Result<(), TrialError> {
+    run_recorded_from(
+        device,
+        expected,
+        transport,
+        InitialTab::WorldClock,
+        receipts,
+    )
+}
+
+fn run_recorded_from(
+    device: &mut impl TrialDevice,
+    expected: &HardwareId,
+    transport: Transport,
+    initial: InitialTab,
+    receipts: &mut ClockReceipts,
+) -> Result<(), TrialError> {
     let (before, first) = receipts.preflight_1.measure(|| {
         let before = device.capture().map_err(TrialError::Refused)?;
-        let first =
-            validate(&before, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
+        let first = validate_from(&before, expected, device.now_ms(), false, initial)
+            .map_err(TrialError::Refused)?;
         Ok((before, first))
     })?;
     // Reobserve every precondition; only stable accessibility geometry authorizes input.
     let (current, second, input_started) = receipts.preflight_2.measure(|| {
         let current = device.capture().map_err(TrialError::Refused)?;
-        let second =
-            validate(&current, expected, device.now_ms(), false).map_err(TrialError::Refused)?;
+        let second = validate_from(&current, expected, device.now_ms(), false, initial)
+            .map_err(TrialError::Refused)?;
         if current.session != before.session {
             return Err(TrialError::Refused(RefusalReason::SessionUnproven));
         }
@@ -679,7 +701,8 @@ fn run_recorded(
     let postcondition = transport.unknown(CoordinateUnknown::PostconditionUnproven);
     let result = (|| {
         let after = after.map_err(TrialError::Refused)?;
-        validate(&after, expected, device.now_ms(), true).map_err(TrialError::Refused)?;
+        validate_from(&after, expected, device.now_ms(), true, initial)
+            .map_err(TrialError::Refused)?;
         if after.session != current.session {
             return Err(TrialError::Refused(RefusalReason::SessionUnproven));
         }
@@ -698,11 +721,12 @@ fn run_recorded(
     result.map_err(|_| postcondition)
 }
 
-fn validate(
+fn validate_from(
     snapshot: &Snapshot,
     expected: &HardwareId,
     now: Result<u64, ()>,
     after: bool,
+    initial: InitialTab,
 ) -> Result<Rect, RefusalReason> {
     let raw = &snapshot.observation;
     if Instant::now() >= snapshot.fresh_until {
@@ -762,20 +786,24 @@ fn validate(
     {
         return Err(RefusalReason::GeometryMismatch);
     }
+    let stopwatch_active = (initial == InitialTab::Stopwatch) != after;
     let explicit_selected = evidence.stopwatch.selected_present || evidence.world.selected_present;
     if !evidence
         .stopwatch
-        .selection_matches(after, explicit_selected)
+        .selection_matches(stopwatch_active, explicit_selected)
     {
         return Err(RefusalReason::StopwatchAttributes);
     }
-    if !evidence.world.selection_matches(!after, explicit_selected) {
+    if !evidence
+        .world
+        .selection_matches(!stopwatch_active, explicit_selected)
+    {
         return Err(RefusalReason::WorldClockAttributes);
     }
-    if evidence.world_clock_navigation != u8::from(!after) {
+    if evidence.world_clock_navigation != u8::from(!stopwatch_active) {
         return Err(RefusalReason::WorldClockAttributes);
     }
-    let start_matches = if after {
+    let start_matches = if stopwatch_active {
         evidence.start_ready
     } else {
         evidence.start_hidden_or_absent
@@ -783,7 +811,11 @@ fn validate(
     if !start_matches {
         return Err(RefusalReason::StopwatchAttributes);
     }
-    Ok(evidence.stopwatch.rect)
+    Ok(if initial == InitialTab::WorldClock {
+        evidence.stopwatch.rect
+    } else {
+        evidence.world.rect
+    })
 }
 
 fn require_native_unlocked(state: LockState) -> Result<(), RefusalReason> {
@@ -1396,6 +1428,33 @@ mod tests {
             &mut receipts,
         );
         (result, receipts)
+    }
+
+    #[test]
+    fn reverse_clock_transition_taps_world_clock_once_after_two_stopwatch_preflights() {
+        let mut fixture = Fixture::new();
+        fixture.captures = [
+            Ok(snapshot(true, 100)),
+            Ok(snapshot(true, 200)),
+            Ok(snapshot(false, 300)),
+        ]
+        .into();
+        let mut receipts = ClockReceipts::default();
+        assert_eq!(
+            run_recorded_from(
+                &mut fixture,
+                &HardwareId::new("fixture-device").unwrap(),
+                Transport::W3c,
+                InitialTab::Stopwatch,
+                &mut receipts,
+            ),
+            Ok(())
+        );
+        assert_eq!(fixture.taps.len(), 1);
+        assert_eq!(fixture.taps[0].1, Point { x: 50.0, y: 740.0 });
+        assert!(fixture.captures.is_empty());
+        assert_eq!(receipts.tap.outcome, StepOutcome::Complete);
+        assert_eq!(receipts.postcheck.outcome, StepOutcome::Complete);
     }
 
     #[test]
@@ -2337,14 +2396,17 @@ mod tests {
             }),
         ];
         for (reason, repair) in repairs {
-            assert_eq!(validate(&sample, &expected, Err(()), false), Err(*reason));
+            assert_eq!(
+                validate_from(&sample, &expected, Err(()), false, InitialTab::WorldClock),
+                Err(*reason)
+            );
             repair(&mut sample);
         }
         assert_eq!(
-            validate(&sample, &expected, Err(()), false),
+            validate_from(&sample, &expected, Err(()), false, InitialTab::WorldClock),
             Err(FreshnessUnproven)
         );
-        assert!(validate(&sample, &expected, Ok(1000), false).is_ok());
+        assert!(validate_from(&sample, &expected, Ok(1000), false, InitialTab::WorldClock).is_ok());
     }
 
     #[test]
