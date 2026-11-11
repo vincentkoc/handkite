@@ -1,7 +1,10 @@
 use super::*;
 use handkite_host::release_manifest::{ReleaseArtifact, RustIdentity, SdkIdentity};
 use std::cell::Cell;
-use std::io::{Read, SeekFrom, Write};
+#[cfg(target_os = "macos")]
+use std::io::Read;
+use std::io::{SeekFrom, Write};
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 use tempfile::NamedTempFile;
 
@@ -51,7 +54,7 @@ fn expected() -> NamedTempFile {
 }
 
 #[test]
-fn exact_arguments_and_independent_private_inputs_dispatch_once() {
+fn exact_arguments_and_independent_inputs_follow_platform_admission() {
     assert!(arguments(
         ["--binding-fd", "3"].map(OsString::from).into_iter()
     ));
@@ -80,8 +83,15 @@ fn exact_arguments_and_independent_private_inputs_dispatch_once() {
             Outcome::Staged
         },
     );
-    assert_eq!(outcome, Outcome::Staged);
-    assert_eq!(calls.get(), 1);
+    if cfg!(target_os = "macos") {
+        assert_eq!(outcome, Outcome::Staged);
+        assert_eq!(calls.get(), 1);
+    } else {
+        assert_eq!(outcome, Outcome::Invalid);
+        assert_eq!(calls.get(), 0);
+        assert_eq!(input.stream_position().unwrap(), 0);
+        assert_eq!(expected.stream_position().unwrap(), 0);
+    }
 }
 
 #[test]
@@ -123,6 +133,7 @@ fn invalid_pins_manifest_or_binding_never_reaches_setup() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn private_inputs_reject_modes_links_offsets_shared_inode_and_acl() {
     for variant in 0..8 {
@@ -170,6 +181,7 @@ fn private_inputs_reject_modes_links_offsets_shared_inode_and_acl() {
     }
 }
 
+#[cfg(target_os = "macos")]
 #[test]
 fn changed_input_during_read_is_rejected_without_accepting_new_baseline() {
     let mut input = private(b"original");
