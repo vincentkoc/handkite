@@ -11,6 +11,14 @@ verified image signature. The bundled Apple and third-party ADI binary origins
 and redistribution terms remain unresolved. `docker compose config` validates
 the bundle syntax without pulling or starting the image.
 
+The pinned `linux/amd64` image passed one local `--backend macos --check` run
+under amd64 emulation with no network or state mount. That command verifies the
+bundled macOS asset and exits before server initialization; it does not qualify
+native execution, provisioning, headers, or signing. The exact digests and
+receipt are in `VALIDATION.md`. Repeat the asset check on an admitted native
+x86_64 host before the first stateful start, using the same digest and no data
+mount; do not treat normal startup as a read-only health check.
+
 ## Boundaries
 
 - `compose.yaml` pins one upstream image digest, selects the macOS ADI backend, binds port 6969 to loopback only, and mounts a persistent private data directory. It refuses implicit pulls and host-directory creation, and it has no automatic restart during initial qualification. Do not put the Apple ID, phone PIN, pairing records, or screenshots in this volume or the sidecar environment.
