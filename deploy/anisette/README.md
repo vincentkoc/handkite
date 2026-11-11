@@ -26,6 +26,24 @@ path matcher normalizes escapes, slashes, and dot segments and ignores case; the
 additional URI equality rejects those aliases, a bare `?`, and malformed queries.
 The three canonical client operations do not need query parameters.
 
+## Local proxy regression test
+
+With Python 3, OpenSSL, and a verified Caddy binary available, run from the repository root:
+
+```sh
+CADDY_BIN=/path/to/caddy python3 -B deploy/anisette/test_proxy.py -fv
+```
+
+The test fails if Caddy is unavailable. It loads the checked-in routing and client-auth
+rules into real Caddy, replacing only fixture addresses and certificate paths. It
+disables automatic HTTPS and the admin API, binds ephemeral loopback ports, and
+generates temporary test identities. A synthetic upstream accepts every method so
+an upstream refusal cannot hide a proxy leak. Tests verify allowed requests, blocked
+requests with zero upstream receipts, client authentication, and WebSocket frames
+in both directions. The fixture stops its own processes and removes its files;
+it does not load the Anisette image or contact Apple. See `VALIDATION.md` for the
+tested Caddy version and binary provenance.
+
 ## Host admission
 
 1. Confirm the host owner, CPU architecture, free storage, existing port 6969 and 80/443 listeners, container runtime, and backup destination. Do not replace an existing Caddy site or container.
