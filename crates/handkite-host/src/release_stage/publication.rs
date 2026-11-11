@@ -3,6 +3,12 @@ use super::{InstallerLock, StagedRelease};
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(all(test, target_os = "macos"))]
+type SignerCheck<'a> = &'a mut dyn FnMut(
+    crate::release_manifest::ArtifactName,
+    &std::path::Path,
+) -> Result<(), &'static str>;
+
 /// The commit point is the exclusive stage-to-digest rename, not receipt creation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PublicationPhase {
@@ -45,6 +51,22 @@ pub struct PublishedRelease<'lock> {
 }
 
 impl PublishedRelease<'_> {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn revalidate_for_owner(
+        &mut self,
+        owner: &InstallerLock,
+        #[cfg(test)] check: Option<SignerCheck<'_>>,
+    ) -> Result<(), &'static str> {
+        if !std::ptr::eq(self.staged._owner, owner) {
+            return Err("published release installer lock mismatch");
+        }
+        macos::revalidate(
+            self,
+            #[cfg(test)]
+            check,
+        )
+    }
+
     #[cfg(target_os = "macos")]
     pub(crate) fn selection_parent(&self) -> &std::fs::File {
         self.staged._destination.publication_parent()

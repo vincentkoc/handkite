@@ -44,6 +44,22 @@ impl From<Metadata> for Fingerprint {
 }
 
 impl Fingerprint {
+    /// APFS counts regular entries in directory links; other filesystems may not.
+    /// Call only after verifying the exact one-file creation or same-parent rename.
+    pub(super) fn matches_after_entry_change(&self, original: &Self, added_file: bool) -> bool {
+        if self.links != original.links
+            && !(added_file && original.links.checked_add(1) == Some(self.links))
+        {
+            return false;
+        }
+        let mut compared = self.clone();
+        compared.links = original.links;
+        compared.size = original.size;
+        compared.modified = original.modified;
+        compared.changed = original.changed;
+        compared == *original
+    }
+
     /// codesign replaces the active copy; its unlinked original must stay intact.
     pub(super) fn matches_after_unlink(&self, original: &Self) -> bool {
         if self.links != 0 {

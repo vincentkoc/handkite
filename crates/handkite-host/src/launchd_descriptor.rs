@@ -1,4 +1,7 @@
-//! Pure rendering of the intended per-account supervised service descriptor.
+//! Fixed rendering and protected staging of the per-account service descriptor.
+
+pub(crate) mod staging;
+pub use staging::{StageFailure, StagePhase, StagedDescriptor, stage};
 
 use crate::service_layout::ServiceLayout;
 use std::path::Path;

@@ -18,6 +18,7 @@ use std::time::Duration;
 
 mod retained;
 mod selection_intent;
+mod service_stage;
 
 const CERTIFICATE: &str = "1111111111111111111111111111111111111111";
 const NONCE: [u8; 16] = [0x24; 16];
