@@ -6,7 +6,10 @@ import subprocess
 import unicodedata
 
 
-TEXT_SUFFIXES = {".rs", ".md", ".py", ".toml", ".yaml", ".lock"}
+TEXT_SUFFIXES = {
+    ".css", ".html", ".js", ".json", ".lock", ".md", ".py", ".rs",
+    ".sh", ".svg", ".toml", ".ts", ".txt", ".yaml", ".yml",
+}
 TEXT_NAMES = {".gitignore", "Caddyfile"}
 
 
@@ -32,6 +35,9 @@ def main() -> int:
         if not name:
             continue
         relative = Path(name.decode("utf-8"))
+        if has_han(relative.as_posix()):
+            violations.append(relative)
+            continue
         if relative.suffix not in TEXT_SUFFIXES and relative.name not in TEXT_NAMES:
             continue
         path = root / relative
@@ -39,7 +45,12 @@ def main() -> int:
             violations.append(relative)
             continue
         checked += 1
-        if has_han(path.read_text(encoding="utf-8")):
+        try:
+            content = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            violations.append(relative)
+            continue
+        if has_han(content):
             violations.append(relative)
     for path in violations:
         print(f"source_han=found path={path}")
