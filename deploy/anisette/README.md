@@ -14,9 +14,17 @@ the bundle syntax without pulling or starting the image.
 ## Boundaries
 
 - `compose.yaml` pins one upstream image digest, selects the macOS ADI backend, binds port 6969 to loopback only, and mounts a persistent private data directory. It refuses implicit pulls and host-directory creation, and it has no automatic restart during initial qualification. Do not put the Apple ID, phone PIN, pairing records, or screenshots in this volume or the sidecar environment.
-- `Caddyfile` exposes only the three V3 paths over HTTPS and requires a verified client certificate. Place the client CA certificate at `/etc/handkite/anisette-client-ca.pem` on the proxy host. Keep the CA private key and the Mac client's certificate and key outside Git.
+- `Caddyfile` requires a verified client certificate and admits only query-free `GET /v3/client_info`, `POST /v3/get_headers`, and `GET /v3/provisioning_session` (including WebSocket upgrades). Other methods, paths, and queries receive 404 without reaching the upstream. Place the client CA certificate at `/etc/handkite/anisette-client-ca.pem` on the proxy host. Keep the CA private key and the Mac client's certificate and key outside Git.
 - The server's opaque provisioning state and generated headers are sensitive. Container access logs are disabled. Do not enable request or response body logging on the proxy.
 - The upstream sidecar is GPL-2.0 and bundles Apple ADI binaries. Its [Dockerfile](https://github.com/fdkevin0/anisette-server-rs/blob/a62f94094b6240f2dd79225fb1511f248c5ee6fd/Dockerfile) fetches Apple assets and a third-party ADI binary; its [license inventory](https://github.com/fdkevin0/anisette-server-rs/blob/a62f94094b6240f2dd79225fb1511f248c5ee6fd/docs/licenses.md) records unresolved compatibility. Keep it as an independently deployed service; resolve asset and license terms before redistributing an image.
+
+The configured macOS backend is only an upstream default: the pinned server accepts
+`?backend=android|macos|windows` on each V3 endpoint. The proxy rejects every query,
+including a macOS override. [Caddy matcher sets](https://caddyserver.com/docs/caddyfile/matchers)
+combine the method, path, empty-query, and exact URI conditions with AND. Caddy's
+path matcher normalizes escapes, slashes, and dot segments and ignores case; the
+additional URI equality rejects those aliases, a bare `?`, and malformed queries.
+The three canonical client operations do not need query parameters.
 
 ## Host admission
 
