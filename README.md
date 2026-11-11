@@ -343,6 +343,22 @@ is stopped, excludes restart or another PID, identifies a launch supervisor, or
 permits selection, activation, or WDA ownership. Independent pins remain private
 and are never generated from the process being compared by the production API.
 
+`handkite-controller-process --pinned-stdin` exposes that diagnostic without
+service setup. Stdin must already be an effective-user-owned, mode-0600 regular
+file with one link, an empty ACL, offset zero, and stable metadata. It accepts at
+most 8192 bytes containing one strict JSON object with `schema_version: 1`,
+positive `pid`, positive `start_seconds`, `start_microseconds` below one million,
+positive `start_abstime` (raw host-local Mach absolute ticks), `effective_uid`,
+an exact absolute `executable_path`, and a nonzero `executable_uuid` encoded as
+32 lowercase hexadecimal characters. Duplicate, unknown, missing, mistyped, or
+invalid fields refuse before any process lookup. Preserve independent host/boot
+provenance for these pins; the command does not discover or export them.
+
+Stdout contains only `controller_process=match` (exit 0), `mismatch` or `absent`
+(exit 1), or `unknown` (exit 3). Invalid arguments/input also produce `unknown`;
+stderr carries no diagnostic details. No PID, path, UID, UUID, or timestamps are
+printed. A match establishes only the stated comparison, never handoff admission.
+
 After cleanup, the owned Clock route emits nine fixed-field timing receipts to
 stderr before its unchanged terminal status. Monotonic `elapsed_us` covers runner
 startup, the session/settings transaction, both preflights, tap, the sole
