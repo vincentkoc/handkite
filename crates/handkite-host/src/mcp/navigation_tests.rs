@@ -19,6 +19,7 @@ struct FakeState {
     app: Option<String>,
     actions: Vec<&'static str>,
     fail_action: bool,
+    fail_capture_after_action: bool,
     mismatch_after_action: bool,
     oversized_after_action: bool,
 }
@@ -44,6 +45,9 @@ impl DeviceAdapter for FakeAdapter {
             .unwrap()
             .as_millis() as u64;
         let state = self.0.lock().unwrap();
+        if state.fail_capture_after_action && !state.actions.is_empty() {
+            return Err(AdapterError);
+        }
         Ok(RawObservation {
             connected_usb,
             wda_target,
@@ -392,6 +396,8 @@ fn socket_transcript_navigates_and_never_discloses_control_or_screen_content() {
         .collect();
     assert_eq!(payload(&replies[2])["receipt"]["accepted"], true);
     assert_eq!(payload(&replies[2])["effect"], "changed");
+    assert!(replies[2]["result"].get("isError").is_none());
+    assert!(replies[3]["result"].get("isError").is_none());
     assert_eq!(
         payload(&replies[2])["after"]["state"]["foreground_app"],
         "com.apple.mobiletimer"
@@ -531,6 +537,111 @@ fn expired_lease_requires_a_new_explicit_acquisition() {
 }
 
 #[test]
+fn valid_action_outcomes_preserve_evidence_and_flag_failures_without_replay() {
+    for (accepted, effect, is_error) in [
+        (json!(true), "changed", false),
+        (json!(false), "changed", true),
+        (Value::Null, "changed", true),
+        (json!(true), "unconfirmed", true),
+        (json!(false), "unconfirmed", true),
+        (Value::Null, "unconfirmed", true),
+    ] {
+        let mut session = Session::default();
+        session.acquire(&mut |_| {
+            Ok(serde_json::to_vec(&json!({
+                "type": "acquired", "lease": "0123456789abcdef0123456789abcdef"
+            }))
+            .unwrap())
+        });
+        let receipt = json!({"accepted": accepted, "action_kind": "home"});
+        let after_metadata = json!({
+            "device": "fixture-phone", "revision": 3,
+            "window": {"started_unix_ms": 10, "finished_unix_ms": 20},
+            "state": {"lock": "unlocked", "wda_ready": true,
+                "foreground_app": "com.apple.springboard"}
+        });
+        let mut after = after_metadata.clone();
+        after["accessibility_tree"] = json!("<private-screen/>");
+        after["screenshot_format"] = json!("png");
+        after["screenshot_base64"] = json!("cHJpdmF0ZS1zY3JlZW4=");
+        let mut requests = Vec::new();
+        let reply = process(
+            &call("handkite_home", json!({"expected_revision": 1})),
+            &device(),
+            Capabilities::Navigation,
+            &mut session,
+            &mut |bytes| {
+                requests.push(serde_json::from_slice::<Value>(bytes).unwrap());
+                Ok(serde_json::to_vec(&json!({
+                    "type": "acted", "receipt": receipt, "effect": effect,
+                    "after": after, "native_lock": null
+                }))
+                .unwrap())
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            reply["result"].get("isError"),
+            is_error.then_some(&json!(true))
+        );
+        assert_eq!(
+            payload(&reply),
+            json!({"receipt": receipt, "effect": effect, "after": after_metadata})
+        );
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["method"], "act");
+    }
+}
+
+#[test]
+fn accepted_unchanged_view_and_failed_capture_are_errors_over_socket() {
+    for fail_capture in [false, true] {
+        let mut fixture = SocketFixture::new();
+        {
+            let mut state = fixture.state.lock().unwrap();
+            state.app = Some("com.apple.springboard".into());
+            state.fail_capture_after_action = fail_capture;
+        }
+        let mut session = Session::default();
+        let before = payload(&fixture.call(&mut session, "handkite_status", json!({})));
+        fixture.call(&mut session, "handkite_acquire_control", json!({}));
+        let reply = fixture.call(
+            &mut session,
+            "handkite_home",
+            json!({"expected_revision": 1}),
+        );
+        let result = payload(&reply);
+        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(
+            result["receipt"],
+            json!({"accepted": true, "action_kind": "home"})
+        );
+        assert_eq!(result["effect"], "unconfirmed");
+        assert!(result.get("delivery").is_none());
+        if fail_capture {
+            assert_eq!(result["after"], Value::Null);
+        } else {
+            assert_eq!(result["after"]["device"], before["device"]);
+            assert_eq!(result["after"]["revision"], 3);
+            assert_eq!(result["after"]["state"], before["state"]);
+            assert!(result["after"]["window"]["started_unix_ms"].is_u64());
+            assert!(result["after"].get("screenshot_base64").is_none());
+            assert!(result["after"].get("accessibility_tree").is_none());
+        }
+        assert_eq!(fixture.state.lock().unwrap().actions, ["home"]);
+        assert_eq!(
+            fixture
+                .requests
+                .iter()
+                .map(|request| request["method"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["observe", "acquire", "act"]
+        );
+        session.cleanup(&mut |bytes| fixture.exchange(bytes));
+    }
+}
+
+#[test]
 fn uncertain_action_delivery_is_reported_without_replay() {
     for lose_socket_reply in [true, false] {
         let mut fixture = SocketFixture::new();
@@ -547,6 +658,7 @@ fn uncertain_action_delivery_is_reported_without_replay() {
             "handkite_home",
             json!({"expected_revision": 1}),
         );
+        assert_eq!(reply["result"]["isError"], true);
         assert_eq!(payload(&reply)["receipt"]["accepted"], Value::Null);
         assert_eq!(payload(&reply)["effect"], "unconfirmed");
         assert_eq!(payload(&reply)["delivery"], "unknown");
@@ -580,6 +692,7 @@ fn post_input_identity_and_response_size_failures_report_unknown_delivery() {
             "handkite_home",
             json!({"expected_revision": 1}),
         );
+        assert_eq!(reply["result"]["isError"], true);
         assert_eq!(payload(&reply)["receipt"]["accepted"], Value::Null);
         assert_eq!(payload(&reply)["delivery"], "unknown");
         assert_eq!(fixture.state.lock().unwrap().actions, ["home"]);

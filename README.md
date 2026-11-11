@@ -251,6 +251,13 @@ Acquire control explicitly before an action. The process holds the controller's 
 
 Home and Clock return delivery receipt, observed effect, and optional post-action metadata. They do not return screenshots or accessibility content. A lost acknowledgment, unexpected reply, post-input identity mismatch, or oversized response reports unknown delivery with `receipt.accepted: null` and `effect: "unconfirmed"`. No action is automatically replayed. A stale revision requires a fresh authorized observation; an expired lease requires another explicit acquisition.
 
+The MCP result sets `isError: true` when the effect is `unconfirmed` or
+`receipt.accepted` is not `true`, preserving the receipt, effect, and available
+post-action metadata. An unconfirmed effect includes an accepted action that
+leaves the view unchanged and a failed post-action capture. Input may have
+happened; inspect a fresh authorized observation before another action. An
+accepted action with a changed view omits `isError`.
+
 For remote use, an authenticated SSH key must be bound to a restricted forced command that fixes the socket, device, and capabilities, disables forwarding and PTY allocation, and ignores client-supplied commands. Do not grant that principal an unrestricted shell or direct socket access. A CLI capability flag is host policy, not authentication; SSH access that lets a caller select another command or flags does not enforce capability separation. Keep the Unix socket and WDA off network listeners. Host identity, key enrollment, forced-command restrictions, and the intended OpenClaw connection remain unqualified and require separate setup and acceptance.
 
 The bridge has passed a previous live read-only capture through the device host's protected socket. Navigation is qualified only by offline fixtures; no live navigation or OpenClaw acceptance is claimed. Observation returns private screen content to the calling agent.

@@ -113,8 +113,12 @@ impl Session {
                 {
                     return uncertain_result(kind);
                 }
-                text_result(json!({"receipt": receipt, "effect": effect,
-                    "after": after.as_ref().map(metadata)}))
+                let mut result = text_result(json!({"receipt": receipt, "effect": effect,
+                    "after": after.as_ref().map(metadata)}));
+                if effect == ObservedEffect::Unconfirmed || receipt.accepted != Some(true) {
+                    result["isError"] = json!(true);
+                }
+                result
             }
             Ok(Reply::Error { code }) => {
                 if code == "InvalidLease" {
