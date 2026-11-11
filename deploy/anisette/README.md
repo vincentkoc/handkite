@@ -19,6 +19,77 @@ receipt are in `VALIDATION.md`. Repeat the asset check on an admitted native
 x86_64 host before the first stateful start, using the same digest and no data
 mount; do not treat normal startup as a read-only health check.
 
+## Explicit native image asset check
+
+After admitting a native Linux x86_64 host and its Docker daemon, make the pinned
+image available locally through a separately approved pull. From that host, run
+one explicit check with Python 3, a Docker CLI supporting platform-qualified
+image inspection (Docker 29 or later), and Docker's containerd image store:
+
+```sh
+python3 -B deploy/anisette/check_image.py \
+  --context ADMITTED_LOCAL_CONTEXT \
+  --expected-daemon-id ADMITTED_DAEMON_ID
+```
+
+Supply the independently admitted daemon ID; do not infer the expected identity
+from whichever daemon happens to answer this invocation. The named context must
+use an existing local Unix socket. Remote contexts and transport/API environment
+overrides are refused. The helper resolves that context once, then passes its
+fixed Unix endpoint with `--host` to every daemon command. Later context edits
+cannot redirect execution or cleanup. Before create, start, and cleanup, it checks
+the socket device/inode, expected daemon ID, architecture, and containerd-store
+signal; it rechecks the route after cleanup's absence observations. These are
+point-in-time checks, not an atomic daemon lease. A socket or daemon replacement
+between a check and the following command remains a race; host admission must
+exclude concurrent endpoint/daemon replacement. Detected drift stops the operation
+and leaves any created container's cleanup `unknown` for explicit recovery.
+Both the executing host and daemon must report native Linux amd64. An emulated
+amd64 image on an arm64 host does not satisfy this check.
+
+The helper fixes the index and amd64 child digests above, the `anisette-server`
+entrypoint, UID/GID `10001:10001`, and `--backend macos --check`. Docker 29's
+platform-qualified image `.Id` must equal the child manifest digest. The registry
+config digest in `VALIDATION.md` remains provenance evidence; it is not substituted
+for that local image identity. The created container must report the pinned child
+in `ImageManifestDescriptor.digest`; its top-level `.Image` can be a config ID.
+The helper requires Docker's `driver-type=io.containerd.snapshotter.v1` signal;
+Docker 29 with the legacy image store does not satisfy this contract.
+
+One uniquely named container is created without a pull, network, ports, mounts,
+state directory, healthcheck, or restart policy. It has a read-only root,
+`no-new-privileges`, all capabilities dropped, one CPU, 256 MiB memory with no
+additional swap, and a 32-PID limit. The helper inspects that configuration before
+one attached start with a 30-second CLI timeout. The container can continue after
+that timeout until exact-owned cleanup removes it. Success requires the exact expected
+stdout line, no stderr, exit zero, and `OOMKilled=false`. It then removes only its
+verified container ID and verifies the ID and task name are absent. It never
+removes an image or prunes Docker resources.
+
+Network isolation applies to the container. The helper forbids implicit image
+pulls, but the daemon or a lazy snapshotter may still fetch image layers. It does
+not establish host-wide or daemon-wide network isolation.
+
+The single JSON receipt contains fixed status fields, pinned digests, exit/OOM
+facts, and generated task identifiers. It suppresses raw Docker output, endpoint,
+and daemon identity. Exit zero requires both a successful check and verified
+cleanup. An uncertain create or start is never replayed. If cleanup is `unknown`,
+use the reported task name and validated ID for independent inspection on the
+same admitted daemon; do not rerun the helper or remove other containers by
+inference. No receipt file is written. Abrupt process or host loss can still leave
+the task container for explicit recovery.
+
+Run the helper's offline regression tests without Docker:
+
+```sh
+python3 -B deploy/anisette/test_check_image.py -fv
+```
+
+All subprocess calls in that suite are intercepted by a fake Docker daemon. These
+tests qualify command construction, refusal, receipt, and cleanup logic only. The
+helper has not yet passed a native image run, and this asset check cannot qualify
+ADI execution, Apple requests, provisioning, headers, or signing.
+
 ## Boundaries
 
 - `compose.yaml` pins one upstream image digest, selects the macOS ADI backend, binds port 6969 to loopback only, and mounts a persistent private data directory. It refuses implicit pulls and host-directory creation, and it has no automatic restart during initial qualification. Do not put the Apple ID, phone PIN, pairing records, or screenshots in this volume or the sidecar environment.
