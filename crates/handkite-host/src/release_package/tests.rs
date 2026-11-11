@@ -24,8 +24,8 @@ fn parse(value: Value) -> Result<PackageRequest, &'static str> {
 fn request_is_unsigned_inventory_with_explicit_build_and_signer_inputs() {
     let request = parse(request_json()).unwrap();
     assert_eq!(request.certificate_sha1(), CERTIFICATE);
-    assert_eq!(request.candidates().source_sha(), "a".repeat(40));
-    assert_eq!(request.candidates().artifacts().len(), 3);
+    assert_eq!(request.source_sha(), "a".repeat(40));
+    assert_eq!(request.candidates.artifacts().len(), 3);
 }
 
 #[test]

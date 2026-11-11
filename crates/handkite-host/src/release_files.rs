@@ -44,6 +44,17 @@ impl From<Metadata> for Fingerprint {
 }
 
 impl Fingerprint {
+    /// codesign replaces the active copy; its unlinked original must stay intact.
+    pub(super) fn matches_after_unlink(&self, original: &Self) -> bool {
+        if self.links != 0 {
+            return false;
+        }
+        let mut compared = self.clone();
+        compared.links = original.links;
+        compared.changed = original.changed;
+        compared == *original
+    }
+
     /// A rename may change ctime, but not identity, access, contents, or mtime.
     pub(super) fn matches_after_rename(&self, original: &Self) -> bool {
         let mut compared = self.clone();

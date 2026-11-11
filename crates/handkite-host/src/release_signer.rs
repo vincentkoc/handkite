@@ -47,7 +47,7 @@ impl SignerPolicy {
         self.check_with(candidate, run_command)
     }
 
-    fn check_with(
+    pub(crate) fn check_with(
         &self,
         candidate: &Path,
         run: impl FnOnce(&mut Command, Duration) -> Result<ExitStatus, RunError>,
@@ -79,12 +79,15 @@ impl SignerPolicy {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum RunError {
+pub(crate) enum RunError {
     Unavailable,
     Timeout,
 }
 
-fn run_command(command: &mut Command, timeout: Duration) -> Result<ExitStatus, RunError> {
+pub(crate) fn run_command(
+    command: &mut Command,
+    timeout: Duration,
+) -> Result<ExitStatus, RunError> {
     // Capture zero output bytes: tool diagnostics may contain candidate paths.
     let mut child = command
         .stdin(Stdio::null())

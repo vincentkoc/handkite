@@ -6,6 +6,10 @@ use crate::release_manifest::{
 };
 use crate::release_signer::SignerPolicy;
 use serde::Deserialize;
+use std::path::Path;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 pub const MAX_REQUEST_BYTES: usize = MAX_MANIFEST_BYTES;
 
@@ -63,13 +67,81 @@ impl PackageRequest {
 }
 
 impl PackageRequest {
-    /// Pre-signing candidate records; these hashes must never be used as final release hashes.
-    pub fn candidates(&self) -> &ReleaseManifest {
-        &self.candidates
+    pub fn source_sha(&self) -> &str {
+        self.candidates.source_sha()
     }
 
     pub fn certificate_sha1(&self) -> &str {
         &self.certificate
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PackagePhase {
+    Admission,
+    Copy,
+    Signing,
+    Inventory,
+    Verification,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct PackageFailure {
+    phase: PackagePhase,
+    residue: bool,
+}
+
+impl PackageFailure {
+    pub fn phase(&self) -> PackagePhase {
+        self.phase
+    }
+
+    /// True after this invocation creates its output root. Failure never removes
+    /// or retries any output, including a possibly partially signed artifact.
+    pub fn residue_present(&self) -> bool {
+        self.residue
+    }
+}
+
+/// Candidate inventory for independent review, never an acceptance capability.
+pub struct PackagedRelease {
+    manifest_sha256: [u8; 32],
+}
+
+impl PackagedRelease {
+    pub fn manifest_sha256(&self) -> &[u8; 32] {
+        &self.manifest_sha256
+    }
+}
+
+/// Sign exactly three copies in a new private output root and write canonical
+/// `manifest.json` beside `artifacts`. Source files are never modified. Success
+/// checks final signed bytes using the existing verifier, with the generated
+/// digest used only for internal consistency, not independently approved trust.
+/// Same-account races between observations remain possible. No installation,
+/// selection, activation, notarization, or keychain administration is performed.
+pub fn package(
+    source: &Path,
+    output: &Path,
+    request: &PackageRequest,
+) -> Result<PackagedRelease, PackageFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::package(
+            source,
+            output,
+            request,
+            #[cfg(test)]
+            None,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (source, output, &request.candidates, &request.certificate);
+        Err(PackageFailure {
+            phase: PackagePhase::Admission,
+            residue: false,
+        })
     }
 }
 
