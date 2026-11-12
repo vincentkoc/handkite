@@ -2,6 +2,7 @@ use super::*;
 use crate::current_selection::macos::Snapshot;
 use std::ffi::CStr;
 
+pub(crate) mod initial;
 mod journal;
 pub(crate) mod pending;
 pub(crate) mod preparation;

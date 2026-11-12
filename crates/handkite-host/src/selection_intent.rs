@@ -6,8 +6,8 @@
 //! use handkite_host::selection_intent::{Intent, inspect};
 //! ```
 //!
-//! Mutation stays crate-private until a production installer admits stopped
-//! controllers. Internal transactions consume independently pinned device agreement.
+//! Only first-time selection has a public coordinator. Individual transaction
+//! capabilities remain private and consume independently pinned device agreement.
 //!
 //! ```compile_fail,E0603
 //! use handkite_host::selection_intent::prepare;
@@ -353,7 +353,7 @@ impl PreparedSelection<'_, '_> {
 /// The consumed device agreement and release handles must retain this exact lock.
 /// Reobserve the original device after signer checks and before the first write.
 /// All errors preserve residues, with no retry, rollback, adoption, or cleanup.
-// No production caller exists until stopped-controller admission is implemented.
+// Only the initial-selection coordinator is exposed to production callers.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
@@ -556,6 +556,72 @@ pub(crate) async fn retire<'held, 'lock>(
             reason: "selection journal retirement requires macOS",
             phase: RetirementPhase::Before,
             residues: Vec::new(),
+        })
+    }
+}
+
+/// Failure location for one initial selection; never an instruction to retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InitialSelectionStage {
+    Preparation,
+    Commit,
+    Retirement,
+    Verification,
+}
+
+/// Fixed diagnostics only. Every failure preserves all remaining files.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct InitialSelectionFailure {
+    stage: InitialSelectionStage,
+    selection_may_be_applied: bool,
+    has_residue: bool,
+}
+
+impl InitialSelectionFailure {
+    pub fn stage(&self) -> InitialSelectionStage {
+        self.stage
+    }
+
+    /// True for any uncertain commit or failure after the commit point.
+    pub fn selection_may_be_applied(&self) -> bool {
+        self.selection_may_be_applied
+    }
+
+    pub fn has_residue(&self) -> bool {
+        self.has_residue
+    }
+}
+
+/// Select only the first published release without starting launchd or sending UI input.
+///
+/// The agreement and release must borrow this exact installer lock. Current must
+/// be absent. Each phase reobserves the original USB/Lockdown route and requires
+/// fixed user-domain job absence under the cooperative lock. This neither excludes
+/// unrelated controllers nor grants activation authority. Success returns no
+/// reusable transaction or service-start capability.
+pub async fn select_initial<'lock>(
+    owner: &'lock InstallerLock,
+    agreement: DeviceAgreement<'lock>,
+    destination: &mut PublishedRelease<'lock>,
+) -> Result<(), InitialSelectionFailure> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::initial::select(
+            owner,
+            agreement,
+            destination,
+            #[cfg(test)]
+            &mut macos::initial::Hooks::production(),
+        )
+        .await
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (owner, agreement, destination);
+        Err(InitialSelectionFailure {
+            stage: InitialSelectionStage::Preparation,
+            selection_may_be_applied: false,
+            has_residue: false,
         })
     }
 }
