@@ -60,6 +60,26 @@ class BuildTests(unittest.TestCase):
                 {"PLATFORM_NAME": "iphoneos"},
             )
         self.assertNotIn("CPATH", run.call_args.kwargs["env"])
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-destination") + 1], f"platform=iOS,id={MODERN_UDID}")
+
+    def test_generic_settings_probe_uses_only_literal_generic_destination(self):
+        with mock.patch.object(build.subprocess, "run", return_value=mock.Mock(
+            returncode=0, stdout=b"    PLATFORM_NAME = iphoneos\n",
+        )) as run:
+            build.resolved_settings(Path("/project"), "ABCDE12345", MODERN_UDID, True)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-destination") + 1], "generic/platform=iOS")
+        self.assertNotIn("-allowProvisioningUpdates", command)
+        self.assertNotIn("-allowProvisioningDeviceRegistration", command)
+
+    def test_generic_destination_still_requires_valid_target_identity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "build"
+            for team, udid in [("bad", MODERN_UDID), ("ABCDE12345", "bad")]:
+                with self.assertRaisesRegex(ValueError, "identity_invalid"):
+                    build.build(Path("/source"), output, team, udid, "com.example.Runner", False, True)
+                self.assertFalse(output.exists())
 
     def test_udid_accepts_legacy_and_modern_forms_only(self):
         self.assertIsNotNone(build.UDID.fullmatch("a" * 40))
@@ -90,6 +110,10 @@ class BuildTests(unittest.TestCase):
             self.assertFalse(output.exists())
 
     def test_build_requires_checked_settings_and_never_installs_or_launches(self):
+        self.check_build_destination(False)
+        self.check_build_destination(True)
+
+    def check_build_destination(self, generic):
         data = project_fixture()
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "build"
@@ -109,13 +133,16 @@ class BuildTests(unittest.TestCase):
                     "DEVELOPMENT_TEAM": "ABCDE12345",
                     "CODE_SIGN_STYLE": "Automatic",
                     "PLATFORM_NAME": "iphoneos",
-                }),
+                }) as settings,
                 mock.patch.object(build.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
             ):
-                build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID, "com.example.Runner", False)
+                build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID,
+                            "com.example.Runner", False, generic)
+            self.assertEqual(settings.call_args.args[-1], generic)
             command = run.call_args.args[0]
             self.assertEqual(command[:3], ["/usr/bin/xcodebuild", "clean", "build-for-testing"])
-            self.assertIn(f"platform=iOS,id={MODERN_UDID}", command)
+            self.assertEqual(command[command.index("-destination") + 1],
+                             "generic/platform=iOS" if generic else f"platform=iOS,id={MODERN_UDID}")
             self.assertNotIn("-allowProvisioningUpdates", command)
             self.assertNotIn("-allowProvisioningDeviceRegistration", command)
             self.assertNotIn("PRODUCT_BUNDLE_IDENTIFIER=com.example.Runner", command)

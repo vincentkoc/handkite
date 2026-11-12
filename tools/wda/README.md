@@ -13,6 +13,8 @@ python3 tools/wda/build.py \
   --bundle-id com.example.HandkiteRunner
 ```
 
+When the signing Mac does not have the target phone connected, add `--generic-ios-destination`. This explicit opt-in uses the literal `generic/platform=iOS` destination for both the settings probe and `build-for-testing`, following [Appium's generic-device build route](https://github.com/appium/appium-xcuitest-driver/blob/master/docs/getting-started/provisioning-profile/generic-device-config.md). `--udid` remains required and validated as the intended device for subsequent profile/package verification; the generic build does not require that device to be connected. It does not enable provisioning updates, device registration, installation or launch. Without the flag, both commands still target the supplied UDID.
+
 The tool checks the exact source commit, clean worktree, and pinned project hash. It archives that commit into the new output directory and changes the iOS Runner target's two bundle-ID configurations and applies the lock-state patch described below in the copy. It checks Xcode's resolved target settings before `clean build-for-testing`. It never installs, launches, or runs tests on the phone. The original checkout is not patched. Build output stays in the private directory; `build.log` is mode 0600 and may contain device or account metadata.
 
 The tool removes inherited `CPATH` from its Xcode child processes. Host include paths such as `/usr/local/include` are unsafe for an iOS cross-compile; the caller's environment is unchanged.

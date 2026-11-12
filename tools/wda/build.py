@@ -215,12 +215,14 @@ def xcode_environment() -> dict[str, str]:
     return environment
 
 
-def resolved_settings(project: Path, team: str, udid: str) -> dict[str, str]:
+def resolved_settings(project: Path, team: str, udid: str,
+                      generic_ios_destination: bool = False) -> dict[str, str]:
+    destination = "generic/platform=iOS" if generic_ios_destination else f"platform=iOS,id={udid}"
     command = [
         "/usr/bin/xcodebuild", "-showBuildSettings",
         "-project", str(project), "-target", "WebDriverAgentRunner",
         "-configuration", "Debug", "-sdk", "iphoneos",
-        "-destination", f"platform=iOS,id={udid}",
+        "-destination", destination,
         f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_STYLE=Automatic",
     ]
     result = subprocess.run(command, capture_output=True, check=False, env=xcode_environment())
@@ -233,7 +235,8 @@ def resolved_settings(project: Path, team: str, udid: str) -> dict[str, str]:
     return settings
 
 
-def build(source: Path, output: Path, team: str, udid: str, bundle_id: str, allow_updates: bool) -> None:
+def build(source: Path, output: Path, team: str, udid: str, bundle_id: str,
+          allow_updates: bool, generic_ios_destination: bool = False) -> None:
     if not TEAM.fullmatch(team) or not UDID.fullmatch(udid):
         raise ValueError("identity_invalid")
     if not BUNDLE.fullmatch(bundle_id) or len(bundle_id) > 235:
@@ -255,7 +258,7 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str, allo
     with os.fdopen(manifest_fd, "w", encoding="utf-8") as manifest:
         json.dump(patch_manifest, manifest, sort_keys=True, indent=2)
         manifest.write("\n")
-    settings = resolved_settings(work / "WebDriverAgent.xcodeproj", team, udid)
+    settings = resolved_settings(work / "WebDriverAgent.xcodeproj", team, udid, generic_ios_destination)
     expected = {
         "PRODUCT_BUNDLE_IDENTIFIER": bundle_id,
         "DEVELOPMENT_TEAM": team,
@@ -264,12 +267,13 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str, allo
     }
     if any(settings.get(key) != value for key, value in expected.items()):
         raise ValueError("build_settings_mismatch")
+    destination = "generic/platform=iOS" if generic_ios_destination else f"platform=iOS,id={udid}"
     command = [
         "/usr/bin/xcodebuild", "clean", "build-for-testing",
         "-project", str(work / "WebDriverAgent.xcodeproj"),
         "-scheme", "WebDriverAgentRunner",
         "-configuration", "Debug",
-        "-destination", f"platform=iOS,id={udid}",
+        "-destination", destination,
         "-derivedDataPath", str(output / "DerivedData"),
         f"DEVELOPMENT_TEAM={team}", "CODE_SIGN_STYLE=Automatic",
     ]
@@ -294,9 +298,12 @@ def main() -> int:
     parser.add_argument("--udid", required=True)
     parser.add_argument("--bundle-id", required=True)
     parser.add_argument("--allow-provisioning-updates", action="store_true")
+    parser.add_argument("--generic-ios-destination", action="store_true",
+                        help="build for generic iOS without requiring the pinned device to be connected")
     args = parser.parse_args()
     try:
-        build(args.source, args.output, args.team, args.udid, args.bundle_id, args.allow_provisioning_updates)
+        build(args.source, args.output, args.team, args.udid, args.bundle_id,
+              args.allow_provisioning_updates, args.generic_ios_destination)
     except (OSError, ValueError) as error:
         print(f"wda_build={error.args[0] if isinstance(error, ValueError) else 'io_failed'}")
         return 1
