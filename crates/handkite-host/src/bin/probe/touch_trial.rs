@@ -598,13 +598,39 @@ struct Snapshot {
     observation: RawObservation,
     session: String,
     native: LockState,
+    springboard_launch_unlocked: bool,
     fresh_until: Instant,
+}
+
+fn springboard_launch_unlocked(
+    observation: &RawObservation,
+    native: LockState,
+    reported_lock: Option<bool>,
+) -> bool {
+    let tree = &observation.accessibility_tree;
+    native == LockState::Unlocked
+        && reported_lock == Some(false)
+        && observation.state.lock == LockState::Uncertain
+        && observation.state.foreground_app.as_deref() == Some("com.apple.springboard")
+        && tree.contains("XCUIElementTypeApplication")
+        && tree.contains("XCUIElementTypeIcon")
+        && ![
+            "proud-lock",
+            "passcode-view",
+            "call-to-action-label",
+            "Enter Passcode",
+            "XCUIElementTypeAlert",
+            "XCUIElementTypeSheet",
+            "XCUIElementTypeSecureTextField",
+        ]
+        .iter()
+        .any(|marker| tree.contains(marker))
 }
 
 trait TrialDevice {
     fn capture(&mut self) -> Result<Snapshot, RefusalReason>;
     fn now_ms(&self) -> Result<u64, ()>;
-    fn launch_clock(&mut self, session: &str) -> Result<(), TrialError>;
+    fn launch_clock(&mut self, session: &str, fresh_until: Instant) -> Result<(), TrialError>;
     fn tap(
         &mut self,
         transport: Transport,
@@ -635,11 +661,11 @@ impl<D: TrialDevice> TrialDevice for SessionBound<'_, D> {
         self.device.now_ms()
     }
 
-    fn launch_clock(&mut self, session: &str) -> Result<(), TrialError> {
+    fn launch_clock(&mut self, session: &str, fresh_until: Instant) -> Result<(), TrialError> {
         if session != self.session || self.admission.is_some_and(|admit| !admit()) {
             return Err(TrialError::Refused(RefusalReason::SessionUnproven));
         }
-        let result = self.device.launch_clock(session);
+        let result = self.device.launch_clock(session, fresh_until);
         if self.admission.is_some_and(|admit| !admit()) {
             return Err(TrialError::Unknown);
         }
@@ -702,6 +728,7 @@ fn run_auto_recorded(
             match snapshot.observation.state.lock {
                 LockState::Unlocked => {}
                 LockState::Locked => return Err(TrialError::Refused(RefusalReason::WdaLocked)),
+                LockState::Uncertain if snapshot.springboard_launch_unlocked => {}
                 LockState::Uncertain => {
                     return Err(TrialError::Refused(RefusalReason::WdaLockUnproven));
                 }
@@ -709,9 +736,26 @@ fn run_auto_recorded(
             if !snapshot.observation.state.wda_ready {
                 return Err(TrialError::Refused(RefusalReason::SessionUnproven));
             }
-            Ok(snapshot.session)
+            if Instant::now() >= snapshot.fresh_until
+                || snapshot
+                    .observation
+                    .window
+                    .duration_ms()
+                    .map_err(|_| TrialError::Refused(RefusalReason::FreshnessUnproven))?
+                    > MAX_CAPTURE_MS
+                || device
+                    .now_ms()
+                    .map_err(|_| TrialError::Refused(RefusalReason::FreshnessUnproven))?
+                    .checked_sub(snapshot.observation.window.finished_unix_ms)
+                    .filter(|age| *age <= MAX_AGE_MS)
+                    .is_none()
+            {
+                return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
+            }
+            Ok((snapshot.session, snapshot.fresh_until))
         });
-    let launch = session.and_then(|session| device.launch_clock(&session));
+    let launch =
+        session.and_then(|(session, fresh_until)| device.launch_clock(&session, fresh_until));
     receipts.clock_launch.finish(
         started,
         match launch {
@@ -1296,9 +1340,9 @@ impl TrialDevice for Live {
             .map_err(|_| RefusalReason::IdentityUnproven)?;
         let session = self.status()?;
         require_native_unlocked(native_lock::query(&self.expected).state)?;
-        let (mut observation, captured_at) = self
+        let (mut observation, captured_at, reported_lock) = self
             .adapter
-            .observe_with_attributes()
+            .observe_with_attributes_and_lock_report()
             .map_err(|_| RefusalReason::CaptureFailed)?;
         let fresh_until = captured_at
             .checked_add(Duration::from_millis(MAX_AGE_MS))
@@ -1310,6 +1354,8 @@ impl TrialDevice for Live {
             return Err(RefusalReason::SessionUnproven);
         }
         let native = native_lock::query(&self.expected).state;
+        let springboard_launch_unlocked =
+            springboard_launch_unlocked(&observation, native, reported_lock);
         self.adapter
             .identities()
             .map_err(|_| RefusalReason::IdentityUnproven)?;
@@ -1319,6 +1365,7 @@ impl TrialDevice for Live {
             observation,
             session,
             native,
+            springboard_launch_unlocked,
             fresh_until,
         })
     }
@@ -1330,7 +1377,10 @@ impl TrialDevice for Live {
             .map_err(|_| ())
     }
 
-    fn launch_clock(&mut self, session: &str) -> Result<(), TrialError> {
+    fn launch_clock(&mut self, session: &str, fresh_until: Instant) -> Result<(), TrialError> {
+        if Instant::now() >= fresh_until {
+            return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
+        }
         self.adapter
             .identities()
             .map_err(|_| TrialError::Refused(RefusalReason::IdentityUnproven))?;
@@ -1348,7 +1398,7 @@ impl TrialDevice for Live {
         let receipt = self
             .runtime
             .block_on(self.actions.execute_existing(
-                &self.wda,
+                &self.wda.with_write_deadline(fresh_until),
                 &Action::LaunchApp {
                     bundle_id: CLOCK.into(),
                 },
@@ -1494,6 +1544,7 @@ mod tests {
             },
             session: "fixture-session".into(),
             native: LockState::Unlocked,
+            springboard_launch_unlocked: false,
             fresh_until: Instant::now() + Duration::from_millis(MAX_AGE_MS),
         }
     }
@@ -1544,7 +1595,10 @@ mod tests {
         fn now_ms(&self) -> Result<u64, ()> {
             Ok(self.now)
         }
-        fn launch_clock(&mut self, session: &str) -> Result<(), TrialError> {
+        fn launch_clock(&mut self, session: &str, fresh_until: Instant) -> Result<(), TrialError> {
+            if Instant::now() >= fresh_until {
+                return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
+            }
             self.launches.push(session.to_owned());
             self.launch_result
         }
@@ -1658,6 +1712,102 @@ mod tests {
             assert_eq!(receipts.tap.outcome, StepOutcome::Complete);
             assert_eq!(receipts.postcheck.outcome, StepOutcome::Complete);
         }
+    }
+
+    #[test]
+    fn springboard_home_launch_requires_native_and_wda_agreement() {
+        let mut home = snapshot(false, 50);
+        home.observation.state.foreground_app = Some("com.apple.springboard".into());
+        home.observation.state.lock = LockState::Uncertain;
+        let home_tree = "<XCUIElementTypeApplication name=\"SpringBoard\"><XCUIElementTypeIcon name=\"Clock\"/></XCUIElementTypeApplication>";
+        home.observation.accessibility_tree = home_tree.into();
+        assert!(springboard_launch_unlocked(
+            &home.observation,
+            LockState::Unlocked,
+            Some(false)
+        ));
+        for (native, reported) in [
+            (LockState::Locked, Some(false)),
+            (LockState::Uncertain, Some(false)),
+            (LockState::Unlocked, Some(true)),
+            (LockState::Unlocked, None),
+        ] {
+            assert!(!springboard_launch_unlocked(
+                &home.observation,
+                native,
+                reported
+            ));
+        }
+        for marker in [
+            "proud-lock",
+            "passcode-view",
+            "call-to-action-label",
+            "Enter Passcode",
+            "XCUIElementTypeAlert",
+            "XCUIElementTypeSheet",
+            "XCUIElementTypeSecureTextField",
+        ] {
+            let mut blocked = home.observation.accessibility_tree.clone();
+            blocked.push_str(marker);
+            home.observation.accessibility_tree = blocked;
+            assert!(!springboard_launch_unlocked(
+                &home.observation,
+                LockState::Unlocked,
+                Some(false)
+            ));
+            home.observation.accessibility_tree = home_tree.into();
+        }
+        home.observation.accessibility_tree =
+            "<XCUIElementTypeApplication name=\"SpringBoard\"/>".into();
+        assert!(!springboard_launch_unlocked(
+            &home.observation,
+            LockState::Unlocked,
+            Some(false)
+        ));
+        home.observation.accessibility_tree = home_tree.into();
+        home.springboard_launch_unlocked =
+            springboard_launch_unlocked(&home.observation, LockState::Unlocked, Some(false));
+        let mut fixture = Fixture::new();
+        fixture.captures = [
+            Ok(home),
+            Ok(snapshot(false, 100)),
+            Ok(snapshot(false, 200)),
+            Ok(snapshot(false, 300)),
+            Ok(snapshot(true, 400)),
+        ]
+        .into();
+        let mut receipts = ClockReceipts::default();
+        assert_eq!(
+            run_auto_recorded(
+                &mut fixture,
+                &HardwareId::new("fixture-device").unwrap(),
+                Transport::W3c,
+                &mut receipts,
+            ),
+            Ok(())
+        );
+        assert_eq!(fixture.launches, ["fixture-session"]);
+        assert_eq!(fixture.taps.len(), 1);
+
+        let mut stale = snapshot(false, 50);
+        stale.observation.state.foreground_app = Some("com.apple.springboard".into());
+        stale.observation.state.lock = LockState::Uncertain;
+        stale.springboard_launch_unlocked = true;
+        stale.fresh_until = Instant::now() - Duration::from_millis(1);
+        let mut fixture = Fixture::new();
+        fixture.captures = [Ok(stale)].into();
+        let mut receipts = ClockReceipts::default();
+        assert_eq!(
+            run_auto_recorded(
+                &mut fixture,
+                &HardwareId::new("fixture-device").unwrap(),
+                Transport::W3c,
+                &mut receipts,
+            ),
+            Err(TrialError::Refused(RefusalReason::FreshnessUnproven))
+        );
+        assert!(fixture.launches.is_empty());
+        assert!(fixture.taps.is_empty());
     }
 
     #[test]

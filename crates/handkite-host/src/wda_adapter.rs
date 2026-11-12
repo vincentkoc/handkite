@@ -167,6 +167,14 @@ impl WdaAdapter {
         &self,
         source_path: &str,
     ) -> Result<(RawObservation, Instant), AdapterError> {
+        self.capture_checked_with_lock_report(source_path)
+            .map(|(observation, captured_at, _)| (observation, captured_at))
+    }
+
+    fn capture_checked_with_lock_report(
+        &self,
+        source_path: &str,
+    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
         self.validate_owned()?;
         let captured = self
             .runtime
@@ -181,7 +189,7 @@ impl WdaAdapter {
         usb: &PinnedUsb,
         expected: &HardwareId,
         source_path: &str,
-    ) -> Result<(RawObservation, Instant), AdapterError> {
+    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
         let started_unix_ms = unix_ms()?;
         let wda = UsbWda::new(usb.clone());
         let (image, source, app, reported_lock) = tokio::join!(
@@ -211,7 +219,8 @@ impl WdaAdapter {
             .filter(|value| !value.is_empty())
             .ok_or(AdapterError)?
             .to_owned();
-        let lock = classify_lock(&app, &tree, reported_lock.as_bool());
+        let reported_lock = reported_lock.as_bool();
+        let lock = classify_lock(&app, &tree, reported_lock);
         let finished = Instant::now();
         let observation = RawObservation {
             connected_usb: expected.clone(),
@@ -231,7 +240,7 @@ impl WdaAdapter {
                 bytes: screenshot,
             },
         };
-        Ok((observation, finished))
+        Ok((observation, finished, reported_lock))
     }
 
     /// Diagnostic capture retaining visibility, enabled and selected attributes.
@@ -239,6 +248,14 @@ impl WdaAdapter {
     /// Ordinary controller observations continue to use the smaller projection.
     pub fn observe_with_attributes(&mut self) -> Result<(RawObservation, Instant), AdapterError> {
         self.capture_checked(ATTRIBUTE_SOURCE)
+    }
+
+    /// Diagnostic-only raw lock reply paired with the same image and tree capture.
+    /// Callers must combine it with fresh native state before authorizing input.
+    pub fn observe_with_attributes_and_lock_report(
+        &mut self,
+    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+        self.capture_checked_with_lock_report(ATTRIBUTE_SOURCE)
     }
 
     /// Paired diagnostic capture with the PIN parser's visible/enabled attributes.
