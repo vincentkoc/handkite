@@ -87,6 +87,9 @@ time-bounded InstallationProxy lookup, and readiness. Startup cancellation and
 handle Drop abort the owned host task; `abort_and_join` also observes completion.
 Startup receipts distinguish an unproven test-plan callback, an unresolved UI
 Automation authorization wait, initialization failure, and bootstrap failure.
+Known XCTest initialization failures that carry `LocalAuthentication` or
+`enabling automation mode`, or occur during an observed automation wait, use
+the authorization category. Other initialization failures remain separate.
 Raw XCTest messages are not returned; HTTP readiness alone cannot admit a runner.
 Callers must retain the handle inside an active Tokio runtime and establish
 exclusive device/WDA ownership before calling it.

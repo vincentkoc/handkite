@@ -369,6 +369,17 @@ fn startup_timeout_error(state: PlanState) -> RunnerError {
     }
 }
 
+fn initialization_failure(message: &str, automation_waiting: bool) -> RunnerError {
+    if automation_waiting
+        || message.contains("enabling automation mode")
+        || message.contains("com.apple.LocalAuthentication")
+    {
+        RunnerError::AutomationAuthorizationRequired
+    } else {
+        RunnerError::InitializationFailed
+    }
+}
+
 struct PlanListener {
     phase: watch::Sender<PlanState>,
 }
@@ -376,7 +387,8 @@ struct PlanListener {
 impl XCUITestListener for PlanListener {
     async fn log_debug_message(&mut self, message: &str) -> Result<(), IdeviceError> {
         if message.contains("Failed to initialize for UI testing") {
-            self.fail(RunnerError::InitializationFailed);
+            let automation_waiting = self.phase.borrow().automation_waiting;
+            self.fail(initialization_failure(message, automation_waiting));
             return Ok(());
         }
         let waiting =
@@ -421,9 +433,10 @@ impl XCUITestListener for PlanListener {
 
     async fn initialization_for_ui_testing_did_fail(
         &mut self,
-        _description: &str,
+        description: &str,
     ) -> Result<(), IdeviceError> {
-        self.fail(RunnerError::InitializationFailed);
+        let automation_waiting = self.phase.borrow().automation_waiting;
+        self.fail(initialization_failure(description, automation_waiting));
         Ok(())
     }
 

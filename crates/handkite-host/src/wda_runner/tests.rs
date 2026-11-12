@@ -296,6 +296,53 @@ async fn task_exit_preserves_pending_automation_diagnosis() {
 }
 
 #[tokio::test]
+async fn automation_initialization_failures_keep_the_permission_category() {
+    for mode in 0..3 {
+        let probes = AtomicUsize::new(0);
+        let result = OwnedWdaRunner::start_task(
+            move |mut listener| async move {
+                match mode {
+                    0 => listener
+                        .log_debug_message(
+                            "Failed to initialize for UI testing: Error Domain=com.apple.LocalAuthentication Code=-4",
+                        )
+                        .await
+                        .unwrap(),
+                    1 => listener
+                        .initialization_for_ui_testing_did_fail(
+                            "Timed out while enabling automation mode",
+                        )
+                        .await
+                        .unwrap(),
+                    _ => {
+                        listener
+                            .log_debug_message("entering wait loop for enabling automation mode")
+                            .await
+                            .unwrap();
+                        listener
+                            .initialization_for_ui_testing_did_fail("opaque archive")
+                            .await
+                            .unwrap();
+                    }
+                }
+                pending().await
+            },
+            || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                async { ready() }
+            },
+            deadline(),
+        )
+        .await;
+        assert_eq!(
+            result.err(),
+            Some(RunnerError::AutomationAuthorizationRequired)
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[tokio::test]
 async fn initialization_failure_during_status_probe_keeps_its_category() {
     let (release, released) = oneshot::channel();
     let mut release = Some(release);
