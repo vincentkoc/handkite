@@ -7,9 +7,9 @@ use crate::wda_session::{SessionClose, close_owned_session, create_owned_session
 use crate::wda_settings::validate_session;
 use crate::wda_transport::UsbWda;
 use base64::Engine;
-use handkite_core::controller::{AdapterError, DeviceAdapter, RawObservation};
+use handkite_core::controller::{ActionAdmission, AdapterError, DeviceAdapter, RawObservation};
 use handkite_core::protocol::{
-    Action, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, ScreenImage,
+    Action, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, Point, ScreenImage,
     TransportReceipt,
 };
 use std::future::Future;
@@ -301,8 +301,11 @@ impl DeviceAdapter for WdaAdapter {
     fn observe_for_action(
         &mut self,
         action: &Action,
-    ) -> Result<(RawObservation, Option<Instant>), AdapterError> {
-        if !matches!(action, Action::LaunchApp { .. }) {
+    ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
+        let owned_tap = matches!(action, Action::Tap { .. })
+            && self.owned_session.is_some()
+            && self.owned_runner.is_some();
+        if !matches!(action, Action::LaunchApp { .. }) && !owned_tap {
             return self.observe().map(|observation| (observation, None));
         }
         let native_before = native_lock::query(&self.expected).state;
@@ -310,14 +313,28 @@ impl DeviceAdapter for WdaAdapter {
             self.capture_checked_with_lock_report(SCREEN_SOURCE)?;
         let native_after = native_lock::query(&self.expected).state;
         self.validate_owned()?;
-        let deadline = springboard_home_launch_deadline(
-            &observation,
-            native_before,
-            native_after,
-            reported_lock,
-            captured_at,
-        );
-        Ok((observation, deadline))
+        let admission = if let Action::Tap { at } = action {
+            visible_tap_deadline(
+                &observation,
+                owned_tap,
+                native_before,
+                native_after,
+                reported_lock,
+                *at,
+                captured_at,
+            )
+            .map(|until| ActionAdmission::VisibleTap { at: *at, until })
+        } else {
+            springboard_home_launch_deadline(
+                &observation,
+                native_before,
+                native_after,
+                reported_lock,
+                captured_at,
+            )
+            .map(|until| ActionAdmission::HomeLaunch { until })
+        };
+        Ok((observation, admission))
     }
 
     fn execute(
@@ -326,7 +343,8 @@ impl DeviceAdapter for WdaAdapter {
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
         self.validate_owned()?;
-        if matches!(action, Action::LaunchApp { .. })
+        if (matches!(action, Action::LaunchApp { .. })
+            || matches!(action, Action::Tap { .. }) && self.owned_session.is_some())
             && native_lock::query(&self.expected).state != LockState::Unlocked
         {
             return Err(AdapterError);
@@ -401,6 +419,33 @@ fn classify_lock(app: &str, tree: &str, reported: Option<bool>) -> LockState {
     LockState::Uncertain
 }
 
+fn visible_tap_deadline(
+    observation: &RawObservation,
+    owned: bool,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    at: Point,
+    captured_at: Instant,
+) -> Option<Instant> {
+    if !owned
+        || native_before != LockState::Unlocked
+        || native_after != LockState::Unlocked
+        || reported_lock != Some(false)
+        || observation.state.lock != LockState::Unlocked
+        || !observation.state.wda_ready
+        || observation
+            .state
+            .foreground_app
+            .as_deref()
+            .is_none_or(|app| app == "com.apple.springboard")
+        || !crate::wda_tap_admission::visible_button(&observation.accessibility_tree, at)
+    {
+        return None;
+    }
+    captured_at.checked_add(HOME_LAUNCH_AGE)
+}
+
 /// One-capture private admission for launching an app from unlocked Home.
 /// It never changes the public lock classification or authorizes direct input.
 pub fn springboard_home_launch_deadline(
@@ -438,6 +483,102 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tap_admission_requires_owned_native_unlocked_context_and_capture_deadline() {
+        let id = HardwareId::new("fixture-device").unwrap();
+        let mut observation = RawObservation {
+            connected_usb: id.clone(), wda_target: id,
+            window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
+            state: DeviceState { lock: LockState::Unlocked, wda_ready: true, foreground_app: Some("com.example.app".into()) },
+            accessibility_tree: r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeButton label="Clear" visible="true" enabled="true" x="270" y="490" width="30" height="30"/></XCUIElementTypeApplication></AppiumAUT>"#.into(),
+            screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+        };
+        let at = Point { x: 285.0, y: 505.0 };
+        let captured_at = Instant::now();
+        let deadline = |observation: &RawObservation, owned, before, after, raw| {
+            visible_tap_deadline(observation, owned, before, after, raw, at, captured_at)
+        };
+        assert_eq!(
+            deadline(
+                &observation,
+                true,
+                LockState::Unlocked,
+                LockState::Unlocked,
+                Some(false)
+            ),
+            Some(captured_at + Duration::from_secs(2))
+        );
+        assert_eq!(
+            deadline(
+                &observation,
+                false,
+                LockState::Unlocked,
+                LockState::Unlocked,
+                Some(false)
+            ),
+            None
+        );
+        for lock in [LockState::Locked, LockState::Uncertain] {
+            assert_eq!(
+                deadline(&observation, true, lock, LockState::Unlocked, Some(false)),
+                None
+            );
+            assert_eq!(
+                deadline(&observation, true, LockState::Unlocked, lock, Some(false)),
+                None
+            );
+            observation.state.lock = lock;
+            assert_eq!(
+                deadline(
+                    &observation,
+                    true,
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    Some(false)
+                ),
+                None
+            );
+            observation.state.lock = LockState::Unlocked;
+        }
+        for raw in [None, Some(true)] {
+            assert_eq!(
+                deadline(
+                    &observation,
+                    true,
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    raw
+                ),
+                None
+            );
+        }
+        observation.state.wda_ready = false;
+        assert_eq!(
+            deadline(
+                &observation,
+                true,
+                LockState::Unlocked,
+                LockState::Unlocked,
+                Some(false)
+            ),
+            None
+        );
+        observation.state.wda_ready = true;
+        for app in [None, Some("com.apple.springboard".into())] {
+            observation.state.foreground_app = app;
+            assert_eq!(
+                deadline(
+                    &observation,
+                    true,
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    Some(false)
+                ),
+                None
+            );
+        }
+    }
 
     #[tokio::test]
     async fn shutdown_cancels_pending_runner_startup() {

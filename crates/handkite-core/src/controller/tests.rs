@@ -16,6 +16,7 @@ struct FakeAdapter {
     locked: bool,
     uncertain: bool,
     home_launch_until: Option<Instant>,
+    tap_admission: Option<ActionAdmission>,
     leak_home_evidence: bool,
     actions: usize,
     native_lock: LockState,
@@ -43,6 +44,7 @@ impl FakeAdapter {
             locked: false,
             uncertain: false,
             home_launch_until: None,
+            tap_admission: None,
             leak_home_evidence: false,
             actions: 0,
             native_lock: LockState::Uncertain,
@@ -104,12 +106,15 @@ impl DeviceAdapter for FakeAdapter {
     fn observe_for_action(
         &mut self,
         action: &Action,
-    ) -> Result<(RawObservation, Option<Instant>), AdapterError> {
+    ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
         let observation = self.observe()?;
         let admission = if matches!(action, Action::LaunchApp { .. }) || self.leak_home_evidence {
-            self.home_launch_until.take()
+            self.home_launch_until
+                .take()
+                .map(|until| ActionAdmission::HomeLaunch { until })
+                .or_else(|| self.tap_admission.take())
         } else {
-            None
+            self.tap_admission.take()
         };
         Ok((observation, admission))
     }
@@ -477,6 +482,114 @@ fn changed_screen_or_lock_state_blocks_input_before_transport() {
         Some(ControllerError::LockedAction)
     );
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+}
+
+#[test]
+fn visible_tap_allows_only_pixel_drift_with_matching_fresh_typed_evidence() {
+    let at = Point { x: 20.0, y: 30.0 };
+    for change in 0..9 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = vec![1];
+            inner.adapter.tap_admission = Some(ActionAdmission::VisibleTap { at, until });
+            match change {
+                1 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::VisibleTap {
+                        at: Point { x: 21.0, y: 30.0 },
+                        until,
+                    })
+                }
+                2 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::VisibleTap {
+                        at,
+                        until: Instant::now() - Duration::from_secs(1),
+                    })
+                }
+                3 => inner.adapter.tap_admission = Some(ActionAdmission::HomeLaunch { until }),
+                4 => inner.adapter.tree_suffix = "changed".into(),
+                5 => inner.adapter.wda_ready = false,
+                6 => inner.adapter.locked = true,
+                7 => inner.adapter.uncertain = true,
+                8 => inner.adapter.tap_admission = None,
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action: Action::Tap { at },
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        if change == 0 {
+            let result = result.unwrap();
+            assert_eq!(inner.adapter.actions, 1);
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
+            assert_eq!(result.effect, ObservedEffect::Unconfirmed);
+        } else {
+            assert!(
+                matches!(result, Err(ControllerError::ViewChanged(_))),
+                "case {change}"
+            );
+            assert_eq!(inner.adapter.actions, 0);
+        }
+    }
+}
+
+#[test]
+fn visible_tap_evidence_cannot_admit_other_actions() {
+    let at = Point { x: 20.0, y: 30.0 };
+    for action in [
+        Action::Home,
+        Action::Lock,
+        Action::Text {
+            value: "fixture".into(),
+        },
+        Action::LaunchApp {
+            bundle_id: "com.example.app".into(),
+        },
+        Action::Swipe {
+            from: at,
+            to: Point { x: 40.0, y: 50.0 },
+            duration_ms: 100,
+        },
+    ] {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = vec![1];
+            inner.adapter.tap_admission = Some(ActionAdmission::VisibleTap {
+                at,
+                until: Instant::now() + Duration::from_secs(2),
+            });
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        assert!(matches!(
+            controller.act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action,
+                }
+            ),
+            Err(ControllerError::ViewChanged(_))
+        ));
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
 }
 
 #[test]

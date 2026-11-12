@@ -1,6 +1,6 @@
 use crate::protocol::{
     Action, ActionRequest, ActionResult, DeviceBinding, DeviceKey, DeviceState, HardwareId,
-    LockState, Observation, ObservationWindow, ObservedEffect, Revision, ScreenImage,
+    LockState, Observation, ObservationWindow, ObservedEffect, Point, Revision, ScreenImage,
     TransportReceipt,
 };
 use std::sync::Mutex;
@@ -18,16 +18,21 @@ pub struct RawObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdapterError;
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ActionAdmission {
+    HomeLaunch { until: Instant },
+    VisibleTap { at: Point, until: Instant },
+}
+
 pub trait DeviceAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
-    /// Private, one-capture admission for LaunchApp from unlocked SpringBoard.
-    /// The deadline must be anchored to that capture; ordinary observations
-    /// and all other actions return no admission.
+    /// Private admission bound to the exact action and capture deadline.
+    /// Ordinary observations return no admission.
     fn observe_for_action(
         &mut self,
         _action: &Action,
-    ) -> Result<(RawObservation, Option<Instant>), AdapterError> {
+    ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
         self.observe().map(|observation| (observation, None))
     }
     /// The adapter must send no action bytes at or after this monotonic deadline.
@@ -213,16 +218,40 @@ impl<A: DeviceAdapter> Controller<A> {
             .verify(&request.device, &usb, &wda)
             .map_err(|_| ControllerError::DeviceMismatch)?;
 
-        let (fresh, home_launch_until) =
+        let (fresh, admission) =
             self.capture(&mut inner, &request.device, Some(&request.action))?;
+        let home_launch_until = match admission {
+            Some(ActionAdmission::HomeLaunch { until }) => Some(until),
+            _ => None,
+        };
         let admitted_home_launch = matches!(&request.action, Action::LaunchApp { .. })
             && fresh.state.lock == LockState::Uncertain
             && home_launch_until.is_some_and(|until| Instant::now() < until);
+        let visible_tap_until = match (&request.action, admission) {
+            (
+                Action::Tap { at },
+                Some(ActionAdmission::VisibleTap {
+                    at: admitted,
+                    until,
+                }),
+            ) if *at == admitted
+                && fresh.state.lock == LockState::Unlocked
+                && fresh.state.wda_ready
+                && Instant::now() < until =>
+            {
+                Some(until)
+            }
+            _ => None,
+        };
         // App launch uses a bundle ID, so Home animations need not match.
         // Fresh private admission and device state still must.
         if request.expected_revision.is_some()
             && inner.last.as_ref().is_some_and(|last| {
-                !(same_view(last, &fresh) || admitted_home_launch && last.state == fresh.state)
+                !(same_view(last, &fresh)
+                    || admitted_home_launch && last.state == fresh.state
+                    || visible_tap_until.is_some()
+                        && last.state == fresh.state
+                        && last.accessibility_tree == fresh.accessibility_tree)
             })
         {
             let change =
@@ -265,6 +294,9 @@ impl<A: DeviceAdapter> Controller<A> {
         let mut send_deadline = observation_deadline.min(lease.expires_at);
         if admitted_home_launch {
             send_deadline = send_deadline.min(home_launch_until.expect("admitted deadline"));
+        }
+        if let Some(until) = visible_tap_until {
+            send_deadline = send_deadline.min(until);
         }
         let receipt = match inner.adapter.execute(&request.action, send_deadline) {
             Ok(receipt) => receipt,
@@ -339,8 +371,8 @@ impl<A: DeviceAdapter> Controller<A> {
         inner: &mut Inner<A>,
         requested: &DeviceKey,
         action: Option<&Action>,
-    ) -> Result<(Observation, Option<Instant>), ControllerError> {
-        let (raw, home_launch_until) = match action {
+    ) -> Result<(Observation, Option<ActionAdmission>), ControllerError> {
+        let (raw, admission) = match action {
             Some(action) => inner.adapter.observe_for_action(action),
             None => inner
                 .adapter
@@ -382,7 +414,7 @@ impl<A: DeviceAdapter> Controller<A> {
                 accessibility_tree: raw.accessibility_tree,
                 screenshot: raw.screenshot,
             },
-            home_launch_until,
+            admission,
         ))
     }
 }
