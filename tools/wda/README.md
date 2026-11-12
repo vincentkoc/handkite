@@ -2,7 +2,7 @@
 
 This is an explicit Xcode-managed route for a Handkite-owned iOS XCTest runner. It is separate from the macOS host release. The [source pin](SOURCE.md) identifies the one upstream revision accepted by the build command.
 
-Use a trusted Mac with Xcode, an exact device UDID, an independently chosen Apple development team, and a clean checkout of the pinned source. Select a new output directory outside both repositories. The command creates that directory once and preserves it on failure.
+Use a trusted Mac with Xcode, an exact device UDID, an independently chosen Apple development team, and a clean checkout of the pinned source. The build and verification tools support Python 3.9 or later, including Xcode's native `/usr/bin/python3`. Select a new output directory outside both repositories. The command creates that directory once and preserves it on failure.
 
 ```sh
 python3 tools/wda/build.py \
@@ -46,4 +46,4 @@ The pinned upstream runner initializes its lock cache only after a notification.
 
 The builder verifies SHA-256 preimages for all three patched upstream files before mutation. `source-patches.json` records the upstream commit, patch-tool hash, original file hashes and resulting file hashes, including the small added header. The original checkout is unchanged. This patch does not update an already installed runner; a new candidate still requires normal build, signature verification and separately authorized installation.
 
-Focused offline checks are `python3 -m unittest discover -s tools/wda -p test_build.py` and `python3 -m unittest discover -s tools/wda -p test_lock_state.py`. The native C fixture replaces the notification read with a fake; it performs no phone, notification, signing or account operation.
+Focused offline checks are `python3 -m unittest discover -s tools/wda -p test_build.py`, `python3 -m unittest discover -s tools/wda -p test_verify.py`, and `python3 -m unittest discover -s tools/wda -p test_lock_state.py`. Run the verifier checks with `/usr/bin/python3 -B` to cover native Python 3.9 compatibility. The native C fixture replaces the notification read with a fake; it performs no phone, notification, signing or account operation.

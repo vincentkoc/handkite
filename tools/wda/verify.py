@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Read-only signature and profile admission for one built iOS XCTest runner."""
 
+from __future__ import annotations
+
 import argparse
 from datetime import datetime, timezone
 import hashlib

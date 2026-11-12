@@ -34,6 +34,16 @@ def fixture(directory: str) -> tuple[Path, Path, Path]:
 
 
 class VerifyTests(unittest.TestCase):
+    def test_tool_postpones_annotations_and_preserves_subprocess_contract(self):
+        self.assertEqual(verify.tool.__annotations__["cwd"], "Path | None")
+        command = ["fixture-tool", "--read-only"]
+        directory = Path("/fixture")
+        with mock.patch.object(verify.subprocess, "run", return_value=mock.Mock(
+            returncode=0, stdout=b"fixture", stderr=b"",
+        )) as run:
+            self.assertEqual(verify.tool(command, cwd=directory), b"fixture")
+        run.assert_called_once_with(command, cwd=directory, capture_output=True, check=False)
+
     def test_entitlement_allowances_are_bounded(self):
         self.assertTrue(verify.allowed_claim("ABCDE12345.com.example.Runner", "ABCDE12345.*"))
         self.assertFalse(verify.allowed_claim("OTHER12345.com.example.Runner", "ABCDE12345.*"))
