@@ -1,9 +1,12 @@
 use super::*;
-use handkite_host::release_manifest::{ReleaseArtifact, RustIdentity, SdkIdentity};
+use handkite_host::release_manifest::{
+    ArtifactName, ReleaseArtifact, ReleaseManifest, RustIdentity, SdkIdentity,
+};
 use std::cell::Cell;
+use std::ffi::OsString;
 #[cfg(target_os = "macos")]
 use std::io::Read;
-use std::io::{SeekFrom, Write};
+use std::io::{Seek, SeekFrom, Write};
 #[cfg(target_os = "macos")]
 use std::os::unix::fs::PermissionsExt;
 use tempfile::NamedTempFile;
