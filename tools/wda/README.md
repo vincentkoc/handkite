@@ -17,6 +17,8 @@ When the signing Mac does not have the target phone connected, add `--generic-io
 
 The tool checks the exact source commit, clean worktree, and pinned project hash. It archives that commit into the new output directory and changes the iOS Runner target's two bundle-ID configurations and applies the lock-state patch described below in the copy. It checks Xcode's resolved target settings before `clean build-for-testing`. It never installs, launches, or runs tests on the phone. The original checkout is not patched. Build output stays in the private directory; `build.log` is mode 0600 and may contain device or account metadata.
 
+The builder flushes fixed phase messages for source checks, source preparation, settings checks, and build start, each with elapsed seconds. Its final `wda_build` status also includes total elapsed seconds. Xcode still runs synchronously; there are no periodic updates during a phase. Progress messages contain no log contents, paths, or device/account identities. A `completed_unverified` status still requires the separate verifier below.
+
 The tool removes inherited `CPATH` from its Xcode child processes. Host include paths such as `/usr/local/include` are unsafe for an iOS cross-compile; the caller's environment is unchanged.
 
 Add `--allow-provisioning-updates` only when intentionally allowing Xcode to contact Apple and manage signing assets. The command does not enable automatic device registration. Team and UDID are passed to Xcode as process arguments on the trusted Mac; no PIN, Apple password, or token is accepted by this tool.

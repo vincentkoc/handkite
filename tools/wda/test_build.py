@@ -113,15 +113,29 @@ class BuildTests(unittest.TestCase):
         self.check_build_destination(False)
         self.check_build_destination(True)
 
-    def check_build_destination(self, generic):
+    def test_failed_xcode_build_keeps_private_log_and_reports_failure(self):
+        self.check_build_destination(False, returncode=65)
+
+    def check_build_destination(self, generic, returncode=0):
         data = project_fixture()
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "build"
+            messages = [
+                mock.call("wda_build_phase=source_check elapsed_seconds=1.0", flush=True),
+                mock.call("wda_build_phase=source_prepare elapsed_seconds=2.0", flush=True),
+                mock.call("wda_build_phase=settings_check elapsed_seconds=4.0", flush=True),
+                mock.call("wda_build_phase=build_start elapsed_seconds=10.0", flush=True),
+            ]
 
             def archive(_, destination):
                 project = destination / build.PROJECT
                 project.parent.mkdir(parents=True)
                 project.write_bytes(data)
+
+            def xcode(*args, **kwargs):
+                self.assertEqual(report.call_args_list, messages)
+                kwargs["stdout"].write(b"private Xcode output\n")
+                return mock.Mock(returncode=returncode)
 
             with (
                 mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()),
@@ -134,10 +148,18 @@ class BuildTests(unittest.TestCase):
                     "CODE_SIGN_STYLE": "Automatic",
                     "PLATFORM_NAME": "iphoneos",
                 }) as settings,
-                mock.patch.object(build.subprocess, "run", return_value=mock.Mock(returncode=0)) as run,
+                mock.patch.object(build.subprocess, "run", side_effect=xcode) as run,
+                mock.patch.object(build.time, "monotonic", side_effect=[10, 11, 12, 14, 20]),
+                mock.patch("builtins.print") as report,
             ):
-                build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID,
-                            "com.example.Runner", False, generic)
+                if returncode:
+                    with self.assertRaisesRegex(ValueError, "^xcode_build_failed$"):
+                        build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID,
+                                    "com.example.Runner", False, generic)
+                else:
+                    build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID,
+                                "com.example.Runner", False, generic)
+            self.assertEqual(report.call_args_list, messages)
             self.assertEqual(settings.call_args.args[-1], generic)
             command = run.call_args.args[0]
             self.assertEqual(command[:3], ["/usr/bin/xcodebuild", "clean", "build-for-testing"])
@@ -149,6 +171,35 @@ class BuildTests(unittest.TestCase):
             self.assertFalse(any(word in command for word in ("test-without-building", "install", "launch")))
             self.assertNotIn("CPATH", run.call_args.kwargs["env"])
             self.assertEqual((output / "build.log").stat().st_mode & 0o777, 0o600)
+            self.assertEqual((output / "build.log").read_bytes(), b"private Xcode output\n")
+
+    def test_cli_flushes_final_status_and_elapsed_time_without_error_details(self):
+        arguments = [
+            "build.py", "--source", "/source", "--output", "/output",
+            "--team", "ABCDE12345", "--udid", MODERN_UDID,
+            "--bundle-id", "com.example.Runner",
+        ]
+        for error, status, code in (
+            (None, "completed_unverified", 0),
+            (ValueError("xcode_build_failed"), "xcode_build_failed", 1),
+            (ValueError("build_settings_unavailable"), "build_settings_unavailable", 1),
+            (OSError("private path and account details"), "io_failed", 1),
+        ):
+            with (
+                self.subTest(status=status),
+                mock.patch("sys.argv", arguments),
+                mock.patch.object(build, "build", side_effect=error) as run,
+                mock.patch.object(build.time, "monotonic", side_effect=[10, 27.5]),
+                mock.patch("builtins.print") as report,
+            ):
+                self.assertEqual(build.main(), code)
+            run.assert_called_once_with(
+                Path("/source"), Path("/output"), "ABCDE12345", MODERN_UDID,
+                "com.example.Runner", False, False,
+            )
+            report.assert_called_once_with(
+                f"wda_build={status} elapsed_seconds=17.5", flush=True,
+            )
 
     def test_mismatched_resolved_settings_prevent_build(self):
         data = project_fixture()

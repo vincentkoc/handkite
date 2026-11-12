@@ -10,6 +10,7 @@ from pathlib import Path, PurePosixPath
 import re
 import subprocess
 import tarfile
+import time
 
 
 SOURCE_COMMIT = "02cb92f0e93c8b021443bcbb8eeb80932c113220"
@@ -235,8 +236,14 @@ def resolved_settings(project: Path, team: str, udid: str,
     return settings
 
 
+def progress(phase: str, started: float) -> None:
+    print(f"wda_build_phase={phase} elapsed_seconds={time.monotonic() - started:.1f}", flush=True)
+
+
 def build(source: Path, output: Path, team: str, udid: str, bundle_id: str,
           allow_updates: bool, generic_ios_destination: bool = False) -> None:
+    started = time.monotonic()
+    progress("source_check", started)
     if not TEAM.fullmatch(team) or not UDID.fullmatch(udid):
         raise ValueError("identity_invalid")
     if not BUNDLE.fullmatch(bundle_id) or len(bundle_id) > 235:
@@ -247,6 +254,7 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str,
         raise ValueError("output_overlaps_source")
     if not source_is_pinned(source):
         raise ValueError("source_unqualified")
+    progress("source_prepare", started)
     output.mkdir(mode=0o700)
     work = output / "source"
     work.mkdir(mode=0o700)
@@ -258,6 +266,7 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str,
     with os.fdopen(manifest_fd, "w", encoding="utf-8") as manifest:
         json.dump(patch_manifest, manifest, sort_keys=True, indent=2)
         manifest.write("\n")
+    progress("settings_check", started)
     settings = resolved_settings(work / "WebDriverAgent.xcodeproj", team, udid, generic_ios_destination)
     expected = {
         "PRODUCT_BUNDLE_IDENTIFIER": bundle_id,
@@ -282,6 +291,7 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str,
     log = output / "build.log"
     fd = os.open(log, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, "wb") as stream:
+        progress("build_start", started)
         result = subprocess.run(
             command, stdout=stream, stderr=subprocess.STDOUT,
             check=False, env=xcode_environment(),
@@ -301,13 +311,15 @@ def main() -> int:
     parser.add_argument("--generic-ios-destination", action="store_true",
                         help="build for generic iOS without requiring the pinned device to be connected")
     args = parser.parse_args()
+    started = time.monotonic()
     try:
         build(args.source, args.output, args.team, args.udid, args.bundle_id,
               args.allow_provisioning_updates, args.generic_ios_destination)
     except (OSError, ValueError) as error:
-        print(f"wda_build={error.args[0] if isinstance(error, ValueError) else 'io_failed'}")
+        print(f"wda_build={error.args[0] if isinstance(error, ValueError) else 'io_failed'} "
+              f"elapsed_seconds={time.monotonic() - started:.1f}", flush=True)
         return 1
-    print("wda_build=completed_unverified")
+    print(f"wda_build=completed_unverified elapsed_seconds={time.monotonic() - started:.1f}", flush=True)
     return 0
 
 
