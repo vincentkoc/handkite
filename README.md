@@ -249,6 +249,8 @@ The separate `observation,navigation,interaction` profile adds `handkite_tap`, `
 
 An app launch from Home tolerates changes in screenshot or tree bytes only when a fresh private Home check proves native unlock before and after capture, WDA reports unlocked, and device state matches the requested observation. Revision, identity, lease, and send deadlines still apply. Other actions retain exact view matching. `StaleRevision` means the requested revision is no longer current; `ViewChanged` means the fresh screen context failed the action check. Both reject input before transport.
 
+Normal observations retain WDA's visibility, enabled, focus, selection, and placeholder attributes for interaction targets. An absent attribute remains unknown; clients must verify the required target state before sending input. Diagnostic and passcode projections are separate.
+
 The pure `ssh_bridge::render` helper accepts a `ServiceLayout`, one bare canonical
 `ssh-ed25519` public key, and an explicit `mcp::Capabilities` value. It returns one
 LF-terminated `authorized_keys` entry with `restrict` and a forced command:
