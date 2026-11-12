@@ -79,7 +79,8 @@ The CLI's `request` subcommand reads one JSON request from stdin and returns the
 Before each action, default mode checks the existing WDA session on the pinned USB route and validates its session endpoint. It adopts that session on the first action and rejects absent, invalid, stale, or replacement sessions. Owned mode instead retains the exact session it created, checks runner liveness and session identity around observation and input, and refuses drift. Neither mode renews a session automatically. A replaced session requires owner inspection.
 
 The separate `wda_runner::OwnedWdaRunner` library can start one exact installed
-`.xctrunner` bundle through pinned `idevice` 0.1.68. It requires a callback from
+`.xctrunner` bundle through pinned `idevice` 0.1.68 at Git revision
+`89702099f4d7552f704f93b4526756abda319ceb`. It requires a callback from
 that launch's test plan, a still-live task and plan, and HTTP 200 with boolean
 `value.ready: true`. One absolute startup deadline covers discovery, a separately
 time-bounded InstallationProxy lookup, and readiness. Startup cancellation and
