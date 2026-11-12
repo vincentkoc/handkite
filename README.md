@@ -247,6 +247,8 @@ The host can explicitly add `--capabilities navigation` or `--capabilities obser
 
 The separate `observation,navigation,interaction` profile adds `handkite_tap`, `handkite_swipe`, `handkite_text`, and `handkite_launch_app`. It is opt-in at host startup and does not change the existing profiles. Every action requires a current unsigned observation revision and explicit control. Points must be finite coordinates from 0 through 10,000; swipes last 1 through 5,000 ms. Text is limited to 4,096 UTF-8 bytes and excludes control characters. App identifiers are bounded ASCII bundle identifiers. Arguments reject unknown or duplicate fields, including nested point fields. Each call dispatches once, with unknown delivery reported without replay. These tools can perform real purchases or send messages; grant this profile only to a trusted personal agent with approval bound to the concrete action. The included OpenClaw recipe remains disabled and observation-only.
 
+An app launch from Home tolerates changes in screenshot or tree bytes only when a fresh private Home check proves native unlock before and after capture, WDA reports unlocked, and device state matches the requested observation. Revision, identity, lease, and send deadlines still apply. Other actions retain exact view matching. `StaleRevision` means the requested revision is no longer current; `ViewChanged` means the fresh screen context failed the action check. Both reject input before transport.
+
 The pure `ssh_bridge::render` helper accepts a `ServiceLayout`, one bare canonical
 `ssh-ed25519` public key, and an explicit `mcp::Capabilities` value. It returns one
 LF-terminated `authorized_keys` entry with `restrict` and a forced command:

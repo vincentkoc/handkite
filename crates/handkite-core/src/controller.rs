@@ -82,6 +82,7 @@ pub enum ControllerError {
     Randomness,
     DeviceMismatch,
     StaleRevision,
+    ViewChanged,
     LockedAction,
     StaleObservation,
     InvalidObservationWindow,
@@ -192,18 +193,19 @@ impl<A: DeviceAdapter> Controller<A> {
 
         let (fresh, home_launch_until) =
             self.capture(&mut inner, &request.device, Some(&request.action))?;
-        if request.expected_revision.is_some()
-            && inner
-                .last
-                .as_ref()
-                .is_some_and(|last| !same_view(last, &fresh))
-        {
-            inner.last = Some(fresh);
-            return Err(ControllerError::StaleRevision);
-        }
         let admitted_home_launch = matches!(&request.action, Action::LaunchApp { .. })
             && fresh.state.lock == LockState::Uncertain
             && home_launch_until.is_some_and(|until| Instant::now() < until);
+        // App launch uses a bundle ID, so Home animations need not match.
+        // Fresh private admission and device state still must.
+        if request.expected_revision.is_some()
+            && inner.last.as_ref().is_some_and(|last| {
+                !(same_view(last, &fresh) || admitted_home_launch && last.state == fresh.state)
+            })
+        {
+            inner.last = Some(fresh);
+            return Err(ControllerError::ViewChanged);
+        }
         if !matches!(&request.action, Action::Home)
             && fresh.state.lock != LockState::Unlocked
             && !admitted_home_launch

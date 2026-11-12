@@ -128,7 +128,7 @@ impl Session {
                 // Identity checks and response-size limits can also fail after input.
                 if matches!(
                     code.as_str(),
-                    "InvalidLease" | "StaleRevision" | "LockedAction"
+                    "InvalidLease" | "StaleRevision" | "ViewChanged" | "LockedAction"
                 ) {
                     service_error(&code)
                 } else {
@@ -153,6 +153,9 @@ fn service_error(code: &str) -> Value {
         "Busy" => "Busy: another session holds control",
         "InvalidLease" => "InvalidLease: explicit control acquisition required",
         "StaleRevision" => "StaleRevision: obtain a fresh observation before another action",
+        "ViewChanged" => {
+            "ViewChanged: screen context changed before input; obtain a fresh observation"
+        }
         "DeviceMismatch" => "DeviceMismatch: pinned identity verification failed",
         "LockedAction" => "LockedAction: action requires an unlocked phone",
         _ => "device service rejected the request",

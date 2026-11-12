@@ -5,6 +5,9 @@ struct FakeAdapter {
     usb: HardwareId,
     wda: HardwareId,
     app: String,
+    tree_suffix: String,
+    image_suffix: Vec<u8>,
+    wda_ready: bool,
     stale_capture: bool,
     fail_capture: bool,
     fail_after_action: bool,
@@ -29,6 +32,9 @@ impl FakeAdapter {
             usb: id.clone(),
             wda: id,
             app: "com.example.notes".into(),
+            tree_suffix: String::new(),
+            image_suffix: Vec::new(),
+            wda_ready: true,
             stale_capture: false,
             fail_capture: false,
             fail_after_action: false,
@@ -84,13 +90,13 @@ impl DeviceAdapter for FakeAdapter {
                 } else {
                     LockState::Unlocked
                 },
-                wda_ready: true,
+                wda_ready: self.wda_ready,
                 foreground_app: Some(self.app.clone()),
             },
-            accessibility_tree: format!("<app name=\"{}\" />", self.app),
+            accessibility_tree: format!("<app name=\"{}\" />{}", self.app, self.tree_suffix),
             screenshot: ScreenImage {
                 format: ImageFormat::Png,
-                bytes: self.app.as_bytes().to_vec(),
+                bytes: [self.app.as_bytes(), self.image_suffix.as_slice()].concat(),
             },
         })
     }
@@ -409,7 +415,7 @@ fn changed_screen_or_lock_state_blocks_input_before_transport() {
     };
     assert_eq!(
         controller.act("agent", lease, request).err(),
-        Some(ControllerError::StaleRevision)
+        Some(ControllerError::ViewChanged)
     );
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
 
@@ -426,6 +432,144 @@ fn changed_screen_or_lock_state_blocks_input_before_transport() {
         Some(ControllerError::LockedAction)
     );
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+}
+
+#[test]
+fn home_launch_tolerates_visual_drift_only_with_fresh_admission() {
+    for (tree, image) in [(true, false), (false, true), (true, true)] {
+        for admission in [true, false] {
+            let (controller, key) = controller();
+            {
+                let mut inner = controller.inner.lock().unwrap();
+                inner.adapter.app = "com.apple.springboard".into();
+                inner.adapter.uncertain = true;
+            }
+            let before = controller.observe(&key).unwrap();
+            let until = Instant::now() + Duration::from_secs(2);
+            {
+                let mut inner = controller.inner.lock().unwrap();
+                if tree {
+                    inner.adapter.tree_suffix = "animation".into();
+                }
+                if image {
+                    inner.adapter.image_suffix = vec![1];
+                }
+                inner.adapter.home_launch_until = admission.then_some(until);
+            }
+            let lease = controller
+                .acquire("agent".into(), Duration::from_secs(30))
+                .unwrap();
+            let result = controller.act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action: Action::LaunchApp {
+                        bundle_id: "com.apple.mobiletimer".into(),
+                    },
+                },
+            );
+            let inner = controller.inner.lock().unwrap();
+            if admission {
+                assert!(result.is_ok());
+                assert_eq!(inner.adapter.actions, 1);
+                assert!(inner.adapter.send_deadline.unwrap() <= until);
+            } else {
+                assert_eq!(result.err(), Some(ControllerError::ViewChanged));
+                assert_eq!(inner.adapter.actions, 0);
+            }
+        }
+    }
+}
+
+#[test]
+fn home_launch_rejects_changed_state_or_expired_admission() {
+    for change in 0..4 {
+        let (controller, key) = controller();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.app = "com.apple.springboard".into();
+            inner.adapter.uncertain = true;
+        }
+        let before = controller.observe(&key).unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.tree_suffix = "animation".into();
+            inner.adapter.home_launch_until = Some(Instant::now() + Duration::from_secs(2));
+            match change {
+                0 => inner.adapter.app = "com.example.other".into(),
+                1 => inner.adapter.locked = true,
+                2 => inner.adapter.wda_ready = false,
+                _ => {
+                    inner.adapter.home_launch_until = Some(Instant::now() - Duration::from_secs(1))
+                }
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action: Action::LaunchApp {
+                    bundle_id: "com.apple.mobiletimer".into(),
+                },
+            },
+        );
+        assert_eq!(result.err(), Some(ControllerError::ViewChanged));
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
+}
+
+#[test]
+fn visual_drift_still_blocks_other_actions() {
+    for action in [
+        Action::Home,
+        Action::Lock,
+        Action::Tap {
+            at: Point { x: 20.0, y: 30.0 },
+        },
+        Action::Text {
+            value: "fixture".into(),
+        },
+        Action::Swipe {
+            from: Point { x: 20.0, y: 30.0 },
+            to: Point { x: 40.0, y: 50.0 },
+            duration_ms: 100,
+        },
+    ] {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.tree_suffix = "animation".into();
+            inner.adapter.image_suffix = vec![1];
+            inner.adapter.leak_home_evidence = true;
+            inner.adapter.home_launch_until = Some(Instant::now() + Duration::from_secs(2));
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(
+            controller
+                .act(
+                    "agent",
+                    lease,
+                    ActionRequest {
+                        device: key,
+                        expected_revision: Some(before.revision),
+                        action,
+                    }
+                )
+                .err(),
+            Some(ControllerError::ViewChanged)
+        );
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
 }
 
 #[test]

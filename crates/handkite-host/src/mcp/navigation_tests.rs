@@ -579,7 +579,7 @@ fn stale_revision_and_changed_view_do_not_send_input() {
                 json!({"expected_revision": 1})
             )
             .to_string()
-            .contains("StaleRevision")
+            .contains("ViewChanged")
     );
     assert!(fixture.state.lock().unwrap().actions.is_empty());
     session.cleanup(&mut |bytes| fixture.exchange(bytes));
