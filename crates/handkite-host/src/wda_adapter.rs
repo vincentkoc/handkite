@@ -392,6 +392,14 @@ impl DeviceAdapter for WdaAdapter {
             if native_lock::query(&self.expected).state != LockState::Unlocked {
                 return Err(AdapterError);
             }
+            let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
+            let receipt = self
+                .runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(self.actions.activate_home_with_existing_session(&wda))?;
+            self.validate_owned()?;
+            return Ok(receipt);
         }
         self.execute(action, send_deadline)
     }

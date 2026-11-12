@@ -95,6 +95,28 @@ impl WdaActions {
         Self::execute_on(wda, action, session).await
     }
 
+    /// Activates the Home screen once, without a button-press fallback.
+    pub(crate) async fn activate_home_with_existing_session(
+        &mut self,
+        wda: &impl WdaRequest,
+    ) -> Result<TransportReceipt, AdapterError> {
+        if self.session.is_none() {
+            return Err(AdapterError);
+        }
+        self.validate_existing(wda).await?;
+        let response = wda
+            .request("POST", "/wda/homescreen", b"{}", Duration::from_secs(30))
+            .await
+            .map_err(|_| AdapterError)?;
+        if response_ok(response)?.get("value").is_none() {
+            return Err(AdapterError);
+        }
+        Ok(TransportReceipt {
+            accepted: Some(true),
+            action_kind: "home".into(),
+        })
+    }
+
     pub async fn execute_existing(
         &self,
         wda: &UsbWda,
@@ -368,6 +390,92 @@ mod tests {
                 json!({"value": null}),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn home_activation_validates_bound_session_and_sends_one_global_request() {
+        for reply in [
+            Ok(HttpResponse {
+                status: 200,
+                body: br#"{"value":null}"#.to_vec(),
+            }),
+            Ok(HttpResponse {
+                status: 500,
+                body: br#"{"value":null}"#.to_vec(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: br#"{"value":{"error":"fixture-error"}}"#.to_vec(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: b"not-json".to_vec(),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                body: b"{}".to_vec(),
+            }),
+            Err(WdaError::ExpiredBeforeSend),
+            Err(WdaError::AfterSent),
+            Err(WdaError::TimedOutAfterSent),
+        ] {
+            let success = reply
+                .as_ref()
+                .is_ok_and(|reply| reply.status == 200 && reply.body == br#"{"value":null}"#);
+            let mut wda = Script::new(vec![
+                status(json!("fixture-session")),
+                response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+                Step {
+                    method: "POST",
+                    path: "/wda/homescreen",
+                    response: reply,
+                },
+            ]);
+            wda.1 = Some(json!({}));
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            let receipt = actions.activate_home_with_existing_session(&wda).await;
+            if success {
+                let receipt = receipt.unwrap();
+                assert_eq!(receipt.accepted, Some(true));
+                assert_eq!(receipt.action_kind, "home");
+            } else {
+                assert!(receipt.is_err());
+            }
+            wda.done();
+        }
+    }
+
+    #[tokio::test]
+    async fn home_activation_refuses_unbound_or_changed_sessions_before_input() {
+        let wda = Script::new(vec![]);
+        assert!(
+            WdaActions::default()
+                .activate_home_with_existing_session(&wda)
+                .await
+                .is_err()
+        );
+        wda.done();
+        let wda = Script::new(vec![status(json!("different-session"))]);
+        assert!(
+            WdaActions::bound_to_existing("fixture-session")
+                .unwrap()
+                .activate_home_with_existing_session(&wda)
+                .await
+                .is_err()
+        );
+        wda.done();
+        let wda = Script::new(vec![
+            status(json!("fixture-session")),
+            response("GET", "/session/fixture-session", 500, json!({"value":{}})),
+        ]);
+        assert!(
+            WdaActions::bound_to_existing("fixture-session")
+                .unwrap()
+                .activate_home_with_existing_session(&wda)
+                .await
+                .is_err()
+        );
+        wda.done();
     }
 
     #[tokio::test]
