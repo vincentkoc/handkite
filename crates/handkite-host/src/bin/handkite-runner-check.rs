@@ -45,37 +45,44 @@ fn run() -> Result<(), &'static str> {
         tokio::select! {
             result = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120)) =>
                 result.map_err(runner_reason),
-            _ = wait_shutdown() => Err("cleanup_unproven"),
+            _ = wait_shutdown() => Err("shutdown_requested"),
         }
     });
     let result = match startup {
         Ok(runner) => {
+            println!("runner_check_stage=startup_ready");
             let alive = !runner.is_finished();
             let joined = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), runner.abort_and_join())
                     .await
                     .is_ok_and(|result| result.is_ok())
             });
-            if alive && joined {
-                Ok(())
+            if !alive {
+                Err("runner_liveness_unproven")
+            } else if !joined {
+                Err("runner_join_unproven")
             } else {
-                Err("cleanup_unproven")
+                println!("runner_check_stage=runner_joined");
+                Ok(())
             }
         }
         Err(reason) => Err(reason),
     };
     runtime.shutdown_timeout(Duration::from_secs(5));
-    if signals::requested() || owner.validate_current().is_err() {
-        return Err("cleanup_unproven");
+    if signals::requested() {
+        return Err("shutdown_requested");
+    }
+    if owner.validate_current().is_err() {
+        return Err("service_ownership");
     }
     result?;
     let check = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|_| "cleanup_unproven")?;
+        .map_err(|_| "runtime_unavailable")?;
     check
         .block_on(handkite_host::wda_runner::endpoint_vacant(&usb))
-        .map_err(|_| "cleanup_unproven")?;
+        .map_err(|_| "endpoint_unproven")?;
     Ok(())
 }
 
