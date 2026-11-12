@@ -167,8 +167,187 @@ async fn stale_ready_endpoint_cannot_replace_this_launchs_plan_callback() {
         deadline(),
     )
     .await;
-    assert_eq!(result.err(), Some(RunnerError::StartupTimedOut));
+    assert_eq!(result.err(), Some(RunnerError::PlanStartUnproven));
     assert_eq!(probes.load(Ordering::SeqCst), 0);
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn automation_wait_is_bounded_and_done_does_not_establish_plan() {
+    for done in [false, true] {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let probes = AtomicUsize::new(0);
+        let expires = deadline();
+        let result = OwnedWdaRunner::start_task(
+            |mut listener| {
+                let dropped = dropped.clone();
+                async move {
+                    let _guard = OnDrop(dropped);
+                    listener
+                        .log_debug_message("entering wait loop for enabling automation mode")
+                        .await
+                        .unwrap();
+                    if done {
+                        listener
+                            .log_debug_message("cleaning up enabling automation mode")
+                            .await
+                            .unwrap();
+                    }
+                    pending().await
+                }
+            },
+            || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                async { ready() }
+            },
+            expires,
+        )
+        .await;
+        assert_eq!(
+            result.err(),
+            Some(if done {
+                RunnerError::PlanStartUnproven
+            } else {
+                RunnerError::AutomationAuthorizationRequired
+            })
+        );
+        assert_eq!(Instant::now(), expires);
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_startup_failures_are_terminal_and_hide_raw_messages() {
+    for mode in 0..3 {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let probes = AtomicUsize::new(0);
+        let result = OwnedWdaRunner::start_task(
+            |mut listener| {
+                let dropped = dropped.clone();
+                async move {
+                    let _guard = OnDrop(dropped);
+                    if mode == 2 {
+                        let _ = listener
+                            .did_fail_to_bootstrap("sensitive-fixture-token")
+                            .await;
+                    } else if mode == 1 {
+                        listener
+                            .log_debug_message(
+                                "Failed to initialize for UI testing: sensitive-fixture-token",
+                            )
+                            .await
+                            .unwrap();
+                    } else {
+                        listener
+                            .initialization_for_ui_testing_did_fail("sensitive-fixture-token")
+                            .await
+                            .unwrap();
+                    }
+                    listener.did_begin_executing_test_plan().await.unwrap();
+                    pending().await
+                }
+            },
+            || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                async { ready() }
+            },
+            deadline(),
+        )
+        .await;
+        let error = result.err().unwrap();
+        assert_eq!(
+            error,
+            if mode == 2 {
+                RunnerError::BootstrapFailed
+            } else {
+                RunnerError::InitializationFailed
+            }
+        );
+        assert!(!format!("{error:?}").contains("sensitive-fixture-token"));
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn task_exit_preserves_pending_automation_diagnosis() {
+    let probes = AtomicUsize::new(0);
+    let result = OwnedWdaRunner::start_task(
+        |mut listener| async move {
+            listener
+                .log_debug_message("entering wait loop for enabling automation mode")
+                .await
+                .unwrap();
+            Err(RunnerError::RunnerFailed)
+        },
+        || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            async { ready() }
+        },
+        deadline(),
+    )
+    .await;
+    assert_eq!(
+        result.err(),
+        Some(RunnerError::AutomationAuthorizationRequired)
+    );
+    assert_eq!(probes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn initialization_failure_during_status_probe_keeps_its_category() {
+    let (release, released) = oneshot::channel();
+    let mut release = Some(release);
+    let result = OwnedWdaRunner::start_task(
+        |mut listener| async move {
+            listener.did_begin_executing_test_plan().await.unwrap();
+            let _ = released.await;
+            listener
+                .log_debug_message("Failed to initialize for UI testing: sensitive-fixture-token")
+                .await
+                .unwrap();
+            Err(RunnerError::RunnerFailed)
+        },
+        || {
+            release.take().unwrap().send(()).unwrap();
+            async {
+                tokio::task::yield_now().await;
+                ready()
+            }
+        },
+        deadline(),
+    )
+    .await;
+    assert_eq!(result.err(), Some(RunnerError::InitializationFailed));
+}
+
+#[tokio::test]
+async fn completed_automation_wait_can_reach_a_proven_plan() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let runner = OwnedWdaRunner::start_task(
+        |mut listener| {
+            let dropped = dropped.clone();
+            async move {
+                let _guard = OnDrop(dropped);
+                listener
+                    .log_debug_message("entering wait loop for enabling automation mode")
+                    .await
+                    .unwrap();
+                listener
+                    .log_debug_message("cleaning up enabling automation mode")
+                    .await
+                    .unwrap();
+                listener.did_begin_executing_test_plan().await.unwrap();
+                pending().await
+            }
+        },
+        || async { ready() },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    runner.abort_and_join().await.unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
 

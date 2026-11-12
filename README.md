@@ -85,6 +85,9 @@ that launch's test plan, a still-live task and plan, and HTTP 200 with boolean
 `value.ready: true`. One absolute startup deadline covers discovery, a separately
 time-bounded InstallationProxy lookup, and readiness. Startup cancellation and
 handle Drop abort the owned host task; `abort_and_join` also observes completion.
+Startup receipts distinguish an unproven test-plan callback, an unresolved UI
+Automation authorization wait, initialization failure, and bootstrap failure.
+Raw XCTest messages are not returned; HTTP readiness alone cannot admit a runner.
 Callers must retain the handle inside an active Tokio runtime and establish
 exclusive device/WDA ownership before calling it.
 

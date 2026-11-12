@@ -149,6 +149,12 @@ impl ReceiptFailure {
                     RunnerError::EndpointBusy => "runner_endpoint_busy",
                     RunnerError::EndpointUnproven => "runner_endpoint_unproven",
                     RunnerError::StartupTimedOut => "runner_startup_timed_out",
+                    RunnerError::PlanStartUnproven => "runner_plan_start_unproven",
+                    RunnerError::AutomationAuthorizationRequired => {
+                        "runner_automation_authorization_required"
+                    }
+                    RunnerError::InitializationFailed => "runner_initialization_failed",
+                    RunnerError::BootstrapFailed => "runner_bootstrap_failed",
                     RunnerError::RunnerExited => "runner_exited",
                     RunnerError::RunnerFailed => "runner_failed",
                     RunnerError::TaskFailed => "runner_task_failed",
@@ -1962,6 +1968,16 @@ mod tests {
             (RunnerError::EndpointBusy, "runner_endpoint_busy"),
             (RunnerError::EndpointUnproven, "runner_endpoint_unproven"),
             (RunnerError::StartupTimedOut, "runner_startup_timed_out"),
+            (RunnerError::PlanStartUnproven, "runner_plan_start_unproven"),
+            (
+                RunnerError::AutomationAuthorizationRequired,
+                "runner_automation_authorization_required",
+            ),
+            (
+                RunnerError::InitializationFailed,
+                "runner_initialization_failed",
+            ),
+            (RunnerError::BootstrapFailed, "runner_bootstrap_failed"),
             (RunnerError::RunnerExited, "runner_exited"),
             (RunnerError::RunnerFailed, "runner_failed"),
             (RunnerError::TaskFailed, "runner_task_failed"),

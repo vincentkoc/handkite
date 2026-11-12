@@ -34,6 +34,10 @@ pub enum RunnerError {
     EndpointBusy,
     EndpointUnproven,
     StartupTimedOut,
+    PlanStartUnproven,
+    AutomationAuthorizationRequired,
+    InitializationFailed,
+    BootstrapFailed,
     RunnerExited,
     RunnerFailed,
     TaskFailed,
@@ -148,7 +152,7 @@ impl OwnedWdaRunner {
         if Instant::now() >= deadline {
             return Err(RunnerError::StartupTimedOut);
         }
-        let (phase, receiver) = watch::channel(PlanPhase::Starting);
+        let (phase, receiver) = watch::channel(PlanState::starting());
         // Install the abort-on-drop owner before the first await after spawn.
         let mut runner = Self {
             task: Some(tokio::spawn(run(PlanListener { phase }))),
@@ -162,7 +166,7 @@ impl OwnedWdaRunner {
 
     async fn wait_ready<P, PF>(
         &mut self,
-        phase: watch::Receiver<PlanPhase>,
+        phase: watch::Receiver<PlanState>,
         mut probe: P,
         deadline: Instant,
     ) -> Result<(), RunnerError>
@@ -172,9 +176,10 @@ impl OwnedWdaRunner {
     {
         let mut begun = phase.clone();
         let mut finished = phase.clone();
+        let mut failed = phase.clone();
         let readiness = async {
             begun
-                .wait_for(|phase| *phase == PlanPhase::Running)
+                .wait_for(|state| state.phase == PlanPhase::Running)
                 .await
                 .map_err(|_| RunnerError::RunnerExited)?;
             loop {
@@ -186,26 +191,39 @@ impl OwnedWdaRunner {
         };
         tokio::select! {
             biased;
-            _ = sleep_until(deadline) => return Err(RunnerError::StartupTimedOut),
+            failure = async {
+                failed.wait_for(|state| state.failure.is_some()).await.ok().and_then(|state| state.failure)
+            } => {
+                if let Some(error) = failure {
+                    return Err(error);
+                }
+                let result = self.task.as_mut().expect("owned task").await;
+                self.task.take();
+                return Err(startup_exit_with_state(result, *phase.borrow()));
+            }
+            _ = sleep_until(deadline) => return Err(startup_timeout_error(*phase.borrow())),
             result = self.task.as_mut().expect("owned task") => {
                 self.task.take();
-                return Err(startup_exit(result));
+                return Err(startup_exit_with_state(result, *phase.borrow()));
             }
-            _ = finished.wait_for(|phase| *phase == PlanPhase::Finished) => {
+            _ = async { let _ = finished.wait_for(|state| state.phase == PlanPhase::Finished).await; } => {
                 return Err(RunnerError::RunnerExited);
             }
             result = readiness => result?,
         }
         // A ready response cannot override an observed deadline or task/plan exit.
         if Instant::now() >= deadline {
-            return Err(RunnerError::StartupTimedOut);
+            return Err(startup_timeout_error(*phase.borrow()));
+        }
+        if let Some(error) = phase.borrow().failure {
+            return Err(error);
         }
         if self.is_finished() {
             let result = self.task.as_mut().expect("owned task").await;
             self.task.take();
-            return Err(startup_exit(result));
+            return Err(startup_exit_with_state(result, *phase.borrow()));
         }
-        if *phase.borrow() != PlanPhase::Running {
+        if phase.borrow().phase != PlanPhase::Running {
             return Err(RunnerError::RunnerExited);
         }
         Ok(())
@@ -286,6 +304,19 @@ fn startup_exit(result: Result<Result<(), RunnerError>, JoinError>) -> RunnerErr
     }
 }
 
+fn startup_exit_with_state(
+    result: Result<Result<(), RunnerError>, JoinError>,
+    state: PlanState,
+) -> RunnerError {
+    if let Some(error) = state.failure {
+        error
+    } else if state.phase == PlanPhase::Starting && state.automation_waiting {
+        RunnerError::AutomationAuthorizationRequired
+    } else {
+        startup_exit(result)
+    }
+}
+
 #[derive(Clone, Copy, Eq, PartialEq)]
 enum PlanPhase {
     Starting,
@@ -293,15 +324,68 @@ enum PlanPhase {
     Finished,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct PlanState {
+    phase: PlanPhase,
+    automation_waiting: bool,
+    failure: Option<RunnerError>,
+}
+
+impl PlanState {
+    fn starting() -> Self {
+        Self {
+            phase: PlanPhase::Starting,
+            automation_waiting: false,
+            failure: None,
+        }
+    }
+}
+
+fn startup_timeout_error(state: PlanState) -> RunnerError {
+    if let Some(error) = state.failure {
+        error
+    } else if state.phase == PlanPhase::Starting {
+        if state.automation_waiting {
+            RunnerError::AutomationAuthorizationRequired
+        } else {
+            RunnerError::PlanStartUnproven
+        }
+    } else {
+        RunnerError::StartupTimedOut
+    }
+}
+
 struct PlanListener {
-    phase: watch::Sender<PlanPhase>,
+    phase: watch::Sender<PlanState>,
 }
 
 impl XCUITestListener for PlanListener {
+    async fn log_debug_message(&mut self, message: &str) -> Result<(), IdeviceError> {
+        if message.contains("Failed to initialize for UI testing") {
+            self.fail(RunnerError::InitializationFailed);
+            return Ok(());
+        }
+        let waiting =
+            message.contains("entering wait loop") && message.contains("enabling automation mode");
+        let done = message.contains("cleaning up enabling automation mode");
+        if waiting || done {
+            self.phase.send_if_modified(|state| {
+                if state.failure.is_some() || state.phase == PlanPhase::Finished {
+                    return false;
+                }
+                let next = !done;
+                let changed = state.automation_waiting != next;
+                state.automation_waiting = next;
+                changed
+            });
+        }
+        Ok(())
+    }
+
     async fn did_begin_executing_test_plan(&mut self) -> Result<(), IdeviceError> {
-        self.phase.send_if_modified(|phase| {
-            if *phase == PlanPhase::Starting {
-                *phase = PlanPhase::Running;
+        self.phase.send_if_modified(|state| {
+            if state.phase == PlanPhase::Starting && state.failure.is_none() {
+                state.phase = PlanPhase::Running;
                 true
             } else {
                 false
@@ -311,8 +395,41 @@ impl XCUITestListener for PlanListener {
     }
 
     async fn did_finish_executing_test_plan(&mut self) -> Result<(), IdeviceError> {
-        self.phase.send_replace(PlanPhase::Finished);
+        self.phase.send_if_modified(|state| {
+            if state.failure.is_some() || state.phase == PlanPhase::Finished {
+                return false;
+            }
+            state.phase = PlanPhase::Finished;
+            true
+        });
         Ok(())
+    }
+
+    async fn initialization_for_ui_testing_did_fail(
+        &mut self,
+        _description: &str,
+    ) -> Result<(), IdeviceError> {
+        self.fail(RunnerError::InitializationFailed);
+        Ok(())
+    }
+
+    async fn did_fail_to_bootstrap(&mut self, _description: &str) -> Result<(), IdeviceError> {
+        self.fail(RunnerError::BootstrapFailed);
+        Err(IdeviceError::UnexpectedResponse(
+            "test runner bootstrap failed".into(),
+        ))
+    }
+}
+
+impl PlanListener {
+    fn fail(&self, error: RunnerError) {
+        self.phase.send_if_modified(|state| {
+            if state.failure.is_some() || state.phase == PlanPhase::Finished {
+                return false;
+            }
+            state.failure = Some(error);
+            true
+        });
     }
 }
 
