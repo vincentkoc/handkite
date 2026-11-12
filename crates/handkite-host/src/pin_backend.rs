@@ -23,6 +23,8 @@ struct PreparedPinView {
     view: ParsedPasscodeView,
     fresh_until: Instant,
     empty_locked: bool,
+    normal_locked: bool,
+    captured_at: Instant,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -44,6 +46,7 @@ pub struct NativePasscodeBackend {
     supervised_visibility_fallback: bool,
     session_bound: bool,
     awaiting_first_digit: bool,
+    reveal_attempted: bool,
     progress_check: ProgressCheck,
     coordinate_pin_taps: bool,
     input_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
@@ -88,6 +91,7 @@ impl NativePasscodeBackend {
             supervised_visibility_fallback,
             session_bound: false,
             awaiting_first_digit: false,
+            reveal_attempted: false,
             progress_check: ProgressCheck::Disabled,
             coordinate_pin_taps: false,
             input_admission: None,
@@ -147,6 +151,14 @@ impl NativePasscodeBackend {
     }
 
     fn request_action(&mut self, action: &Action) -> Result<(), BackendError> {
+        self.request_action_mode(action, self.coordinate_pin_taps)
+    }
+
+    fn request_action_mode(
+        &mut self,
+        action: &Action,
+        coordinate: bool,
+    ) -> Result<(), BackendError> {
         self.request_action_with(action, Instant::now(), |backend, action, fresh_until| {
             let wda = UsbWda::new(backend.usb.clone())
                 .with_write_deadline(fresh_until)
@@ -159,13 +171,7 @@ impl NativePasscodeBackend {
                             wda: &wda,
                             admission: backend.input_admission.as_deref(),
                         };
-                        bound_action(
-                            &mut backend.actions,
-                            &wda,
-                            action,
-                            backend.coordinate_pin_taps,
-                        )
-                        .await
+                        bound_action(&mut backend.actions, &wda, action, coordinate).await
                     } else {
                         backend.actions.execute_existing(&wda, action).await
                     }
@@ -216,6 +222,65 @@ impl NativePasscodeBackend {
         let result = dispatch(self, &Action::Tap { at });
         if self.progress_check == ProgressCheck::BeforeFirst {
             self.progress_check = ProgressCheck::Pending;
+        }
+        result
+    }
+
+    fn prepare_owned_keypad_with(
+        &mut self,
+        now: Instant,
+        mut snapshot: impl FnMut(&mut Self) -> Result<PasscodeScreen, BackendError>,
+        swipe: impl FnOnce(&mut Self, &Action) -> Result<(), BackendError>,
+    ) -> Result<(), BackendError> {
+        if !self.session_bound
+            || !self.supervised_visibility_fallback
+            || self.input_admission.is_none()
+            || self.reveal_attempted
+        {
+            return Err(BackendError::Unavailable);
+        }
+        self.admit_input()?;
+        let prepared = self.last_view.as_ref().ok_or(BackendError::Unavailable)?;
+        if now >= prepared.fresh_until {
+            self.last_view = None;
+            return Err(BackendError::Unavailable);
+        }
+        if prepared.empty_locked {
+            self.awaiting_first_digit = true;
+            return Ok(());
+        }
+        if !prepared.normal_locked {
+            return Err(BackendError::Unavailable);
+        }
+        let first = prepared.view.normal_lock.ok_or(BackendError::Unavailable)?;
+        let first_at = prepared.captured_at;
+        snapshot(self)?;
+        let confirmed = self.last_view.as_ref().ok_or(BackendError::Unavailable)?;
+        if !confirmed.normal_locked
+            || confirmed.captured_at <= first_at
+            || confirmed.view.normal_lock != Some(first)
+        {
+            self.last_view = None;
+            return Err(BackendError::Unavailable);
+        }
+        // Consume this preparation even if the write acknowledgement is lost.
+        self.reveal_attempted = true;
+        let result = (|| {
+            swipe(self, &keypad_swipe(first.size)?)?;
+            self.awaiting_first_digit = true;
+            snapshot(self)?;
+            if !self
+                .last_view
+                .as_ref()
+                .is_some_and(|view| view.empty_locked)
+            {
+                return Err(BackendError::Unavailable);
+            }
+            Ok(())
+        })();
+        if result.is_err() {
+            self.last_view = None;
+            self.progress_check = ProgressCheck::Failed;
         }
         result
     }
@@ -390,6 +455,16 @@ impl NativePasscodeBackend {
             return Err(BackendError::Unavailable);
         }
         let empty_locked = empty_locked(&screen, &view, &self.expected);
+        let normal_locked = screen.connected_usb == self.expected
+            && screen.wda_target == self.expected
+            && screen.native_lock == LockState::Locked
+            && screen.wda_lock == LockState::Locked
+            && screen.visible_lock == LockState::Locked
+            && !screen.before_first_unlock
+            && !screen.trust_prompt
+            && !screen.keypad_ready
+            && screen.secure_field_value.is_none()
+            && view.normal_lock.is_some();
         if self.awaiting_first_digit && !empty_locked {
             return Err(BackendError::Unavailable);
         }
@@ -397,6 +472,8 @@ impl NativePasscodeBackend {
             view,
             fresh_until,
             empty_locked,
+            normal_locked,
+            captured_at: started,
         });
         if comparing {
             self.progress_check = ProgressCheck::Complete;
@@ -494,6 +571,16 @@ impl PasscodeBackend for NativePasscodeBackend {
             ProgressCheck::Pending | ProgressCheck::Failed
         ) {
             return Err(BackendError::Unavailable);
+        }
+        if self.supervised_visibility_fallback
+            && self.session_bound
+            && self.input_admission.is_some()
+        {
+            return self.prepare_owned_keypad_with(
+                Instant::now(),
+                Self::snapshot,
+                |backend, action| backend.request_action_mode(action, false),
+            );
         }
         if self.supervised_visibility_fallback && self.session_bound {
             if self.last_view.as_ref().is_some_and(|prepared| {
@@ -1045,6 +1132,238 @@ mod tests {
                 Err(UnlockError::Disabled)
             );
             assert_eq!((harness.taps, harness.reads), (1, 1));
+        }
+    }
+
+    fn normal_capture() -> (PasscodeScreen, ParsedPasscodeView) {
+        let (screen, _) = capture();
+        let view = pin_screen::parse(r#"<AppiumAUT><XCUIElementTypeApplication bundleId="com.apple.springboard" x="0" y="0" width="400" height="800"><XCUIElementTypeOther name="proud-lock" visible="true"/></XCUIElementTypeApplication></AppiumAUT>"#).unwrap();
+        (screen, view)
+    }
+
+    #[test]
+    fn owned_empty_keypads_need_no_input_and_require_zero_until_first_digit() {
+        for hidden in [false, true] {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(keypad_capture(hidden)), || start)
+                .unwrap();
+            assert_eq!(
+                backend.prepare_owned_keypad_with(
+                    start,
+                    |_| panic!("already empty: no extra preparation capture"),
+                    |_, _| panic!("already empty: no swipe or wake")
+                ),
+                Ok(())
+            );
+            assert!(backend.awaiting_first_digit);
+            let (mut screen, mut view) = keypad_capture(hidden);
+            screen.secure_field_value = Some("1 of 6 digits".into());
+            view.secure_field_value = screen.secure_field_value.clone();
+            assert!(
+                backend
+                    .snapshot_with(start, |_, _| Ok((screen, view)), || start)
+                    .is_err()
+            );
+            assert!(backend.last_view.is_none());
+        }
+    }
+
+    #[test]
+    fn owned_normal_lock_reveals_once_then_requires_empty_keypad() {
+        for coordinate in [false, true] {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            backend.coordinate_pin_taps = coordinate;
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+                .unwrap();
+            let mut captures = 0;
+            let mut writes = 0;
+            assert_eq!(
+                backend.prepare_owned_keypad_with(
+                    start,
+                    |backend| {
+                        captures += 1;
+                        let at = start + Duration::from_millis(captures);
+                        backend.snapshot_with(
+                            at,
+                            |_, _| {
+                                Ok(if captures == 1 {
+                                    normal_capture()
+                                } else {
+                                    keypad_capture(false)
+                                })
+                            },
+                            || at,
+                        )
+                    },
+                    |backend, action| {
+                        writes += 1;
+                        let Action::Swipe {
+                            from,
+                            to,
+                            duration_ms,
+                        } = action
+                        else {
+                            panic!("reveal must be a single swipe");
+                        };
+                        assert_eq!(
+                            (from.x, from.y, to.x, to.y, *duration_ms),
+                            (200.0, 792.0, 200.0, 360.0, 300)
+                        );
+                        backend.request_action_with(
+                            action,
+                            start + Duration::from_millis(1),
+                            |_, _, deadline| {
+                                assert_eq!(
+                                    deadline,
+                                    start + Duration::from_millis(1) + PIN_VIEW_BUDGET
+                                );
+                                Ok(())
+                            },
+                        )
+                    }
+                ),
+                Ok(())
+            );
+            assert_eq!((captures, writes), (2, 1));
+            assert!(backend.awaiting_first_digit);
+            assert!(backend.last_view.as_ref().unwrap().empty_locked);
+            assert!(
+                backend
+                    .prepare_owned_keypad_with(
+                        start,
+                        |_| panic!("no repeat capture"),
+                        |_, _| panic!("no reswipe")
+                    )
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn owned_reveal_refuses_changed_reused_or_unowned_preparation_before_writes() {
+        for case in 0..13 {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            let (mut screen, mut view) = normal_capture();
+            match case {
+                0 => screen.connected_usb = HardwareId::new("other-phone").unwrap(),
+                1 => screen.wda_target = HardwareId::new("other-phone").unwrap(),
+                2 => screen.native_lock = LockState::Uncertain,
+                3 => screen.wda_lock = LockState::Uncertain,
+                4 => screen.visible_lock = LockState::Uncertain,
+                5 => screen.before_first_unlock = true,
+                6 => screen.trust_prompt = true,
+                7 => view.normal_lock = None,
+                _ => (),
+            }
+            backend
+                .snapshot_with(start, |_, _| Ok((screen, view)), || start)
+                .unwrap();
+            if case == 8 {
+                backend.input_admission = Some(Arc::new(|| false));
+            }
+            let now = if case == 9 {
+                start + PIN_VIEW_BUDGET
+            } else {
+                start
+            };
+            assert!(
+                backend
+                    .prepare_owned_keypad_with(
+                        now,
+                        |backend| {
+                            assert!(case >= 10);
+                            let (screen, mut view) = normal_capture();
+                            if case == 10 {
+                                view.normal_lock.as_mut().unwrap().size.0 += 1.0;
+                            }
+                            if case == 12 {
+                                view.normal_lock.as_mut().unwrap().proud_visible = false;
+                            }
+                            let at = if case == 11 {
+                                start
+                            } else {
+                                start + Duration::from_millis(1)
+                            };
+                            backend.snapshot_with(at, |_, _| Ok((screen, view)), || at)
+                        },
+                        |_, _| panic!("unsafe preparation: zero writes")
+                    )
+                    .is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn uncertain_reveal_never_reswipes_or_permits_a_digit() {
+        for case in 0..4 {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+                .unwrap();
+            let mut captures = 0;
+            let mut writes = 0;
+            assert!(
+                backend
+                    .prepare_owned_keypad_with(
+                        start,
+                        |backend| {
+                            captures += 1;
+                            if captures == 2 && case == 1 {
+                                return Err(BackendError::Unavailable);
+                            }
+                            let at = start + Duration::from_millis(captures);
+                            let (mut screen, mut view) = if captures == 1 || case == 2 {
+                                normal_capture()
+                            } else {
+                                keypad_capture(false)
+                            };
+                            if captures == 2 && case == 3 {
+                                screen.secure_field_value = Some("1 of 6 digits".into());
+                                view.secure_field_value = screen.secure_field_value.clone();
+                            }
+                            backend.snapshot_with(at, |_, _| Ok((screen, view)), || at)
+                        },
+                        |backend, action| {
+                            writes += 1;
+                            backend.request_action_with(
+                                action,
+                                start + Duration::from_millis(1),
+                                |_, _, _| {
+                                    if case == 0 {
+                                        Err(BackendError::Unavailable)
+                                    } else {
+                                        Ok(())
+                                    }
+                                },
+                            )
+                        }
+                    )
+                    .is_err()
+            );
+            assert_eq!(writes, 1);
+            assert_eq!(backend.progress_check, ProgressCheck::Failed);
+            assert!(backend.last_view.is_none());
+            assert!(
+                backend
+                    .prepare_owned_keypad_with(
+                        start,
+                        |_| panic!("terminal"),
+                        |_, _| panic!("no reswipe")
+                    )
+                    .is_err()
+            );
+            assert!(
+                backend
+                    .press_digit_with(0, |_, _| panic!("no digit"))
+                    .is_err()
+            );
         }
     }
 
