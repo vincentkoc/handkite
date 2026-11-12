@@ -111,7 +111,7 @@ fn owned_session_requires_fixed_protected_config_before_stdin_or_device_work() {
 
 #[test]
 fn alternate_device_keys_are_rejected_before_state_or_pin_input() {
-    for key in ["phone", "iphone-15-pro", "other"] {
+    for key in ["iphone", "iphone-15-pro", "other"] {
         let config = Config::new(key);
         for extra in [vec![], vec!["--supervised-visibility-fallback"]] {
             let output = config.run(&extra);
@@ -119,8 +119,18 @@ fn alternate_device_keys_are_rejected_before_state_or_pin_input() {
             assert!(output.stdout.is_empty());
             assert_eq!(
                 String::from_utf8(output.stderr).unwrap(),
-                "handkite-unlock-once: PIN entry requires the fixed device key iphone\n"
+                "handkite-unlock-once: PIN entry requires the selected device key phone\n"
             );
         }
     }
+}
+
+#[test]
+fn selected_device_key_reaches_the_existing_gate_without_pin_input() {
+    let config = Config::new("phone");
+    let output = config.run(&[]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!error.contains("selected device key"));
 }

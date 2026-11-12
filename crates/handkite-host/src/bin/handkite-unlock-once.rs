@@ -38,8 +38,8 @@ fn run() -> Result<(), String> {
         );
     }
     let binding = host_config::load(Path::new(&args[2])).map_err(str::to_owned)?;
-    if binding.key.as_str() != "iphone" {
-        return Err("PIN entry requires the fixed device key iphone".into());
+    if binding.key.as_str() != unlock_state::SELECTED_DEVICE_KEY {
+        return Err("PIN entry requires the selected device key phone".into());
     }
     let mut gate =
         unlock_state::iphone_gate().map_err(|_| "account PIN state is unavailable or insecure")?;

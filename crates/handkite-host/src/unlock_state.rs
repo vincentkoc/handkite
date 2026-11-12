@@ -13,6 +13,9 @@ const STATE_COMPONENTS: [&str; 5] = [
     "iphone",
 ];
 
+/// Keep the stop marker at its established path when accepting the selected key.
+pub const SELECTED_DEVICE_KEY: &str = "phone";
+
 /// Open the one-phone stop gate without creating or relocating account state.
 pub fn iphone_gate() -> Result<FileAttemptGate, GateError> {
     gate_for_home(&account_home().ok_or(GateError)?)

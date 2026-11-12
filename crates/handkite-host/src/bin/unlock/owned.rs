@@ -34,8 +34,8 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
         .wda_runner_bundle_id()
         .ok_or("unlock_idle=refused reason=runner_unconfigured")?;
     let binding = config.binding().clone();
-    if binding.key.as_str() != "iphone" {
-        return Err("PIN entry requires the fixed device key iphone".into());
+    if binding.key.as_str() != unlock_state::SELECTED_DEVICE_KEY {
+        return Err("PIN entry requires the selected device key phone".into());
     }
     let gate =
         unlock_state::iphone_gate().map_err(|_| "unlock_idle=refused reason=gate_unavailable")?;
