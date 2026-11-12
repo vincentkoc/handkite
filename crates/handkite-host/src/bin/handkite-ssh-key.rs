@@ -4,7 +4,7 @@ use handkite_host::ssh_bridge::{self, PUBLIC_KEY_BYTES};
 use std::ffi::OsString;
 use std::io::{self, Read, Write};
 
-const USAGE: &str = "usage: handkite-ssh-key --capabilities observation|navigation|observation,navigation < bare-public-key";
+const USAGE: &str = "usage: handkite-ssh-key --capabilities observation|navigation|observation,navigation|observation,navigation,interaction < bare-public-key";
 
 fn main() {
     if let Err(error) = run() {
@@ -36,6 +36,9 @@ fn parse_args(args: &[OsString]) -> Result<Capabilities, &'static str> {
         Some("observation") => Ok(Capabilities::Observation),
         Some("navigation") => Ok(Capabilities::Navigation),
         Some("observation,navigation") => Ok(Capabilities::ObservationAndNavigation),
+        Some("observation,navigation,interaction") => {
+            Ok(Capabilities::ObservationNavigationInteraction)
+        }
         _ => Err("invalid capabilities"),
     }
 }
@@ -71,6 +74,10 @@ mod tests {
             (
                 "observation,navigation",
                 Capabilities::ObservationAndNavigation,
+            ),
+            (
+                "observation,navigation,interaction",
+                Capabilities::ObservationNavigationInteraction,
             ),
         ] {
             let result = parse_args(&["--capabilities".into(), value.into()]).unwrap();

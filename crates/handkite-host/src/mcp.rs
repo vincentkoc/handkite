@@ -1,10 +1,13 @@
 use crate::wire::Reply;
-use handkite_core::protocol::{Action, DeviceKey, ImageFormat, Revision};
+#[cfg(test)]
+use handkite_core::protocol::{Action, Revision};
+use handkite_core::protocol::{DeviceKey, ImageFormat};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 mod catalog;
+mod interaction;
 mod response;
 mod session;
 pub use catalog::Capabilities;
@@ -162,22 +165,10 @@ where
                 return Some(error(id, -32602, "unknown or unauthorized tool"));
             };
             if tool.is_action() {
-                let Ok(arguments) = serde_json::from_value::<ActionArguments>(params.arguments)
-                else {
-                    return Some(error(
-                        id,
-                        -32602,
-                        "expected_revision must be the only argument and an unsigned integer",
-                    ));
+                let Ok((revision, action)) = interaction::parse(tool, params.arguments) else {
+                    return Some(error(id, -32602, "invalid action arguments"));
                 };
-                let action = if tool == Tool::Home {
-                    Action::Home
-                } else {
-                    Action::LaunchApp {
-                        bundle_id: "com.apple.mobiletimer".into(),
-                    }
-                };
-                session.act(device, arguments.expected_revision, action, exchange)
+                session.act(device, revision, action, exchange)
             } else {
                 if !params
                     .arguments
@@ -205,12 +196,6 @@ struct ToolCall {
     name: String,
     #[serde(default = "empty_arguments")]
     arguments: Value,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ActionArguments {
-    expected_revision: Revision,
 }
 
 // Validate the raw frame as well: decoding to Value alone discards duplicate keys.
@@ -242,8 +227,8 @@ fn valid_tool_frame(bytes: &[u8]) -> bool {
         return false;
     };
     let arguments = envelope.params.arguments.map_or("{}", |raw| raw.get());
-    if Tool::from_name(&envelope.params.name).is_some_and(Tool::is_action) {
-        serde_json::from_str::<ActionArguments>(arguments).is_ok()
+    if let Some(tool) = Tool::from_name(&envelope.params.name).filter(|tool| tool.is_action()) {
+        interaction::valid_raw(tool, arguments)
     } else {
         serde_json::from_str::<Empty>(arguments).is_ok()
     }

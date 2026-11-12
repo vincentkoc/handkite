@@ -26,6 +26,7 @@ pub fn render(
         Capabilities::Observation => "observation",
         Capabilities::Navigation => "navigation",
         Capabilities::ObservationAndNavigation => "observation,navigation",
+        Capabilities::ObservationNavigationInteraction => "observation,navigation,interaction",
     };
     Ok(format!(
         "restrict,command=\"exec '{path}' --service --capabilities {capabilities}\" {public_key}\n"
@@ -86,13 +87,17 @@ mod tests {
         format!("ssh-ed25519 {}", STANDARD.encode(wire_key()))
     }
 
-    fn capabilities() -> [(Capabilities, &'static str); 3] {
+    fn capabilities() -> [(Capabilities, &'static str); 4] {
         [
             (Capabilities::Observation, "observation"),
             (Capabilities::Navigation, "navigation"),
             (
                 Capabilities::ObservationAndNavigation,
                 "observation,navigation",
+            ),
+            (
+                Capabilities::ObservationNavigationInteraction,
+                "observation,navigation,interaction",
             ),
         ]
     }

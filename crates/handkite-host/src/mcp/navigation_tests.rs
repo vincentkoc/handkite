@@ -254,12 +254,27 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
         "handkite_home",
         "handkite_launch_clock",
     ];
+    let interaction = [
+        "handkite_tap",
+        "handkite_swipe",
+        "handkite_text",
+        "handkite_launch_app",
+    ];
     for (capabilities, expected) in [
         (Capabilities::Observation, observation.to_vec()),
         (Capabilities::Navigation, navigation.to_vec()),
         (
             Capabilities::ObservationAndNavigation,
             [observation.as_slice(), navigation.as_slice()].concat(),
+        ),
+        (
+            Capabilities::ObservationNavigationInteraction,
+            [
+                observation.as_slice(),
+                navigation.as_slice(),
+                interaction.as_slice(),
+            ]
+            .concat(),
         ),
     ] {
         let mut no_exchange = |_: &[u8]| panic!("discovery or unauthorized call reached socket");
@@ -279,17 +294,22 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
         assert_eq!(names, expected);
-        for name in observation.iter().chain(navigation.iter()).chain(
-            [
-                "handkite_act",
-                "handkite_tap",
-                "handkite_swipe",
-                "handkite_text",
-                "handkite_lock",
-                "handkite_unlock",
-            ]
-            .iter(),
-        ) {
+        for name in observation
+            .iter()
+            .chain(navigation.iter())
+            .chain(interaction.iter())
+            .chain(
+                [
+                    "handkite_act",
+                    "handkite_tap",
+                    "handkite_swipe",
+                    "handkite_text",
+                    "handkite_lock",
+                    "handkite_unlock",
+                ]
+                .iter(),
+            )
+        {
             if !expected.contains(name) {
                 assert_eq!(
                     process(
@@ -305,6 +325,72 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
             }
         }
     }
+}
+
+#[test]
+fn interaction_requires_explicit_profile_and_control_without_socket_input() {
+    let action = call(
+        "handkite_tap",
+        json!({"expected_revision":1,"at":{"x":20,"y":30}}),
+    );
+    for capability in [
+        Capabilities::Observation,
+        Capabilities::Navigation,
+        Capabilities::ObservationAndNavigation,
+    ] {
+        let reply = process(
+            &action,
+            &device(),
+            capability,
+            &mut Session::default(),
+            &mut |_| panic!("socket reached"),
+        );
+        assert_eq!(reply.unwrap()["error"]["code"], -32602);
+    }
+    let reply = process(
+        &action,
+        &device(),
+        Capabilities::ObservationNavigationInteraction,
+        &mut Session::default(),
+        &mut |_| panic!("socket reached"),
+    );
+    assert_eq!(reply.unwrap()["result"]["isError"], true);
+}
+
+#[test]
+fn interaction_lost_reply_dispatches_once_and_reports_unknown() {
+    let mut session = Session::default();
+    session.acquire(&mut |_| {
+        Ok(serde_json::to_vec(&json!({
+            "type":"acquired", "lease":"0123456789abcdef0123456789abcdef"
+        }))
+        .unwrap())
+    });
+    let mut requests = Vec::new();
+    let reply = process(
+        &call(
+            "handkite_text",
+            json!({"expected_revision":7,"value":"fixture text"}),
+        ),
+        &device(),
+        Capabilities::ObservationNavigationInteraction,
+        &mut session,
+        &mut |bytes| {
+            requests.push(serde_json::from_slice::<Value>(bytes).unwrap());
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "lost reply"))
+        },
+    )
+    .unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(
+        requests[0]["request"]["action"],
+        json!({"type":"text","value":"fixture text"})
+    );
+    assert_eq!(requests[0]["request"]["expected_revision"], 7);
+    assert_eq!(payload(&reply)["receipt"]["accepted"], Value::Null);
+    assert_eq!(reply["result"]["isError"], true);
+    assert!(!reply.to_string().contains("fixture text"));
+    assert!(!reply.to_string().contains("0123456789abcdef"));
 }
 
 #[test]

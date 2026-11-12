@@ -220,7 +220,9 @@ not authenticate the caller: bind the exact invocation and capabilities to an
 SSH forced command, with forwarding and PTY allocation disabled. The default
 capability remains observation only.
 
-The host can explicitly add `--capabilities navigation` or `--capabilities observation,navigation`. Navigation permits only `handkite_acquire_control`, `handkite_release_control`, `handkite_home`, and `handkite_launch_clock`. Home and Clock require an unsigned integer `expected_revision` and reject every other argument. Clock always means `com.apple.mobiletimer`. Navigation alone does not grant either observation tool. There are no generic input, lock, unlock, or PIN tools.
+The host can explicitly add `--capabilities navigation` or `--capabilities observation,navigation`. Navigation permits only `handkite_acquire_control`, `handkite_release_control`, `handkite_home`, and `handkite_launch_clock`. Home and Clock require an unsigned integer `expected_revision` and reject every other argument. Clock always means `com.apple.mobiletimer`. Navigation alone does not grant either observation tool. There are no lock, unlock, or PIN tools.
+
+The separate `observation,navigation,interaction` profile adds `handkite_tap`, `handkite_swipe`, `handkite_text`, and `handkite_launch_app`. It is opt-in at host startup and does not change the existing profiles. Every action requires a current unsigned observation revision and explicit control. Points must be finite coordinates from 0 through 10,000; swipes last 1 through 5,000 ms. Text is limited to 4,096 UTF-8 bytes and excludes control characters. App identifiers are bounded ASCII bundle identifiers. Arguments reject unknown or duplicate fields, including nested point fields. Each call dispatches once, with unknown delivery reported without replay. These tools can perform real purchases or send messages; grant this profile only to a trusted personal agent with approval bound to the concrete action. The included OpenClaw recipe remains disabled and observation-only.
 
 The pure `ssh_bridge::render` helper accepts a `ServiceLayout`, one bare canonical
 `ssh-ed25519` public key, and an explicit `mcp::Capabilities` value. It returns one
@@ -242,8 +244,8 @@ account isolation, and agent acceptance remain unqualified. Account shell startu
 and server configuration, including `ForceCommand`, need separate review.
 
 `handkite-ssh-key --capabilities observation < bare-public-key` exposes that
-renderer as a read-only CLI. Capabilities are mandatory; `navigation` and
-`observation,navigation` are the only other accepted values. Stdin must contain
+renderer as a read-only CLI. Capabilities are mandatory; `navigation`,
+`observation,navigation`, and `observation,navigation,interaction` are the other accepted values. Stdin must contain
 the bare key with at most one final LF, followed by EOF. It reads at most 82 bytes
 and prints the single entry to stdout; failures emit fixed errors to stderr and
 exit 1 without echoing rejected data. It derives the effective account's layout

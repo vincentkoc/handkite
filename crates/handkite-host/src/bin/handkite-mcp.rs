@@ -4,7 +4,7 @@ use handkite_host::{install_config, local_client, mcp};
 use std::io::{self, BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 
-const USAGE: &str = "usage: handkite-mcp --service [--capabilities observation|navigation|observation,navigation] | handkite-mcp --socket PATH --device DEVICE_KEY [--capabilities observation|navigation|observation,navigation]";
+const USAGE: &str = "usage: handkite-mcp --service [--capabilities observation|navigation|observation,navigation|observation,navigation,interaction] | handkite-mcp --socket PATH --device DEVICE_KEY [--capabilities observation|navigation|observation,navigation|observation,navigation,interaction]";
 
 enum Endpoint<'a> {
     Service,
@@ -72,6 +72,9 @@ fn parse_capabilities(args: &[String]) -> Result<mcp::Capabilities, String> {
             "observation" => Ok(mcp::Capabilities::Observation),
             "navigation" => Ok(mcp::Capabilities::Navigation),
             "observation,navigation" => Ok(mcp::Capabilities::ObservationAndNavigation),
+            "observation,navigation,interaction" => {
+                Ok(mcp::Capabilities::ObservationNavigationInteraction)
+            }
             _ => Err("invalid capabilities".into()),
         },
         _ => Err("invalid capability option".into()),
@@ -92,6 +95,7 @@ mod tests {
             ("observation", 0),
             ("navigation", 1),
             ("observation,navigation", 2),
+            ("observation,navigation,interaction", 3),
         ] {
             let parsed = parse_capabilities(&["--capabilities".into(), value.into()]).unwrap();
             assert_eq!(
@@ -99,6 +103,7 @@ mod tests {
                     mcp::Capabilities::Observation => 0,
                     mcp::Capabilities::Navigation => 1,
                     mcp::Capabilities::ObservationAndNavigation => 2,
+                    mcp::Capabilities::ObservationNavigationInteraction => 3,
                 },
                 expected
             );
