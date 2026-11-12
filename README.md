@@ -251,6 +251,8 @@ An app launch from Home tolerates changes in screenshot or tree bytes only when 
 
 Normal observations retain WDA's visibility, enabled, focus, selection, and placeholder attributes for interaction targets. An absent attribute remains unknown; clients must verify the required target state before sending input. Diagnostic and passcode projections are separate.
 
+The pinned WDA exports the XML `focused` attribute only on tvOS. Do not require it for an iPhone test or interpret its absence as `false`. Text values can contain the placeholder when the actual field is empty. The benign Settings-search test uses the observed search field and keyboard, then verifies the exact resulting text.
+
 The pure `ssh_bridge::render` helper accepts a `ServiceLayout`, one bare canonical
 `ssh-ed25519` public key, and an explicit `mcp::Capabilities` value. It returns one
 LF-terminated `authorized_keys` entry with `restrict` and a forced command:
@@ -292,9 +294,16 @@ leaves the view unchanged and a failed post-action capture. Input may have
 happened; inspect a fresh authorized observation before another action. An
 accepted action with a changed view omits `isError`.
 
+An explicit accepted receipt with `effect: "unconfirmed"` legitimately carries
+`isError: true`. Preserve both fields and take one fresh read-only observation
+to check the expected UI result. Record that semantic confirmation separately
+from the original effect. A proved postcondition can admit the next different
+planned action; it never authorizes replaying the accepted input. Malformed
+replies and false or unknown acceptance stop the sequence.
+
 For remote use, an authenticated SSH key must be bound to a restricted forced command that fixes the socket, device, and capabilities, disables forwarding and PTY allocation, and ignores client-supplied commands. Do not grant that principal an unrestricted shell or direct socket access. A CLI capability flag is host policy, not authentication; SSH access that lets a caller select another command or flags does not enforce capability separation. Keep the Unix socket and WDA off network listeners. Host identity, key enrollment, forced-command restrictions, and the intended OpenClaw connection remain unqualified and require separate setup and acceptance.
 
-The bridge has passed a previous live read-only capture through the device host's protected socket. Navigation is qualified only by offline fixtures; no live navigation or OpenClaw acceptance is claimed. Observation returns private screen content to the calling agent.
+The owned local MCP path has passed real-device Clock launch and Home return, as well as observation and Settings launch. Typing remains under qualification. Remote SSH enrollment and OpenClaw acceptance remain unqualified. Observation returns private screen content to the calling agent.
 
 An authorized client with both capabilities follows this sequence after MCP initialization:
 
