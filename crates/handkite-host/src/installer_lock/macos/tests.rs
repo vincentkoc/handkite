@@ -52,6 +52,72 @@ fn clear_acl(path: &Path) {
 }
 
 #[test]
+fn user_job_admission_requires_absence_and_preserves_private_state() {
+    use crate::launchd_observation::Observation;
+
+    let (_scratch, layout) = fixture();
+    let paths = [
+        layout.config_file(),
+        layout.state_directory().join("UNLOCK-DISABLED"),
+    ];
+    for path in &paths {
+        fs::write(path, b"preserve-private-state").unwrap();
+        chmod(path, 0o600);
+    }
+    let owner = InstallerLock::acquire(&layout).unwrap();
+    let before: Vec<_> = paths
+        .iter()
+        .map(|path| Fingerprint::from(fs::symlink_metadata(path).unwrap()))
+        .collect();
+    for observation in [
+        Observation::Absent,
+        Observation::Loaded,
+        Observation::Unknown,
+    ] {
+        owner.set_user_job_for_test(observation);
+        assert_eq!(
+            owner.require_user_job_absent(),
+            if observation == Observation::Absent {
+                Ok(())
+            } else {
+                Err(crate::installer_lock::JOB_UNAVAILABLE)
+            }
+        );
+    }
+    for (path, fingerprint) in paths.iter().zip(before) {
+        assert_eq!(fs::read(path).unwrap(), b"preserve-private-state");
+        assert_eq!(fingerprint, fs::symlink_metadata(path).unwrap().into());
+    }
+}
+
+#[test]
+fn user_job_admission_rejects_lock_replacement_before_and_during_observation() {
+    use crate::launchd_observation::Observation;
+
+    for during in [false, true] {
+        let (_scratch, layout) = fixture();
+        let owner = InstallerLock::acquire(&layout).unwrap();
+        let replace = || {
+            fs::remove_file(layout.process_lock()).unwrap();
+            drop(lock_file(&layout));
+        };
+        if !during {
+            replace();
+        }
+        let mut observed = false;
+        assert_eq!(
+            owner.check_user_job_absent(|| {
+                observed = true;
+                replace();
+                Observation::Absent
+            }),
+            Err(crate::installer_lock::UNAVAILABLE)
+        );
+        assert_eq!(observed, during);
+    }
+}
+
+#[test]
 fn preserves_existing_lock_and_all_other_private_state() {
     for existing in [false, true] {
         let (_scratch, layout) = fixture();

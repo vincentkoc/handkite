@@ -204,6 +204,7 @@ pub(crate) async fn commit<'held, 'lock>(
         }
         #[cfg(not(test))]
         prepared.agreement.reobserve().await?;
+        prepared.retained.owner.require_user_job_absent()?;
         // Check every retained baseline after the await, before inventory or rename.
         prepared.custody()?;
         checkpoint(

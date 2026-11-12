@@ -98,10 +98,12 @@ impl Fixture {
         .unwrap();
         let source = SourceFixture::new();
         let bytes = manifest(&source.stage);
+        let owner = InstallerLock::acquire(&layout).unwrap();
+        owner.set_user_job_for_test(crate::launchd_observation::Observation::Absent);
         Self {
             _home: home,
             source,
-            owner: InstallerLock::acquire(&layout).unwrap(),
+            owner,
             bytes,
         }
     }
