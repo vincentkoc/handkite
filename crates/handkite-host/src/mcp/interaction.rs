@@ -206,8 +206,8 @@ mod tests {
             ),
             (
                 Tool::Text,
-                json!({"expected_revision":7,"value":"hello 世界"}),
-                json!({"type":"text","value":"hello 世界"}),
+                json!({"expected_revision":7,"value":"hello café"}),
+                json!({"type":"text","value":"hello café"}),
             ),
             (
                 Tool::LaunchApp,
