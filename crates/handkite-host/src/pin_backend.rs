@@ -8,6 +8,7 @@ use handkite_core::controller::AdapterError;
 use handkite_core::passcode::PasscodeProgress;
 use handkite_core::protocol::{Action, HardwareId, LockState, Point, TransportReceipt};
 use handkite_core::unlock::{BackendError, PasscodeBackend, PasscodeScreen};
+use std::future::Future;
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -123,6 +124,17 @@ pub struct PinPreparationDiagnostic {
     pub snapshot: Option<PinDiagnostics>,
     pub timings: PinCaptureTimings,
     pub wda_reported_lock: PinReportedLock,
+}
+
+// Await every read, including native query completion after a failed WDA read.
+// The native command must not block this current-thread runtime's USB futures.
+async fn capture_reads<S, L, N: Send + 'static>(
+    source: impl Future<Output = S>,
+    lock: impl Future<Output = L>,
+    native: impl FnOnce() -> N + Send + 'static,
+) -> (S, L, Result<N, tokio::task::JoinError>) {
+    let native = tokio::task::spawn_blocking(native);
+    tokio::join!(source, lock, native)
 }
 
 struct PreparedPinView {
@@ -681,8 +693,9 @@ impl NativePasscodeBackend {
         let prepared = self.runtime.block_on(self.actions.prepare_existing(&wda));
         self.capture_timings.session_before_ms = step_started.elapsed().as_millis();
         prepared.map_err(|_| BackendError::Unavailable)?;
-        let ((source, source_ms), (reported_lock, lock_ms)) = self.runtime.block_on(async {
-            tokio::join!(
+        let expected = self.expected.clone();
+        let ((source, source_ms), (reported_lock, lock_ms), native) =
+            self.runtime.block_on(capture_reads(
                 async {
                     let started = Instant::now();
                     let result = wda
@@ -697,8 +710,15 @@ impl NativePasscodeBackend {
                         .await;
                     (result, started.elapsed().as_millis())
                 },
-            )
-        });
+                move || {
+                    let started = Instant::now();
+                    let native = native_lock::query(&expected);
+                    (native, started.elapsed().as_millis())
+                },
+            ));
+        if let Ok((_, native_ms)) = &native {
+            self.capture_timings.native_ms = *native_ms;
+        }
         self.capture_timings.source_ms = source_ms;
         self.capture_timings.lock_ms = lock_ms;
         self.capture_step = PinCaptureStep::SourceRead;
@@ -733,9 +753,7 @@ impl NativePasscodeBackend {
         self.capture_timings.parse_ms = step_started.elapsed().as_millis();
         let parsed = parsed.map_err(|_| BackendError::Unavailable)?;
         self.capture_step = PinCaptureStep::NativeLock;
-        let step_started = Instant::now();
-        let native = native_lock::query(&self.expected);
-        self.capture_timings.native_ms = step_started.elapsed().as_millis();
+        let (native, _) = native.map_err(|_| BackendError::Unavailable)?;
         self.last_diagnostics = Some(PinDiagnostics {
             snapshot_ms: started.elapsed().as_millis(),
             screen_size: parsed.screen_size.is_some(),
@@ -1363,6 +1381,33 @@ mod tests {
         let (screen, _) = capture();
         let view = pin_screen::parse(r#"<AppiumAUT><XCUIElementTypeApplication bundleId="com.apple.springboard" x="0" y="0" width="400" height="800"><XCUIElementTypeOther name="proud-lock" visible="true"/></XCUIElementTypeApplication></AppiumAUT>"#).unwrap();
         (screen, view)
+    }
+
+    #[tokio::test]
+    async fn native_query_overlaps_async_reads_and_is_joined_after_read_failure() {
+        let (native_started, wait_native) = tokio::sync::oneshot::channel();
+        let (source_done, wait_source) = std::sync::mpsc::channel();
+        let (source, lock, native) = tokio::time::timeout(
+            Duration::from_secs(2),
+            capture_reads(
+                async {
+                    wait_native.await.unwrap();
+                    source_done.send(()).unwrap();
+                    Err::<(), _>("source failed")
+                },
+                async { "lock read" },
+                move || {
+                    native_started.send(()).unwrap();
+                    wait_source.recv_timeout(Duration::from_secs(1)).unwrap();
+                    "native finished"
+                },
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(source, Err("source failed"));
+        assert_eq!(lock, "lock read");
+        assert_eq!(native.unwrap(), "native finished");
     }
 
     #[test]
