@@ -399,6 +399,47 @@ fn old_screen_capture_is_rejected() {
 }
 
 #[test]
+fn view_change_reports_only_the_components_that_changed() {
+    for mask in 1..8 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let changed = ViewChange {
+            state: mask & 1 != 0,
+            accessibility_tree: mask & 2 != 0,
+            screenshot: mask & 4 != 0,
+        };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.wda_ready = !changed.state;
+            if changed.accessibility_tree {
+                inner.adapter.tree_suffix = "changed".into();
+            }
+            if changed.screenshot {
+                inner.adapter.image_suffix = vec![1];
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(
+            controller
+                .act(
+                    "agent",
+                    lease,
+                    ActionRequest {
+                        device: key,
+                        expected_revision: Some(before.revision),
+                        action: Action::Home,
+                    }
+                )
+                .err(),
+            Some(ControllerError::ViewChanged(changed))
+        );
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
+}
+
+#[test]
 fn changed_screen_or_lock_state_blocks_input_before_transport() {
     let (controller, key) = controller();
     let lease = controller
@@ -415,7 +456,11 @@ fn changed_screen_or_lock_state_blocks_input_before_transport() {
     };
     assert_eq!(
         controller.act("agent", lease, request).err(),
-        Some(ControllerError::ViewChanged)
+        Some(ControllerError::ViewChanged(ViewChange {
+            state: true,
+            accessibility_tree: true,
+            screenshot: true,
+        }))
     );
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
 
@@ -476,7 +521,14 @@ fn home_launch_tolerates_visual_drift_only_with_fresh_admission() {
                 assert_eq!(inner.adapter.actions, 1);
                 assert!(inner.adapter.send_deadline.unwrap() <= until);
             } else {
-                assert_eq!(result.err(), Some(ControllerError::ViewChanged));
+                assert_eq!(
+                    result.err(),
+                    Some(ControllerError::ViewChanged(ViewChange {
+                        state: false,
+                        accessibility_tree: tree,
+                        screenshot: image,
+                    }))
+                );
                 assert_eq!(inner.adapter.actions, 0);
             }
         }
@@ -520,7 +572,14 @@ fn home_launch_rejects_changed_state_or_expired_admission() {
                 },
             },
         );
-        assert_eq!(result.err(), Some(ControllerError::ViewChanged));
+        assert_eq!(
+            result.err(),
+            Some(ControllerError::ViewChanged(ViewChange {
+                state: change < 3,
+                accessibility_tree: true,
+                screenshot: change == 0,
+            }))
+        );
         assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
     }
 }
@@ -566,7 +625,11 @@ fn visual_drift_still_blocks_other_actions() {
                     }
                 )
                 .err(),
-            Some(ControllerError::ViewChanged)
+            Some(ControllerError::ViewChanged(ViewChange {
+                state: false,
+                accessibility_tree: true,
+                screenshot: true,
+            }))
         );
         assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
     }

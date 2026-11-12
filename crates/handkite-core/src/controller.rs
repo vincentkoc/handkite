@@ -75,6 +75,28 @@ impl From<LeaseId> for String {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ViewChange {
+    pub state: bool,
+    pub accessibility_tree: bool,
+    pub screenshot: bool,
+}
+
+impl ViewChange {
+    fn between(before: &Observation, after: &Observation) -> Self {
+        Self {
+            state: before.state != after.state,
+            accessibility_tree: before.accessibility_tree != after.accessibility_tree,
+            screenshot: before.screenshot != after.screenshot,
+        }
+    }
+
+    pub fn any(self) -> bool {
+        self.state || self.accessibility_tree || self.screenshot
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ControllerError {
     Busy,
@@ -82,7 +104,7 @@ pub enum ControllerError {
     Randomness,
     DeviceMismatch,
     StaleRevision,
-    ViewChanged,
+    ViewChanged(ViewChange),
     LockedAction,
     StaleObservation,
     InvalidObservationWindow,
@@ -203,8 +225,10 @@ impl<A: DeviceAdapter> Controller<A> {
                 !(same_view(last, &fresh) || admitted_home_launch && last.state == fresh.state)
             })
         {
+            let change =
+                ViewChange::between(inner.last.as_ref().expect("checked revision"), &fresh);
             inner.last = Some(fresh);
-            return Err(ControllerError::ViewChanged);
+            return Err(ControllerError::ViewChanged(change));
         }
         if !matches!(&request.action, Action::Home)
             && fresh.state.lock != LockState::Unlocked

@@ -1,5 +1,5 @@
 use base64::Engine;
-use handkite_core::controller::{Controller, DeviceAdapter, LeaseId};
+use handkite_core::controller::{Controller, ControllerError, DeviceAdapter, LeaseId, ViewChange};
 use handkite_core::protocol::{
     ActionRequest, DeviceKey, DeviceState, ImageFormat, LockState, Observation, ObservationWindow,
     ObservedEffect, Revision, TransportReceipt,
@@ -46,6 +46,9 @@ pub enum Reply {
     },
     Error {
         code: String,
+    },
+    ViewChanged {
+        changed: ViewChange,
     },
 }
 
@@ -118,8 +121,11 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
             };
         }
     };
-    result.unwrap_or_else(|error| Reply::Error {
-        code: format!("{error:?}"),
+    result.unwrap_or_else(|error| match error {
+        ControllerError::ViewChanged(changed) => Reply::ViewChanged { changed },
+        _ => Reply::Error {
+            code: format!("{error:?}"),
+        },
     })
 }
 

@@ -571,18 +571,74 @@ fn stale_revision_and_changed_view_do_not_send_input() {
             .contains("StaleRevision")
     );
     fixture.state.lock().unwrap().app = Some("com.example.changed".into());
-    assert!(
-        fixture
-            .call(
-                &mut session,
-                "handkite_home",
-                json!({"expected_revision": 1})
-            )
-            .to_string()
-            .contains("ViewChanged")
+    let changed = fixture.call(
+        &mut session,
+        "handkite_home",
+        json!({"expected_revision": 1}),
     );
+    assert_eq!(changed["result"]["isError"], true);
+    assert_eq!(
+        changed["result"]["content"][0]["text"],
+        "ViewChanged: screen context changed before input; obtain a fresh observation"
+    );
+    assert_eq!(
+        changed["result"]["structuredContent"],
+        json!({
+            "code":"ViewChanged", "changed":{"state":true,"accessibility_tree":false,"screenshot":false}
+        })
+    );
+    for private in ["private-screen", "com.example.changed", "fixture-usb"] {
+        assert!(!changed.to_string().contains(private));
+    }
     assert!(fixture.state.lock().unwrap().actions.is_empty());
     session.cleanup(&mut |bytes| fixture.exchange(bytes));
+}
+
+#[test]
+fn view_change_diagnostics_are_typed_and_do_not_forward_private_fields() {
+    let mut cases = Vec::new();
+    for mask in 1..8 {
+        cases.push((json!({"state":mask & 1 != 0,"accessibility_tree":mask & 2 != 0,"screenshot":mask & 4 != 0}), true));
+    }
+    for changed in [
+        json!({"state":false,"accessibility_tree":false,"screenshot":false}),
+        json!({"state":"private-value","accessibility_tree":true,"screenshot":false}),
+        json!({"state":true,"screenshot":false}),
+        json!({"state":true,"accessibility_tree":false,"screenshot":false,"private-value":"private-screen"}),
+    ] {
+        cases.push((changed, false));
+    }
+    for (changed, valid) in cases {
+        let mut session = Session::default();
+        session.acquire(&mut |_| {
+            Ok(serde_json::to_vec(&json!({
+                "type":"acquired","lease":"0123456789abcdef0123456789abcdef"
+            }))
+            .unwrap())
+        });
+        let mut calls = 0;
+        let result = session.act(&device(), Revision(1), Action::Home, &mut |_| {
+            calls += 1;
+            Ok(serde_json::to_vec(&json!({"type":"view_changed","changed":changed})).unwrap())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result["isError"], true);
+        if valid {
+            assert_eq!(
+                result["structuredContent"],
+                json!({"code":"ViewChanged","changed":changed})
+            );
+        } else {
+            assert!(result.get("structuredContent").is_none());
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert_eq!(
+                serde_json::from_str::<Value>(text).unwrap()["delivery"],
+                "unknown"
+            );
+        }
+        assert!(!result.to_string().contains("private-value"));
+        assert!(!result.to_string().contains("private-screen"));
+    }
 }
 
 #[test]

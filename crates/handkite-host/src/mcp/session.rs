@@ -101,6 +101,11 @@ impl Session {
             exchange,
         );
         match response {
+            Ok(Reply::ViewChanged { changed }) if changed.any() => {
+                let mut result = service_error("ViewChanged");
+                result["structuredContent"] = json!({"code":"ViewChanged","changed":changed});
+                result
+            }
             Ok(Reply::Acted {
                 receipt,
                 after,

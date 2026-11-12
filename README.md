@@ -249,6 +249,8 @@ The separate `observation,navigation,interaction` profile adds `handkite_tap`, `
 
 An app launch from Home tolerates changes in screenshot or tree bytes only when a fresh private Home check proves native unlock before and after capture, WDA reports unlocked, and device state matches the requested observation. Revision, identity, lease, and send deadlines still apply. Other actions retain exact view matching. `StaleRevision` means the requested revision is no longer current; `ViewChanged` means the fresh screen context failed the action check. Both reject input before transport.
 
+A `ViewChanged` refusal includes `structuredContent.changed` with boolean `state`, `accessibility_tree`, and `screenshot` fields. These identify the changed components without returning their contents. They do not authorize a retry or relax the comparison. Invalid diagnostic replies retain the unknown-delivery result.
+
 Normal observations retain WDA's visibility, enabled, focus, selection, and placeholder attributes for interaction targets. An absent attribute remains unknown; clients must verify the required target state before sending input. Diagnostic and passcode projections are separate.
 
 The pinned WDA exports the XML `focused` attribute only on tvOS. Do not require it for an iPhone test or interpret its absence as `false`. Text values can contain the placeholder when the actual field is empty. The benign Settings-search test uses the observed search field and keyboard, then verifies the exact resulting text.
