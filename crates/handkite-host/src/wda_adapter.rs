@@ -2,7 +2,7 @@ use crate::native_lock;
 use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
 use crate::wda_http::HttpResponse;
-use crate::wda_runner::OwnedWdaRunner;
+use crate::wda_runner::{OwnedWdaRunner, RunnerError};
 use crate::wda_session::{SessionClose, close_owned_session, create_owned_session};
 use crate::wda_settings::validate_session;
 use crate::wda_transport::UsbWda;
@@ -28,6 +28,28 @@ pub struct WdaAdapter {
     owned_session: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnedStartupError {
+    ShutdownRequested,
+    RuntimeUnavailable,
+    Runner(RunnerError),
+    SessionUnavailable,
+}
+
+impl OwnedStartupError {
+    pub fn category(self) -> &'static str {
+        match self {
+            Self::ShutdownRequested => "shutdown_requested",
+            Self::RuntimeUnavailable => "runtime_unavailable",
+            Self::Runner(RunnerError::AutomationAuthorizationRequired) => {
+                "automation_authorization_required"
+            }
+            Self::Runner(_) => "runner_startup_failed",
+            Self::SessionUnavailable => "session_unavailable",
+        }
+    }
+}
+
 impl WdaAdapter {
     pub fn new(expected: HardwareId) -> Result<Self, AdapterError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -51,23 +73,24 @@ impl WdaAdapter {
         expected: HardwareId,
         runner_bundle_id: &str,
         should_stop: impl Fn() -> bool,
-    ) -> Result<Self, AdapterError> {
+    ) -> Result<Self, OwnedStartupError> {
         if should_stop() {
-            return Err(AdapterError);
+            return Err(OwnedStartupError::ShutdownRequested);
         }
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .enable_all()
             .build()
-            .map_err(|_| AdapterError)?;
+            .map_err(|_| OwnedStartupError::RuntimeUnavailable)?;
         let usb = PinnedUsb::new(expected.clone());
         let runner = runtime.block_on(run_until_shutdown(
             async {
                 OwnedWdaRunner::start(usb.clone(), runner_bundle_id, Duration::from_secs(120))
                     .await
-                    .map_err(|_| AdapterError)
+                    .map_err(OwnedStartupError::Runner)
             },
             &should_stop,
+            OwnedStartupError::ShutdownRequested,
         ));
         let runner = match runner {
             Ok(runner) => runner,
@@ -103,11 +126,12 @@ impl WdaAdapter {
                     }
                 },
             ))
-            .map_err(|_| AdapterError)?;
+            .map_err(|_| OwnedStartupError::SessionUnavailable)?;
         adapter.owned_session = Some(session.clone());
-        adapter.actions = WdaActions::bound_to_existing(&session)?;
+        adapter.actions = WdaActions::bound_to_existing(&session)
+            .map_err(|_| OwnedStartupError::SessionUnavailable)?;
         if should_stop() || liveness.is_finished() {
-            return Err(AdapterError);
+            return Err(OwnedStartupError::SessionUnavailable);
         }
         Ok(adapter)
     }
@@ -225,17 +249,18 @@ impl WdaAdapter {
     }
 }
 
-async fn run_until_shutdown<T>(
-    work: impl Future<Output = Result<T, AdapterError>>,
+async fn run_until_shutdown<T, E: Copy>(
+    work: impl Future<Output = Result<T, E>>,
     should_stop: &impl Fn() -> bool,
-) -> Result<T, AdapterError> {
+    stop_error: E,
+) -> Result<T, E> {
     tokio::select! {
         result = work => result,
         _ = async {
             while !should_stop() {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
-        } => Err(AdapterError),
+        } => Err(stop_error),
     }
 }
 
@@ -361,7 +386,7 @@ mod tests {
             std::future::pending::<Result<(), AdapterError>>().await
         };
         assert_eq!(
-            run_until_shutdown(work, &|| stop.load(Ordering::Acquire)).await,
+            run_until_shutdown(work, &|| stop.load(Ordering::Acquire), AdapterError).await,
             Err(AdapterError)
         );
         setter.await.unwrap();
@@ -371,7 +396,22 @@ mod tests {
     #[test]
     fn preexisting_shutdown_refuses_owned_startup_before_device_access() {
         let expected = HardwareId::new("fixture-device").unwrap();
-        assert!(WdaAdapter::new_owned(expected, "com.example.xctrunner", || true).is_err());
+        assert_eq!(
+            WdaAdapter::new_owned(expected, "com.example.xctrunner", || true).err(),
+            Some(OwnedStartupError::ShutdownRequested)
+        );
+    }
+
+    #[test]
+    fn owned_startup_keeps_automation_authorization_distinct() {
+        assert_eq!(
+            OwnedStartupError::Runner(RunnerError::AutomationAuthorizationRequired).category(),
+            "automation_authorization_required"
+        );
+        assert_eq!(
+            OwnedStartupError::Runner(RunnerError::InitializationFailed).category(),
+            "runner_startup_failed"
+        );
     }
 
     #[test]

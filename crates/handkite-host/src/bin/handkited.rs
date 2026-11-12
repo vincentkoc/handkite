@@ -144,7 +144,7 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
                         runner_id,
                         signals::requested,
                     )
-                    .map_err(|_| "cannot start owned WDA runner and session")?;
+                    .map_err(|error| format!("cannot start owned WDA: {}", error.category()))?;
                     serve_adapter(binding, adapter, listener)
                 },
             )
