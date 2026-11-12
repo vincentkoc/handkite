@@ -4,7 +4,7 @@ use handkite_host::service_layout::ServiceLayout;
 use handkite_host::service_lock::ServiceLock;
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_action::{CoordinateTapError, WdaActions};
-use handkite_host::wda_adapter::WdaAdapter;
+use handkite_host::wda_adapter::{WdaAdapter, springboard_home_launch_deadline};
 use handkite_host::wda_http::HttpResponse;
 use handkite_host::wda_runner::{OwnedWdaRunner, RunnerError};
 use handkite_host::wda_session::{
@@ -598,33 +598,8 @@ struct Snapshot {
     observation: RawObservation,
     session: String,
     native: LockState,
-    springboard_launch_unlocked: bool,
+    home_launch_until: Option<Instant>,
     fresh_until: Instant,
-}
-
-fn springboard_launch_unlocked(
-    observation: &RawObservation,
-    native: LockState,
-    reported_lock: Option<bool>,
-) -> bool {
-    let tree = &observation.accessibility_tree;
-    native == LockState::Unlocked
-        && reported_lock == Some(false)
-        && observation.state.lock == LockState::Uncertain
-        && observation.state.foreground_app.as_deref() == Some("com.apple.springboard")
-        && tree.contains("XCUIElementTypeApplication")
-        && tree.contains("XCUIElementTypeIcon")
-        && ![
-            "proud-lock",
-            "passcode-view",
-            "call-to-action-label",
-            "Enter Passcode",
-            "XCUIElementTypeAlert",
-            "XCUIElementTypeSheet",
-            "XCUIElementTypeSecureTextField",
-        ]
-        .iter()
-        .any(|marker| tree.contains(marker))
 }
 
 trait TrialDevice {
@@ -725,17 +700,6 @@ fn run_auto_recorded(
                 return Err(TrialError::Refused(RefusalReason::IdentityUnproven));
             }
             require_native_unlocked(snapshot.native).map_err(TrialError::Refused)?;
-            match snapshot.observation.state.lock {
-                LockState::Unlocked => {}
-                LockState::Locked => return Err(TrialError::Refused(RefusalReason::WdaLocked)),
-                LockState::Uncertain if snapshot.springboard_launch_unlocked => {}
-                LockState::Uncertain => {
-                    return Err(TrialError::Refused(RefusalReason::WdaLockUnproven));
-                }
-            }
-            if !snapshot.observation.state.wda_ready {
-                return Err(TrialError::Refused(RefusalReason::SessionUnproven));
-            }
             if Instant::now() >= snapshot.fresh_until
                 || snapshot
                     .observation
@@ -752,7 +716,28 @@ fn run_auto_recorded(
             {
                 return Err(TrialError::Refused(RefusalReason::FreshnessUnproven));
             }
-            Ok((snapshot.session, snapshot.fresh_until))
+            match snapshot.observation.state.lock {
+                LockState::Unlocked => {}
+                LockState::Locked => return Err(TrialError::Refused(RefusalReason::WdaLocked)),
+                LockState::Uncertain
+                    if snapshot
+                        .home_launch_until
+                        .is_some_and(|until| Instant::now() < until) => {}
+                LockState::Uncertain => {
+                    return Err(TrialError::Refused(RefusalReason::WdaLockUnproven));
+                }
+            }
+            if !snapshot.observation.state.wda_ready {
+                return Err(TrialError::Refused(RefusalReason::SessionUnproven));
+            }
+            Ok((
+                snapshot.session,
+                snapshot
+                    .home_launch_until
+                    .map_or(snapshot.fresh_until, |until| {
+                        snapshot.fresh_until.min(until)
+                    }),
+            ))
         });
     let launch =
         session.and_then(|(session, fresh_until)| device.launch_clock(&session, fresh_until));
@@ -1339,7 +1324,8 @@ impl TrialDevice for Live {
             .identities()
             .map_err(|_| RefusalReason::IdentityUnproven)?;
         let session = self.status()?;
-        require_native_unlocked(native_lock::query(&self.expected).state)?;
+        let native_before = native_lock::query(&self.expected).state;
+        require_native_unlocked(native_before)?;
         let (mut observation, captured_at, reported_lock) = self
             .adapter
             .observe_with_attributes_and_lock_report()
@@ -1354,8 +1340,13 @@ impl TrialDevice for Live {
             return Err(RefusalReason::SessionUnproven);
         }
         let native = native_lock::query(&self.expected).state;
-        let springboard_launch_unlocked =
-            springboard_launch_unlocked(&observation, native, reported_lock);
+        let home_launch_until = springboard_home_launch_deadline(
+            &observation,
+            native_before,
+            native,
+            reported_lock,
+            captured_at,
+        );
         self.adapter
             .identities()
             .map_err(|_| RefusalReason::IdentityUnproven)?;
@@ -1365,7 +1356,7 @@ impl TrialDevice for Live {
             observation,
             session,
             native,
-            springboard_launch_unlocked,
+            home_launch_until,
             fresh_until,
         })
     }
@@ -1544,7 +1535,7 @@ mod tests {
             },
             session: "fixture-session".into(),
             native: LockState::Unlocked,
-            springboard_launch_unlocked: false,
+            home_launch_until: None,
             fresh_until: Instant::now() + Duration::from_millis(MAX_AGE_MS),
         }
     }
@@ -1721,22 +1712,45 @@ mod tests {
         home.observation.state.lock = LockState::Uncertain;
         let home_tree = "<XCUIElementTypeApplication name=\"SpringBoard\"><XCUIElementTypeIcon name=\"Clock\"/></XCUIElementTypeApplication>";
         home.observation.accessibility_tree = home_tree.into();
-        assert!(springboard_launch_unlocked(
-            &home.observation,
-            LockState::Unlocked,
-            Some(false)
-        ));
+        let captured_at = Instant::now();
+        assert!(
+            springboard_home_launch_deadline(
+                &home.observation,
+                LockState::Unlocked,
+                LockState::Unlocked,
+                Some(false),
+                captured_at,
+            )
+            .is_some()
+        );
         for (native, reported) in [
             (LockState::Locked, Some(false)),
             (LockState::Uncertain, Some(false)),
             (LockState::Unlocked, Some(true)),
             (LockState::Unlocked, None),
         ] {
-            assert!(!springboard_launch_unlocked(
-                &home.observation,
-                native,
-                reported
-            ));
+            assert!(
+                springboard_home_launch_deadline(
+                    &home.observation,
+                    native,
+                    LockState::Unlocked,
+                    reported,
+                    captured_at,
+                )
+                .is_none()
+            );
+        }
+        for native_after in [LockState::Locked, LockState::Uncertain] {
+            assert!(
+                springboard_home_launch_deadline(
+                    &home.observation,
+                    LockState::Unlocked,
+                    native_after,
+                    Some(false),
+                    captured_at,
+                )
+                .is_none()
+            );
         }
         for marker in [
             "proud-lock",
@@ -1750,23 +1764,38 @@ mod tests {
             let mut blocked = home.observation.accessibility_tree.clone();
             blocked.push_str(marker);
             home.observation.accessibility_tree = blocked;
-            assert!(!springboard_launch_unlocked(
-                &home.observation,
-                LockState::Unlocked,
-                Some(false)
-            ));
+            assert!(
+                springboard_home_launch_deadline(
+                    &home.observation,
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    Some(false),
+                    captured_at,
+                )
+                .is_none()
+            );
             home.observation.accessibility_tree = home_tree.into();
         }
         home.observation.accessibility_tree =
             "<XCUIElementTypeApplication name=\"SpringBoard\"/>".into();
-        assert!(!springboard_launch_unlocked(
+        assert!(
+            springboard_home_launch_deadline(
+                &home.observation,
+                LockState::Unlocked,
+                LockState::Unlocked,
+                Some(false),
+                captured_at,
+            )
+            .is_none()
+        );
+        home.observation.accessibility_tree = home_tree.into();
+        home.home_launch_until = springboard_home_launch_deadline(
             &home.observation,
             LockState::Unlocked,
-            Some(false)
-        ));
-        home.observation.accessibility_tree = home_tree.into();
-        home.springboard_launch_unlocked =
-            springboard_launch_unlocked(&home.observation, LockState::Unlocked, Some(false));
+            LockState::Unlocked,
+            Some(false),
+            captured_at,
+        );
         let mut fixture = Fixture::new();
         fixture.captures = [
             Ok(home),
@@ -1792,7 +1821,7 @@ mod tests {
         let mut stale = snapshot(false, 50);
         stale.observation.state.foreground_app = Some("com.apple.springboard".into());
         stale.observation.state.lock = LockState::Uncertain;
-        stale.springboard_launch_unlocked = true;
+        stale.home_launch_until = Some(Instant::now() - Duration::from_millis(1));
         stale.fresh_until = Instant::now() - Duration::from_millis(1);
         let mut fixture = Fixture::new();
         fixture.captures = [Ok(stale)].into();

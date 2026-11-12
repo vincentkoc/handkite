@@ -11,6 +11,9 @@ struct FakeAdapter {
     lose_ack: bool,
     mismatch_after_action: bool,
     locked: bool,
+    uncertain: bool,
+    home_launch_until: Option<Instant>,
+    leak_home_evidence: bool,
     actions: usize,
     native_lock: LockState,
     native_queries: usize,
@@ -32,6 +35,9 @@ impl FakeAdapter {
             lose_ack: false,
             mismatch_after_action: false,
             locked: false,
+            uncertain: false,
+            home_launch_until: None,
+            leak_home_evidence: false,
             actions: 0,
             native_lock: LockState::Uncertain,
             native_queries: 0,
@@ -73,6 +79,8 @@ impl DeviceAdapter for FakeAdapter {
             state: DeviceState {
                 lock: if self.locked {
                     LockState::Locked
+                } else if self.uncertain {
+                    LockState::Uncertain
                 } else {
                     LockState::Unlocked
                 },
@@ -85,6 +93,19 @@ impl DeviceAdapter for FakeAdapter {
                 bytes: self.app.as_bytes().to_vec(),
             },
         })
+    }
+
+    fn observe_for_action(
+        &mut self,
+        action: &Action,
+    ) -> Result<(RawObservation, Option<Instant>), AdapterError> {
+        let observation = self.observe()?;
+        let admission = if matches!(action, Action::LaunchApp { .. }) || self.leak_home_evidence {
+            self.home_launch_until.take()
+        } else {
+            None
+        };
+        Ok((observation, admission))
     }
 
     fn execute(
@@ -103,6 +124,9 @@ impl DeviceAdapter for FakeAdapter {
         }
         if matches!(action, Action::Home) {
             self.app = "com.apple.springboard".into();
+        }
+        if let Action::LaunchApp { bundle_id } = action {
+            self.app = bundle_id.clone();
         }
         if matches!(action, Action::Lock) {
             self.app = "com.apple.shortcuts".into();
@@ -402,6 +426,137 @@ fn changed_screen_or_lock_state_blocks_input_before_transport() {
         Some(ControllerError::LockedAction)
     );
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+}
+
+#[test]
+fn fresh_home_evidence_allows_only_one_launch_from_uncertain_lock() {
+    let (controller, key) = controller();
+    {
+        let mut inner = controller.inner.lock().unwrap();
+        inner.adapter.app = "com.apple.springboard".into();
+        inner.adapter.uncertain = true;
+    }
+    let before = controller.observe(&key).unwrap();
+    assert_eq!(before.state.lock, LockState::Uncertain);
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    let evidence_until = Instant::now() + Duration::from_secs(2);
+    controller.inner.lock().unwrap().adapter.home_launch_until = Some(evidence_until);
+    let result = controller
+        .act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key.clone(),
+                expected_revision: Some(before.revision),
+                action: Action::LaunchApp {
+                    bundle_id: "com.apple.mobiletimer".into(),
+                },
+            },
+        )
+        .unwrap();
+    assert_eq!(result.effect, ObservedEffect::Changed);
+    assert_eq!(result.after.unwrap().state.lock, LockState::Uncertain);
+    let inner = controller.inner.lock().unwrap();
+    assert_eq!(inner.adapter.actions, 1);
+    assert!(inner.adapter.send_deadline.unwrap() <= evidence_until);
+    drop(inner);
+    assert_eq!(
+        controller
+            .act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: None,
+                    action: Action::LaunchApp {
+                        bundle_id: "com.example.other".into(),
+                    },
+                },
+            )
+            .err(),
+        Some(ControllerError::LockedAction)
+    );
+    assert_eq!(controller.inner.lock().unwrap().adapter.actions, 1);
+}
+
+#[test]
+fn home_evidence_cannot_authorize_locked_or_non_launch_actions() {
+    let denied = [
+        Action::Tap {
+            at: Point { x: 20.0, y: 30.0 },
+        },
+        Action::Swipe {
+            from: Point { x: 20.0, y: 30.0 },
+            to: Point { x: 40.0, y: 50.0 },
+            duration_ms: 100,
+        },
+        Action::Text {
+            value: "fixture".into(),
+        },
+        Action::Lock,
+    ];
+    for action in denied {
+        let (controller, key) = controller();
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.uncertain = true;
+            inner.adapter.home_launch_until = Some(Instant::now() + Duration::from_secs(2));
+            inner.adapter.leak_home_evidence = true;
+        }
+        assert_eq!(
+            controller
+                .act(
+                    "agent",
+                    lease,
+                    ActionRequest {
+                        device: key,
+                        expected_revision: None,
+                        action,
+                    },
+                )
+                .err(),
+            Some(ControllerError::LockedAction)
+        );
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
+    for (locked, deadline) in [
+        (false, None),
+        (false, Some(Instant::now() - Duration::from_millis(1))),
+        (true, Some(Instant::now() + Duration::from_secs(2))),
+    ] {
+        let (controller, key) = controller();
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.uncertain = true;
+            inner.adapter.locked = locked;
+            inner.adapter.home_launch_until = deadline;
+        }
+        assert_eq!(
+            controller
+                .act(
+                    "agent",
+                    lease,
+                    ActionRequest {
+                        device: key,
+                        expected_revision: None,
+                        action: Action::LaunchApp {
+                            bundle_id: "com.apple.mobiletimer".into(),
+                        },
+                    },
+                )
+                .err(),
+            Some(ControllerError::LockedAction)
+        );
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
 }
 
 fn lock(

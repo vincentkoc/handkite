@@ -18,6 +18,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=visible,accessible,focused,enabled,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
+const HOME_LAUNCH_AGE: Duration = Duration::from_secs(2);
 
 pub struct WdaAdapter {
     expected: HardwareId,
@@ -297,12 +298,39 @@ impl DeviceAdapter for WdaAdapter {
             .map(|(observation, _)| observation)
     }
 
+    fn observe_for_action(
+        &mut self,
+        action: &Action,
+    ) -> Result<(RawObservation, Option<Instant>), AdapterError> {
+        if !matches!(action, Action::LaunchApp { .. }) {
+            return self.observe().map(|observation| (observation, None));
+        }
+        let native_before = native_lock::query(&self.expected).state;
+        let (observation, captured_at, reported_lock) =
+            self.capture_checked_with_lock_report(SCREEN_SOURCE)?;
+        let native_after = native_lock::query(&self.expected).state;
+        self.validate_owned()?;
+        let deadline = springboard_home_launch_deadline(
+            &observation,
+            native_before,
+            native_after,
+            reported_lock,
+            captured_at,
+        );
+        Ok((observation, deadline))
+    }
+
     fn execute(
         &mut self,
         action: &Action,
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
         self.validate_owned()?;
+        if matches!(action, Action::LaunchApp { .. })
+            && native_lock::query(&self.expected).state != LockState::Unlocked
+        {
+            return Err(AdapterError);
+        }
         let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
         let receipt = self
             .runtime
@@ -371,6 +399,40 @@ fn classify_lock(app: &str, tree: &str, reported: Option<bool>) -> LockState {
         return LockState::Unlocked;
     }
     LockState::Uncertain
+}
+
+/// One-capture private admission for launching an app from unlocked Home.
+/// It never changes the public lock classification or authorizes direct input.
+pub fn springboard_home_launch_deadline(
+    observation: &RawObservation,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    captured_at: Instant,
+) -> Option<Instant> {
+    let tree = &observation.accessibility_tree;
+    if native_before != LockState::Unlocked
+        || native_after != LockState::Unlocked
+        || reported_lock != Some(false)
+        || observation.state.lock != LockState::Uncertain
+        || observation.state.foreground_app.as_deref() != Some("com.apple.springboard")
+        || !tree.contains("XCUIElementTypeApplication")
+        || !tree.contains("XCUIElementTypeIcon")
+        || [
+            "proud-lock",
+            "passcode-view",
+            "call-to-action-label",
+            "Enter Passcode",
+            "XCUIElementTypeAlert",
+            "XCUIElementTypeSheet",
+            "XCUIElementTypeSecureTextField",
+        ]
+        .iter()
+        .any(|marker| tree.contains(marker))
+    {
+        return None;
+    }
+    captured_at.checked_add(HOME_LAUNCH_AGE)
 }
 
 #[cfg(test)]

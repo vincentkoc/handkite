@@ -21,6 +21,15 @@ pub struct AdapterError;
 pub trait DeviceAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
+    /// Private, one-capture admission for LaunchApp from unlocked SpringBoard.
+    /// The deadline must be anchored to that capture; ordinary observations
+    /// and all other actions return no admission.
+    fn observe_for_action(
+        &mut self,
+        _action: &Action,
+    ) -> Result<(RawObservation, Option<Instant>), AdapterError> {
+        self.observe().map(|observation| (observation, None))
+    }
     /// The adapter must send no action bytes at or after this monotonic deadline.
     fn execute(
         &mut self,
@@ -181,7 +190,8 @@ impl<A: DeviceAdapter> Controller<A> {
             .verify(&request.device, &usb, &wda)
             .map_err(|_| ControllerError::DeviceMismatch)?;
 
-        let fresh = self.capture(&mut inner, &request.device)?;
+        let (fresh, home_launch_until) =
+            self.capture(&mut inner, &request.device, Some(&request.action))?;
         if request.expected_revision.is_some()
             && inner
                 .last
@@ -191,7 +201,13 @@ impl<A: DeviceAdapter> Controller<A> {
             inner.last = Some(fresh);
             return Err(ControllerError::StaleRevision);
         }
-        if !matches!(&request.action, Action::Home) && fresh.state.lock != LockState::Unlocked {
+        let admitted_home_launch = matches!(&request.action, Action::LaunchApp { .. })
+            && fresh.state.lock == LockState::Uncertain
+            && home_launch_until.is_some_and(|until| Instant::now() < until);
+        if !matches!(&request.action, Action::Home)
+            && fresh.state.lock != LockState::Unlocked
+            && !admitted_home_launch
+        {
             inner.last = Some(fresh);
             return Err(ControllerError::LockedAction);
         }
@@ -220,7 +236,10 @@ impl<A: DeviceAdapter> Controller<A> {
         let observation_deadline = Instant::now()
             .checked_add(Duration::from_millis(remaining))
             .ok_or(ControllerError::StaleObservation)?;
-        let send_deadline = observation_deadline.min(lease.expires_at);
+        let mut send_deadline = observation_deadline.min(lease.expires_at);
+        if admitted_home_launch {
+            send_deadline = send_deadline.min(home_launch_until.expect("admitted deadline"));
+        }
         let receipt = match inner.adapter.execute(&request.action, send_deadline) {
             Ok(receipt) => receipt,
             // An error can follow delivery. Keep checking the postcondition without replay.
@@ -239,7 +258,9 @@ impl<A: DeviceAdapter> Controller<A> {
         } else {
             ObservedEffect::Unconfirmed
         };
-        let observed = self.capture(&mut inner, &request.device);
+        let observed = self
+            .capture(&mut inner, &request.device, None)
+            .map(|(observation, _)| observation);
         match observed {
             Ok(after) => {
                 let changed = inner
@@ -282,7 +303,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner: &mut Inner<A>,
         requested: &DeviceKey,
     ) -> Result<Observation, ControllerError> {
-        let observation = self.capture(inner, requested)?;
+        let (observation, _) = self.capture(inner, requested, None)?;
         inner.last = Some(observation.clone());
         Ok(observation)
     }
@@ -291,11 +312,16 @@ impl<A: DeviceAdapter> Controller<A> {
         &self,
         inner: &mut Inner<A>,
         requested: &DeviceKey,
-    ) -> Result<Observation, ControllerError> {
-        let raw = inner
-            .adapter
-            .observe()
-            .map_err(|_| ControllerError::Adapter)?;
+        action: Option<&Action>,
+    ) -> Result<(Observation, Option<Instant>), ControllerError> {
+        let (raw, home_launch_until) = match action {
+            Some(action) => inner.adapter.observe_for_action(action),
+            None => inner
+                .adapter
+                .observe()
+                .map(|observation| (observation, None)),
+        }
+        .map_err(|_| ControllerError::Adapter)?;
         self.binding
             .verify(requested, &raw.connected_usb, &raw.wda_target)
             .map_err(|_| ControllerError::DeviceMismatch)?;
@@ -321,14 +347,17 @@ impl<A: DeviceAdapter> Controller<A> {
             .next()
             .map_err(|_| ControllerError::RevisionExhausted)?;
         inner.revision = revision;
-        Ok(Observation {
-            device: requested.clone(),
-            revision,
-            window: raw.window,
-            state: raw.state,
-            accessibility_tree: raw.accessibility_tree,
-            screenshot: raw.screenshot,
-        })
+        Ok((
+            Observation {
+                device: requested.clone(),
+                revision,
+                window: raw.window,
+                state: raw.state,
+                accessibility_tree: raw.accessibility_tree,
+                screenshot: raw.screenshot,
+            },
+            home_launch_until,
+        ))
     }
 }
 
