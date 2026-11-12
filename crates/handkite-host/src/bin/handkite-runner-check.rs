@@ -7,6 +7,7 @@ use handkite_host::service_lock::ServiceLock;
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_runner::{OwnedWdaRunner, RunnerError};
 use std::time::Duration;
+use std::time::Instant;
 
 #[path = "handkited/signals.rs"]
 mod signals;
@@ -80,9 +81,21 @@ fn run() -> Result<(), &'static str> {
         .enable_all()
         .build()
         .map_err(|_| "runtime_unavailable")?;
-    check
-        .block_on(handkite_host::wda_runner::endpoint_vacant(&usb))
-        .map_err(|_| "endpoint_unproven")?;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        if signals::requested() {
+            return Err("shutdown_requested");
+        }
+        owner.validate_current().map_err(|_| "service_ownership")?;
+        match check.block_on(handkite_host::wda_runner::endpoint_vacant(&usb)) {
+            Ok(()) => break,
+            Err(RunnerError::EndpointBusy) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(250));
+            }
+            Err(RunnerError::EndpointBusy) => return Err("endpoint_cleanup_timeout"),
+            Err(_) => return Err("endpoint_unproven"),
+        }
+    }
     Ok(())
 }
 
