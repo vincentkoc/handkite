@@ -24,6 +24,7 @@ struct FakeAdapter {
     capture_wait_until: Option<Instant>,
     send_deadline: Option<Instant>,
     send_started: Option<Instant>,
+    execution_admission: Option<ActionAdmission>,
 }
 
 impl FakeAdapter {
@@ -52,6 +53,7 @@ impl FakeAdapter {
             capture_wait_until: None,
             send_deadline: None,
             send_started: None,
+            execution_admission: None,
         }
     }
 }
@@ -117,6 +119,22 @@ impl DeviceAdapter for FakeAdapter {
             self.tap_admission.take()
         };
         Ok((observation, admission))
+    }
+
+    fn execute_with_admission(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        admission: Option<ActionAdmission>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.execution_admission = admission;
+        if matches!(admission, Some(ActionAdmission::NativeHome { .. })) {
+            self.native_queries += 1;
+            if self.native_lock != LockState::Unlocked {
+                return Err(AdapterError);
+            }
+        }
+        self.execute(action, send_deadline)
     }
 
     fn execute(
@@ -590,6 +608,147 @@ fn visible_tap_evidence_cannot_admit_other_actions() {
         ));
         assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
     }
+}
+
+#[test]
+fn native_home_admission_tolerates_only_pixels_and_is_passed_to_execution() {
+    for change in 0..10 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = vec![1];
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeHome { until });
+            inner.adapter.native_lock = LockState::Unlocked;
+            match change {
+                1 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeHome {
+                        until: Instant::now() - Duration::from_secs(1),
+                    })
+                }
+                2 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::VisibleTap {
+                        at: Point { x: 20.0, y: 30.0 },
+                        until,
+                    })
+                }
+                3 => inner.adapter.tap_admission = Some(ActionAdmission::HomeLaunch { until }),
+                4 => inner.adapter.tree_suffix = "changed".into(),
+                5 => inner.adapter.wda_ready = false,
+                6 => inner.adapter.locked = true,
+                7 => inner.adapter.uncertain = true,
+                8 => inner.adapter.tap_admission = None,
+                9 => inner.adapter.native_lock = LockState::Locked,
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action: Action::Home,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        if change == 0 {
+            assert!(result.is_ok());
+            assert_eq!(inner.adapter.actions, 1);
+            assert_eq!(
+                inner.adapter.execution_admission,
+                Some(ActionAdmission::NativeHome { until })
+            );
+            assert_eq!(inner.adapter.native_queries, 1);
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
+        } else {
+            assert!(
+                matches!(
+                    result,
+                    Err(ControllerError::ViewChanged(_)) | Err(ControllerError::Adapter)
+                ),
+                "case {change}"
+            );
+            assert_eq!(inner.adapter.actions, 0);
+        }
+    }
+}
+
+#[test]
+fn native_home_evidence_cannot_admit_other_actions() {
+    let at = Point { x: 20.0, y: 30.0 };
+    for action in [
+        Action::Tap { at },
+        Action::Lock,
+        Action::Text {
+            value: "fixture".into(),
+        },
+        Action::LaunchApp {
+            bundle_id: "com.example.app".into(),
+        },
+        Action::Swipe {
+            from: at,
+            to: Point { x: 40.0, y: 50.0 },
+            duration_ms: 100,
+        },
+    ] {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = vec![1];
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeHome {
+                until: Instant::now() + Duration::from_secs(2),
+            });
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        assert!(matches!(
+            controller.act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action
+                }
+            ),
+            Err(ControllerError::ViewChanged(_))
+        ));
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
+}
+
+#[test]
+fn exact_view_home_from_locked_does_not_require_unlock_admission() {
+    let (controller, key) = controller();
+    controller.inner.lock().unwrap().adapter.locked = true;
+    let before = controller.observe(&key).unwrap();
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    assert!(
+        controller
+            .act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action: Action::Home
+                }
+            )
+            .is_ok()
+    );
+    let inner = controller.inner.lock().unwrap();
+    assert_eq!(inner.adapter.actions, 1);
+    assert_eq!(inner.adapter.native_queries, 0);
+    assert_eq!(inner.adapter.execution_admission, None);
 }
 
 #[test]

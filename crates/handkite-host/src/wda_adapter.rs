@@ -302,10 +302,10 @@ impl DeviceAdapter for WdaAdapter {
         &mut self,
         action: &Action,
     ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
-        let owned_tap = matches!(action, Action::Tap { .. })
+        let owned_input = matches!(action, Action::Tap { .. } | Action::Home)
             && self.owned_session.is_some()
             && self.owned_runner.is_some();
-        if !matches!(action, Action::LaunchApp { .. }) && !owned_tap {
+        if !matches!(action, Action::LaunchApp { .. }) && !owned_input {
             return self.observe().map(|observation| (observation, None));
         }
         let native_before = native_lock::query(&self.expected).state;
@@ -316,7 +316,7 @@ impl DeviceAdapter for WdaAdapter {
         let admission = if let Action::Tap { at } = action {
             visible_tap_deadline(
                 &observation,
-                owned_tap,
+                owned_input,
                 native_before,
                 native_after,
                 reported_lock,
@@ -324,6 +324,16 @@ impl DeviceAdapter for WdaAdapter {
                 captured_at,
             )
             .map(|until| ActionAdmission::VisibleTap { at: *at, until })
+        } else if matches!(action, Action::Home) {
+            native_home_deadline(
+                &observation,
+                owned_input,
+                native_before,
+                native_after,
+                reported_lock,
+                captured_at,
+            )
+            .map(|until| ActionAdmission::NativeHome { until })
         } else {
             springboard_home_launch_deadline(
                 &observation,
@@ -361,6 +371,29 @@ impl DeviceAdapter for WdaAdapter {
 
     fn native_lock_state(&mut self) -> LockState {
         native_lock::query(&self.expected).state
+    }
+
+    fn execute_with_admission(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        admission: Option<ActionAdmission>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        if let Some(ActionAdmission::NativeHome { until }) = admission {
+            if !matches!(action, Action::Home)
+                || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            self.validate_owned()?;
+            if native_lock::query(&self.expected).state != LockState::Unlocked {
+                return Err(AdapterError);
+            }
+        }
+        self.execute(action, send_deadline)
     }
 }
 
@@ -439,7 +472,33 @@ fn visible_tap_deadline(
             .foreground_app
             .as_deref()
             .is_none_or(|app| app == "com.apple.springboard")
-        || !crate::wda_tap_admission::visible_button(&observation.accessibility_tree, at)
+        || !crate::wda_ui_admission::visible_button(&observation.accessibility_tree, at)
+    {
+        return None;
+    }
+    captured_at.checked_add(HOME_LAUNCH_AGE)
+}
+
+fn native_home_deadline(
+    observation: &RawObservation,
+    owned: bool,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    captured_at: Instant,
+) -> Option<Instant> {
+    if !owned
+        || native_before != LockState::Unlocked
+        || native_after != LockState::Unlocked
+        || reported_lock != Some(false)
+        || observation.state.lock != LockState::Unlocked
+        || !observation.state.wda_ready
+        || observation
+            .state
+            .foreground_app
+            .as_deref()
+            .is_none_or(|app| app == "com.apple.springboard")
+        || !crate::wda_ui_admission::safe_context(&observation.accessibility_tree)
     {
         return None;
     }
@@ -485,7 +544,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn tap_admission_requires_owned_native_unlocked_context_and_capture_deadline() {
+    fn input_admission_requires_owned_native_unlocked_context_and_capture_deadline() {
         let id = HardwareId::new("fixture-device").unwrap();
         let mut observation = RawObservation {
             connected_usb: id.clone(), wda_target: id,
@@ -497,7 +556,10 @@ mod tests {
         let at = Point { x: 285.0, y: 505.0 };
         let captured_at = Instant::now();
         let deadline = |observation: &RawObservation, owned, before, after, raw| {
-            visible_tap_deadline(observation, owned, before, after, raw, at, captured_at)
+            let tap = visible_tap_deadline(observation, owned, before, after, raw, at, captured_at);
+            let home = native_home_deadline(observation, owned, before, after, raw, captured_at);
+            assert_eq!(tap, home);
+            home
         };
         assert_eq!(
             deadline(

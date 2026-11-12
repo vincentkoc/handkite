@@ -22,6 +22,7 @@ pub struct AdapterError;
 pub enum ActionAdmission {
     HomeLaunch { until: Instant },
     VisibleTap { at: Point, until: Instant },
+    NativeHome { until: Instant },
 }
 
 pub trait DeviceAdapter {
@@ -41,6 +42,19 @@ pub trait DeviceAdapter {
         action: &Action,
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError>;
+    /// Receives only validated private admission used by this action check.
+    /// NativeHome requires an additional native unlock check before sending.
+    fn execute_with_admission(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        admission: Option<ActionAdmission>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        if matches!(admission, Some(ActionAdmission::NativeHome { .. })) {
+            return Err(AdapterError);
+        }
+        self.execute(action, send_deadline)
+    }
     /// Query only the pinned device, without sending input or retrying the action.
     fn native_lock_state(&mut self) -> LockState {
         LockState::Uncertain
@@ -227,7 +241,7 @@ impl<A: DeviceAdapter> Controller<A> {
         let admitted_home_launch = matches!(&request.action, Action::LaunchApp { .. })
             && fresh.state.lock == LockState::Uncertain
             && home_launch_until.is_some_and(|until| Instant::now() < until);
-        let visible_tap_until = match (&request.action, admission) {
+        let pixel_drift_until = match (&request.action, admission) {
             (
                 Action::Tap { at },
                 Some(ActionAdmission::VisibleTap {
@@ -241,6 +255,13 @@ impl<A: DeviceAdapter> Controller<A> {
             {
                 Some(until)
             }
+            (Action::Home, Some(ActionAdmission::NativeHome { until }))
+                if fresh.state.lock == LockState::Unlocked
+                    && fresh.state.wda_ready
+                    && Instant::now() < until =>
+            {
+                Some(until)
+            }
             _ => None,
         };
         // App launch uses a bundle ID, so Home animations need not match.
@@ -249,7 +270,7 @@ impl<A: DeviceAdapter> Controller<A> {
             && inner.last.as_ref().is_some_and(|last| {
                 !(same_view(last, &fresh)
                     || admitted_home_launch && last.state == fresh.state
-                    || visible_tap_until.is_some()
+                    || pixel_drift_until.is_some()
                         && last.state == fresh.state
                         && last.accessibility_tree == fresh.accessibility_tree)
             })
@@ -295,10 +316,17 @@ impl<A: DeviceAdapter> Controller<A> {
         if admitted_home_launch {
             send_deadline = send_deadline.min(home_launch_until.expect("admitted deadline"));
         }
-        if let Some(until) = visible_tap_until {
+        if let Some(until) = pixel_drift_until {
             send_deadline = send_deadline.min(until);
         }
-        let receipt = match inner.adapter.execute(&request.action, send_deadline) {
+        let execution_admission = (admitted_home_launch || pixel_drift_until.is_some())
+            .then_some(admission)
+            .flatten();
+        let receipt = match inner.adapter.execute_with_admission(
+            &request.action,
+            send_deadline,
+            execution_admission,
+        ) {
             Ok(receipt) => receipt,
             // An error can follow delivery. Keep checking the postcondition without replay.
             Err(_) if is_lock => TransportReceipt {

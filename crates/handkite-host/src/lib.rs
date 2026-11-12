@@ -42,6 +42,6 @@ pub mod wda_http;
 pub mod wda_runner;
 pub mod wda_session;
 pub mod wda_settings;
-mod wda_tap_admission;
 pub mod wda_transport;
+mod wda_ui_admission;
 pub mod wire;

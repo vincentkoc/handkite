@@ -54,11 +54,18 @@ impl Rect {
 /// Proves one unambiguous public button at this point in the complete tree.
 /// The caller checks native lock, ownership and capture freshness separately.
 pub(crate) fn visible_button(xml: &str, at: Point) -> bool {
-    parse(xml, at) == Some(())
+    parse(xml, Some(at)) == Some(())
 }
 
-fn parse(xml: &str, at: Point) -> Option<()> {
-    if xml.is_empty() || xml.len() > 2 * 1024 * 1024 || !at.x.is_finite() || !at.y.is_finite() {
+pub(crate) fn safe_context(xml: &str) -> bool {
+    parse(xml, None) == Some(())
+}
+
+fn parse(xml: &str, at: Option<Point>) -> Option<()> {
+    if xml.is_empty()
+        || xml.len() > 2 * 1024 * 1024
+        || at.is_some_and(|at| !at.x.is_finite() || !at.y.is_finite())
+    {
         return None;
     }
     let mut reader = quick_xml::Reader::from_str(xml);
@@ -121,13 +128,14 @@ fn parse(xml: &str, at: Point) -> Option<()> {
                         return None;
                     }
                     let rect = Rect::read(&attrs)?;
-                    if rect.x != 0.0 || rect.y != 0.0 || !rect.contains(at) {
+                    if rect.x != 0.0 || rect.y != 0.0 || at.is_some_and(|at| !rect.contains(at)) {
                         return None;
                     }
                     screen = Some(rect);
                 }
                 if kind == "XCUIElementTypeButton"
                     && attrs.get("visible").map(String::as_str) != Some("false")
+                    && let Some(at) = at
                 {
                     let rect = Rect::read(&attrs)?;
                     if rect.contains(at) {
@@ -158,7 +166,13 @@ fn parse(xml: &str, at: Point) -> Option<()> {
             Event::Decl(_) if roots == 0 && !declared => {
                 declared = true;
             }
-            Event::Eof => return (roots == 1 && stack.is_empty() && target).then_some(()),
+            Event::Eof => {
+                return (roots == 1
+                    && stack.is_empty()
+                    && screen.is_some()
+                    && (at.is_none() || target))
+                    .then_some(());
+            }
             _ => return None,
         }
     }
@@ -245,6 +259,7 @@ mod tests {
             "<!-- ambiguous -->",
             "<wrong></other>",
         ] {
+            assert!(!safe_context(&tree(&format!("{BUTTON}{extra}"))), "{extra}");
             assert!(
                 !visible_button(&tree(&format!("{BUTTON}{extra}")), point()),
                 "{extra}"
@@ -261,5 +276,27 @@ mod tests {
             &tree(BUTTON).replace("<AppiumAUT>", "<?xml version=\"1.0\"?><AppiumAUT>"),
             point()
         ));
+    }
+
+    #[test]
+    fn home_context_requires_one_valid_application_but_not_a_button() {
+        assert!(safe_context(&tree("")));
+        assert!(safe_context(&tree(BUTTON)));
+        for xml in [
+            "<root/>",
+            "<root><node/></root>",
+            "",
+            "<AppiumAUT><XCUIElementTypeApplication/></AppiumAUT>",
+        ] {
+            assert!(!safe_context(xml));
+        }
+        assert!(!safe_context(
+            &tree("").replace("width=\"393\"", "width=\"NaN\"")
+        ));
+        assert!(!safe_context(&(tree("") + "<other/>")));
+        assert!(!safe_context(&tree("").replace(
+            "<AppiumAUT>",
+            "<AppiumAUT type=\"XCUIElementTypeAlert\">"
+        )));
     }
 }
