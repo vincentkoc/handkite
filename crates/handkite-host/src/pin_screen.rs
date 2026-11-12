@@ -2,11 +2,15 @@ use handkite_core::protocol::{LockState, Point};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
+mod normal_lock;
+pub use normal_lock::{NormalLockScreen, normal_lock_screen};
+
 const MAX_XML_BYTES: usize = 8 * 1024 * 1024;
 const ALIGN_TOLERANCE: f64 = 12.0;
 const FRAME_EDGE_TOLERANCE: f64 = 2.0;
 
 pub struct ParsedPasscodeView {
+    pub normal_lock: Option<NormalLockScreen>,
     pub visible_lock: LockState,
     pub screen_size: Option<(f64, f64)>,
     pub secure_field_value: Option<String>,
@@ -329,6 +333,7 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
         (candidates.len() == 1).then(|| candidates[0])
     });
     Ok(ParsedPasscodeView {
+        normal_lock: normal_lock_screen(xml).ok(),
         visible_lock: if lock_marker || field.is_some() {
             LockState::Locked
         } else if foreground_app
