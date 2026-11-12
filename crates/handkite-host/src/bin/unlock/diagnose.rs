@@ -144,6 +144,18 @@ fn finish(
             report.normal_locked,
             report.empty_locked
         );
+        let timings = report.timings;
+        println!(
+            "preparation=observed phase=capture_timings session_before_ms={} source_ms={} lock_ms={} direct_field_ms={} session_after_ms={} parse_ms={} native_ms={} wda_reported_lock={}",
+            timings.session_before_ms,
+            timings.source_ms,
+            timings.lock_ms,
+            timings.direct_field_ms,
+            timings.session_after_ms,
+            timings.parse_ms,
+            timings.native_ms,
+            report.wda_reported_lock.as_str()
+        );
         if let Some(snapshot) = report.snapshot {
             println!(
                 "preparation=observed phase=snapshot snapshot_ms={} screen_size={} field_seen={} field_accepted={} keys_seen={} keys_eligible={} keys_visible={} keys_enabled={} field_visible={} field_enabled={} layout_valid={} visibility_fallback={} native_locked={} wda_locked={} visible_locked={} prior_unlock={} alert={} normal_marker={}",
@@ -208,6 +220,8 @@ mod tests {
             normal_locked: false,
             empty_locked: false,
             snapshot: None,
+            timings: Default::default(),
+            wda_reported_lock: Default::default(),
         }
     }
 

@@ -75,6 +75,43 @@ impl PinCaptureStep {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PinCaptureTimings {
+    pub session_before_ms: u128,
+    pub source_ms: u128,
+    pub lock_ms: u128,
+    pub direct_field_ms: u128,
+    pub session_after_ms: u128,
+    pub parse_ms: u128,
+    pub native_ms: u128,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PinReportedLock {
+    Locked,
+    Unlocked,
+    #[default]
+    Unknown,
+}
+
+impl PinReportedLock {
+    fn from_bool(value: Option<bool>) -> Self {
+        match value {
+            Some(true) => Self::Locked,
+            Some(false) => Self::Unlocked,
+            None => Self::Unknown,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Locked => "true",
+            Self::Unlocked => "false",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 pub struct PinPreparationDiagnostic {
     pub outcome: &'static str,
     pub phase: PinPhase,
@@ -84,6 +121,8 @@ pub struct PinPreparationDiagnostic {
     pub normal_locked: bool,
     pub empty_locked: bool,
     pub snapshot: Option<PinDiagnostics>,
+    pub timings: PinCaptureTimings,
+    pub wda_reported_lock: PinReportedLock,
 }
 
 struct PreparedPinView {
@@ -112,6 +151,8 @@ pub struct NativePasscodeBackend {
     last_diagnostics: Option<PinDiagnostics>,
     phase: PinPhase,
     capture_step: PinCaptureStep,
+    capture_timings: PinCaptureTimings,
+    wda_reported_lock: PinReportedLock,
     supervised_visibility_fallback: bool,
     session_bound: bool,
     awaiting_first_digit: bool,
@@ -165,6 +206,8 @@ impl NativePasscodeBackend {
             last_diagnostics: None,
             phase: PinPhase::InitialSnapshot,
             capture_step: PinCaptureStep::SessionBefore,
+            capture_timings: PinCaptureTimings::default(),
+            wda_reported_lock: PinReportedLock::Unknown,
             supervised_visibility_fallback,
             session_bound: false,
             awaiting_first_digit: false,
@@ -242,6 +285,8 @@ impl NativePasscodeBackend {
                 .as_ref()
                 .is_some_and(|view| view.empty_locked),
             snapshot: self.last_diagnostics,
+            timings: self.capture_timings,
+            wda_reported_lock: self.wda_reported_lock,
         }
     }
 
@@ -580,6 +625,8 @@ impl NativePasscodeBackend {
     ) -> Result<PasscodeScreen, BackendError> {
         self.last_view = None;
         self.last_diagnostics = None;
+        self.capture_timings = PinCaptureTimings::default();
+        self.wda_reported_lock = PinReportedLock::Unknown;
         if self.progress_check == ProgressCheck::Failed {
             return Err(BackendError::Unavailable);
         }
@@ -630,44 +677,65 @@ impl NativePasscodeBackend {
     ) -> Result<(PasscodeScreen, ParsedPasscodeView), BackendError> {
         let wda = UsbWda::new(self.usb.clone());
         self.capture_step = PinCaptureStep::SessionBefore;
-        self.runtime
-            .block_on(self.actions.prepare_existing(&wda))
-            .map_err(|_| BackendError::Unavailable)?;
-        let (source, reported_lock) = self.runtime.block_on(async {
+        let step_started = Instant::now();
+        let prepared = self.runtime.block_on(self.actions.prepare_existing(&wda));
+        self.capture_timings.session_before_ms = step_started.elapsed().as_millis();
+        prepared.map_err(|_| BackendError::Unavailable)?;
+        let ((source, source_ms), (reported_lock, lock_ms)) = self.runtime.block_on(async {
             tokio::join!(
-                wda.request("GET", PIN_SOURCE, b"", Duration::from_secs(10)),
-                wda.request("GET", "/wda/locked", b"", Duration::from_secs(10)),
+                async {
+                    let started = Instant::now();
+                    let result = wda
+                        .request("GET", PIN_SOURCE, b"", Duration::from_secs(10))
+                        .await;
+                    (result, started.elapsed().as_millis())
+                },
+                async {
+                    let started = Instant::now();
+                    let result = wda
+                        .request("GET", "/wda/locked", b"", Duration::from_secs(10))
+                        .await;
+                    (result, started.elapsed().as_millis())
+                },
             )
         });
+        self.capture_timings.source_ms = source_ms;
+        self.capture_timings.lock_ms = lock_ms;
         self.capture_step = PinCaptureStep::SourceRead;
         let source = response_value(source.map_err(wda_error)?)?;
         self.capture_step = PinCaptureStep::LockRead;
         let reported_lock = response_value(reported_lock.map_err(wda_error)?)?;
+        self.wda_reported_lock = PinReportedLock::from_bool(reported_lock.as_bool());
         let direct = if self.progress_check == ProgressCheck::Pending {
             self.capture_step = PinCaptureStep::DirectField;
             let session = self
                 .actions
                 .prepared_session()
                 .ok_or(BackendError::Unavailable)?;
-            Some(
-                self.runtime
-                    .block_on(pin_field::read(&wda, session))
-                    .map_err(|_| BackendError::Unavailable)?,
-            )
+            let step_started = Instant::now();
+            let direct = self.runtime.block_on(pin_field::read(&wda, session));
+            self.capture_timings.direct_field_ms = step_started.elapsed().as_millis();
+            Some(direct.map_err(|_| BackendError::Unavailable)?)
         } else {
             None
         };
         if self.session_bound {
             self.capture_step = PinCaptureStep::SessionAfter;
-            self.runtime
-                .block_on(self.actions.prepare_existing(&wda))
-                .map_err(|_| BackendError::Unavailable)?;
+            let step_started = Instant::now();
+            let prepared = self.runtime.block_on(self.actions.prepare_existing(&wda));
+            self.capture_timings.session_after_ms = step_started.elapsed().as_millis();
+            prepared.map_err(|_| BackendError::Unavailable)?;
         }
         self.capture_step = PinCaptureStep::ParseSource;
         let xml = source.as_str().ok_or(BackendError::Unavailable)?;
-        let parsed = pin_screen::parse(xml).map_err(|_| BackendError::Unavailable)?;
+        let step_started = Instant::now();
+        let parsed = pin_screen::parse(xml);
+        self.capture_timings.parse_ms = step_started.elapsed().as_millis();
+        let parsed = parsed.map_err(|_| BackendError::Unavailable)?;
         self.capture_step = PinCaptureStep::NativeLock;
+        let step_started = Instant::now();
         let native = native_lock::query(&self.expected);
+        self.capture_timings.native_ms = step_started.elapsed().as_millis();
         self.last_diagnostics = Some(PinDiagnostics {
             snapshot_ms: started.elapsed().as_millis(),
             screen_size: parsed.screen_size.is_some(),
@@ -1295,6 +1363,51 @@ mod tests {
         let (screen, _) = capture();
         let view = pin_screen::parse(r#"<AppiumAUT><XCUIElementTypeApplication bundleId="com.apple.springboard" x="0" y="0" width="400" height="800"><XCUIElementTypeOther name="proud-lock" visible="true"/></XCUIElementTypeApplication></AppiumAUT>"#).unwrap();
         (screen, view)
+    }
+
+    #[test]
+    fn reported_wda_lock_keeps_false_distinct_from_unknown() {
+        for (value, expected) in [
+            (Some(true), "true"),
+            (Some(false), "false"),
+            (None, "unknown"),
+        ] {
+            assert_eq!(PinReportedLock::from_bool(value).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn preparation_diagnostic_retains_only_current_capture_timings() {
+        let backend = bound_backend().with_input_admission(|| true).unwrap();
+        let mut captures = 0;
+        let report = backend.diagnose_preparation_with(|backend| {
+            captures += 1;
+            let now = Instant::now();
+            backend.snapshot_with(
+                now,
+                |backend, _| {
+                    assert_eq!(backend.capture_timings, PinCaptureTimings::default());
+                    assert_eq!(backend.wda_reported_lock, PinReportedLock::Unknown);
+                    if captures == 1 {
+                        backend.capture_timings.native_ms = 101;
+                        backend.wda_reported_lock = PinReportedLock::Unlocked;
+                        Ok(normal_capture())
+                    } else {
+                        backend.capture_timings.source_ms = 7;
+                        backend.capture_step = PinCaptureStep::SourceRead;
+                        Err(BackendError::Unavailable)
+                    }
+                },
+                || now,
+            )
+        });
+        assert_eq!(report.outcome, "backend_unavailable");
+        assert_eq!(report.phase, PinPhase::NormalConfirmation);
+        assert_eq!(report.capture_step, PinCaptureStep::SourceRead);
+        assert_eq!(report.timings.source_ms, 7);
+        assert_eq!(report.timings.native_ms, 0);
+        assert_eq!(report.wda_reported_lock, PinReportedLock::Unknown);
+        assert!(report.snapshot.is_none());
     }
 
     #[test]
