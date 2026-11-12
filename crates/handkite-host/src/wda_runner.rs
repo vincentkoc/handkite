@@ -230,6 +230,20 @@ impl OwnedWdaRunner {
     }
 }
 
+/// Check the pinned device's WDA port without creating a session or runner.
+/// A refusal proves vacancy only at this instant; callers must exclude restarts.
+pub async fn endpoint_vacant(usb: &PinnedUsb) -> Result<(), RunnerError> {
+    let provider = usb
+        .provider()
+        .await
+        .map_err(|_| RunnerError::LookupFailed)?;
+    require_port_vacant(
+        provider.connect(WDA_PORT),
+        Instant::now() + VACANCY_TIMEOUT + Duration::from_secs(1),
+    )
+    .await
+}
+
 impl Drop for OwnedWdaRunner {
     fn drop(&mut self) {
         if let Some(task) = &self.task {

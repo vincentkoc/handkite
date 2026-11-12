@@ -91,6 +91,17 @@ Raw XCTest messages are not returned; HTTP readiness alone cannot admit a runner
 Callers must retain the handle inside an active Tokio runtime and establish
 exclusive device/WDA ownership before calling it.
 
+`handkite-runner-check --service` is a diagnostic for that exclusive handoff. It
+loads the fixed protected config, holds the Handkite service lock, starts the
+configured XCTest runner once, then aborts and joins the host task. It creates
+no WDA session and sends no phone input, so the phone may be locked. Success
+also requires the pinned WDA port to refuse a fresh connection after join.
+SIGTERM/SIGINT during startup requests cancellation and reports cleanup
+unproven. Any refusal requires an independent vacant-port check before another
+controller starts; a fixed startup category never proves cleanup. The command
+cannot exclude an external controller or its restart. Establish that boundary
+before running it, and keep this diagnostic out of the three-artifact release.
+
 The [independent WDA build and verification tools](tools/wda/README.md) prepare
 an Xcode-signed iOS runner from a pinned Appium source revision. Their offline
 tests do not qualify a real build, install, or launch.
