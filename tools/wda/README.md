@@ -13,7 +13,7 @@ python3 tools/wda/build.py \
   --bundle-id com.example.HandkiteRunner
 ```
 
-The tool checks the exact source commit, clean worktree, and pinned project hash. It archives that commit into the new output directory and changes only the iOS Runner target's two bundle-ID configurations in the copy. It checks Xcode's resolved target settings before `clean build-for-testing`. It never installs, launches, or runs tests on the phone. The original checkout is not patched. Build output stays in the private directory; `build.log` is mode 0600 and may contain device or account metadata.
+The tool checks the exact source commit, clean worktree, and pinned project hash. It archives that commit into the new output directory and changes the iOS Runner target's two bundle-ID configurations and applies the lock-state patch described below in the copy. It checks Xcode's resolved target settings before `clean build-for-testing`. It never installs, launches, or runs tests on the phone. The original checkout is not patched. Build output stays in the private directory; `build.log` is mode 0600 and may contain device or account metadata.
 
 The tool removes inherited `CPATH` from its Xcode child processes. Host include paths such as `/usr/local/include` are unsafe for an iOS cross-compile; the caller's environment is unchanged.
 
@@ -37,3 +37,11 @@ python3 tools/wda/verify.py \
 The verifier requires one runner app and one `.xctestrun`, checks the app identifier, verifies the app, test bundle, and nested signatures individually with `codesign`, compares the extracted leaf certificate, and checks the decoded development profile's team, target device, expiry, application ID, certificate, and signed entitlements. Signed claims may be a subset of the profile's allowances; a terminal `.*` allowance can expand to a nonempty qualified name. Other wildcard shapes and nested allowance values fail closed. It emits only SHA-256 hashes of the runner tree and `.xctestrun`. A decoded profile is a diagnostic view; [Apple TN3125](https://developer.apple.com/documentation/technotes/tn3125-inside-code-signing-provisioning-profiles) notes that the DER profile is authoritative on modern iOS. Verification is a point-in-time filesystem check, not a held custody capability.
 
 Neither command installs a runner or proves Xcode account access, profile issuance, on-device signature acceptance, XCTest launch, WDA endpoint ownership, or Handkite input. The existing installed runner and PIN stop marker remain untouched. After independent review, install and launch only on the pinned test phone, then prove the owned no-PIN Clock action before any guarded unlock attempt.
+
+## Initial lock-state patch
+
+The pinned upstream runner initializes its lock cache only after a notification. A fresh runner can therefore report false when the phone was already locked. The builder patches only its private archived copy: registration success triggers an immediate state read, and that read and every callback use one mutex for the complete read-and-publish operation. The getter reads the validity and value together. Registration or state-read failure produces the fixed `lock_state_unavailable` WDA error from `/wda/locked`, never a default Boolean.
+
+The builder verifies SHA-256 preimages for all three patched upstream files before mutation. `source-patches.json` records the upstream commit, patch-tool hash, original file hashes and resulting file hashes, including the small added header. The original checkout is unchanged. This patch does not update an already installed runner; a new candidate still requires normal build, signature verification and separately authorized installation.
+
+Focused offline checks are `python3 -m unittest discover -s tools/wda -p test_build.py` and `python3 -m unittest discover -s tools/wda -p test_lock_state.py`. The native C fixture replaces the notification read with a fake; it performs no phone, notification, signing or account operation.

@@ -4,6 +4,7 @@
 import argparse
 import hashlib
 import io
+import json
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -19,6 +20,115 @@ ORIGINAL_BUNDLE = "PRODUCT_BUNDLE_IDENTIFIER = com.facebook.WebDriverAgentRunner
 TEAM = re.compile(r"[A-Z0-9]{10}\Z")
 UDID = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{8}-[0-9a-fA-F]{16})\Z")
 BUNDLE = re.compile(r"[A-Za-z0-9]+(?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9]+(?:[A-Za-z0-9-]*[A-Za-z0-9])?)+\Z")
+
+
+LOCK_HELPERS = Path("WebDriverAgentLib/Categories/XCUIDevice+FBHelpers.m")
+LOCK_HEADER = Path("WebDriverAgentLib/Categories/XCUIDevice+FBHelpers.h")
+LOCK_COMMANDS = Path("WebDriverAgentLib/Commands/FBCustomCommands.m")
+LOCK_SOURCE_HASHES = {
+    LOCK_HELPERS: "ecd4ffce2bee99210c3e2370f1462a42645e8440d6f86c059c39c96d03d8119d",
+    LOCK_HEADER: "54e499e74a2ac9dc93a0a5021ac279a307d1f67111e1ef04a8912223a12afe41",
+    LOCK_COMMANDS: "d42b495cbe6ae86577a97bb57d0c38604145f52cdf7073895b95ad963988c72a",
+}
+LOCK_REGISTER = '''+ (void)fb_registerAppforDetectLockState
+{
+  int notify_token;
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wstrict-prototypes"
+  notify_register_dispatch("com.apple.springboard.lockstate", &notify_token, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(int token) {
+    uint64_t state = UINT64_MAX;
+    notify_get_state(token, &state);
+    fb_isLocked = state != 0;
+  });
+#pragma clang diagnostic pop
+}'''
+LOCK_REGISTER_FIXED = '''+ (void)fb_registerAppforDetectLockState
+{
+  int notify_token;
+  uint32_t status = notify_register_dispatch("com.apple.springboard.lockstate", &notify_token, dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^(int token) {
+    fb_refreshLockState(token);
+  });
+  if (status == NOTIFY_STATUS_OK) {
+    fb_refreshLockState(notify_token);
+  } else {
+    fb_invalidateLockState();
+  }
+}'''
+LOCK_GETTER = '''- (BOOL)fb_isScreenLocked
+{
+  return fb_isLocked;
+}'''
+LOCK_GETTER_FIXED = '''- (BOOL)fb_isScreenLocked
+{
+  bool locked = false;
+  return fb_copyLockState(&locked) && locked;
+}
+- (nullable NSNumber *)fb_observedScreenLockState
+{
+  bool locked = false;
+  return fb_copyLockState(&locked) ? @(locked) : nil;
+}'''
+LOCK_ENDPOINT = '''+ (id<FBResponsePayload>)handleIsLocked:(FBRouteRequest *)request
+{
+  BOOL isLocked = [XCUIDevice sharedDevice].fb_isScreenLocked;
+  return FBResponseWithObject(isLocked ? @YES : @NO);
+}'''
+LOCK_ENDPOINT_FIXED = '''+ (id<FBResponsePayload>)handleIsLocked:(FBRouteRequest *)request
+{
+  NSNumber *isLocked = [[XCUIDevice sharedDevice] fb_observedScreenLockState];
+  if (nil == isLocked) {
+    return FBResponseWithStatus([FBCommandStatus unknownErrorWithMessage:@"lock_state_unavailable"
+                                                             traceback:nil]);
+  }
+  return FBResponseWithObject(isLocked);
+}'''
+
+
+def replace_once(text: str, before: str, after: str) -> str:
+    if text.count(before) != 1:
+        raise ValueError("lock_source_shape_mismatch")
+    return text.replace(before, after)
+
+
+def patch_lock_state(work: Path) -> dict:
+    # Validate every preimage before changing the archived copy.
+    original = {path: (work / path).read_bytes() for path in LOCK_SOURCE_HASHES}
+    if any(hashlib.sha256(data).hexdigest() != LOCK_SOURCE_HASHES[path]
+           for path, data in original.items()):
+        raise ValueError("lock_source_mismatch")
+    helpers = original[LOCK_HELPERS].decode("utf-8")
+    helpers = replace_once(helpers, "#include <notify.h>",
+                           '#include <notify.h>\n#include "FBHandkiteLockState.h"')
+    helpers = replace_once(helpers, "static bool fb_isLocked;\n", "")
+    helpers = replace_once(helpers, LOCK_REGISTER, LOCK_REGISTER_FIXED)
+    helpers = replace_once(helpers, LOCK_GETTER, LOCK_GETTER_FIXED)
+    if helpers.count("fb_isLocked") != 4:
+        raise ValueError("lock_source_shape_mismatch")
+    helpers = helpers.replace("fb_isLocked", "[self fb_isScreenLocked]")
+    header = replace_once(original[LOCK_HEADER].decode("utf-8"),
+                          "- (BOOL)fb_isScreenLocked;",
+                          "- (BOOL)fb_isScreenLocked;\n- (nullable NSNumber *)fb_observedScreenLockState;")
+    commands = replace_once(original[LOCK_COMMANDS].decode("utf-8"),
+                            LOCK_ENDPOINT, LOCK_ENDPOINT_FIXED)
+    output = {LOCK_HELPERS: helpers.encode(), LOCK_HEADER: header.encode(),
+              LOCK_COMMANDS: commands.encode()}
+    helper_path = LOCK_HELPERS.with_name("FBHandkiteLockState.h")
+    if (work / helper_path).exists():
+        raise ValueError("lock_helper_exists")
+    output[helper_path] = Path(__file__).with_name("FBHandkiteLockState.h").read_bytes()
+    with (work / helper_path).open("xb") as helper:
+        helper.write(output[helper_path])
+    for path, data in output.items():
+        if path != helper_path:
+            (work / path).write_bytes(data)
+    return {
+        "source_commit": SOURCE_COMMIT,
+        "patch": "initial-lock-state-v1",
+        "patch_tool_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "files": [{"path": str(path), "source_sha256": LOCK_SOURCE_HASHES.get(path),
+                   "output_sha256": hashlib.sha256(data).hexdigest()}
+                  for path, data in output.items()],
+    }
 
 
 def source_is_pinned(source: Path) -> bool:
@@ -140,6 +250,11 @@ def build(source: Path, output: Path, team: str, udid: str, bundle_id: str, allo
     archive_source(source, work)
     project_file = work / PROJECT
     project_file.write_bytes(patch_project(project_file.read_bytes(), bundle_id))
+    patch_manifest = patch_lock_state(work)
+    manifest_fd = os.open(output / "source-patches.json", os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(manifest_fd, "w", encoding="utf-8") as manifest:
+        json.dump(patch_manifest, manifest, sort_keys=True, indent=2)
+        manifest.write("\n")
     settings = resolved_settings(work / "WebDriverAgent.xcodeproj", team, udid)
     expected = {
         "PRODUCT_BUNDLE_IDENTIFIER": bundle_id,

@@ -103,6 +103,7 @@ class BuildTests(unittest.TestCase):
                 mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()),
                 mock.patch.object(build, "source_is_pinned", return_value=True),
                 mock.patch.object(build, "archive_source", side_effect=archive),
+                mock.patch.object(build, "patch_lock_state", return_value={"fixture": True}),
                 mock.patch.object(build, "resolved_settings", return_value={
                     "PRODUCT_BUNDLE_IDENTIFIER": "com.example.Runner",
                     "DEVELOPMENT_TEAM": "ABCDE12345",
@@ -136,6 +137,7 @@ class BuildTests(unittest.TestCase):
                 mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()),
                 mock.patch.object(build, "source_is_pinned", return_value=True),
                 mock.patch.object(build, "archive_source", side_effect=archive),
+                mock.patch.object(build, "patch_lock_state", return_value={"fixture": True}),
                 mock.patch.object(build, "resolved_settings", return_value={"PLATFORM_NAME": "iphonesimulator"}),
                 mock.patch.object(build.subprocess, "run") as run,
             ):
