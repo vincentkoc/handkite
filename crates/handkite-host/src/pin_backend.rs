@@ -45,6 +45,47 @@ impl PinPhase {
     }
 }
 
+/// Fixed capture checkpoints; never includes source XML, session IDs or field values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinCaptureStep {
+    SessionBefore,
+    SourceRead,
+    LockRead,
+    DirectField,
+    SessionAfter,
+    ParseSource,
+    NativeLock,
+    Freshness,
+    Complete,
+}
+
+impl PinCaptureStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SessionBefore => "session_before",
+            Self::SourceRead => "source_read",
+            Self::LockRead => "lock_read",
+            Self::DirectField => "direct_field",
+            Self::SessionAfter => "session_after",
+            Self::ParseSource => "parse_source",
+            Self::NativeLock => "native_lock",
+            Self::Freshness => "freshness",
+            Self::Complete => "complete",
+        }
+    }
+}
+
+pub struct PinPreparationDiagnostic {
+    pub outcome: &'static str,
+    pub phase: PinPhase,
+    pub capture_step: PinCaptureStep,
+    pub elapsed_ms: u128,
+    pub captures: usize,
+    pub normal_locked: bool,
+    pub empty_locked: bool,
+    pub snapshot: Option<PinDiagnostics>,
+}
+
 struct PreparedPinView {
     view: ParsedPasscodeView,
     fresh_until: Instant,
@@ -70,6 +111,7 @@ pub struct NativePasscodeBackend {
     last_view: Option<PreparedPinView>,
     last_diagnostics: Option<PinDiagnostics>,
     phase: PinPhase,
+    capture_step: PinCaptureStep,
     supervised_visibility_fallback: bool,
     session_bound: bool,
     awaiting_first_digit: bool,
@@ -93,6 +135,12 @@ pub struct PinDiagnostics {
     pub field_enabled: bool,
     pub layout_valid: bool,
     pub visibility_fallback: bool,
+    pub native_locked: bool,
+    pub wda_locked: bool,
+    pub visible_locked: bool,
+    pub prior_unlock: bool,
+    pub alert: bool,
+    pub normal_marker: bool,
 }
 
 impl NativePasscodeBackend {
@@ -116,6 +164,7 @@ impl NativePasscodeBackend {
             last_view: None,
             last_diagnostics: None,
             phase: PinPhase::InitialSnapshot,
+            capture_step: PinCaptureStep::SessionBefore,
             supervised_visibility_fallback,
             session_bound: false,
             awaiting_first_digit: false,
@@ -142,6 +191,58 @@ impl NativePasscodeBackend {
         backend.session_bound = true;
         backend.progress_check = ProgressCheck::BeforeFirst;
         Ok(backend)
+    }
+
+    /// Consumes the backend without calling any input transport. Runs the same
+    /// preparation checks as unlock, stopping before a normal-lock reveal.
+    pub fn diagnose_preparation(self) -> PinPreparationDiagnostic {
+        self.diagnose_preparation_with(Self::snapshot)
+    }
+
+    fn diagnose_preparation_with(
+        mut self,
+        mut snapshot: impl FnMut(&mut Self) -> Result<PasscodeScreen, BackendError>,
+    ) -> PinPreparationDiagnostic {
+        let started = Instant::now();
+        let mut captures = 0;
+        let mut capture = |backend: &mut Self| {
+            captures += 1;
+            snapshot(backend)
+        };
+        let mut reveal_required = false;
+        let result = (|| {
+            capture(&mut self)?;
+            self.prepare_owned_keypad_with(Instant::now(), &mut capture, |_, _| {
+                reveal_required = true;
+                Err(BackendError::Unavailable)
+            })?;
+            // Match the core's fresh empty check without marking a PIN attempt.
+            capture(&mut self)?;
+            Ok::<(), BackendError>(())
+        })();
+        PinPreparationDiagnostic {
+            outcome: if reveal_required {
+                "reveal_required"
+            } else if result.is_ok() {
+                "empty_confirmed"
+            } else {
+                "backend_unavailable"
+            },
+            phase: self.phase,
+            capture_step: self.capture_step,
+            elapsed_ms: started.elapsed().as_millis(),
+            captures,
+            normal_locked: reveal_required
+                || self
+                    .last_view
+                    .as_ref()
+                    .is_some_and(|view| view.normal_locked),
+            empty_locked: self
+                .last_view
+                .as_ref()
+                .is_some_and(|view| view.empty_locked),
+            snapshot: self.last_diagnostics,
+        }
     }
 
     pub fn phase(&self) -> PinPhase {
@@ -478,6 +579,7 @@ impl NativePasscodeBackend {
         now: impl FnOnce() -> Instant,
     ) -> Result<PasscodeScreen, BackendError> {
         self.last_view = None;
+        self.last_diagnostics = None;
         if self.progress_check == ProgressCheck::Failed {
             return Err(BackendError::Unavailable);
         }
@@ -490,6 +592,7 @@ impl NativePasscodeBackend {
             self.progress_check = ProgressCheck::Failed;
         }
         let (screen, view) = captured?;
+        self.capture_step = PinCaptureStep::Freshness;
         if now() >= fresh_until {
             return Err(BackendError::Unavailable);
         }
@@ -517,6 +620,7 @@ impl NativePasscodeBackend {
         if comparing {
             self.progress_check = ProgressCheck::Complete;
         }
+        self.capture_step = PinCaptureStep::Complete;
         Ok(screen)
     }
 
@@ -525,6 +629,7 @@ impl NativePasscodeBackend {
         started: Instant,
     ) -> Result<(PasscodeScreen, ParsedPasscodeView), BackendError> {
         let wda = UsbWda::new(self.usb.clone());
+        self.capture_step = PinCaptureStep::SessionBefore;
         self.runtime
             .block_on(self.actions.prepare_existing(&wda))
             .map_err(|_| BackendError::Unavailable)?;
@@ -534,9 +639,12 @@ impl NativePasscodeBackend {
                 wda.request("GET", "/wda/locked", b"", Duration::from_secs(10)),
             )
         });
+        self.capture_step = PinCaptureStep::SourceRead;
         let source = response_value(source.map_err(wda_error)?)?;
+        self.capture_step = PinCaptureStep::LockRead;
         let reported_lock = response_value(reported_lock.map_err(wda_error)?)?;
         let direct = if self.progress_check == ProgressCheck::Pending {
+            self.capture_step = PinCaptureStep::DirectField;
             let session = self
                 .actions
                 .prepared_session()
@@ -550,12 +658,15 @@ impl NativePasscodeBackend {
             None
         };
         if self.session_bound {
+            self.capture_step = PinCaptureStep::SessionAfter;
             self.runtime
                 .block_on(self.actions.prepare_existing(&wda))
                 .map_err(|_| BackendError::Unavailable)?;
         }
+        self.capture_step = PinCaptureStep::ParseSource;
         let xml = source.as_str().ok_or(BackendError::Unavailable)?;
         let parsed = pin_screen::parse(xml).map_err(|_| BackendError::Unavailable)?;
+        self.capture_step = PinCaptureStep::NativeLock;
         let native = native_lock::query(&self.expected);
         self.last_diagnostics = Some(PinDiagnostics {
             snapshot_ms: started.elapsed().as_millis(),
@@ -570,6 +681,12 @@ impl NativePasscodeBackend {
             field_enabled: parsed.field_enabled,
             layout_valid: parsed.layout_valid,
             visibility_fallback: parsed.visibility_fallback,
+            native_locked: native.state == LockState::Locked,
+            wda_locked: reported_lock.as_bool() == Some(true),
+            visible_locked: parsed.visible_lock == LockState::Locked,
+            prior_unlock: native.unlocked_since_boot == Some(true),
+            alert: parsed.has_alert,
+            normal_marker: parsed.normal_lock.is_some(),
         });
         let wda_lock = match reported_lock.as_bool() {
             Some(true) => LockState::Locked,
@@ -1178,6 +1295,93 @@ mod tests {
         let (screen, _) = capture();
         let view = pin_screen::parse(r#"<AppiumAUT><XCUIElementTypeApplication bundleId="com.apple.springboard" x="0" y="0" width="400" height="800"><XCUIElementTypeOther name="proud-lock" visible="true"/></XCUIElementTypeApplication></AppiumAUT>"#).unwrap();
         (screen, view)
+    }
+
+    #[test]
+    fn preparation_diagnostic_stops_before_reveal_or_any_digit() {
+        for normal in [false, true] {
+            let backend = bound_backend().with_input_admission(|| true).unwrap();
+            let report = backend.diagnose_preparation_with(|backend| {
+                let now = Instant::now();
+                backend.snapshot_with(
+                    now,
+                    |_, _| {
+                        Ok(if normal {
+                            normal_capture()
+                        } else {
+                            keypad_capture(false)
+                        })
+                    },
+                    || now,
+                )
+            });
+            assert_eq!(
+                report.outcome,
+                if normal {
+                    "reveal_required"
+                } else {
+                    "empty_confirmed"
+                }
+            );
+            assert_eq!(report.captures, 2);
+            assert_eq!(
+                report.phase,
+                if normal {
+                    PinPhase::RevealDispatch
+                } else {
+                    PinPhase::EmptyConfirmation
+                }
+            );
+            assert_eq!(report.normal_locked, normal);
+            assert_eq!(report.empty_locked, !normal);
+            assert_eq!(report.capture_step, PinCaptureStep::Complete);
+        }
+    }
+
+    #[test]
+    fn preparation_diagnostic_retains_failure_step_and_refuses_drift() {
+        let report = bound_backend()
+            .with_input_admission(|| true)
+            .unwrap()
+            .diagnose_preparation_with(|backend| {
+                backend.capture_step = PinCaptureStep::SourceRead;
+                Err(BackendError::Unavailable)
+            });
+        assert_eq!(report.outcome, "backend_unavailable");
+        assert_eq!(report.phase, PinPhase::InitialSnapshot);
+        assert_eq!(report.capture_step, PinCaptureStep::SourceRead);
+        assert_eq!(report.captures, 1);
+        for denied in [false, true] {
+            let backend = bound_backend()
+                .with_input_admission(move || !denied)
+                .unwrap();
+            let mut captures = 0;
+            let report = backend.diagnose_preparation_with(|backend| {
+                captures += 1;
+                let now = Instant::now();
+                backend.snapshot_with(
+                    now,
+                    |_, _| {
+                        Ok(if captures == 1 {
+                            normal_capture()
+                        } else {
+                            keypad_capture(false)
+                        })
+                    },
+                    || now,
+                )
+            });
+            assert_eq!(report.outcome, "backend_unavailable");
+            assert_eq!(
+                report.phase,
+                if denied {
+                    PinPhase::OwnedAdmission
+                } else {
+                    PinPhase::NormalConfirmation
+                }
+            );
+            assert_eq!(report.captures, if denied { 1 } else { 2 });
+        }
     }
 
     #[test]

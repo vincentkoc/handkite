@@ -143,14 +143,14 @@ fn admitted_input<T>(
     read()
 }
 
-struct Completion<T> {
-    outcome: Result<T, OwnedSessionError>,
-    close: Option<SessionClose>,
-    runner_alive: bool,
-    runner_joined: bool,
+pub(super) struct Completion<T> {
+    pub(super) outcome: Result<T, OwnedSessionError>,
+    pub(super) close: Option<SessionClose>,
+    pub(super) runner_alive: bool,
+    pub(super) runner_joined: bool,
 }
 
-async fn complete<T, C, S>(
+pub(super) async fn complete<T, C, S>(
     transaction: Result<(String, T), OwnedSessionError>,
     close: impl FnOnce(String) -> C,
     stop: impl FnOnce() -> S,

@@ -5,6 +5,8 @@ use handkite_host::pin_input;
 use handkite_host::unlock_state;
 use std::path::Path;
 
+#[path = "unlock/diagnose.rs"]
+mod diagnose;
 #[path = "unlock/idle.rs"]
 mod idle;
 #[path = "unlock/owned.rs"]
@@ -19,6 +21,12 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--diagnose-preparation")
+    {
+        return diagnose::run(diagnose::config_path(&args)?);
+    }
     let (
         supervised_visibility_fallback,
         temporary_idle_settings,
