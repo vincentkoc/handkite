@@ -95,7 +95,7 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
                         &code,
                         UnlockPolicy::default(),
                     )
-                    .map_err(WorkerError::Unlock)
+                    .map_err(|error| WorkerError::TracedUnlock(error, backend.phase()))
                 })
                 .await
                 .map_err(|_| WorkerError::Join)?

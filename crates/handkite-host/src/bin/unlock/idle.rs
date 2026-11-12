@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy)]
 pub(super) enum WorkerError {
     Unlock(UnlockError),
+    TracedUnlock(UnlockError, handkite_host::pin_backend::PinPhase),
     Initialization,
     GateAccess,
     Join,
@@ -180,6 +181,9 @@ pub(super) fn diagnostic(
     if let Some(index) = index {
         line.push_str(&format!(" first_unconfirmed_index={index}"));
     }
+    if let IdleAction::Completed(Err(WorkerError::TracedUnlock(_, phase))) = outcome.action {
+        line.push_str(&format!(" phase={}", phase.as_str()));
+    }
     line
 }
 
@@ -191,7 +195,9 @@ fn action_reason(action: &IdleAction<UnlockOutcome, WorkerError>) -> (&'static s
         IdleAction::Completed(Err(WorkerError::Initialization)) => "backend_initialization",
         IdleAction::Completed(Err(WorkerError::GateAccess)) => "gate_access",
         IdleAction::Completed(Err(WorkerError::Join)) => "worker_join",
-        IdleAction::Completed(Err(WorkerError::Unlock(error))) => match error {
+        IdleAction::Completed(Err(
+            WorkerError::Unlock(error) | WorkerError::TracedUnlock(error, _),
+        )) => match error {
             UnlockError::Disabled => "disabled",
             UnlockError::DeviceMismatch => "device_mismatch",
             UnlockError::ManualRequired => "manual_required",
@@ -331,6 +337,68 @@ mod tests {
             );
             assert!(gate.inner.disabled);
             assert_eq!(gate.inner.clears, 0);
+        }
+    }
+
+    #[test]
+    fn owned_phase_diagnostics_preserve_errors_restoration_and_stop_protection() {
+        use handkite_host::pin_backend::PinPhase;
+        for phase in [
+            PinPhase::InitialSnapshot,
+            PinPhase::OwnedAdmission,
+            PinPhase::NormalConfirmation,
+            PinPhase::RevealDispatch,
+            PinPhase::RevealPostcapture,
+            PinPhase::EmptyConfirmation,
+            PinPhase::DigitInput,
+        ] {
+            for (error, action, index) in [
+                (
+                    UnlockError::Backend(BackendError::Unavailable),
+                    "backend_unavailable",
+                    "",
+                ),
+                (
+                    UnlockError::Incomplete { digit: 1 },
+                    "incomplete",
+                    " first_unconfirmed_index=1",
+                ),
+            ] {
+                for restoration in [
+                    Restoration::Verified,
+                    Restoration::Unproven(SettingsError::ReadUnproven),
+                ] {
+                    let mut gate = DeferredGate::new(Gate::default());
+                    gate.mark_uncertain().unwrap();
+                    let reason = if restoration == Restoration::Verified {
+                        action
+                    } else {
+                        "restoration_unproven"
+                    };
+                    let restore = if restoration == Restoration::Verified {
+                        "verified"
+                    } else {
+                        "unproven"
+                    };
+                    assert_eq!(
+                        finish(
+                            &mut gate,
+                            IdleSettingsOutcome {
+                                action: IdleAction::Completed(Err(WorkerError::TracedUnlock(
+                                    error, phase
+                                ))),
+                                restoration
+                            }
+                        ),
+                        Err(format!(
+                            "unlock_idle=unknown reason={reason} action={action} restoration={restore}{index} phase={}",
+                            phase.as_str()
+                        ))
+                    );
+                    assert!(gate.inner.disabled);
+                    assert_eq!(gate.inner.clears, 0);
+                }
+            }
         }
     }
 

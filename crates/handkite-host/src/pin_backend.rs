@@ -19,6 +19,32 @@ const SUPERVISED_WAKE_SETTLE: Duration = Duration::from_millis(1500);
 mod owned_input;
 use owned_input::InputRequests;
 
+/// Fixed labels contain no credential, session or screen values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PinPhase {
+    InitialSnapshot,
+    OwnedAdmission,
+    NormalConfirmation,
+    RevealDispatch,
+    RevealPostcapture,
+    EmptyConfirmation,
+    DigitInput,
+}
+
+impl PinPhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InitialSnapshot => "initial_snapshot",
+            Self::OwnedAdmission => "owned_admission",
+            Self::NormalConfirmation => "normal_confirmation",
+            Self::RevealDispatch => "reveal_dispatch",
+            Self::RevealPostcapture => "reveal_postcapture",
+            Self::EmptyConfirmation => "empty_confirmation",
+            Self::DigitInput => "digit_input",
+        }
+    }
+}
+
 struct PreparedPinView {
     view: ParsedPasscodeView,
     fresh_until: Instant,
@@ -43,6 +69,7 @@ pub struct NativePasscodeBackend {
     actions: WdaActions,
     last_view: Option<PreparedPinView>,
     last_diagnostics: Option<PinDiagnostics>,
+    phase: PinPhase,
     supervised_visibility_fallback: bool,
     session_bound: bool,
     awaiting_first_digit: bool,
@@ -88,6 +115,7 @@ impl NativePasscodeBackend {
             actions: WdaActions::default(),
             last_view: None,
             last_diagnostics: None,
+            phase: PinPhase::InitialSnapshot,
             supervised_visibility_fallback,
             session_bound: false,
             awaiting_first_digit: false,
@@ -114,6 +142,10 @@ impl NativePasscodeBackend {
         backend.session_bound = true;
         backend.progress_check = ProgressCheck::BeforeFirst;
         Ok(backend)
+    }
+
+    pub fn phase(&self) -> PinPhase {
+        self.phase
     }
 
     pub fn diagnostics(&self) -> Option<PinDiagnostics> {
@@ -218,6 +250,7 @@ impl NativePasscodeBackend {
             .and_then(|keys| keys.get(usize::from(digit)))
             .copied()
             .ok_or(BackendError::Unavailable)?;
+        self.phase = PinPhase::DigitInput;
         self.awaiting_first_digit = false;
         let result = dispatch(self, &Action::Tap { at });
         if self.progress_check == ProgressCheck::BeforeFirst {
@@ -232,6 +265,7 @@ impl NativePasscodeBackend {
         mut snapshot: impl FnMut(&mut Self) -> Result<PasscodeScreen, BackendError>,
         swipe: impl FnOnce(&mut Self, &Action) -> Result<(), BackendError>,
     ) -> Result<(), BackendError> {
+        self.phase = PinPhase::OwnedAdmission;
         if !self.session_bound
             || !self.supervised_visibility_fallback
             || self.input_admission.is_none()
@@ -247,6 +281,7 @@ impl NativePasscodeBackend {
         }
         if prepared.empty_locked {
             self.awaiting_first_digit = true;
+            self.phase = PinPhase::EmptyConfirmation;
             return Ok(());
         }
         if !prepared.normal_locked {
@@ -254,6 +289,7 @@ impl NativePasscodeBackend {
         }
         let first = prepared.view.normal_lock.ok_or(BackendError::Unavailable)?;
         let first_at = prepared.captured_at;
+        self.phase = PinPhase::NormalConfirmation;
         snapshot(self)?;
         let confirmed = self.last_view.as_ref().ok_or(BackendError::Unavailable)?;
         if !confirmed.normal_locked
@@ -265,8 +301,10 @@ impl NativePasscodeBackend {
         }
         // Consume this preparation even if the write acknowledgement is lost.
         self.reveal_attempted = true;
+        self.phase = PinPhase::RevealDispatch;
         let result = (|| {
             swipe(self, &keypad_swipe(first.size)?)?;
+            self.phase = PinPhase::RevealPostcapture;
             self.awaiting_first_digit = true;
             snapshot(self)?;
             if !self
@@ -276,6 +314,7 @@ impl NativePasscodeBackend {
             {
                 return Err(BackendError::Unavailable);
             }
+            self.phase = PinPhase::EmptyConfirmation;
             Ok(())
         })();
         if result.is_err() {
@@ -1186,6 +1225,14 @@ mod tests {
                     start,
                     |backend| {
                         captures += 1;
+                        assert_eq!(
+                            backend.phase(),
+                            if captures == 1 {
+                                PinPhase::NormalConfirmation
+                            } else {
+                                PinPhase::RevealPostcapture
+                            }
+                        );
                         let at = start + Duration::from_millis(captures);
                         backend.snapshot_with(
                             at,
@@ -1201,6 +1248,7 @@ mod tests {
                     },
                     |backend, action| {
                         writes += 1;
+                        assert_eq!(backend.phase(), PinPhase::RevealDispatch);
                         let Action::Swipe {
                             from,
                             to,
@@ -1229,6 +1277,7 @@ mod tests {
                 Ok(())
             );
             assert_eq!((captures, writes), (2, 1));
+            assert_eq!(backend.phase(), PinPhase::EmptyConfirmation);
             assert!(backend.awaiting_first_digit);
             assert!(backend.last_view.as_ref().unwrap().empty_locked);
             assert!(
@@ -1348,6 +1397,14 @@ mod tests {
                     .is_err()
             );
             assert_eq!(writes, 1);
+            assert_eq!(
+                backend.phase(),
+                if case == 0 {
+                    PinPhase::RevealDispatch
+                } else {
+                    PinPhase::RevealPostcapture
+                }
+            );
             assert_eq!(backend.progress_check, ProgressCheck::Failed);
             assert!(backend.last_view.is_none());
             assert!(
