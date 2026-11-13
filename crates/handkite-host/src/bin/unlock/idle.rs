@@ -21,7 +21,7 @@ pub(super) enum WorkerError {
         UnlockError,
         handkite_host::pin_backend::PinPhase,
         handkite_host::pin_backend::PinCaptureStep,
-        Option<handkite_host::pin_backend::PinCaptureTimings>,
+        Option<[TimeBucket; 7]>,
     ),
     Initialization,
     GateAccess,
@@ -192,16 +192,19 @@ pub(super) fn diagnostic(
     {
         line.push_str(&format!(" phase={} step={}", phase.as_str(), step.as_str()));
         if let Some(timings) = timings {
-            for (name, elapsed) in [
-                ("session_before_time", timings.session_before_ms),
-                ("source_time", timings.source_ms),
-                ("lock_time", timings.lock_ms),
-                ("direct_field_time", timings.direct_field_ms),
-                ("session_after_time", timings.session_after_ms),
-                ("parse_time", timings.parse_ms),
-                ("native_time", timings.native_ms),
-            ] {
-                line.push_str(&format!(" {name}={}", timing_bucket(elapsed)));
+            for (name, bucket) in [
+                "session_before_time",
+                "source_time",
+                "lock_time",
+                "direct_field_time",
+                "session_after_time",
+                "parse_time",
+                "native_time",
+            ]
+            .into_iter()
+            .zip(timings)
+            {
+                line.push_str(&format!(" {name}={}", bucket.as_str()));
             }
         }
     }
@@ -219,17 +222,61 @@ pub(super) fn diagnostic(
     line
 }
 
-fn timing_bucket(elapsed_ms: u128) -> &'static str {
+#[derive(Clone, Copy)]
+pub(super) enum TimeBucket {
+    Under1ms,
+    Under10ms,
+    Under100ms,
+    Under1s,
+    Under5s,
+    Under10s,
+    Under30s,
+    Under120s,
+    Over120s,
+}
+
+impl TimeBucket {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Under1ms => "lt_1ms",
+            Self::Under10ms => "lt_10ms",
+            Self::Under100ms => "lt_100ms",
+            Self::Under1s => "lt_1s",
+            Self::Under5s => "lt_5s",
+            Self::Under10s => "lt_10s",
+            Self::Under30s => "lt_30s",
+            Self::Under120s => "lt_120s",
+            Self::Over120s => "ge_120s",
+        }
+    }
+}
+
+pub(super) fn capture_timing_buckets(
+    t: handkite_host::pin_backend::PinCaptureTimings,
+) -> [TimeBucket; 7] {
+    [
+        t.session_before_ms,
+        t.source_ms,
+        t.lock_ms,
+        t.direct_field_ms,
+        t.session_after_ms,
+        t.parse_ms,
+        t.native_ms,
+    ]
+    .map(timing_bucket)
+}
+
+fn timing_bucket(elapsed_ms: u128) -> TimeBucket {
     match elapsed_ms {
-        0 => "lt_1ms",
-        1..=9 => "lt_10ms",
-        10..=99 => "lt_100ms",
-        100..=999 => "lt_1s",
-        1_000..=4_999 => "lt_5s",
-        5_000..=9_999 => "lt_10s",
-        10_000..=29_999 => "lt_30s",
-        30_000..=119_999 => "lt_120s",
-        _ => "ge_120s",
+        0 => TimeBucket::Under1ms,
+        1..=9 => TimeBucket::Under10ms,
+        10..=99 => TimeBucket::Under100ms,
+        100..=999 => TimeBucket::Under1s,
+        1_000..=4_999 => TimeBucket::Under5s,
+        5_000..=9_999 => TimeBucket::Under10s,
+        10_000..=29_999 => TimeBucket::Under30s,
+        30_000..=119_999 => TimeBucket::Under120s,
+        _ => TimeBucket::Over120s,
     }
 }
 
@@ -409,18 +456,18 @@ mod tests {
             (120000, "ge_120s"),
             (u128::MAX, "ge_120s"),
         ] {
-            assert_eq!(timing_bucket(elapsed), label);
+            assert_eq!(timing_bucket(elapsed).as_str(), label);
         }
         let outcome = IdleSettingsOutcome {
             action: IdleAction::Completed(Err(WorkerError::TracedUnlock(
                 UnlockError::Backend(BackendError::Unavailable),
                 PinPhase::DigitInput,
                 PinCaptureStep::Freshness,
-                Some(PinCaptureTimings {
+                Some(capture_timing_buckets(PinCaptureTimings {
                     source_ms: 5010,
                     native_ms: 7999,
                     ..Default::default()
-                }),
+                })),
             ))),
             restoration: Restoration::Verified,
         };

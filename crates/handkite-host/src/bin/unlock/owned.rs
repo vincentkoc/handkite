@@ -103,7 +103,7 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
                             error,
                             backend.phase(),
                             backend.capture_step(),
-                            Some(backend.capture_timings()),
+                            Some(idle::capture_timing_buckets(backend.capture_timings())),
                         )
                     })
                 })
