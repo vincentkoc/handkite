@@ -87,6 +87,14 @@ for the next action. LaunchApp rechecks native lock before the write and keeps
 the original observation, lease, and capture deadlines. Tap, swipe, text, and
 lock retain the ordinary lock gate.
 
+Readiness monitors must distinguish this Home state from an unavailable
+controller. A matching, ready service may be observed while its public lock
+state is `Uncertain`; that alone does not authorize input. For an unlocked
+SpringBoard Home screen, use the existing guarded `LaunchApp` path and verify
+the resulting app observation. Do not stop an otherwise healthy service just
+because its first status reports `Uncertain`, or reinterpret that value as
+`Unlocked`.
+
 The separate `wda_runner::OwnedWdaRunner` library can start one exact installed
 `.xctrunner` bundle through pinned `idevice` 0.1.68 at Git revision
 `89702099f4d7552f704f93b4526756abda319ceb`. It requires a callback from
