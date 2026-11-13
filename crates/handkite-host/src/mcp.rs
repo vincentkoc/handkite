@@ -1,7 +1,7 @@
 use crate::wire::Reply;
+use handkite_core::protocol::DeviceKey;
 #[cfg(test)]
 use handkite_core::protocol::{Action, Revision};
-use handkite_core::protocol::{DeviceKey, ImageFormat};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
@@ -168,7 +168,13 @@ where
                 let Ok((revision, action)) = interaction::parse(tool, params.arguments) else {
                     return Some(error(id, -32602, "invalid action arguments"));
                 };
-                session.act(device, revision, action, exchange)
+                session.act(
+                    device,
+                    revision,
+                    action,
+                    Tool::Observe.allowed(capabilities),
+                    exchange,
+                )
             } else {
                 if !params
                     .arguments
@@ -254,17 +260,7 @@ where
     if tool == Tool::Status {
         return response::text_result(metadata);
     }
-    let tree = observation.accessibility_tree;
-    let image = observation.screenshot_base64;
-    let mime = match observation.screenshot_format {
-        ImageFormat::Png => "image/png",
-        ImageFormat::Jpeg => "image/jpeg",
-    };
-    let text = json!({"metadata": metadata, "accessibility_tree": tree}).to_string();
-    json!({"content": [
-        {"type": "text", "text": text},
-        {"type": "image", "data": image, "mimeType": mime}
-    ]})
+    json!({"content": response::observation_content(observation)})
 }
 
 fn tool_error(message: &str) -> Value {

@@ -1,4 +1,4 @@
-use super::response::{exchange_reply, metadata, text_result};
+use super::response::{exchange_reply, metadata, observation_content, text_result};
 use super::tool_error;
 use crate::wire::Reply;
 use handkite_core::controller::LeaseId;
@@ -86,6 +86,7 @@ impl Session {
         device: &DeviceKey,
         revision: Revision,
         action: Action,
+        include_observation: bool,
         exchange: &mut F,
     ) -> Value
     where
@@ -122,6 +123,12 @@ impl Session {
                     "after": after.as_ref().map(metadata)}));
                 if effect == ObservedEffect::Unconfirmed || receipt.accepted != Some(true) {
                     result["isError"] = json!(true);
+                }
+                if include_observation && let Some(observation) = after {
+                    result["content"]
+                        .as_array_mut()
+                        .expect("text result has a content array")
+                        .extend(observation_content(observation));
                 }
                 result
             }

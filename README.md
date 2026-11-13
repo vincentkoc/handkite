@@ -304,7 +304,7 @@ policy separately before any enrollment.
 
 Acquire control explicitly before an action. The process holds the controller's random lease token internally for a fixed two-minute TTL; neither the token nor an owner override is exposed through MCP. Acquire never renews an existing lease. A competing session receives `Busy`. Release is explicit, with best-effort release again on EOF or input/output failure. A killed process relies on expiry. If the acquire response is lost, that process refuses further acquisition: close it and wait two minutes before starting a new session.
 
-Home and Clock return delivery receipt, observed effect, and optional post-action metadata. They do not return screenshots or accessibility content. A lost acknowledgment, unexpected reply, post-input identity mismatch, or oversized response reports unknown delivery with `receipt.accepted: null` and `effect: "unconfirmed"`. No action is automatically replayed. A stale revision requires a fresh authorized observation; an expired lease requires another explicit acquisition.
+Actions return a delivery receipt, observed effect, and optional post-action metadata. When the host grants observation capability, the same response also includes the already captured post-action screenshot and accessibility tree. This adds no device request. Navigation-only clients receive metadata alone. A lost acknowledgment, unexpected reply, post-input identity mismatch, or oversized response reports unknown delivery with `receipt.accepted: null` and `effect: "unconfirmed"`. No action is automatically replayed. A stale revision requires a fresh authorized observation; an expired lease requires another explicit acquisition.
 
 The MCP result sets `isError: true` when the effect is `unconfirmed` or
 `receipt.accepted` is not `true`, preserving the receipt, effect, and available
@@ -314,8 +314,9 @@ happened; inspect a fresh authorized observation before another action. An
 accepted action with a changed view omits `isError`.
 
 An explicit accepted receipt with `effect: "unconfirmed"` legitimately carries
-`isError: true`. Preserve both fields and take one fresh read-only observation
-to check the expected UI result. Record that semantic confirmation separately
+`isError: true`. Preserve both fields and inspect the returned screen, or take
+one fresh read-only observation if none was returned, to check the expected UI
+result. Record that semantic confirmation separately
 from the original effect. A proved postcondition can admit the next different
 planned action; it never authorizes replaying the accepted input. Malformed
 replies and false or unknown acceptance stop the sequence.
@@ -327,9 +328,9 @@ The owned local MCP path has passed real-device Clock launch and Home return, as
 An authorized client with both capabilities follows this sequence after MCP initialization:
 
 1. Call `handkite_acquire_control` with `{}`.
-2. Call `handkite_status` with `{}` and read its `revision`.
+2. Call `handkite_observe` with `{}` and inspect its screen and `revision`.
 3. Call `handkite_launch_clock` with only `expected_revision` set to that integer.
-4. Inspect the receipt and effect. Obtain a fresh status before calling `handkite_home` with its new revision.
+4. Inspect the receipt, effect and returned screen. Use its `after.revision` for the next action. Observe again if no post-action screen was returned or the view has since changed.
 5. Call `handkite_release_control` with `{}` when finished.
 
 Use `handkite_observe` only when the agent needs private screen content. A navigation-only client needs a current revision supplied through a separately authorized observation path. A stale or missing revision cannot authorize input; do not guess revisions. After unknown delivery, inspect a fresh observation before deciding on a new action; repeating the earlier request is not recovery proof. The bridge never switches to another device or fallback route.

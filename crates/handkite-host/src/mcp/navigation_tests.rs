@@ -2,7 +2,7 @@ use super::*;
 use crate::{local_client, local_socket};
 use handkite_core::controller::{AdapterError, Controller, DeviceAdapter, RawObservation};
 use handkite_core::protocol::{
-    DeviceBinding, DeviceState, HardwareId, LockState, ObservationWindow, ScreenImage,
+    DeviceBinding, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, ScreenImage,
     TransportReceipt,
 };
 use std::io::Cursor;
@@ -464,7 +464,7 @@ fn duplicate_fields_are_rejected_before_socket_dispatch() {
 }
 
 #[test]
-fn socket_transcript_navigates_and_never_discloses_control_or_screen_content() {
+fn socket_transcript_returns_post_action_screen_without_another_observation() {
     let mut fixture = SocketFixture::new();
     let input = frames(&[
         call("handkite_status", json!({})),
@@ -492,6 +492,15 @@ fn socket_transcript_navigates_and_never_discloses_control_or_screen_content() {
         payload(&replies[3])["after"]["state"]["foreground_app"],
         "com.apple.springboard"
     );
+    for reply in &replies[2..4] {
+        let content = reply["result"]["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
+        let screen: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(screen["metadata"], payload(reply)["after"]);
+        assert_eq!(screen["accessibility_tree"], "<private-screen/>");
+        assert_eq!(content[2]["type"], "image");
+        assert_eq!(content[2]["data"], "cHJpdmF0ZS1zY3JlZW4=");
+    }
     assert_eq!(
         fixture.state.lock().unwrap().actions,
         ["launch_app", "home"]
@@ -513,13 +522,12 @@ fn socket_transcript_navigates_and_never_discloses_control_or_screen_content() {
         assert!(request["request"]["expected_revision"].is_u64());
     }
     let output = String::from_utf8(output).unwrap();
-    for secret in fixture.tokens.iter().map(String::as_str).chain([
-        "handkite-mcp",
-        "<private-screen/>",
-        "cHJpdmF0ZS1zY3JlZW4=",
-        "screenshot",
-        "accessibility_tree",
-    ]) {
+    for secret in fixture
+        .tokens
+        .iter()
+        .map(String::as_str)
+        .chain(["handkite-mcp"])
+    {
         assert!(!output.contains(secret));
     }
 }
@@ -617,7 +625,7 @@ fn view_change_diagnostics_are_typed_and_do_not_forward_private_fields() {
             .unwrap())
         });
         let mut calls = 0;
-        let result = session.act(&device(), Revision(1), Action::Home, &mut |_| {
+        let result = session.act(&device(), Revision(1), Action::Home, true, &mut |_| {
             calls += 1;
             Ok(serde_json::to_vec(&json!({"type":"view_changed","changed":changed})).unwrap())
         });
@@ -680,58 +688,92 @@ fn expired_lease_requires_a_new_explicit_acquisition() {
 
 #[test]
 fn valid_action_outcomes_preserve_evidence_and_flag_failures_without_replay() {
-    for (accepted, effect, is_error) in [
-        (json!(true), "changed", false),
-        (json!(false), "changed", true),
-        (Value::Null, "changed", true),
-        (json!(true), "unconfirmed", true),
-        (json!(false), "unconfirmed", true),
-        (Value::Null, "unconfirmed", true),
+    for (capabilities, format, mime) in [
+        (Capabilities::Navigation, "png", None),
+        (Capabilities::Navigation, "jpeg", None),
+        (
+            Capabilities::ObservationAndNavigation,
+            "png",
+            Some("image/png"),
+        ),
+        (
+            Capabilities::ObservationAndNavigation,
+            "jpeg",
+            Some("image/jpeg"),
+        ),
+        (
+            Capabilities::ObservationNavigationInteraction,
+            "png",
+            Some("image/png"),
+        ),
     ] {
-        let mut session = Session::default();
-        session.acquire(&mut |_| {
-            Ok(serde_json::to_vec(&json!({
-                "type": "acquired", "lease": "0123456789abcdef0123456789abcdef"
-            }))
-            .unwrap())
-        });
-        let receipt = json!({"accepted": accepted, "action_kind": "home"});
-        let after_metadata = json!({
-            "device": "fixture-phone", "revision": 3,
-            "window": {"started_unix_ms": 10, "finished_unix_ms": 20},
-            "state": {"lock": "unlocked", "wda_ready": true,
-                "foreground_app": "com.apple.springboard"}
-        });
-        let mut after = after_metadata.clone();
-        after["accessibility_tree"] = json!("<private-screen/>");
-        after["screenshot_format"] = json!("png");
-        after["screenshot_base64"] = json!("cHJpdmF0ZS1zY3JlZW4=");
-        let mut requests = Vec::new();
-        let reply = process(
-            &call("handkite_home", json!({"expected_revision": 1})),
-            &device(),
-            Capabilities::Navigation,
-            &mut session,
-            &mut |bytes| {
-                requests.push(serde_json::from_slice::<Value>(bytes).unwrap());
+        for (accepted, effect, is_error) in [
+            (json!(true), "changed", false),
+            (json!(false), "changed", true),
+            (Value::Null, "changed", true),
+            (json!(true), "unconfirmed", true),
+            (json!(false), "unconfirmed", true),
+            (Value::Null, "unconfirmed", true),
+        ] {
+            let mut session = Session::default();
+            session.acquire(&mut |_| {
                 Ok(serde_json::to_vec(&json!({
-                    "type": "acted", "receipt": receipt, "effect": effect,
-                    "after": after, "native_lock": null
+                    "type": "acquired", "lease": "0123456789abcdef0123456789abcdef"
                 }))
                 .unwrap())
-            },
-        )
-        .unwrap();
-        assert_eq!(
-            reply["result"].get("isError"),
-            is_error.then_some(&json!(true))
-        );
-        assert_eq!(
-            payload(&reply),
-            json!({"receipt": receipt, "effect": effect, "after": after_metadata})
-        );
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["method"], "act");
+            });
+            let receipt = json!({"accepted": accepted, "action_kind": "home"});
+            let after_metadata = json!({
+                "device": "fixture-phone", "revision": 3,
+                "window": {"started_unix_ms": 10, "finished_unix_ms": 20},
+                "state": {"lock": "unlocked", "wda_ready": true,
+                    "foreground_app": "com.apple.springboard"}
+            });
+            let mut after = after_metadata.clone();
+            after["accessibility_tree"] = json!("<private-screen/>");
+            after["screenshot_format"] = json!(format);
+            after["screenshot_base64"] = json!("cHJpdmF0ZS1zY3JlZW4=");
+            let mut requests = Vec::new();
+            let reply = process(
+                &call("handkite_home", json!({"expected_revision": 1})),
+                &device(),
+                capabilities,
+                &mut session,
+                &mut |bytes| {
+                    requests.push(serde_json::from_slice::<Value>(bytes).unwrap());
+                    Ok(serde_json::to_vec(&json!({
+                        "type": "acted", "receipt": receipt, "effect": effect,
+                        "after": after, "native_lock": null
+                    }))
+                    .unwrap())
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                reply["result"].get("isError"),
+                is_error.then_some(&json!(true))
+            );
+            assert_eq!(
+                payload(&reply),
+                json!({"receipt": receipt, "effect": effect, "after": after_metadata})
+            );
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0]["method"], "act");
+            let content = reply["result"]["content"].as_array().unwrap();
+            if let Some(mime) = mime {
+                assert_eq!(content.len(), 3);
+                let screen: Value =
+                    serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+                assert_eq!(screen["metadata"], after_metadata);
+                assert_eq!(screen["accessibility_tree"], "<private-screen/>");
+                assert_eq!(content[2]["mimeType"], mime);
+                assert_eq!(content[2]["data"], "cHJpdmF0ZS1zY3JlZW4=");
+            } else {
+                assert_eq!(content.len(), 1);
+                assert!(!reply.to_string().contains("private-screen"));
+                assert!(!reply.to_string().contains("cHJpdmF0ZS1zY3JlZW4="));
+            }
+        }
     }
 }
 
@@ -770,6 +812,10 @@ fn accepted_unchanged_view_and_failed_capture_are_errors_over_socket() {
             assert!(result["after"].get("screenshot_base64").is_none());
             assert!(result["after"].get("accessibility_tree").is_none());
         }
+        assert_eq!(
+            reply["result"]["content"].as_array().unwrap().len(),
+            if fail_capture { 1 } else { 3 }
+        );
         assert_eq!(fixture.state.lock().unwrap().actions, ["home"]);
         assert_eq!(
             fixture
@@ -941,7 +987,7 @@ fn unexpected_service_replies_cannot_disclose_tokens() {
     let mut exchange = |_: &[u8]| Ok(serde_json::to_vec(&replies.next().unwrap()).unwrap());
     let mut outputs = vec![session.acquire(&mut exchange)];
     for _ in 0..3 {
-        outputs.push(session.act(&device(), Revision(1), Action::Home, &mut exchange));
+        outputs.push(session.act(&device(), Revision(1), Action::Home, true, &mut exchange));
     }
     outputs.push(session.release(&mut exchange));
     assert!(outputs[1..4].iter().all(|reply| reply["isError"] == true));

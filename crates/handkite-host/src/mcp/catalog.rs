@@ -89,27 +89,27 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         ),
         (
             "handkite_home",
-            "Press Home once using an expected observation revision. Returns delivery and observed effect separately, without screen content.",
+            "Press Home once using an expected observation revision. Returns delivery, observed effect, and the captured screen when observation is authorized.",
         ),
         (
             "handkite_launch_clock",
-            "Launch the fixed Clock app once using an expected observation revision. Returns delivery and observed effect separately, without screen content.",
+            "Launch the fixed Clock app once using an expected observation revision. Returns delivery, observed effect, and the captured screen when observation is authorized.",
         ),
         (
             "handkite_tap",
-            "Tap one screen point using an expected observation revision.",
+            "Tap one screen point using an expected observation revision and return the captured screen.",
         ),
         (
             "handkite_swipe",
-            "Swipe once between two screen points using an expected observation revision.",
+            "Swipe once between two screen points using an expected observation revision and return the captured screen.",
         ),
         (
             "handkite_text",
-            "Type text once using an expected observation revision. Control characters are rejected.",
+            "Type text once using an expected observation revision and return the captured screen. Control characters are rejected.",
         ),
         (
             "handkite_launch_app",
-            "Launch one app by bundle identifier using an expected observation revision.",
+            "Launch one app by bundle identifier using an expected observation revision and return the captured screen.",
         ),
     ];
     let tools: Vec<_> = definitions
