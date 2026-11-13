@@ -368,7 +368,7 @@ class BrokerTests(unittest.TestCase):
                 dispatch.assert_not_called()
 
     def test_native_cleanup_refuses_each_unproven_boundary(self):
-        for case in ("job", "lock", "endpoint", "timeout", "controller", "custody"):
+        for case in ("job", "lock", "endpoint", "timeout", "late_refusal", "controller", "custody"):
             with self.subTest(case=case):
                 f = self.fixture()
                 p, stops = f.open()
@@ -389,10 +389,11 @@ class BrokerTests(unittest.TestCase):
                     native.endpoint.return_value = 5 if case == "endpoint" else 0
                 elif case == "controller":
                     native.controllers.side_effect = files.Refused("controller_present")
-                else:
+                elif case == "custody":
                     p.recheck = unittest.mock.Mock(side_effect=files.Refused("custody_changed"))
                 try:
-                    with patch.object(broker.time, "monotonic", side_effect=[0, 181]):
+                    with patch.object(broker.time, "monotonic", return_value=0,
+                            side_effect=[0, 0, 181] if case in ("timeout", "late_refusal") else None):
                         with self.assertRaises((files.Refused, BlockingIOError)):
                             native.cleanup()
                 finally:
@@ -400,7 +401,7 @@ class BrokerTests(unittest.TestCase):
                         os.close(lock_fd)
                 if case in ("job", "lock"):
                     native.endpoint.assert_not_called()
-                if case in ("endpoint", "timeout"):
+                if case in ("endpoint", "timeout", "late_refusal"):
                     native.controllers.assert_not_called()
 
     def test_native_cleanup_success_retains_exact_order_and_waits_for_refusal(self):
@@ -412,7 +413,7 @@ class BrokerTests(unittest.TestCase):
         native.jobs = lambda: events.append("jobs")
         native.controllers = lambda: events.append("controllers")
         results = iter((0, 3))
-        native.endpoint = lambda: (events.append("endpoint"), next(results))[1]
+        native.endpoint = lambda deadline: (events.append("endpoint"), next(results))[1]
         p.recheck = lambda: events.append("custody")
         @contextmanager
         def lock(held):
@@ -633,6 +634,75 @@ class BrokerTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_endpoint_fragmentation_uses_one_deadline_per_query(self):
+        native = broker.Native.__new__(broker.Native)
+        native.p = SimpleNamespace(config={"usb_id": "fixture-device"})
+        replies = [{"DeviceList": [{"DeviceID": 1, "Properties": {
+            "SerialNumber": "fixture-device", "ConnectionType": "USB"}}]},
+            {"MessageType": "Result", "Number": 3}]
+        for step, completes in ((0.01, True), (1, False)):
+            clock, channels = [0], []
+            for reply in replies:
+                payload = broker.plistlib.dumps(reply)
+                wire = bytearray(broker.struct.pack("<IIII", len(payload)+16, 1, 8, 1) + payload)
+                channel = unittest.mock.MagicMock()
+                channel.__enter__.return_value = channel
+                def receive(count, wire=wire):
+                    clock[0] += step
+                    count = min(count, 8, len(wire))
+                    result = bytes(wire[:count])
+                    del wire[:count]
+                    return result
+                channel.recv.side_effect = receive
+                channels.append(channel)
+            with patch.object(broker.socket, "socket", side_effect=channels), \
+                 patch.object(broker.time, "monotonic", side_effect=lambda: clock[0]):
+                if completes:
+                    self.assertEqual(native.endpoint(), 3)
+                else:
+                    with self.assertRaisesRegex(files.Refused, "endpoint_timeout"):
+                        native.endpoint()
+                    channels[1].connect.assert_not_called()
+            timeouts = [call.args[0] for call in channels[0].settimeout.call_args_list]
+            self.assertTrue(all(0 < timeout <= 5 for timeout in timeouts))
+            self.assertLess(timeouts[-1], timeouts[0])
+
+    def test_slow_lease_reply_expires_before_any_lock_action(self):
+        native = broker.Native.__new__(broker.Native)
+        native.p = SimpleNamespace(path=lambda role: "/fixture/" + role,
+            root="/fixture", recheck=lambda: None,
+            files={"daemon": SimpleNamespace(check=lambda: None)})
+        native.env = {}
+        child = unittest.mock.Mock()
+        child.data, child.fault = {"stderr": b"handkited ready\n"}, False
+        child.process.pid, child.process.poll.return_value = 123, None
+        child.wait.return_value = (0, b"", b"handkited ready\n", False)
+        clock, wire = [0], bytearray(encoded({"type": "acquired", "lease": "a"*32}))
+        channel = unittest.mock.MagicMock()
+        channel.__enter__.return_value = channel
+        def receive(count):
+            clock[0] += 2
+            result = bytes(wire[:1])
+            del wire[:1]
+            return result
+        channel.recv.side_effect = receive
+        meta = SimpleNamespace(st_mode=stat.S_IFSOCK | 0o600,
+            st_uid=os.geteuid(), st_nlink=1)
+        with patch.object(broker, "Child", return_value=child), \
+             patch.object(broker.os, "lstat", return_value=meta), \
+             patch.object(broker, "fp", return_value=()), \
+             patch.object(broker.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=b"123\n")), \
+             patch.object(broker.socket, "socket", return_value=channel) as sockets, \
+             patch.object(broker.time, "monotonic", side_effect=lambda: clock[0]):
+            with self.assertRaises(files.Refused):
+                native.lock()
+        self.assertEqual(sockets.call_count, 1)
+        self.assertEqual(channel.sendall.call_count, 1)
+        self.assertEqual(json.loads(channel.sendall.call_args.args[0])["method"], "acquire")
+        self.assertEqual(clock[0], 60)
+        child.process.send_signal.assert_called_once_with(broker.signal.SIGTERM)
+        child.process.kill.assert_not_called()
+
     def test_native_jobs_requires_both_fixed_account_domains_absent(self):
         native = broker.Native.__new__(broker.Native)
         native.env = {"PATH": "/usr/bin:/bin"}

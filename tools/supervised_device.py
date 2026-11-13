@@ -30,6 +30,12 @@ ROLES = {"config": 0o600, "binding": 0o600, "receipt": 0o600,
          "runtime_lock": 0o600}
 
 
+def socket_budget(channel, deadline, category):
+    remaining = deadline - time.monotonic()
+    require(remaining > 0, category)
+    channel.settimeout(remaining)
+
+
 class Profile:
     def __init__(self, fd, expected, mode, home):
         self.fd, self.home, self.mode, self.files = os.dup(fd), home, mode, {}
@@ -252,24 +258,31 @@ class Native:
         require(code == 0 and not err and not fault and match is not None, "native_unproven")
         return match[1].decode(), match[2] == b"Some(true)"
 
-    def endpoint(self):
+    def endpoint(self, deadline=None):
         def query(message):
+            expires = time.monotonic() + 5
+            if deadline is not None:
+                expires = min(expires, deadline)
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                channel.settimeout(5)
+                socket_budget(channel, expires, "endpoint_timeout")
                 channel.connect("/var/run/usbmuxd")
                 body = plistlib.dumps(dict(ClientVersionString="Handkite supervision",
                     ProgName="handkite", kLibUSBMuxVersion=3, **message))
+                socket_budget(channel, expires, "endpoint_timeout")
                 channel.sendall(struct.pack("<IIII", len(body)+16, 1, 8, 1) + body)
                 def receive(count):
                     data = bytearray()
                     while len(data) < count:
+                        socket_budget(channel, expires, "endpoint_timeout")
                         part = channel.recv(count-len(data))
                         require(bool(part), "mux_eof")
                         data.extend(part)
                     return data
                 length, version, kind, tag = struct.unpack("<IIII", receive(16))
                 require(16 <= length <= 1048576 and (version, kind, tag) == (1, 8, 1), "mux_frame")
-                return plistlib.loads(receive(length-16))
+                reply = plistlib.loads(receive(length-16))
+                require(time.monotonic() < expires, "endpoint_timeout")
+                return reply
         devices = query({"MessageType": "ListDevices"}).get("DeviceList", [])
         matches = [entry for entry in devices if entry.get("Properties", {}).get("SerialNumber") ==
                    self.p.config["usb_id"] and entry.get("Properties", {}).get("ConnectionType") == "USB"]
@@ -286,12 +299,13 @@ class Native:
             pass
         deadline = time.monotonic() + 180
         while True:
-            result = self.endpoint()
+            require(time.monotonic() < deadline, "cleanup_timeout")
+            result = self.endpoint(deadline)
+            require(time.monotonic() < deadline, "cleanup_timeout")
             require(result in (0, 3), "endpoint_unproven")
             if result == 3:
                 break
-            require(time.monotonic() < deadline, "cleanup_timeout")
-            time.sleep(0.25)
+            time.sleep(min(0.25, max(0, deadline-time.monotonic())))
         self.controllers()
         self.p.recheck()
 
@@ -327,14 +341,16 @@ class Native:
             require(owners.returncode == 0 and owners.stdout.split() ==
                     [str(child.process.pid).encode()], "socket_owner")
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
-                require(time.monotonic() < deadline, "action_deadline")
-                channel.settimeout(min(60, deadline-time.monotonic()))
+                expires = min(deadline, time.monotonic() + 60)
+                socket_budget(channel, expires, "action_deadline")
                 channel.connect(path)
                 require(fp(os.lstat(path)) == fp(before), "socket_changed")
+                socket_budget(channel, expires, "action_deadline")
                 channel.sendall(json.dumps(value, separators=(",", ":")).encode() + b"\n")
                 channel.shutdown(socket.SHUT_WR)
                 data = bytearray()
                 while not data.endswith(b"\n"):
+                    socket_budget(channel, expires, "action_deadline")
                     part = channel.recv(65536)
                     require(bool(part) and len(data)+len(part) <= 16*1024*1024, "rpc_frame")
                     data.extend(part)
@@ -342,6 +358,7 @@ class Native:
                 require(not child.fault, "daemon_fault")
                 reply = exact_json(data)
                 require(type(reply) is dict, "rpc_object")
+                require(time.monotonic() < expires, "action_deadline")
                 return reply
         try:
             while b"handkited ready\n" not in child.data["stderr"]:
