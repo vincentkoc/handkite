@@ -972,9 +972,11 @@ fn response_value(
     if response.status != 200 {
         return Err(BackendError::Unavailable);
     }
-    let json: serde_json::Value =
+    let mut json: serde_json::Value =
         serde_json::from_slice(&response.body).map_err(|_| BackendError::Unavailable)?;
-    json.get("value").cloned().ok_or(BackendError::Unavailable)
+    json.get_mut("value")
+        .map(serde_json::Value::take)
+        .ok_or(BackendError::Unavailable)
 }
 
 fn keypad_swipe(size: (f64, f64)) -> Result<Action, BackendError> {

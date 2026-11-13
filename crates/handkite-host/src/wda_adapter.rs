@@ -221,11 +221,10 @@ impl WdaAdapter {
         if !screenshot.starts_with(b"\x89PNG\r\n\x1a\n") {
             return Err(AdapterError);
         }
-        let tree = source
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or(AdapterError)?
-            .to_owned();
+        let tree = match source {
+            serde_json::Value::String(tree) if !tree.is_empty() => tree,
+            _ => return Err(AdapterError),
+        };
         let app = app["bundleId"]
             .as_str()
             .filter(|value| !value.is_empty())
@@ -446,9 +445,11 @@ fn response_value(response: HttpResponse) -> Result<serde_json::Value, AdapterEr
     if response.status != 200 {
         return Err(AdapterError);
     }
-    let json: serde_json::Value =
+    let mut json: serde_json::Value =
         serde_json::from_slice(&response.body).map_err(|_| AdapterError)?;
-    json.get("value").cloned().ok_or(AdapterError)
+    json.get_mut("value")
+        .map(serde_json::Value::take)
+        .ok_or(AdapterError)
 }
 
 fn unix_ms() -> Result<u64, AdapterError> {
@@ -561,6 +562,35 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn response_values_preserve_null_and_reject_missing_or_failed_envelopes() {
+        for value in [
+            serde_json::Value::Null,
+            serde_json::json!({"nested": [1, 2]}),
+            serde_json::json!("screen"),
+        ] {
+            let body = serde_json::to_vec(&serde_json::json!({"value": value})).unwrap();
+            assert_eq!(
+                response_value(HttpResponse { status: 200, body }).unwrap(),
+                value
+            );
+        }
+        for (status, body) in [
+            (200, b"{}".as_slice()),
+            (200, b"null"),
+            (200, b"invalid"),
+            (500, b"{\"value\":null}"),
+        ] {
+            assert!(
+                response_value(HttpResponse {
+                    status,
+                    body: body.to_vec()
+                })
+                .is_err()
+            );
+        }
+    }
 
     #[test]
     fn borrowed_adapter_has_no_runner_liveness() {
