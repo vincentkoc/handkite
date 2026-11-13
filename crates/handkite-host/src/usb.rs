@@ -83,6 +83,10 @@ impl PinnedUsb {
         Self { expected }
     }
 
+    pub(crate) fn expected_id(&self) -> &HardwareId {
+        &self.expected
+    }
+
     pub async fn provider(&self) -> Result<Arc<dyn IdeviceProvider>, UsbError> {
         // Preserve the existing live provider's pinned-library transport behavior.
         let mut mux = tokio::time::timeout(QUERY_TIMEOUT, fixed_address().connect(0))

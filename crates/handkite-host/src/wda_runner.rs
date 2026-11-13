@@ -13,6 +13,7 @@ use idevice::services::installation_proxy::InstallationProxyClient;
 use idevice::usbmuxd::errors::UsbmuxdError;
 use idevice::{IdeviceError, IdeviceService};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
@@ -24,6 +25,8 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const VACANCY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+
+mod native_process;
 
 /// Fixed categories only: no upstream error, device identifier, or test log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,16 +46,21 @@ pub enum RunnerError {
     RunnerExited,
     RunnerFailed,
     TaskFailed,
+    OwnershipLost,
+    ProcessIdentityUnproven,
+    RunnerStopUnproven,
 }
 
 /// Owns the host XCTest task, including while startup or shutdown is cancelled.
 ///
-/// Drop requests host cancellation only. `abort_and_join` also requires a fresh
-/// pinned endpoint refusal; it does not send a device-side termination request.
+/// Drop requests host cancellation only. `abort_and_join` stops the exact owned
+/// native runner once and requires native absence plus pinned endpoint refusal.
 #[must_use = "keep the handle alive for the lifetime of the XCTest task"]
 pub struct OwnedWdaRunner {
     task: Option<JoinHandle<Result<(), RunnerError>>>,
     usb: Option<PinnedUsb>,
+    ownership: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    native: Option<native_process::Identity>,
 }
 
 /// Read-only task liveness for a blocking action worker. It cannot cancel the runner.
@@ -71,14 +79,21 @@ impl OwnedWdaRunner {
     /// The timeout must be positive and at most 120 seconds. One absolute deadline
     /// covers discovery, lookup, the test-plan callback, and HTTP readiness. Lookup
     /// additionally has a 15-second time bound. No WDA session is created or adopted.
+    /// The ownership callback must retain and validate the caller's ServiceLock;
+    /// it remains required through exact native process cleanup.
     /// Call and retain this handle inside a running Tokio runtime.
     pub async fn start(
         usb: PinnedUsb,
         runner_bundle_id: &str,
         startup_timeout: Duration,
+        owns: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<Self, RunnerError> {
         validate_runner_bundle_id(runner_bundle_id).map_err(|_| RunnerError::InvalidBundleId)?;
         let deadline = startup_deadline(startup_timeout)?;
+        let owns: Arc<dyn Fn() -> bool + Send + Sync> = Arc::new(owns);
+        if !owns() {
+            return Err(RunnerError::OwnershipLost);
+        }
         let (provider, config) = lookup_before_deadline(
             async {
                 let provider = usb
@@ -98,9 +113,28 @@ impl OwnedWdaRunner {
             deadline,
         )
         .await?;
+        if !owns() {
+            return Err(RunnerError::OwnershipLost);
+        }
+        let target = native_process::Target::new(
+            usb.expected_id().clone(),
+            &config.runner_app_path,
+            &config.runner_bundle_executable,
+        )?;
+        if target
+            .observe(&usb, deadline, &*owns, None)
+            .await?
+            .is_some()
+        {
+            return Err(RunnerError::ProcessIdentityUnproven);
+        }
         let wda = UsbWda::new(usb.clone());
+        let launch_owns = Arc::clone(&owns);
         let mut runner = Self::start_task(
             move |mut listener| async move {
+                if !launch_owns() {
+                    return Err(RunnerError::OwnershipLost);
+                }
                 XCUITestService::new(provider)
                     .run(config, &mut listener, None)
                     .await
@@ -115,7 +149,17 @@ impl OwnedWdaRunner {
             deadline,
         )
         .await?;
-        runner.usb = Some(usb);
+        runner.usb = Some(usb.clone());
+        runner.ownership = Some(Arc::clone(&owns));
+        let identity = target.observe(&usb, deadline, &*owns, None).await;
+        match identity {
+            Ok(Some(pid)) => runner.native = Some(native_process::Identity { target, pid }),
+            result => {
+                let error = result.err().unwrap_or(RunnerError::ProcessIdentityUnproven);
+                let _ = runner.abort_and_join().await;
+                return Err(error);
+            }
+        }
         Ok(runner)
     }
 
@@ -130,22 +174,66 @@ impl OwnedWdaRunner {
 
     /// Join the cancelled host task and observe pinned endpoint refusal within
     /// one deadline. Cancellation keeps the abort guard; it never proves cleanup.
-    pub async fn abort_and_join(self) -> Result<(), RunnerError> {
+    pub async fn abort_and_join(mut self) -> Result<(), RunnerError> {
         let usb = self.usb.clone();
-        self.abort_and_join_with(move || {
-            let usb = usb.clone();
-            async move { endpoint_vacant(&usb.ok_or(RunnerError::EndpointCleanupUnproven)?).await }
-        })
-        .await
+        let native = self.native.clone();
+        let ownership = self.ownership.clone();
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let joined = self.join_host(deadline).await;
+        let stop = match (&usb, &native, &ownership) {
+            (Some(usb), Some(identity), Some(owns)) => {
+                identity.stop_once(usb, deadline, &**owns).await
+            }
+            _ => Err(RunnerError::RunnerStopUnproven),
+        };
+        // Even an unproven signal acknowledgement must be followed by read-only
+        // cleanup observation. It can never authorize a repeated signal.
+        let closed = Self::wait_closed(
+            move || {
+                let usb = usb.clone();
+                let native = native.clone();
+                let ownership = ownership.clone();
+                async move {
+                    let usb = usb.ok_or(RunnerError::EndpointCleanupUnproven)?;
+                    let identity = native.ok_or(RunnerError::RunnerStopUnproven)?;
+                    let owns = ownership.ok_or(RunnerError::OwnershipLost)?;
+                    if identity
+                        .target
+                        .observe(&usb, deadline, &*owns, Some(identity.pid))
+                        .await?
+                        .is_some()
+                    {
+                        return Err(RunnerError::EndpointBusy);
+                    }
+                    endpoint_vacant(&usb).await?;
+                    if !owns() {
+                        return Err(RunnerError::OwnershipLost);
+                    }
+                    Ok(())
+                }
+            },
+            deadline,
+        )
+        .await;
+        stop?;
+        closed?;
+        joined
     }
 
-    async fn abort_and_join_with<P, PF>(mut self, mut probe: P) -> Result<(), RunnerError>
+    #[cfg(test)]
+    async fn abort_and_join_with<P, PF>(mut self, probe: P) -> Result<(), RunnerError>
     where
         P: FnMut() -> PF,
         PF: Future<Output = Result<(), RunnerError>>,
     {
         let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
-        let joined = if let Some(task) = self.task.as_mut() {
+        let joined = self.join_host(deadline).await;
+        Self::wait_closed(probe, deadline).await?;
+        joined
+    }
+
+    async fn join_host(&mut self, deadline: Instant) -> Result<(), RunnerError> {
+        if let Some(task) = self.task.as_mut() {
             task.abort();
             let result = timeout_at(deadline, task).await;
             match result {
@@ -161,7 +249,14 @@ impl OwnedWdaRunner {
             }
         } else {
             Ok(())
-        };
+        }
+    }
+
+    async fn wait_closed<P, PF>(mut probe: P, deadline: Instant) -> Result<(), RunnerError>
+    where
+        P: FnMut() -> PF,
+        PF: Future<Output = Result<(), RunnerError>>,
+    {
         loop {
             if Instant::now() >= deadline {
                 return Err(RunnerError::EndpointCleanupUnproven);
@@ -171,10 +266,15 @@ impl OwnedWdaRunner {
                 return Err(RunnerError::EndpointCleanupUnproven);
             }
             match observed {
-                Ok(Ok(())) => return joined,
+                Ok(Ok(())) => return Ok(()),
                 Ok(Err(RunnerError::EndpointBusy)) => {
                     sleep_until(deadline.min(Instant::now() + POLL_INTERVAL)).await;
                 }
+                Ok(Err(
+                    error @ (RunnerError::OwnershipLost
+                    | RunnerError::ProcessIdentityUnproven
+                    | RunnerError::RunnerStopUnproven),
+                )) => return Err(error),
                 _ => return Err(RunnerError::EndpointCleanupUnproven),
             }
         }
@@ -199,6 +299,8 @@ impl OwnedWdaRunner {
         let mut runner = Self {
             task: Some(tokio::spawn(run(PlanListener { phase }))),
             usb: None,
+            ownership: None,
+            native: None,
         };
         if let Err(error) = runner.wait_ready(receiver, probe, deadline).await {
             let _ = runner.abort_and_join().await;

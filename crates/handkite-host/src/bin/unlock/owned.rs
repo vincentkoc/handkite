@@ -53,9 +53,12 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
         // Input may have blocked; admission must still hold before device work.
         admit_attempt(&*gate.lock().map_err(|_| "unlock_idle=refused")?, owns)?;
         let usb = PinnedUsb::new(binding.usb_id.clone());
-        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120))
-            .await
-            .map_err(|_| "unlock_idle=refused reason=runner_unavailable")?;
+        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120), {
+            let owner = Arc::clone(&owner);
+            move || owner.validate_current().is_ok()
+        })
+        .await
+        .map_err(|_| "unlock_idle=refused reason=runner_unavailable")?;
         let liveness = runner.liveness();
         let wda = UsbWda::new(usb);
         let admit = || {

@@ -74,6 +74,7 @@ impl WdaAdapter {
         expected: HardwareId,
         runner_bundle_id: &str,
         should_stop: impl Fn() -> bool,
+        owns: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<Self, OwnedStartupError> {
         if should_stop() {
             return Err(OwnedStartupError::ShutdownRequested);
@@ -86,9 +87,14 @@ impl WdaAdapter {
         let usb = PinnedUsb::new(expected.clone());
         let runner = runtime.block_on(run_until_shutdown(
             async {
-                OwnedWdaRunner::start(usb.clone(), runner_bundle_id, Duration::from_secs(120))
-                    .await
-                    .map_err(OwnedStartupError::Runner)
+                OwnedWdaRunner::start(
+                    usb.clone(),
+                    runner_bundle_id,
+                    Duration::from_secs(120),
+                    owns,
+                )
+                .await
+                .map_err(OwnedStartupError::Runner)
             },
             &should_stop,
             OwnedStartupError::ShutdownRequested,
@@ -687,7 +693,7 @@ mod tests {
     fn preexisting_shutdown_refuses_owned_startup_before_device_access() {
         let expected = HardwareId::new("fixture-device").unwrap();
         assert_eq!(
-            WdaAdapter::new_owned(expected, "com.example.xctrunner", || true).err(),
+            WdaAdapter::new_owned(expected, "com.example.xctrunner", || true, || true).err(),
             Some(OwnedStartupError::ShutdownRequested)
         );
     }

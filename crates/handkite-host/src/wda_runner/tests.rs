@@ -121,7 +121,7 @@ async fn public_start_rejects_invalid_inputs_before_device_lookup() {
         "example.xctrunner",
     ] {
         assert_eq!(
-            OwnedWdaRunner::start(usb.clone(), bundle, Duration::from_secs(1))
+            OwnedWdaRunner::start(usb.clone(), bundle, Duration::from_secs(1), || true)
                 .await
                 .err(),
             Some(RunnerError::InvalidBundleId)
@@ -137,12 +137,26 @@ async fn public_start_rejects_invalid_inputs_before_device_lookup() {
         MAX_STARTUP_TIMEOUT + Duration::from_nanos(1),
     ] {
         assert_eq!(
-            OwnedWdaRunner::start(usb.clone(), "com.example.xctrunner", timeout)
+            OwnedWdaRunner::start(usb.clone(), "com.example.xctrunner", timeout, || true)
                 .await
                 .err(),
             Some(RunnerError::InvalidTimeout)
         );
     }
+}
+
+#[tokio::test]
+async fn lost_owner_refuses_startup_before_device_access() {
+    assert!(matches!(
+        OwnedWdaRunner::start(
+            PinnedUsb::new(HardwareId::new("fixture-device").unwrap()),
+            "com.example.xctrunner",
+            Duration::from_secs(1),
+            || false,
+        )
+        .await,
+        Err(RunnerError::OwnershipLost)
+    ));
 }
 
 #[tokio::test(start_paused = true)]
@@ -834,7 +848,7 @@ async fn shutdown_without_pinned_endpoint_never_claims_cleanup() {
     .unwrap();
     assert_eq!(
         runner.abort_and_join().await,
-        Err(RunnerError::EndpointCleanupUnproven)
+        Err(RunnerError::RunnerStopUnproven)
     );
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }

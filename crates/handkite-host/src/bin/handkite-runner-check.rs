@@ -6,6 +6,7 @@ use handkite_host::service_layout::ServiceLayout;
 use handkite_host::service_lock::ServiceLock;
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_runner::{OwnedWdaRunner, RunnerError};
+use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -31,7 +32,7 @@ fn main() {
 fn run() -> Result<(), &'static str> {
     let _signals = signals::ShutdownSignals::install().map_err(|_| "signal_setup")?;
     let layout = ServiceLayout::current_account().map_err(|_| "service_layout")?;
-    let owner = ServiceLock::acquire(layout).map_err(|_| "service_ownership")?;
+    let owner = Arc::new(ServiceLock::acquire(layout).map_err(|_| "service_ownership")?);
     let config =
         install_config::load_protected_config(owner.layout()).map_err(|_| "protected_config")?;
     let runner_id = config.wda_runner_bundle_id().ok_or("runner_unconfigured")?;
@@ -44,7 +45,10 @@ fn run() -> Result<(), &'static str> {
         .map_err(|_| "runtime_unavailable")?;
     let startup = runtime.block_on(async {
         tokio::select! {
-            result = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120)) =>
+            result = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120), {
+                let owner = Arc::clone(&owner);
+                move || owner.validate_current().is_ok()
+            }) =>
                 result.map_err(runner_reason),
             _ = wait_shutdown() => Err("shutdown_requested"),
         }
@@ -122,6 +126,9 @@ fn runner_reason(error: RunnerError) -> &'static str {
         RunnerError::RunnerExited => "runner_exited",
         RunnerError::RunnerFailed => "runner_failed",
         RunnerError::TaskFailed => "task_failed",
+        RunnerError::OwnershipLost => "ownership_lost",
+        RunnerError::ProcessIdentityUnproven => "process_identity_unproven",
+        RunnerError::RunnerStopUnproven => "runner_stop_unproven",
     }
 }
 
@@ -134,6 +141,9 @@ mod tests {
         for error in [
             RunnerError::EndpointBusy,
             RunnerError::EndpointCleanupUnproven,
+            RunnerError::OwnershipLost,
+            RunnerError::ProcessIdentityUnproven,
+            RunnerError::RunnerStopUnproven,
             RunnerError::PlanStartUnproven,
             RunnerError::AutomationAuthorizationRequired,
             RunnerError::InitializationFailed,

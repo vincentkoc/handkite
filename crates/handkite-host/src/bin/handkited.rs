@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 #[path = "handkited/signals.rs"]
 mod signals;
@@ -100,7 +101,8 @@ fn check_service_layout(layout: &ServiceLayout) -> Result<(), String> {
 
 fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
     let _signals = signals::ShutdownSignals::install().map_err(str::to_owned)?;
-    let owner = ServiceLock::acquire(layout).map_err(|_| "cannot acquire service ownership")?;
+    let owner =
+        Arc::new(ServiceLock::acquire(layout).map_err(|_| "cannot acquire service ownership")?);
     if signals::requested() {
         return Ok(());
     }
@@ -143,6 +145,10 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
                         binding.usb_id.clone(),
                         runner_id,
                         signals::requested,
+                        {
+                            let owner = Arc::clone(&owner);
+                            move || owner.validate_current().is_ok()
+                        },
                     )
                     .map_err(|error| format!("cannot start owned WDA: {}", error.category()))?;
                     serve_adapter(binding, adapter, listener)

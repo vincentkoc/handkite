@@ -159,6 +159,9 @@ impl ReceiptFailure {
                     RunnerError::RunnerExited => "runner_exited",
                     RunnerError::RunnerFailed => "runner_failed",
                     RunnerError::TaskFailed => "runner_task_failed",
+                    RunnerError::OwnershipLost => "runner_ownership_lost",
+                    RunnerError::ProcessIdentityUnproven => "runner_process_identity_unproven",
+                    RunnerError::RunnerStopUnproven => "runner_stop_unproven",
                 };
             }
             Self::LaunchUnproven => return "launch_unproven",
@@ -382,7 +385,11 @@ fn owned_trial(
     let result = runtime.block_on(async {
         let usb = PinnedUsb::new(expected.clone());
         let started = Instant::now();
-        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120)).await;
+        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120), {
+            let owner = Arc::clone(&owner);
+            move || owner.validate_current().is_ok()
+        })
+        .await;
         receipts.runner_startup.finish(
             started,
             match &runner {
@@ -2165,6 +2172,12 @@ mod tests {
             (RunnerError::RunnerExited, "runner_exited"),
             (RunnerError::RunnerFailed, "runner_failed"),
             (RunnerError::TaskFailed, "runner_task_failed"),
+            (RunnerError::OwnershipLost, "runner_ownership_lost"),
+            (
+                RunnerError::ProcessIdentityUnproven,
+                "runner_process_identity_unproven",
+            ),
+            (RunnerError::RunnerStopUnproven, "runner_stop_unproven"),
         ];
         for (error, reason) in failures {
             let report = OwnedReceipts {

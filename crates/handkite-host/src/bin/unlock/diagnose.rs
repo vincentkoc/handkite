@@ -88,7 +88,10 @@ fn run_mode(path: &Path, prepares: bool) -> Result<(), String> {
         }
         let started = Instant::now();
         let usb = PinnedUsb::new(binding.usb_id.clone());
-        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120))
+        let runner = OwnedWdaRunner::start(usb.clone(), runner_id, Duration::from_secs(120), {
+            let owner = Arc::clone(&owner);
+            move || owner.validate_current().is_ok()
+        })
             .await
             .map_err(|error| {
                 format!(
