@@ -187,7 +187,10 @@ class Child:
             except Exception:
                 if self.process.poll() is None:
                     self.fault = True
-            time.sleep(0.25)
+            try:
+                self.process.wait(timeout=0.25)
+            except subprocess.TimeoutExpired:
+                pass
         for thread in self.threads:
             thread.join(5)
         self.fault |= any(thread.is_alive() for thread in self.threads)

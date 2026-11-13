@@ -641,6 +641,24 @@ class PureTests(unittest.TestCase):
         self.assertEqual(broker.pin_result((0, b"unlock_idle=code_submitted\n", b"", True)),
                          (False, False))
 
+    def test_child_wait_rechecks_identity_after_timeout_without_interrupting(self):
+        child = broker.Child.__new__(broker.Child)
+        child.process = unittest.mock.Mock()
+        child.process.poll.side_effect = [None, None, None, None, 0]
+        child.process.wait.side_effect = [subprocess.TimeoutExpired("fixture", 0.25), None, None]
+        child.process.returncode = 0
+        child.process.stdout, child.process.stderr = io.BytesIO(), io.BytesIO()
+        child.identity = unittest.mock.Mock(side_effect=[None, files.Refused("identity"), None])
+        child.threads = []
+        child.data = {"stdout": bytearray(b"fixture"), "stderr": bytearray()}
+        child.fault = False
+        self.assertEqual(child.wait(), (0, b"fixture", b"", True))
+        self.assertEqual(child.identity.call_count, 3)
+        self.assertEqual(child.process.wait.call_args_list,
+                         [unittest.mock.call(timeout=0.25)] * 3)
+        child.process.terminate.assert_not_called()
+        child.process.kill.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
