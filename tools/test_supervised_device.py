@@ -107,7 +107,11 @@ class Fixture:
         with self.profile_path.open("rb") as stream:
             p = broker.Profile(stream.fileno(), hashlib.sha256(stream.read()).hexdigest(),
                                self.value["mode"], str(self.home))
-        return p, files.StopSet(str(self.home), self.receipt)
+        try:
+            return p, files.StopSet(str(self.home), self.receipt)
+        except BaseException:
+            p.close()
+            raise
 
     def close(self):
         self.temp.cleanup()
@@ -211,6 +215,65 @@ class BrokerTests(unittest.TestCase):
         finally:
             os.close(read)
         return code, fake, output
+
+    def test_failed_stop_construction_closes_profile(self):
+        f = self.fixture(6)
+        profiles = []
+        original = broker.Profile
+
+        def capture(*args):
+            profile = original(*args)
+            profiles.append(profile)
+            return profile
+
+        with patch.object(broker, "Profile", side_effect=capture), \
+                patch.object(files, "StopSet", side_effect=Crash()):
+            with self.assertRaises(Crash):
+                f.open()
+        self.assertEqual(len(profiles), 1)
+        self.assertTrue(all(held.fd is None for held in profiles[0].files.values()))
+        self.assertEqual(profiles[0].selection.fds, [])
+        with self.assertRaises(OSError):
+            os.fstat(profiles[0].fd)
+
+    def test_failed_rename_validation_retains_descriptors_for_cleanup(self):
+        for restoring in (False, True):
+            for failure in ("stat", "metadata"):
+                with self.subTest(restoring=restoring, failure=failure):
+                    f = self.fixture(6)
+                    profile, stops = f.open()
+                    self.addCleanup(profile.close)
+                    self.addCleanup(stops.close)
+                    if restoring:
+                        stops.rotate()
+                    source = stops.hold if restoring else stops.active
+                    held = stops.held[source]
+                    descriptors = [held.fd, *held.anchor.fds]
+                    original = os.fstat
+
+                    def fail_after_rename(fd):
+                        meta = original(fd)
+                        if fd == held.fd and not (f.state / source).exists():
+                            if failure == "stat":
+                                raise OSError("synthetic stat failure")
+                            fields = {name: getattr(meta, name) for name in (
+                                "st_dev", "st_ino", "st_mode", "st_uid", "st_gid",
+                                "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")}
+                            fields["st_size"] += 1
+                            return SimpleNamespace(**fields)
+                        return meta
+
+                    with patch.object(files.os, "fstat", side_effect=fail_after_rename):
+                        with self.assertRaises((OSError, files.Refused)):
+                            (stops.restore if restoring else stops.rotate)()
+                    self.assertIn(held, stops.held.values())
+                    stops.block()
+                    self.assertTrue(f.active.exists())
+                    self.assertEqual(len(list(f.state.glob("*.hold"))), 6 if restoring else 7)
+                    stops.close()
+                    for fd in descriptors:
+                        with self.assertRaises(OSError):
+                            os.fstat(fd)
 
     def test_dynamic_zero_one_six_and_many_holds_restore_and_reuse_same_profile(self):
         for count in (0, 1, 6, 40):

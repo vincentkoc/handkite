@@ -212,12 +212,12 @@ class StopSet:
                 self.inventory() == self.baseline, "state_changed")
 
     def _renamed(self, source, destination):
-        held = self.held.pop(source)
+        held = self.held[source]
         current = fp(os.fstat(held.fd))
         require(current[:8] == held.original[:8], "renamed_marker_changed")
         held.original = current
         held.anchor.parts[-1] = destination
-        self.held[destination] = held
+        self.held[destination] = self.held.pop(source)
         expected = dict(self.baseline)
         del expected[source]
         expected[destination] = current
