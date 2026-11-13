@@ -12,6 +12,7 @@ use std::fs::{File, Metadata};
 use std::io::Seek;
 use std::os::unix::fs::MetadataExt;
 
+#[allow(dead_code)] // The update command has its own explicit operation/fd arguments.
 pub(super) fn arguments(mut args: impl Iterator<Item = OsString>) -> bool {
     args.next().as_deref() == Some(std::ffi::OsStr::new("--binding-fd"))
         && args.next().as_deref() == Some(std::ffi::OsStr::new("3"))
@@ -71,6 +72,7 @@ pub(super) fn protected_read(
     Some(bytes)
 }
 
+#[allow(dead_code)] // Initial selection and descriptor staging use two inputs.
 pub(super) fn run<R>(
     input: &mut File,
     expected: &mut File,
@@ -81,15 +83,8 @@ pub(super) fn run<R>(
     if (left.dev(), left.ino()) == (right.dev(), right.ino()) {
         return None;
     }
-    let bytes = protected_read(input, MAX_MANIFEST_BYTES + 106, release_input::read_input)?;
+    let bytes = release_bytes(input)?;
     let pins = release_input::envelope(&bytes)?;
-    let manifest = ReleaseManifest::parse(pins.manifest).ok()?;
-    if manifest.canonical_json().ok().as_deref() != Some(pins.manifest)
-        || ring::digest::digest(&ring::digest::SHA256, pins.manifest).as_ref() != pins.digest
-        || SignerPolicy::new(pins.certificate, ArtifactName::Daemon).is_err()
-    {
-        return None;
-    }
     let expected_binding = binding_input::read_binding(expected)?;
     if !expected
         .metadata()
@@ -99,4 +94,58 @@ pub(super) fn run<R>(
         return None;
     }
     Some(stage(pins, &expected_binding))
+}
+
+fn release_bytes(input: &mut File) -> Option<Vec<u8>> {
+    let bytes = protected_read(input, MAX_MANIFEST_BYTES + 106, release_input::read_input)?;
+    let pins = release_input::envelope(&bytes)?;
+    let manifest = ReleaseManifest::parse(pins.manifest).ok()?;
+    if manifest.canonical_json().ok().as_deref() != Some(pins.manifest)
+        || ring::digest::digest(&ring::digest::SHA256, pins.manifest).as_ref() != pins.digest
+        || SignerPolicy::new(pins.certificate, ArtifactName::Daemon).is_err()
+    {
+        return None;
+    }
+    Some(bytes)
+}
+
+#[allow(dead_code)] // Only the update command consumes a previous release pin.
+pub(super) fn run_update<R>(
+    destination: &mut File,
+    binding: &mut File,
+    previous: &mut File,
+    execute: impl FnOnce(release_input::Envelope<'_>, release_input::Envelope<'_>, &DeviceBinding) -> R,
+) -> Option<R> {
+    let before = [
+        destination.metadata().ok()?,
+        binding.metadata().ok()?,
+        previous.metadata().ok()?,
+    ];
+    for left in 0..before.len() {
+        for right in left + 1..before.len() {
+            if (before[left].dev(), before[left].ino())
+                == (before[right].dev(), before[right].ino())
+            {
+                return None;
+            }
+        }
+    }
+    let destination_bytes = release_bytes(destination)?;
+    let previous_bytes = release_bytes(previous)?;
+    let destination_pin = release_input::envelope(&destination_bytes)?;
+    let previous_pin = release_input::envelope(&previous_bytes)?;
+    if destination_pin.digest == previous_pin.digest {
+        return None;
+    }
+    let expected = binding_input::read_binding(binding)?;
+    for (file, original) in [destination, binding, previous].into_iter().zip(&before) {
+        if !file
+            .metadata()
+            .is_ok_and(|after| same_metadata(original, &after))
+            || check_private_input_acl(file).is_err()
+        {
+            return None;
+        }
+    }
+    Some(execute(destination_pin, previous_pin, &expected))
 }
