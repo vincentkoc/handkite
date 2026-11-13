@@ -17,6 +17,7 @@ use handkite_host::wda_settings::{
 use handkite_host::wda_transport::UsbWda;
 use handkite_host::{host_config, install_config, native_lock};
 use quick_xml::events::Event;
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fmt::Write;
 use std::path::Path;
@@ -994,8 +995,10 @@ struct Rect {
     h: f64,
 }
 
+type Attributes<'a> = BTreeMap<&'a str, Cow<'a, str>>;
+
 impl Rect {
-    fn read(attrs: &BTreeMap<String, String>) -> Result<Self, ()> {
+    fn read(attrs: &Attributes<'_>) -> Result<Self, ()> {
         let number = |name| attrs.get(name).ok_or(())?.parse::<f64>().map_err(|_| ());
         let rect = Self {
             x: number("x")?,
@@ -1053,8 +1056,8 @@ struct Tab {
 }
 
 impl Tab {
-    fn read(attrs: &BTreeMap<String, String>) -> Result<Self, ()> {
-        let flag = |key| match attrs.get(key).map(String::as_str) {
+    fn read(attrs: &Attributes<'_>) -> Result<Self, ()> {
+        let flag = |key| match attrs.get(key).map(|value| value.as_ref()) {
             Some("true") => Some(true),
             Some("false") => Some(false),
             _ => None,
@@ -1065,7 +1068,7 @@ impl Tab {
             enabled: flag("enabled"),
             selected: flag("selected"),
             selected_present: attrs.contains_key("selected"),
-            value: match attrs.get("value").map(String::as_str) {
+            value: match attrs.get("value").map(|value| value.as_ref()) {
                 None => TabValue::Absent,
                 Some("1") => TabValue::Active,
                 _ => TabValue::Other,
@@ -1127,13 +1130,14 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
         let is_start = matches!(&event, Event::Start(_));
         match event {
             Event::Start(ref node) | Event::Empty(ref node) => {
-                let kind = String::from_utf8(node.name().as_ref().to_vec())
-                    .map_err(|_| RefusalReason::CaptureFailed)?;
+                let tag = node.name();
+                let kind =
+                    std::str::from_utf8(tag.as_ref()).map_err(|_| RefusalReason::CaptureFailed)?;
                 if stack.len() > 128 {
                     return Err(RefusalReason::CaptureFailed);
                 }
                 if matches!(
-                    kind.as_str(),
+                    kind,
                     "XCUIElementTypeAlert"
                         | "XCUIElementTypeSheet"
                         | "XCUIElementTypeSecureTextField"
@@ -1143,7 +1147,7 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
                 let mut attrs = BTreeMap::new();
                 for attr in node.attributes() {
                     let attr = attr.map_err(|_| RefusalReason::CaptureFailed)?;
-                    let key = String::from_utf8(attr.key.as_ref().to_vec())
+                    let key = std::str::from_utf8(attr.key.into_inner())
                         .map_err(|_| RefusalReason::CaptureFailed)?;
                     let value = attr
                         .decode_and_unescape_value(reader.decoder())
@@ -1159,7 +1163,7 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
                     {
                         return Err(RefusalReason::WdaLocked);
                     }
-                    attrs.insert(key, value.into_owned());
+                    attrs.insert(key, value);
                 }
                 if kind == "XCUIElementTypeApplication" {
                     if screen.is_some() {
@@ -1178,11 +1182,11 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
                     }
                     tabbar = Some(Rect::read(&attrs).map_err(|_| RefusalReason::GeometryMismatch)?);
                 }
-                let name = attrs.get("name").map(String::as_str);
-                let label = attrs.get("label").map(String::as_str);
+                let name = attrs.get("name").map(|value| value.as_ref());
+                let label = attrs.get("label").map(|value| value.as_ref());
                 if kind == "XCUIElementTypeNavigationBar"
                     && (name == Some("World Clock") || label == Some("World Clock"))
-                    && attrs.get("visible").map(String::as_str) == Some("true")
+                    && attrs.get("visible").map(|value| value.as_ref()) == Some("true")
                 {
                     if !stack.iter().any(|s| s == "XCUIElementTypeApplication") {
                         return Err(RefusalReason::WorldClockAttributes);
@@ -1224,7 +1228,7 @@ fn parse(xml: &str) -> Result<Evidence, RefusalReason> {
                             .contains(button.rect);
                 }
                 if is_start {
-                    stack.push(kind);
+                    stack.push(kind.to_owned());
                 }
             }
             Event::End(_) => {
@@ -1510,6 +1514,22 @@ mod tests {
     const WORLD_NAV: &str = r#"<XCUIElementTypeNavigationBar name="World Clock" visible="true"/>"#;
     const HIDDEN_START: &str = r#"<XCUIElementTypeButton name="Start" visible="false" enabled="true" x="300" y="500" width="60" height="60"/>"#;
     const READY_START: &str = r#"<XCUIElementTypeButton name="Start" visible="true" enabled="true" x="300" y="500" width="60" height="60"/>"#;
+
+    #[test]
+    fn borrowed_attributes_still_decode_and_check_unused_values() {
+        assert!(parse(&tree(false).replace("World Clock", "World&#32;Clock")).is_ok());
+        let marker = tree(false).replace(
+            "name=\"Clock\"",
+            "name=\"Clock\" ignored=\"Enter&#32;Passcode\"",
+        );
+        assert!(matches!(parse(&marker), Err(RefusalReason::WdaLocked)));
+        let malformed =
+            tree(false).replace("name=\"Clock\"", "name=\"Clock\" ignored=\"&unknown;\"");
+        assert!(matches!(
+            parse(&malformed),
+            Err(RefusalReason::CaptureFailed)
+        ));
+    }
 
     fn value_schema(xml: &str) -> String {
         xml.replace(" selected=\"true\"", " value=\"1\"")
