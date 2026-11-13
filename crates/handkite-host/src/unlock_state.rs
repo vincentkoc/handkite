@@ -5,6 +5,8 @@ use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+pub mod stop_snapshot;
+
 const STATE_COMPONENTS: [&str; 5] = [
     "Library",
     "Application Support",
