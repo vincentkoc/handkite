@@ -93,12 +93,7 @@ fn run_mode(path: &Path, prepares: bool) -> Result<(), String> {
             move || owner.validate_current().is_ok()
         })
             .await
-            .map_err(|error| {
-                format!(
-                    "preparation=refused phase=runner_start reason={error:?} elapsed_ms={}",
-                    started.elapsed().as_millis()
-                )
-            })?;
+            .map_err(|error| startup_failure(error, started.elapsed().as_millis()))?;
         let runner_ms = started.elapsed().as_millis();
         let liveness = runner.liveness();
         let wda = UsbWda::new(usb);
@@ -273,9 +268,42 @@ fn finish(
     }
 }
 
+fn startup_failure(error: handkite_host::wda_runner::RunnerError, elapsed_ms: u128) -> String {
+    format!("preparation=refused phase=runner_start reason={error} elapsed_ms={elapsed_ms}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_failure_receipt_uses_one_flat_fixed_token() {
+        use handkite_host::wda_runner::{NativeProcessStep, RunnerError};
+        let output = startup_failure(
+            RunnerError::NativeProcess(NativeProcessStep::TargetPath),
+            178,
+        );
+        assert_eq!(
+            output,
+            "preparation=refused phase=runner_start reason=process_target_path elapsed_ms=178"
+        );
+        let token = output
+            .split("reason=")
+            .nth(1)
+            .unwrap()
+            .split_whitespace()
+            .next()
+            .unwrap();
+        assert!(
+            token
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || c == b'_')
+        );
+        assert_eq!(
+            startup_failure(RunnerError::ProcessIdentityUnproven, 1),
+            "preparation=refused phase=runner_start reason=ProcessIdentityUnproven elapsed_ms=1"
+        );
+    }
 
     fn report(outcome: &'static str) -> PinPreparationDiagnostic {
         PinPreparationDiagnostic {

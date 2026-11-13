@@ -28,6 +28,54 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
 mod native_process;
 
+/// Fixed failure checkpoints; never native output, paths, PIDs or identifiers.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NativeProcessStep {
+    TargetPath,
+    UsbDiscovery,
+    UsbDeadline,
+    OutputCreate,
+    CommandSpawn,
+    CommandDeadline,
+    CommandExit,
+    MetadataRead,
+    MetadataLimit,
+    MetadataDecode,
+    MetadataContract,
+    InventorySchema,
+    InventoryPid,
+    InventoryPath,
+    InventoryAmbiguous,
+    IdentityChanged,
+    Preexisting,
+    MissingAfterStart,
+}
+
+impl NativeProcessStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TargetPath => "process_target_path",
+            Self::UsbDiscovery => "process_usb_discovery",
+            Self::UsbDeadline => "process_usb_deadline",
+            Self::OutputCreate => "process_output_create",
+            Self::CommandSpawn => "process_command_spawn",
+            Self::CommandDeadline => "process_command_deadline",
+            Self::CommandExit => "process_command_exit",
+            Self::MetadataRead => "process_metadata_read",
+            Self::MetadataLimit => "process_metadata_limit",
+            Self::MetadataDecode => "process_metadata_decode",
+            Self::MetadataContract => "process_metadata_contract",
+            Self::InventorySchema => "process_inventory_schema",
+            Self::InventoryPid => "process_inventory_pid",
+            Self::InventoryPath => "process_inventory_path",
+            Self::InventoryAmbiguous => "process_inventory_ambiguous",
+            Self::IdentityChanged => "process_identity_changed",
+            Self::Preexisting => "process_preexisting",
+            Self::MissingAfterStart => "process_missing_after_start",
+        }
+    }
+}
+
 /// Fixed categories only: no upstream error, device identifier, or test log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunnerError {
@@ -49,6 +97,17 @@ pub enum RunnerError {
     OwnershipLost,
     ProcessIdentityUnproven,
     RunnerStopUnproven,
+    NativeProcess(NativeProcessStep),
+}
+
+impl std::fmt::Display for RunnerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NativeProcess(step) => f.write_str(step.as_str()),
+            // Every other variant is a fixed unit category.
+            _ => write!(f, "{self:?}"),
+        }
+    }
 }
 
 /// Owns the host XCTest task, including while startup or shutdown is cancelled.
@@ -126,7 +185,7 @@ impl OwnedWdaRunner {
             .await?
             .is_some()
         {
-            return Err(RunnerError::ProcessIdentityUnproven);
+            return Err(RunnerError::NativeProcess(NativeProcessStep::Preexisting));
         }
         let wda = UsbWda::new(usb.clone());
         let launch_owns = Arc::clone(&owns);
@@ -155,7 +214,9 @@ impl OwnedWdaRunner {
         match identity {
             Ok(Some(pid)) => runner.native = Some(native_process::Identity { target, pid }),
             result => {
-                let error = result.err().unwrap_or(RunnerError::ProcessIdentityUnproven);
+                let error = result.err().unwrap_or(RunnerError::NativeProcess(
+                    NativeProcessStep::MissingAfterStart,
+                ));
                 let _ = runner.abort_and_join().await;
                 return Err(error);
             }
@@ -273,7 +334,8 @@ impl OwnedWdaRunner {
                 Ok(Err(
                     error @ (RunnerError::OwnershipLost
                     | RunnerError::ProcessIdentityUnproven
-                    | RunnerError::RunnerStopUnproven),
+                    | RunnerError::RunnerStopUnproven
+                    | RunnerError::NativeProcess(_)),
                 )) => return Err(error),
                 _ => return Err(RunnerError::EndpointCleanupUnproven),
             }

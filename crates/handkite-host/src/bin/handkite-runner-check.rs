@@ -129,6 +129,7 @@ fn runner_reason(error: RunnerError) -> &'static str {
         RunnerError::OwnershipLost => "ownership_lost",
         RunnerError::ProcessIdentityUnproven => "process_identity_unproven",
         RunnerError::RunnerStopUnproven => "runner_stop_unproven",
+        RunnerError::NativeProcess(step) => step.as_str(),
     }
 }
 
@@ -144,6 +145,8 @@ mod tests {
             RunnerError::OwnershipLost,
             RunnerError::ProcessIdentityUnproven,
             RunnerError::RunnerStopUnproven,
+            RunnerError::NativeProcess(handkite_host::wda_runner::NativeProcessStep::TargetPath),
+            RunnerError::NativeProcess(handkite_host::wda_runner::NativeProcessStep::MetadataRead),
             RunnerError::PlanStartUnproven,
             RunnerError::AutomationAuthorizationRequired,
             RunnerError::InitializationFailed,

@@ -749,6 +749,24 @@ async fn shutdown_waits_for_delayed_endpoint_refusal_after_host_join() {
     assert_eq!(Instant::now() - started, 2 * POLL_INTERVAL);
 }
 
+#[tokio::test]
+async fn shutdown_preserves_native_failure_checkpoint() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let runner = OwnedWdaRunner::start_task(
+        |listener| live(listener, dropped.clone()),
+        || async { ready() },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    let error = RunnerError::NativeProcess(NativeProcessStep::InventoryPath);
+    assert_eq!(
+        runner.abort_and_join_with(|| async { Err(error) }).await,
+        Err(error)
+    );
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
 #[tokio::test(start_paused = true)]
 async fn shutdown_refuses_open_unknown_or_unresponsive_endpoint() {
     for case in 0..4 {

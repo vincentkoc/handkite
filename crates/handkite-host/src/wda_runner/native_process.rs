@@ -1,4 +1,4 @@
-use super::RunnerError;
+use super::{NativeProcessStep as Step, RunnerError};
 use crate::usb::PinnedUsb;
 use handkite_core::protocol::HardwareId;
 use serde_json::Value;
@@ -25,7 +25,7 @@ pub(super) struct Identity {
 
 impl Target {
     pub fn new(device: HardwareId, app: &str, executable: &str) -> Result<Self, RunnerError> {
-        let app = absolute_path(app).ok_or(RunnerError::ProcessIdentityUnproven)?;
+        let app = absolute_path(app).ok_or(RunnerError::NativeProcess(Step::TargetPath))?;
         if executable.is_empty()
             || executable.chars().any(char::is_control)
             || Path::new(executable).components().count() != 1
@@ -34,7 +34,7 @@ impl Target {
                 Some(Component::Normal(_))
             )
         {
-            return Err(RunnerError::ProcessIdentityUnproven);
+            return Err(RunnerError::NativeProcess(Step::TargetPath));
         }
         Ok(Self {
             device,
@@ -54,17 +54,9 @@ impl Target {
         }
         timeout_at(deadline, usb.provider())
             .await
-            .map_err(|_| RunnerError::ProcessIdentityUnproven)?
-            .map_err(|_| RunnerError::ProcessIdentityUnproven)?;
-        let json = command(&self.device, None, deadline, owns)
-            .await
-            .map_err(|error| {
-                if error == RunnerError::OwnershipLost {
-                    error
-                } else {
-                    RunnerError::ProcessIdentityUnproven
-                }
-            })?;
+            .map_err(|_| RunnerError::NativeProcess(Step::UsbDeadline))?
+            .map_err(|_| RunnerError::NativeProcess(Step::UsbDiscovery))?;
+        let json = command(&self.device, None, deadline, owns).await?;
         select(&json, &self.executable, retained_pid)
     }
 }
@@ -100,7 +92,7 @@ impl Identity {
                 signal.await?;
                 Ok(true)
             }
-            _ => Err(RunnerError::ProcessIdentityUnproven),
+            _ => Err(RunnerError::NativeProcess(Step::IdentityChanged)),
         }
     }
 }
@@ -137,11 +129,11 @@ fn select(
     if json["info"]["outcome"] != "success"
         || json["info"]["commandType"] != "devicectl.device.info.processes"
     {
-        return Err(RunnerError::ProcessIdentityUnproven);
+        return Err(RunnerError::NativeProcess(Step::MetadataContract));
     }
     let rows = json["result"]["runningProcesses"]
         .as_array()
-        .ok_or(RunnerError::ProcessIdentityUnproven)?;
+        .ok_or(RunnerError::NativeProcess(Step::InventorySchema))?;
     let mut selected = None;
     let mut pids = std::collections::HashSet::new();
     for row in rows {
@@ -149,17 +141,23 @@ fn select(
             .as_u64()
             .and_then(|pid| u32::try_from(pid).ok())
             .filter(|pid| *pid > 0)
-            .ok_or(RunnerError::ProcessIdentityUnproven)?;
+            .ok_or(RunnerError::NativeProcess(Step::InventoryPid))?;
         let path = row["executable"]
             .as_str()
             .and_then(absolute_path)
-            .ok_or(RunnerError::ProcessIdentityUnproven)?;
-        if !pids.insert(pid) || retained_pid == Some(pid) && path != executable {
-            return Err(RunnerError::ProcessIdentityUnproven);
+            .ok_or(RunnerError::NativeProcess(Step::InventoryPath))?;
+        if !pids.insert(pid) {
+            return Err(RunnerError::NativeProcess(Step::InventoryAmbiguous));
+        }
+        if retained_pid == Some(pid) && path != executable {
+            return Err(RunnerError::NativeProcess(Step::IdentityChanged));
         }
         if path == executable {
-            if selected.replace(pid).is_some() || retained_pid.is_some_and(|old| old != pid) {
-                return Err(RunnerError::ProcessIdentityUnproven);
+            if selected.replace(pid).is_some() {
+                return Err(RunnerError::NativeProcess(Step::InventoryAmbiguous));
+            }
+            if retained_pid.is_some_and(|old| old != pid) {
+                return Err(RunnerError::NativeProcess(Step::IdentityChanged));
             }
         }
     }
@@ -172,11 +170,11 @@ impl Output {
         let mut template = b"/tmp/handkite-process-XXXXXX\0".to_vec();
         let raw = unsafe { libc::mkdtemp(template.as_mut_ptr().cast()) };
         if raw.is_null() {
-            return Err(RunnerError::RunnerStopUnproven);
+            return Err(RunnerError::NativeProcess(Step::OutputCreate));
         }
         let path = unsafe { CStr::from_ptr(raw) }
             .to_str()
-            .map_err(|_| RunnerError::RunnerStopUnproven)?;
+            .map_err(|_| RunnerError::NativeProcess(Step::OutputCreate))?;
         Ok(Self(PathBuf::from(path)))
     }
     fn file(&self) -> PathBuf {
@@ -235,42 +233,46 @@ async fn command(
         return Err(RunnerError::OwnershipLost);
     }
     if Instant::now() >= deadline {
-        return Err(RunnerError::RunnerStopUnproven);
+        return Err(RunnerError::NativeProcess(Step::CommandDeadline));
     }
     let mut child = RunningCommand(
         command
             .spawn()
-            .map_err(|_| RunnerError::RunnerStopUnproven)?,
+            .map_err(|_| RunnerError::NativeProcess(Step::CommandSpawn))?,
     );
     loop {
         if !owns() {
             return Err(RunnerError::OwnershipLost);
         }
         if Instant::now() >= deadline {
-            return Err(RunnerError::RunnerStopUnproven);
+            return Err(RunnerError::NativeProcess(Step::CommandDeadline));
         }
         match child.0.try_wait() {
             Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) | Err(_) => return Err(RunnerError::RunnerStopUnproven),
+            Ok(Some(_)) | Err(_) => return Err(RunnerError::NativeProcess(Step::CommandExit)),
             Ok(None) => sleep(Duration::from_millis(20)).await,
         }
     }
     let mut bytes = Vec::new();
     fs::File::open(output.file())
         .and_then(|file| file.take(MAX_JSON + 1).read_to_end(&mut bytes))
-        .map_err(|_| RunnerError::RunnerStopUnproven)?;
+        .map_err(|_| RunnerError::NativeProcess(Step::MetadataRead))?;
+    decode_metadata(&bytes, pid)
+}
+
+fn decode_metadata(bytes: &[u8], pid: Option<u32>) -> Result<Value, RunnerError> {
     if bytes.len() as u64 > MAX_JSON {
-        return Err(RunnerError::RunnerStopUnproven);
+        return Err(RunnerError::NativeProcess(Step::MetadataLimit));
     }
-    let value: Value =
-        serde_json::from_slice(&bytes).map_err(|_| RunnerError::RunnerStopUnproven)?;
+    let value: Value = serde_json::from_slice(bytes)
+        .map_err(|_| RunnerError::NativeProcess(Step::MetadataDecode))?;
     let expected_command = if pid.is_some() {
         "devicectl.device.process.terminate"
     } else {
         "devicectl.device.info.processes"
     };
     if value["info"]["outcome"] != "success" || value["info"]["commandType"] != expected_command {
-        return Err(RunnerError::RunnerStopUnproven);
+        return Err(RunnerError::NativeProcess(Step::MetadataContract));
     }
     Ok(value)
 }
@@ -351,6 +353,55 @@ mod tests {
     }
 
     #[test]
+    fn native_failure_categories_distinguish_metadata_schema_rows_and_identity() {
+        let target = target();
+        assert!(matches!(
+            Target::new(target.device.clone(), "relative", "Runner"),
+            Err(RunnerError::NativeProcess(Step::TargetPath))
+        ));
+        assert_eq!(
+            decode_metadata(b"{", None),
+            Err(RunnerError::NativeProcess(Step::MetadataDecode))
+        );
+        assert_eq!(
+            decode_metadata(b"{}", None),
+            Err(RunnerError::NativeProcess(Step::MetadataContract))
+        );
+        assert_eq!(
+            decode_metadata(&vec![b' '; MAX_JSON as usize + 1], None),
+            Err(RunnerError::NativeProcess(Step::MetadataLimit))
+        );
+        for (rows, retained, expected) in [
+            (json!(null), None, Step::InventorySchema),
+            (
+                json!([{"processIdentifier":0,"executable":"/apps/Other"}]),
+                None,
+                Step::InventoryPid,
+            ),
+            (
+                json!([{"processIdentifier":1,"executable":"relative"}]),
+                None,
+                Step::InventoryPath,
+            ),
+            (
+                json!([{"processIdentifier":1,"executable":"/apps/Other"},{"processIdentifier":1,"executable":"/apps/Other"}]),
+                None,
+                Step::InventoryAmbiguous,
+            ),
+            (
+                json!([{"processIdentifier":1,"executable":"/apps/Other"}]),
+                Some(1),
+                Step::IdentityChanged,
+            ),
+        ] {
+            assert_eq!(
+                select(&processes(rows), &target.executable, retained),
+                Err(RunnerError::NativeProcess(expected))
+            );
+        }
+    }
+
+    #[test]
     fn native_commands_pin_target_and_never_escalate_signal() {
         let target = target();
         for pid in [None, Some(20)] {
@@ -414,7 +465,7 @@ mod tests {
                 match case {
                     0 => Ok(false),
                     1 => Ok(true),
-                    2 => Err(RunnerError::ProcessIdentityUnproven),
+                    2 => Err(RunnerError::NativeProcess(Step::IdentityChanged)),
                     3 => Err(RunnerError::OwnershipLost),
                     _ => Err(RunnerError::RunnerStopUnproven),
                 }

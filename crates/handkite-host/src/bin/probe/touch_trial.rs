@@ -162,6 +162,7 @@ impl ReceiptFailure {
                     RunnerError::OwnershipLost => "runner_ownership_lost",
                     RunnerError::ProcessIdentityUnproven => "runner_process_identity_unproven",
                     RunnerError::RunnerStopUnproven => "runner_stop_unproven",
+                    RunnerError::NativeProcess(step) => step.as_str(),
                 };
             }
             Self::LaunchUnproven => return "launch_unproven",
@@ -2178,6 +2179,12 @@ mod tests {
                 "runner_process_identity_unproven",
             ),
             (RunnerError::RunnerStopUnproven, "runner_stop_unproven"),
+            (
+                RunnerError::NativeProcess(
+                    handkite_host::wda_runner::NativeProcessStep::InventoryPath,
+                ),
+                "process_inventory_path",
+            ),
         ];
         for (error, reason) in failures {
             let report = OwnedReceipts {
