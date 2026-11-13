@@ -437,7 +437,11 @@ impl DeviceAdapter for WdaAdapter {
     ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
         let owned_input = matches!(
             action,
-            Action::Tap { .. } | Action::Home | Action::Text { .. }
+            Action::Tap { .. }
+                | Action::DoubleTap { .. }
+                | Action::LongPress { .. }
+                | Action::Home
+                | Action::Text { .. }
         ) && self.owned_session.is_some()
             && self.owned_runner.is_some();
         if !matches!(action, Action::LaunchApp { .. }) && !owned_input {
@@ -481,6 +485,19 @@ impl DeviceAdapter for WdaAdapter {
                 captured_at,
             )
             .map(|until| ActionAdmission::NativeText { until })
+        } else if let Action::DoubleTap { at } | Action::LongPress { at, .. } = action {
+            native_text_deadline(
+                &observation,
+                owned_input,
+                native_before,
+                native_after,
+                reported_lock,
+                captured_at,
+            )
+            .filter(|_| {
+                crate::wda_ui_admission::visible_text_target(&observation.accessibility_tree, *at)
+            })
+            .map(|until| ActionAdmission::NativeTextGesture { at: *at, until })
         } else if matches!(action, Action::Home) {
             native_home_deadline(
                 &observation,
@@ -511,8 +528,14 @@ impl DeviceAdapter for WdaAdapter {
     ) -> Result<TransportReceipt, AdapterError> {
         self.validate_owned()?;
         if (matches!(action, Action::LaunchApp { .. })
-            || matches!(action, Action::Tap { .. } | Action::Text { .. })
-                && self.owned_session.is_some())
+            || matches!(
+                action,
+                Action::Tap { .. }
+                    | Action::DoubleTap { .. }
+                    | Action::LongPress { .. }
+                    | Action::Text { .. }
+                    | Action::Key { .. }
+            ) && self.owned_session.is_some())
             && native_lock::query(&self.expected).state != LockState::Unlocked
         {
             return Err(AdapterError);
@@ -539,6 +562,17 @@ impl DeviceAdapter for WdaAdapter {
     ) -> Result<TransportReceipt, AdapterError> {
         if let Some(ActionAdmission::NativeText { until }) = admission {
             if !matches!(action, Action::Text { .. })
+                || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            return self.execute(action, send_deadline);
+        }
+        if let Some(ActionAdmission::NativeTextGesture { at, until }) = admission {
+            if !matches!(action, Action::DoubleTap { at: actual } | Action::LongPress { at: actual, .. } if *actual == at)
                 || self.owned_session.is_none()
                 || self.owned_runner.is_none()
                 || Instant::now() >= until

@@ -134,6 +134,7 @@ impl DeviceAdapter for FakeAdapter {
                 ActionAdmission::NativeHome { .. }
                     | ActionAdmission::NativeModalTap { .. }
                     | ActionAdmission::NativeText { .. }
+                    | ActionAdmission::NativeTextGesture { .. }
             )
         ) {
             self.native_queries += 1;
@@ -685,7 +686,7 @@ fn default_adapter_refuses_native_modal_admission_before_execution() {
 
 #[test]
 fn native_text_allows_only_pixel_drift_with_fresh_unchanged_context() {
-    for change in 0..9 {
+    for change in 0..10 {
         let (controller, key) = controller();
         let before = controller.observe(&key).unwrap();
         let until = Instant::now() + Duration::from_secs(5);
@@ -710,6 +711,11 @@ fn native_text_allows_only_pixel_drift_with_fresh_unchanged_context() {
                 6 => inner.adapter.native_lock = LockState::Locked,
                 7 => action = Action::Home,
                 8 => inner.adapter.stale_capture = true,
+                9 => {
+                    action = Action::Key {
+                        key: crate::protocol::KeyboardKey::Backspace,
+                    }
+                }
                 _ => {}
             }
         }
@@ -735,6 +741,60 @@ fn native_text_allows_only_pixel_drift_with_fresh_unchanged_context() {
             assert!(result.is_err(), "case {change}");
             assert_eq!(inner.adapter.actions, 0, "case {change}");
         }
+    }
+}
+
+#[test]
+fn text_gesture_admission_is_bound_to_point_action_tree_and_native_unlock() {
+    let at = Point { x: 20.0, y: 30.0 };
+    for case in 0..8 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut action = Action::LongPress {
+            at,
+            duration_ms: 750,
+        };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = b"cursor".to_vec();
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeTextGesture { at, until });
+            inner.adapter.native_lock = LockState::Unlocked;
+            match case {
+                1 => action = Action::DoubleTap { at },
+                2 => action = Action::Tap { at },
+                3 => {
+                    action = Action::DoubleTap {
+                        at: Point { x: 21.0, y: 30.0 },
+                    }
+                }
+                4 => inner.adapter.tree_suffix = "changed".into(),
+                5 => inner.adapter.native_lock = LockState::Locked,
+                6 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeTextGesture {
+                        at,
+                        until: Instant::now(),
+                    })
+                }
+                7 => inner.adapter.stale_capture = true,
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(result.is_ok(), case <= 1, "case {case}");
+        assert_eq!(inner.adapter.actions, usize::from(case <= 1));
     }
 }
 

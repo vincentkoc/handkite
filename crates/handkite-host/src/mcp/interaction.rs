@@ -1,5 +1,5 @@
 use super::catalog::Tool;
-use handkite_core::protocol::{Action, Point, Revision};
+use handkite_core::protocol::{Action, KeyboardKey, Point, Revision};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -40,6 +40,21 @@ struct TapArguments {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct LongPressArguments {
+    expected_revision: Revision,
+    at: ScreenPoint,
+    duration_ms: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct KeyArguments {
+    expected_revision: Revision,
+    key: KeyboardKey,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SwipeArguments {
     expected_revision: Revision,
     from: ScreenPoint,
@@ -74,17 +89,40 @@ pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> 
             };
             Ok((args.expected_revision, action))
         }
-        Tool::Tap => {
+        Tool::Tap | Tool::DoubleTap => {
             let args: TapArguments = serde_json::from_value(value).map_err(|_| ())?;
             if !args.at.valid() {
                 return Err(());
             }
             Ok((
                 args.expected_revision,
-                Action::Tap {
-                    at: args.at.into_point(),
+                if tool == Tool::DoubleTap {
+                    Action::DoubleTap {
+                        at: args.at.into_point(),
+                    }
+                } else {
+                    Action::Tap {
+                        at: args.at.into_point(),
+                    }
                 },
             ))
+        }
+        Tool::LongPress => {
+            let args: LongPressArguments = serde_json::from_value(value).map_err(|_| ())?;
+            if !args.at.valid() || !(1..=5_000).contains(&args.duration_ms) {
+                return Err(());
+            }
+            Ok((
+                args.expected_revision,
+                Action::LongPress {
+                    at: args.at.into_point(),
+                    duration_ms: args.duration_ms,
+                },
+            ))
+        }
+        Tool::Key => {
+            let args: KeyArguments = serde_json::from_value(value).map_err(|_| ())?;
+            Ok((args.expected_revision, Action::Key { key: args.key }))
         }
         Tool::Swipe => {
             let args: SwipeArguments = serde_json::from_value(value).map_err(|_| ())?;
@@ -137,7 +175,9 @@ pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> 
 pub(super) fn valid_raw(tool: Tool, raw: &str) -> bool {
     match tool {
         Tool::Home | Tool::Clock => serde_json::from_str::<RevisionOnly>(raw).is_ok(),
-        Tool::Tap => serde_json::from_str::<TapArguments>(raw).is_ok(),
+        Tool::Tap | Tool::DoubleTap => serde_json::from_str::<TapArguments>(raw).is_ok(),
+        Tool::LongPress => serde_json::from_str::<LongPressArguments>(raw).is_ok(),
+        Tool::Key => serde_json::from_str::<KeyArguments>(raw).is_ok(),
         Tool::Swipe => serde_json::from_str::<SwipeArguments>(raw).is_ok(),
         Tool::Text => serde_json::from_str::<TextArguments>(raw).is_ok(),
         Tool::LaunchApp => serde_json::from_str::<LaunchArguments>(raw).is_ok(),
@@ -157,9 +197,16 @@ pub(super) fn schema(tool: Tool) -> Value {
     properties.insert("expected_revision".into(), revision);
     let mut required = vec!["expected_revision"];
     match tool {
-        Tool::Tap => {
+        Tool::Tap | Tool::DoubleTap | Tool::LongPress => {
             properties.insert("at".into(), point);
             required.push("at");
+            if tool == Tool::LongPress {
+                properties.insert(
+                    "duration_ms".into(),
+                    json!({"type":"integer","minimum":1,"maximum":5_000}),
+                );
+                required.push("duration_ms");
+            }
         }
         Tool::Swipe => {
             properties.insert("from".into(), point.clone());
@@ -176,6 +223,13 @@ pub(super) fn schema(tool: Tool) -> Value {
                 json!({"type":"string","minLength":1,"description":"At most 4096 UTF-8 bytes; no control characters"}),
             );
             required.push("value");
+        }
+        Tool::Key => {
+            properties.insert(
+                "key".into(),
+                json!({"type":"string","enum":["backspace","enter","tab","escape"]}),
+            );
+            required.push("key");
         }
         Tool::LaunchApp => {
             properties.insert(
@@ -212,6 +266,21 @@ mod tests {
     fn each_tool_translates_to_one_typed_action() {
         for (tool, arguments, expected) in [
             (
+                Tool::DoubleTap,
+                json!({"expected_revision":7,"at":{"x":12.5,"y":90}}),
+                json!({"type":"double_tap","at":{"x":12.5,"y":90.0}}),
+            ),
+            (
+                Tool::LongPress,
+                json!({"expected_revision":7,"at":{"x":12.5,"y":90},"duration_ms":750}),
+                json!({"type":"long_press","at":{"x":12.5,"y":90.0},"duration_ms":750}),
+            ),
+            (
+                Tool::Key,
+                json!({"expected_revision":7,"key":"backspace"}),
+                json!({"type":"key","key":"backspace"}),
+            ),
+            (
                 Tool::Tap,
                 json!({"expected_revision":7,"at":{"x":12.5,"y":900}}),
                 json!({"type":"tap","at":{"x":12.5,"y":900.0}}),
@@ -241,6 +310,23 @@ mod tests {
     #[test]
     fn malformed_interaction_has_no_action() {
         for (tool, arguments) in [
+            (Tool::Key, json!({"expected_revision":1,"key":"command"})),
+            (
+                Tool::Key,
+                json!({"expected_revision":1,"key":"enter","value":"extra"}),
+            ),
+            (
+                Tool::LongPress,
+                json!({"expected_revision":1,"at":{"x":1,"y":2},"duration_ms":0}),
+            ),
+            (
+                Tool::LongPress,
+                json!({"expected_revision":1,"at":{"x":1,"y":2},"duration_ms":5001}),
+            ),
+            (
+                Tool::DoubleTap,
+                json!({"expected_revision":1,"at":{"x":-1,"y":2}}),
+            ),
             (
                 Tool::Tap,
                 json!({"expected_revision":1,"at":{"x":-1,"y":2}}),

@@ -151,6 +151,13 @@ pub enum Action {
     Tap {
         at: Point,
     },
+    DoubleTap {
+        at: Point,
+    },
+    LongPress {
+        at: Point,
+        duration_ms: u32,
+    },
     Swipe {
         from: Point,
         to: Point,
@@ -159,6 +166,9 @@ pub enum Action {
     Text {
         value: String,
     },
+    Key {
+        key: KeyboardKey,
+    },
     Home,
     LaunchApp {
         bundle_id: String,
@@ -166,12 +176,24 @@ pub enum Action {
     Lock,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeyboardKey {
+    Backspace,
+    Enter,
+    Tab,
+    Escape,
+}
+
 impl Action {
     pub fn kind(&self) -> &'static str {
         match self {
             Self::Tap { .. } => "tap",
+            Self::DoubleTap { .. } => "double_tap",
+            Self::LongPress { .. } => "long_press",
             Self::Swipe { .. } => "swipe",
             Self::Text { .. } => "text",
+            Self::Key { .. } => "key",
             Self::Home => "home",
             Self::LaunchApp { .. } => "launch_app",
             Self::Lock => "lock",

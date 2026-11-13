@@ -69,20 +69,25 @@ pub(crate) fn visible_text_input(xml: &str) -> bool {
     parse(xml, Target::TextInput) == Some(())
 }
 
+pub(crate) fn visible_text_target(xml: &str, at: Point) -> bool {
+    parse(xml, Target::TextPoint(at)) == Some(())
+}
+
 enum Target {
     Context,
     Button(Point),
     ModalButton(Point),
     TextInput,
+    TextPoint(Point),
 }
 
 fn parse(xml: &str, target_kind: Target) -> Option<()> {
     let at = match target_kind {
-        Target::Button(at) | Target::ModalButton(at) => Some(at),
+        Target::Button(at) | Target::ModalButton(at) | Target::TextPoint(at) => Some(at),
         _ => None,
     };
     let allow_modal = matches!(target_kind, Target::ModalButton(_));
-    let require_text = matches!(target_kind, Target::TextInput);
+    let require_text = matches!(target_kind, Target::TextInput | Target::TextPoint(_));
     if xml.is_empty()
         || xml.len() > 2 * 1024 * 1024
         || at.is_some_and(|at| !at.x.is_finite() || !at.y.is_finite())
@@ -200,6 +205,11 @@ fn parse(xml: &str, target_kind: Target) -> Option<()> {
                         keyboards += 1;
                     } else {
                         text_inputs += 1;
+                        if matches!(target_kind, Target::TextPoint(_))
+                            && Rect::read(&attrs)?.contains(at?)
+                        {
+                            target = true;
+                        }
                     }
                 }
                 if kind == "XCUIElementTypeButton"
@@ -208,7 +218,8 @@ fn parse(xml: &str, target_kind: Target) -> Option<()> {
                 {
                     let rect = Rect::read(&attrs)?;
                     if rect.contains(at) {
-                        if target
+                        if matches!(target_kind, Target::TextPoint(_))
+                            || target
                             || !stack
                                 .iter()
                                 .any(|parent| parent == "XCUIElementTypeApplication")
@@ -296,6 +307,29 @@ mod tests {
             format!("{body}<broken>"),
         ] {
             assert!(!visible_text_input(&tree(&invalid)), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn text_gesture_requires_an_unobstructed_point_inside_the_only_field() {
+        let field = r#"<XCUIElementTypeSearchField visible="true" enabled="true" x="20" y="67" width="298" height="44"/>"#;
+        let keyboard = r#"<XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/>"#;
+        let at = Point { x: 80.0, y: 80.0 };
+        let body = format!("{field}{keyboard}");
+        assert!(visible_text_target(&tree(&body), at));
+        for point in [
+            Point { x: 19.0, y: 80.0 },
+            Point { x: 318.0, y: 80.0 },
+            Point { x: 80.0, y: 550.0 },
+        ] {
+            assert!(!visible_text_target(&tree(&body), point));
+        }
+        for extra in [
+            field,
+            r#"<XCUIElementTypeButton label="Clear" visible="true" enabled="true" x="60" y="70" width="40" height="30"/>"#,
+            r#"<XCUIElementTypeAlert/>"#,
+        ] {
+            assert!(!visible_text_target(&tree(&format!("{body}{extra}")), at));
         }
     }
 

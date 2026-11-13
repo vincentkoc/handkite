@@ -25,6 +25,7 @@ pub enum ActionAdmission {
     NativeModalTap { at: Point, until: Instant },
     NativeHome { until: Instant },
     NativeText { until: Instant },
+    NativeTextGesture { at: Point, until: Instant },
 }
 
 pub trait DeviceAdapter {
@@ -58,6 +59,7 @@ pub trait DeviceAdapter {
                 ActionAdmission::NativeHome { .. }
                     | ActionAdmission::NativeModalTap { .. }
                     | ActionAdmission::NativeText { .. }
+                    | ActionAdmission::NativeTextGesture { .. }
             )
         ) {
             return Err(AdapterError);
@@ -287,6 +289,19 @@ impl<A: DeviceAdapter> Controller<A> {
                 if fresh.state.lock == LockState::Unlocked
                     && fresh.state.wda_ready
                     && Instant::now() < until =>
+            {
+                Some(until)
+            }
+            (
+                Action::DoubleTap { at } | Action::LongPress { at, .. },
+                Some(ActionAdmission::NativeTextGesture {
+                    at: admitted,
+                    until,
+                }),
+            ) if *at == admitted
+                && fresh.state.lock == LockState::Unlocked
+                && fresh.state.wda_ready
+                && Instant::now() < until =>
             {
                 Some(until)
             }

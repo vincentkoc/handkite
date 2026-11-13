@@ -19,8 +19,11 @@ pub(super) enum Tool {
     Home,
     Clock,
     Tap,
+    DoubleTap,
+    LongPress,
     Swipe,
     Text,
+    Key,
     LaunchApp,
 }
 
@@ -34,8 +37,11 @@ impl Tool {
             "handkite_home" => Some(Self::Home),
             "handkite_launch_clock" => Some(Self::Clock),
             "handkite_tap" => Some(Self::Tap),
+            "handkite_double_tap" => Some(Self::DoubleTap),
+            "handkite_long_press" => Some(Self::LongPress),
             "handkite_swipe" => Some(Self::Swipe),
             "handkite_text" => Some(Self::Text),
+            "handkite_key" => Some(Self::Key),
             "handkite_launch_app" => Some(Self::LaunchApp),
             _ => None,
         }
@@ -43,7 +49,13 @@ impl Tool {
 
     pub(super) fn allowed(self, capabilities: Capabilities) -> bool {
         match self {
-            Self::Tap | Self::Swipe | Self::Text | Self::LaunchApp => {
+            Self::Tap
+            | Self::DoubleTap
+            | Self::LongPress
+            | Self::Swipe
+            | Self::Text
+            | Self::Key
+            | Self::LaunchApp => {
                 matches!(capabilities, Capabilities::ObservationNavigationInteraction)
             }
             Self::Status | Self::Observe => matches!(
@@ -64,7 +76,15 @@ impl Tool {
     pub(super) fn is_action(self) -> bool {
         matches!(
             self,
-            Self::Home | Self::Clock | Self::Tap | Self::Swipe | Self::Text | Self::LaunchApp
+            Self::Home
+                | Self::Clock
+                | Self::Tap
+                | Self::DoubleTap
+                | Self::LongPress
+                | Self::Swipe
+                | Self::Text
+                | Self::Key
+                | Self::LaunchApp
         )
     }
 }
@@ -100,12 +120,24 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
             "Tap one screen point using an expected observation revision and return the captured screen.",
         ),
         (
+            "handkite_double_tap",
+            "Double-tap one screen point as a single gesture using an expected observation revision.",
+        ),
+        (
+            "handkite_long_press",
+            "Press and hold one screen point for a bounded duration using an expected observation revision.",
+        ),
+        (
             "handkite_swipe",
             "Swipe once between two screen points using an expected observation revision and return the captured screen.",
         ),
         (
             "handkite_text",
             "Type text once using an expected observation revision and return the captured screen. Control characters are rejected.",
+        ),
+        (
+            "handkite_key",
+            "Press one editing key: backspace, enter, tab or escape. Enter can submit the current form. Requires an expected observation revision.",
         ),
         (
             "handkite_launch_app",

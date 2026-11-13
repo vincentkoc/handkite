@@ -2,7 +2,7 @@ pub(crate) use crate::pin_field::valid_id as valid_session_id;
 use crate::wda_http::HttpResponse;
 use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::AdapterError;
-use handkite_core::protocol::{Action, Point, TransportReceipt};
+use handkite_core::protocol::{Action, KeyboardKey, Point, TransportReceipt};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -301,6 +301,45 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
                 json!({"type": "pointerUp", "button": 0}),
             ]),
         )),
+        Action::LongPress { at, duration_ms }
+            if point_valid(*at) && (1..=5000).contains(duration_ms) =>
+        {
+            Ok((
+                "/actions",
+                touch_action(vec![
+                    json!({"type":"pointerMove","duration":0,"x":at.x,"y":at.y}),
+                    json!({"type":"pointerDown","button":0}),
+                    json!({"type":"pause","duration":duration_ms}),
+                    json!({"type":"pointerUp","button":0}),
+                ]),
+            ))
+        }
+        Action::DoubleTap { at } if point_valid(*at) => Ok((
+            "/actions",
+            touch_action(vec![
+                json!({"type":"pointerMove","duration":0,"x":at.x,"y":at.y}),
+                json!({"type":"pointerDown","button":0}),
+                json!({"type":"pause","duration":80}),
+                json!({"type":"pointerUp","button":0}),
+                json!({"type":"pause","duration":100}),
+                json!({"type":"pointerDown","button":0}),
+                json!({"type":"pause","duration":80}),
+                json!({"type":"pointerUp","button":0}),
+            ]),
+        )),
+        Action::Key { key } => {
+            let value = match key {
+                KeyboardKey::Backspace => "\u{e003}",
+                KeyboardKey::Enter => "\u{e007}",
+                KeyboardKey::Tab => "\u{e004}",
+                KeyboardKey::Escape => "\u{e00c}",
+            };
+            Ok((
+                "/actions",
+                json!({"actions":[{"type":"key","id":"keyboard",
+                "actions":[{"type":"keyDown","value":value},{"type":"keyUp","value":value}]}]}),
+            ))
+        }
         Action::Swipe {
             from,
             to,
@@ -945,6 +984,88 @@ mod tests {
         let (path, body) = payload(&Action::Lock).unwrap();
         assert_eq!(path, "/wda/lock");
         assert_eq!(body, json!({}));
+    }
+
+    #[tokio::test]
+    async fn editing_inputs_are_balanced_single_requests_without_retry() {
+        let at = Point { x: 25.5, y: 80.0 };
+        let actions = [
+            Action::DoubleTap { at },
+            Action::LongPress {
+                at,
+                duration_ms: 750,
+            },
+            Action::Key {
+                key: KeyboardKey::Backspace,
+            },
+            Action::Key {
+                key: KeyboardKey::Enter,
+            },
+            Action::Key {
+                key: KeyboardKey::Tab,
+            },
+            Action::Key {
+                key: KeyboardKey::Escape,
+            },
+        ];
+        for action in actions {
+            let (path, body) = payload(&action).unwrap();
+            assert_eq!(path, "/actions");
+            let steps = body["actions"][0]["actions"].as_array().unwrap();
+            if let Action::Key { key } = action {
+                let expected = match key {
+                    KeyboardKey::Backspace => "\u{e003}",
+                    KeyboardKey::Enter => "\u{e007}",
+                    KeyboardKey::Tab => "\u{e004}",
+                    KeyboardKey::Escape => "\u{e00c}",
+                };
+                assert_eq!(
+                    steps.as_slice(),
+                    [
+                        json!({"type":"keyDown","value":expected}),
+                        json!({"type":"keyUp","value":expected})
+                    ]
+                );
+            } else {
+                let downs = steps.iter().filter(|s| s["type"] == "pointerDown").count();
+                let ups = steps.iter().filter(|s| s["type"] == "pointerUp").count();
+                assert_eq!(
+                    downs,
+                    if matches!(action, Action::DoubleTap { .. }) {
+                        2
+                    } else {
+                        1
+                    }
+                );
+                assert_eq!(downs, ups);
+                if matches!(action, Action::LongPress { .. }) {
+                    assert_eq!(steps[2]["duration"], 750);
+                }
+            }
+            for lost in [false, true] {
+                let mut step = response(
+                    "POST",
+                    "/session/fixture-session/actions",
+                    200,
+                    json!({"value":null}),
+                );
+                if lost {
+                    step.response = Err(WdaError::AfterSent);
+                }
+                let mut wda = Script::new(vec![step]);
+                wda.1 = Some(body.clone());
+                assert_eq!(
+                    WdaActions::execute_on(&wda, &action, "fixture-session")
+                        .await
+                        .is_err(),
+                    lost
+                );
+                wda.done();
+            }
+        }
+        for duration_ms in [0, 5001] {
+            assert!(payload(&Action::LongPress { at, duration_ms }).is_err());
+        }
     }
 
     #[tokio::test]
