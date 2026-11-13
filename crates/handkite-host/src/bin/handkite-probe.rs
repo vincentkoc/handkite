@@ -26,6 +26,8 @@ mod idle_settings;
 mod lock_ui_attrs;
 #[path = "probe/normal_lock_attrs.rs"]
 mod normal_lock_attrs;
+#[path = "probe/observation_timings.rs"]
+mod observation_timings;
 #[path = "probe/pin_field_compare.rs"]
 mod pin_field_compare;
 #[path = "probe/pin_geometry.rs"]
@@ -37,6 +39,13 @@ mod touch_trial;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| arg == "observation-timings") {
+        if let Err(error) = observation_timings::command(&args[1..]) {
+            eprintln!("observation_timings={error}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.first().is_some_and(|arg| arg == "assistive-attrs") {
         if let Err(error) = assistive_attrs::command(&args[1..]) {
             eprintln!("assistive_attrs={error}");

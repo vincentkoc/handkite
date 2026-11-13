@@ -1,6 +1,6 @@
 use crate::native_lock;
 use crate::usb::PinnedUsb;
-use crate::wda_action::WdaActions;
+use crate::wda_action::{WdaActions, WdaRequest};
 use crate::wda_http::HttpResponse;
 use crate::wda_runner::{OwnedWdaRunner, RunnerError, RunnerLiveness};
 use crate::wda_session::{SessionClose, close_owned_session, create_owned_session};
@@ -14,6 +14,10 @@ use handkite_core::protocol::{
 };
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+mod measurement;
+pub use measurement::CaptureTimings;
+use measurement::{Stage, measure};
 
 pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,index,traits,hittable,customActions,nativeFrame";
 const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
@@ -187,13 +191,51 @@ impl WdaAdapter {
         &self,
         source_path: &str,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
-        self.validate_owned()?;
+        self.capture_checked_recorded(source_path, None)
+    }
+
+    /// One normal capture, with no output or input and no change to ownership checks.
+    pub fn observe_with_timings(
+        &mut self,
+    ) -> (Result<RawObservation, AdapterError>, CaptureTimings) {
+        let mut timings = CaptureTimings::default();
+        let started = Instant::now();
+        let result = self
+            .capture_checked_recorded(SCREEN_SOURCE, Some(&mut timings))
+            .map(|(observation, _, _)| observation);
+        timings.finish(started, result.is_ok());
+        (result, timings)
+    }
+
+    fn capture_checked_recorded(
+        &self,
+        source_path: &str,
+        mut timings: Option<&mut CaptureTimings>,
+    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+        measure(
+            timings.as_deref_mut(),
+            Stage::OwnershipBefore,
+            &Instant::now,
+            |_| 0,
+            || self.validate_owned(),
+        )?;
         let captured = self
             .runtime
             .as_ref()
             .expect("adapter runtime")
-            .block_on(Self::capture(&self.usb, &self.expected, source_path))?;
-        self.validate_owned()?;
+            .block_on(Self::capture(
+                &self.usb,
+                &self.expected,
+                source_path,
+                timings.as_deref_mut(),
+            ))?;
+        measure(
+            timings,
+            Stage::OwnershipAfter,
+            &Instant::now,
+            |_| 0,
+            || self.validate_owned(),
+        )?;
         Ok(captured)
     }
 
@@ -201,44 +243,124 @@ impl WdaAdapter {
         usb: &PinnedUsb,
         expected: &HardwareId,
         source_path: &str,
+        timings: Option<&mut CaptureTimings>,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
         let started_unix_ms = unix_ms()?;
         let wda = UsbWda::new(usb.clone());
-        let (image, source, app, reported_lock) = tokio::join!(
-            wda.request("GET", "/screenshot", b"", Duration::from_secs(20)),
-            wda.request("GET", source_path, b"", Duration::from_secs(20)),
-            wda.request("GET", "/wda/activeAppInfo", b"", Duration::from_secs(10)),
-            wda.request("GET", "/wda/locked", b"", Duration::from_secs(10)),
+        Self::capture_using(
+            &wda,
+            expected,
+            source_path,
+            started_unix_ms,
+            &Instant::now,
+            &unix_ms,
+            timings,
+        )
+        .await
+    }
+
+    async fn capture_using(
+        wda: &impl WdaRequest,
+        expected: &HardwareId,
+        source_path: &str,
+        started_unix_ms: u64,
+        clock: &impl Fn() -> Instant,
+        wall: &impl Fn() -> Result<u64, AdapterError>,
+        mut timings: Option<&mut CaptureTimings>,
+    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+        let enabled = timings.is_some();
+        let (
+            (image, image_timing),
+            (source, source_timing),
+            (app, app_timing),
+            (reported_lock, lock_timing),
+        ) = tokio::join!(
+            measurement::request(
+                enabled,
+                Stage::ScreenshotRequest,
+                clock,
+                wda.request("GET", "/screenshot", b"", Duration::from_secs(20))
+            ),
+            measurement::request(
+                enabled,
+                Stage::SourceRequest,
+                clock,
+                wda.request("GET", source_path, b"", Duration::from_secs(20))
+            ),
+            measurement::request(
+                enabled,
+                Stage::AppRequest,
+                clock,
+                wda.request("GET", "/wda/activeAppInfo", b"", Duration::from_secs(10))
+            ),
+            measurement::request(
+                enabled,
+                Stage::LockRequest,
+                clock,
+                wda.request("GET", "/wda/locked", b"", Duration::from_secs(10))
+            ),
         );
-        let image = response_value(image.map_err(|_| AdapterError)?)?;
-        let source = response_value(source.map_err(|_| AdapterError)?)?;
-        let app = response_value(app.map_err(|_| AdapterError)?)?;
-        let reported_lock = response_value(reported_lock.map_err(|_| AdapterError)?)?;
-        let encoded = image.as_str().ok_or(AdapterError)?;
-        let screenshot = base64::engine::general_purpose::STANDARD
-            .decode(encoded)
-            .map_err(|_| AdapterError)?;
-        if !screenshot.starts_with(b"\x89PNG\r\n\x1a\n") {
-            return Err(AdapterError);
+        if let Some(timings) = timings.as_deref_mut() {
+            timings.append([image_timing, source_timing, app_timing, lock_timing]);
         }
-        let tree = match source {
-            serde_json::Value::String(tree) if !tree.is_empty() => tree,
-            _ => return Err(AdapterError),
+        let mut decode = |response: Result<HttpResponse, crate::wda_transport::WdaError>, stage| {
+            let response = response.map_err(|_| AdapterError)?;
+            let bytes = response.body.len();
+            measure(
+                timings.as_deref_mut(),
+                stage,
+                clock,
+                |_| bytes,
+                || response_value(response),
+            )
         };
-        let app = app["bundleId"]
-            .as_str()
-            .filter(|value| !value.is_empty())
-            .ok_or(AdapterError)?
-            .to_owned();
-        let reported_lock = reported_lock.as_bool();
-        let lock = classify_lock(&app, &tree, reported_lock);
-        let finished = Instant::now();
+        let image = decode(image, Stage::ScreenshotJson)?;
+        let source = decode(source, Stage::SourceJson)?;
+        let app = decode(app, Stage::AppJson)?;
+        let reported_lock = decode(reported_lock, Stage::LockJson)?;
+        let screenshot = measure(
+            timings.as_deref_mut(),
+            Stage::ImageDecode,
+            clock,
+            Vec::len,
+            || {
+                let encoded = image.as_str().ok_or(AdapterError)?;
+                let screenshot = base64::engine::general_purpose::STANDARD
+                    .decode(encoded)
+                    .map_err(|_| AdapterError)?;
+                if !screenshot.starts_with(b"\x89PNG\r\n\x1a\n") {
+                    return Err(AdapterError);
+                }
+                Ok(screenshot)
+            },
+        )?;
+        let (tree, app, reported_lock, lock) = measure(
+            timings,
+            Stage::PayloadValidation,
+            clock,
+            |(tree, _, _, _): &(String, String, Option<bool>, LockState)| tree.len(),
+            || {
+                let tree = match source {
+                    serde_json::Value::String(tree) if !tree.is_empty() => tree,
+                    _ => return Err(AdapterError),
+                };
+                let app = app["bundleId"]
+                    .as_str()
+                    .filter(|value| !value.is_empty())
+                    .ok_or(AdapterError)?
+                    .to_owned();
+                let reported_lock = reported_lock.as_bool();
+                let lock = classify_lock(&app, &tree, reported_lock);
+                Ok((tree, app, reported_lock, lock))
+            },
+        )?;
+        let finished = clock();
         let observation = RawObservation {
             connected_usb: expected.clone(),
             wda_target: expected.clone(),
             window: ObservationWindow {
                 started_unix_ms,
-                finished_unix_ms: unix_ms()?,
+                finished_unix_ms: wall()?,
             },
             state: DeviceState {
                 lock,
