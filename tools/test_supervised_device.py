@@ -658,6 +658,13 @@ class PureTests(unittest.TestCase):
             self.assertEqual(broker.pin_diagnostic(result)["reported_outcome"], "unclassified")
             self.assertEqual(broker.pin_result(result), (False, False))
 
+    def test_final_confirmation_label_does_not_promote_an_unknown_result(self):
+        result = (1, b"", b"handkite-unlock-once: unlock_idle=unknown "
+                  b"reason=backend_unavailable action=backend_unavailable restoration=verified "
+                  b"phase=final_confirmation step=freshness\n", False)
+        self.assertEqual(broker.pin_diagnostic(result)["phase"], "final_confirmation")
+        self.assertEqual(broker.pin_result(result), (False, False))
+
     def test_runner_startup_reasons_are_safe_known_zero_results(self):
         prefix = b"handkite-unlock-once: unlock_idle=refused reason=runner_unavailable runner="
         for reason in broker.RUNNER_REASONS:

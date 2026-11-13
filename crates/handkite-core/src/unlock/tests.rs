@@ -240,6 +240,78 @@ fn run(
 }
 
 #[test]
+fn native_final_witness_is_used_only_after_all_digits_and_verifies_identity() {
+    struct NativeFinal {
+        phone: FakePhone,
+        mode: u8,
+        checks: usize,
+    }
+    impl PasscodeBackend for NativeFinal {
+        fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError> {
+            assert!(self.phone.presses < 6, "final proof must not capture XML");
+            self.phone.snapshot()
+        }
+        fn final_observation(&mut self) -> Result<FinalObservation, BackendError> {
+            assert_eq!(self.phone.presses, 6);
+            assert!(!self.phone.locked);
+            self.checks += 1;
+            if self.mode == 3 {
+                return Err(BackendError::Unavailable);
+            }
+            let wrong = HardwareId::new("fixture-other-phone").unwrap();
+            Ok(FinalObservation::NativeUnlocked {
+                connected_usb: if self.mode == 1 {
+                    wrong.clone()
+                } else {
+                    self.phone.usb.clone()
+                },
+                wda_target: if self.mode == 2 {
+                    wrong
+                } else {
+                    self.phone.wda_target.clone()
+                },
+            })
+        }
+        fn show_keypad(&mut self) -> Result<(), BackendError> {
+            self.phone.show_keypad()
+        }
+        fn press_digit(&mut self, digit: u8) -> Result<(), BackendError> {
+            self.phone.press_digit(digit)
+        }
+        fn delete_digit(&mut self) -> Result<(), BackendError> {
+            self.phone.delete_digit()
+        }
+    }
+    for mode in 0..4 {
+        let mut phone = NativeFinal {
+            phone: FakePhone::new(),
+            mode,
+            checks: 0,
+        };
+        let mut gate = MemoryGate::default();
+        phone.phone.events = Rc::clone(&gate.events);
+        let (binding, key, policy) = fixture();
+        let result = unlock_once(
+            &mut phone,
+            &mut gate,
+            &binding,
+            &key,
+            &Passcode::new("123456".into()).unwrap(),
+            policy,
+        );
+        let expected = match mode {
+            0 => Ok(UnlockOutcome::CodeSubmitted),
+            1 | 2 => Err(UnlockError::DeviceMismatch),
+            _ => Err(UnlockError::Backend(BackendError::Unavailable)),
+        };
+        assert_eq!(result, expected);
+        assert_eq!((phone.phone.presses, phone.checks), (6, 1));
+        assert_eq!(gate.clears, usize::from(mode == 0));
+        assert_eq!(gate.disabled, mode != 0);
+    }
+}
+
+#[test]
 fn submits_all_digits_with_either_count_order_and_stale_wda_flag() {
     for entered_first in [false, true] {
         let mut phone = FakePhone::new();

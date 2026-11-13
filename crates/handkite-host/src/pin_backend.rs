@@ -7,7 +7,7 @@ use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::AdapterError;
 use handkite_core::passcode::PasscodeProgress;
 use handkite_core::protocol::{Action, HardwareId, LockState, Point, TransportReceipt};
-use handkite_core::unlock::{BackendError, PasscodeBackend, PasscodeScreen};
+use handkite_core::unlock::{BackendError, FinalObservation, PasscodeBackend, PasscodeScreen};
 use std::future::Future;
 use std::sync::Arc;
 use std::thread;
@@ -38,6 +38,7 @@ pub enum PinPhase {
     RevealPostcapture,
     EmptyConfirmation,
     DigitInput,
+    FinalConfirmation,
 }
 
 impl PinPhase {
@@ -53,6 +54,7 @@ impl PinPhase {
             Self::RevealPostcapture => "reveal_postcapture",
             Self::EmptyConfirmation => "empty_confirmation",
             Self::DigitInput => "digit_input",
+            Self::FinalConfirmation => "final_confirmation",
         }
     }
 }
@@ -1144,6 +1146,94 @@ impl NativePasscodeBackend {
         Ok(screen)
     }
 
+    fn final_observation_with(
+        &mut self,
+        started: Instant,
+        read: impl FnOnce(&mut Self) -> Result<(native_lock::NativeLock, bool), BackendError>,
+        fallback: impl FnOnce(&mut Self, Instant) -> Result<PasscodeScreen, BackendError>,
+        now: impl FnOnce() -> Instant,
+    ) -> Result<FinalObservation, BackendError> {
+        if !self.session_bound
+            || self.input_admission.is_none()
+            || self.progress_check != ProgressCheck::Complete
+        {
+            return fallback(self, started).map(FinalObservation::Screen);
+        }
+        self.phase = PinPhase::FinalConfirmation;
+        self.last_view = None;
+        self.last_diagnostics = None;
+        self.capture_timings = PinCaptureTimings::default();
+        self.wda_reported_lock = PinReportedLock::Unknown;
+        self.capture_count += 1;
+        let result = (|| {
+            self.admit_input()?;
+            let (native, locked) = read(self)?;
+            self.admit_input()?;
+            self.capture_step = PinCaptureStep::Freshness;
+            if now().saturating_duration_since(started) >= PIN_VIEW_BUDGET
+                || native.unlocked_since_boot != Some(true)
+            {
+                return Err(BackendError::Unavailable);
+            }
+            match (native.state, locked) {
+                (LockState::Unlocked, false) => {
+                    self.capture_step = PinCaptureStep::Complete;
+                    Ok(FinalObservation::NativeUnlocked {
+                        connected_usb: self.expected.clone(),
+                        wda_target: self.expected.clone(),
+                    })
+                }
+                (LockState::Locked, true) => fallback(self, started).map(FinalObservation::Screen),
+                _ => Err(BackendError::Unavailable),
+            }
+        })();
+        if result.is_err() {
+            self.progress_check = ProgressCheck::Failed;
+        }
+        result
+    }
+
+    fn read_final_lock(&mut self) -> Result<(native_lock::NativeLock, bool), BackendError> {
+        let wda = UsbWda::new(self.usb.clone());
+        self.capture_step = PinCaptureStep::SessionBefore;
+        let started = Instant::now();
+        let session = self.runtime.block_on(self.actions.prepare_existing(&wda));
+        self.capture_timings.session_before_ms = started.elapsed().as_millis();
+        session.map_err(|_| BackendError::Unavailable)?;
+        let expected = self.expected.clone();
+        let ((locked, elapsed), (), native) = self.runtime.block_on(capture_reads(
+            async {
+                let started = Instant::now();
+                let result = wda
+                    .request("GET", "/wda/locked", b"", PIN_VIEW_BUDGET)
+                    .await;
+                (result, started.elapsed().as_millis())
+            },
+            async {},
+            move || {
+                let started = Instant::now();
+                (native_lock::query(&expected), started.elapsed().as_millis())
+            },
+        ));
+        self.capture_timings.lock_ms = elapsed;
+        if let Ok((_, elapsed)) = &native {
+            self.capture_timings.native_ms = *elapsed;
+        }
+        self.capture_step = PinCaptureStep::LockRead;
+        let locked = response_value(locked.map_err(wda_error)?)?
+            .as_bool()
+            .ok_or(BackendError::Unavailable)?;
+        self.wda_reported_lock = PinReportedLock::from_bool(Some(locked));
+        self.capture_step = PinCaptureStep::NativeLock;
+        let (native, _) = native.map_err(|_| BackendError::Unavailable)?;
+        self.capture_step = PinCaptureStep::SessionAfter;
+        let started = Instant::now();
+        let session = self.runtime.block_on(self.actions.prepare_existing(&wda));
+        self.capture_timings.session_after_ms = started.elapsed().as_millis();
+        session.map_err(|_| BackendError::Unavailable)?;
+        Ok((native, locked))
+    }
+
     fn capture_snapshot(
         &mut self,
         started: Instant,
@@ -1263,6 +1353,15 @@ impl NativePasscodeBackend {
 impl PasscodeBackend for NativePasscodeBackend {
     fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError> {
         self.snapshot_with(Instant::now(), Self::capture_snapshot, Instant::now)
+    }
+
+    fn final_observation(&mut self) -> Result<FinalObservation, BackendError> {
+        self.final_observation_with(
+            Instant::now(),
+            Self::read_final_lock,
+            |backend, started| backend.snapshot_with(started, Self::capture_snapshot, Instant::now),
+            Instant::now,
+        )
     }
 
     fn show_keypad(&mut self) -> Result<(), BackendError> {
@@ -2383,6 +2482,97 @@ mod tests {
         assert_eq!(source, Err("source failed"));
         assert_eq!(lock, "lock read");
         assert_eq!(native.unwrap(), "native finished");
+    }
+
+    #[test]
+    fn final_native_proof_requires_agreement_freshness_and_retained_ownership() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for case in 0..10 {
+            let owner = Arc::new(AtomicBool::new(case != 8));
+            let check = owner.clone();
+            let mut backend = bound_backend()
+                .with_input_admission(move || check.load(Ordering::SeqCst))
+                .unwrap();
+            backend.progress_check = ProgressCheck::Complete;
+            let started = Instant::now();
+            let result = backend.final_observation_with(
+                started,
+                |_| {
+                    assert_ne!(case, 8, "lost ownership must stop before reads");
+                    if case == 9 {
+                        owner.store(false, Ordering::SeqCst);
+                    }
+                    if case == 7 {
+                        return Err(BackendError::Unavailable);
+                    }
+                    Ok((
+                        native_lock::NativeLock {
+                            state: match case {
+                                1 | 3 => LockState::Locked,
+                                4 => LockState::Uncertain,
+                                _ => LockState::Unlocked,
+                            },
+                            unlocked_since_boot: if case == 5 { None } else { Some(true) },
+                        },
+                        matches!(case, 1 | 2),
+                    ))
+                },
+                |_, original| {
+                    assert_eq!(case, 1, "only matching Locked may fall back");
+                    assert_eq!(original, started);
+                    Ok(keypad_capture(false).0)
+                },
+                || {
+                    if case == 6 {
+                        started + PIN_VIEW_BUDGET
+                    } else {
+                        started
+                    }
+                },
+            );
+            match case {
+                0 => assert!(matches!(
+                    result,
+                    Ok(FinalObservation::NativeUnlocked { .. })
+                )),
+                1 => assert!(matches!(result, Ok(FinalObservation::Screen(_)))),
+                _ => {
+                    assert!(matches!(result, Err(BackendError::Unavailable)));
+                    assert_eq!(backend.progress_check, ProgressCheck::Failed);
+                }
+            }
+            assert!(backend.last_view.is_none());
+        }
+    }
+
+    #[test]
+    fn final_locked_fallback_keeps_original_capture_deadline() {
+        let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+        backend.progress_check = ProgressCheck::Complete;
+        let started = Instant::now();
+        let result = backend.final_observation_with(
+            started,
+            |_| {
+                Ok((
+                    native_lock::NativeLock {
+                        state: LockState::Locked,
+                        unlocked_since_boot: Some(true),
+                    },
+                    true,
+                ))
+            },
+            |backend, original| {
+                backend.snapshot_with(
+                    original,
+                    |_, _| Ok(keypad_capture(false)),
+                    || started + PIN_VIEW_BUDGET,
+                )
+            },
+            || started + Duration::from_millis(100),
+        );
+        assert!(matches!(result, Err(BackendError::Unavailable)));
+        assert_eq!(backend.progress_check, ProgressCheck::Failed);
+        assert!(backend.last_view.is_none());
     }
 
     #[test]

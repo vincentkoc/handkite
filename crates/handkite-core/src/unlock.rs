@@ -16,6 +16,15 @@ pub struct PasscodeScreen {
     pub trust_prompt: bool,
 }
 
+/// Final-state evidence only; it never admits another digit or UI action.
+pub enum FinalObservation {
+    Screen(PasscodeScreen),
+    NativeUnlocked {
+        connected_usb: HardwareId,
+        wda_target: HardwareId,
+    },
+}
+
 impl PasscodeScreen {
     fn confirmed_unlocked(&self) -> bool {
         self.native_lock == LockState::Unlocked && self.visible_lock == LockState::Unlocked
@@ -35,6 +44,9 @@ pub enum BackendError {
 
 pub trait PasscodeBackend {
     fn snapshot(&mut self) -> Result<PasscodeScreen, BackendError>;
+    fn final_observation(&mut self) -> Result<FinalObservation, BackendError> {
+        self.snapshot().map(FinalObservation::Screen)
+    }
     fn show_keypad(&mut self) -> Result<(), BackendError>;
     fn press_digit(&mut self, digit: u8) -> Result<(), BackendError>;
     fn delete_digit(&mut self) -> Result<(), BackendError>;
@@ -192,7 +204,23 @@ fn confirm_final<B: PasscodeBackend>(
 ) -> Result<FinalState, UnlockError> {
     let mut last_count = None;
     for poll in 0..=policy.final_polls {
-        let screen = sample(backend, binding, requested)?;
+        let screen = match backend.final_observation()? {
+            FinalObservation::NativeUnlocked {
+                connected_usb,
+                wda_target,
+            } => {
+                binding
+                    .verify(requested, &connected_usb, &wda_target)
+                    .map_err(|_| UnlockError::DeviceMismatch)?;
+                return Ok(FinalState::Unlocked);
+            }
+            FinalObservation::Screen(screen) => {
+                binding
+                    .verify(requested, &screen.connected_usb, &screen.wda_target)
+                    .map_err(|_| UnlockError::DeviceMismatch)?;
+                screen
+            }
+        };
         if screen.confirmed_unlocked() {
             return Ok(FinalState::Unlocked);
         }
