@@ -134,3 +134,32 @@ fn selected_device_key_reaches_the_existing_gate_without_pin_input() {
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(!error.contains("selected device key"));
 }
+
+#[test]
+fn stop_receipt_modes_reject_action_and_path_overrides_before_state_access() {
+    for mode in ["--stop-state-snapshot", "--check-stop-state"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_handkite-unlock-once"))
+            .args([mode, "--config", "/unused/config"])
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(output.stdout.is_empty());
+        assert_eq!(output.stderr, b"handkite-unlock-once: invalid_arguments\n");
+    }
+}
+
+#[test]
+fn stop_receipt_check_rejects_pipe_before_state_or_pin_access() {
+    let output = Command::new(env!("CARGO_BIN_EXE_handkite-unlock-once"))
+        .arg("--check-stop-state")
+        .stdin(Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    assert_eq!(
+        output.stderr,
+        b"handkite-unlock-once: stop_snapshot_invalid\n"
+    );
+}

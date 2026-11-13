@@ -11,6 +11,8 @@ mod diagnose;
 mod idle;
 #[path = "unlock/owned.rs"]
 mod owned;
+#[path = "unlock/stops.rs"]
+mod stops;
 
 fn main() {
     if let Err(error) = run() {
@@ -21,6 +23,12 @@ fn main() {
 
 fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
+    if args
+        .get(1)
+        .is_some_and(|arg| matches!(arg.as_str(), "--stop-state-snapshot" | "--check-stop-state"))
+    {
+        return stops::run(&args);
+    }
     if args
         .get(1)
         .is_some_and(|arg| arg == "--prepare-keypad-only")
