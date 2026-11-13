@@ -55,7 +55,7 @@ def decode_observation(response, expected_request_id, method, device_key):
 
     Status text is metadata directly; observe text wraps metadata and a tree,
     followed by one PNG/JPEG MIME image with nonempty strict standard base64.
-    Compact tree_chars counts its JSON presentation. Image codec validity is
+    Compact tree_chars counts its XML presentation. Image codec validity is
     not established by this contract decoder.
     """
     _require(method in ("handkite_status", "handkite_observe") and

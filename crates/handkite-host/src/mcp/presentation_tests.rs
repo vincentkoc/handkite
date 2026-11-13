@@ -216,19 +216,52 @@ fn catalog_exposes_only_optional_compact_on_observe() {
     );
 }
 
+fn synthetic_tree(buttons: usize, pretty: bool, unicode: bool) -> String {
+    let label = if unicode {
+        "Café &amp; 🦊"
+    } else {
+        "Example"
+    };
+    let button = format!(
+        "<XCUIElementTypeButton type=\"XCUIElementTypeButton\" name=\"{label}\" label=\"{label}\" enabled=\"true\" visible=\"true\" x=\"10\" y=\"20\" width=\"100\" height=\"40\"/>"
+    );
+    if pretty {
+        format!(
+            "<AppiumAUT>\n{}</AppiumAUT>\n",
+            format!("  {button}\n").repeat(buttons)
+        )
+    } else {
+        format!("<AppiumAUT>{}</AppiumAUT>", button.repeat(buttons))
+    }
+}
+
 #[test]
 fn representative_synthetic_wire_bytes() {
-    let button = "<XCUIElementTypeButton type=\"XCUIElementTypeButton\" name=\"Example\" label=\"Example\" enabled=\"true\" visible=\"true\" x=\"10\" y=\"20\" width=\"100\" height=\"40\"/>";
-    let capture = captured(
-        &format!("<AppiumAUT>{}</AppiumAUT>", button.repeat(100)),
-        "png",
-    );
-    let full = serde_json::to_vec(&call(&request(json!({})), &capture))
-        .unwrap()
-        .len();
-    let compact = serde_json::to_vec(&call(&request(json!({"tree_format":"compact"})), &capture))
-        .unwrap()
-        .len();
-    eprintln!("synthetic MCP bytes: full={full} compact={compact}");
-    assert!(compact < full);
+    for buttons in [1, 100] {
+        for pretty in [false, true] {
+            for unicode in [false, true] {
+                let tree = synthetic_tree(buttons, pretty, unicode);
+                let capture = captured(&tree, "png");
+                let full = call(&request(json!({})), &capture);
+                let compact = call(&request(json!({"tree_format":"compact"})), &capture);
+                assert_eq!(payload(&full)["accessibility_tree"], tree);
+                assert_eq!(
+                    payload(&compact)["accessibility_tree"],
+                    tree.replace("XCUIElementType", "")
+                );
+                assert_eq!(
+                    compact["result"]["content"][1],
+                    full["result"]["content"][1]
+                );
+                let full_bytes = serde_json::to_vec(&full).unwrap().len();
+                let compact_bytes = serde_json::to_vec(&compact).unwrap().len();
+                eprintln!(
+                    "synthetic MCP bytes: buttons={buttons} pretty={pretty} unicode={unicode} full={full_bytes} compact={compact_bytes}"
+                );
+                if buttons == 100 {
+                    assert!(compact_bytes < full_bytes);
+                }
+            }
+        }
+    }
 }
