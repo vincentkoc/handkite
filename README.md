@@ -143,6 +143,12 @@ runner startup can be cancelled before session creation. The staged launchd
 descriptor allows 180 seconds between SIGTERM and
 SIGKILL. These are offline-tested shutdown paths, not proof of a live device exit.
 
+In owned mode, a finished runner task also stops socket admission. The daemon
+lets an in-flight action return and runs its existing owned cleanup, then exits with
+`owned_runner_exited` (code 2) so launchd can restart it. Intentional shutdown
+remains normal; borrowed mode has no runner monitor. A lost reply must not be
+replayed, and restart does not retry input or change PIN stop protection.
+
 Run `handkited --check --config /path/to/config.json` for a read-only preflight. It prints the same bounded JSON health flags and native lock state as `handkite-doctor`, with no USB identifier or screen contents. Exit codes are 0 for observation readiness, 1 for failed readiness, and 2 for invalid arguments, configuration, or reporting errors. The check does not bind or remove a socket, start WDA, create a WDA session, or send input. This is a candidate-only readiness check, not signed-install or independent WDA startup proof.
 
 `handkited --check-service-layout` checks the effective account's fixed directory

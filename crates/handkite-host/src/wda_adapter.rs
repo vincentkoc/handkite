@@ -2,7 +2,7 @@ use crate::native_lock;
 use crate::usb::PinnedUsb;
 use crate::wda_action::WdaActions;
 use crate::wda_http::HttpResponse;
-use crate::wda_runner::{OwnedWdaRunner, RunnerError};
+use crate::wda_runner::{OwnedWdaRunner, RunnerError, RunnerLiveness};
 use crate::wda_session::{SessionClose, close_owned_session, create_owned_session};
 use crate::wda_settings::validate_session;
 use crate::wda_transport::UsbWda;
@@ -52,6 +52,11 @@ impl OwnedStartupError {
 }
 
 impl WdaAdapter {
+    /// Observe the owned host task without transferring or cancelling its ownership.
+    pub fn runner_liveness(&self) -> Option<RunnerLiveness> {
+        self.owned_runner.as_ref().map(OwnedWdaRunner::liveness)
+    }
+
     pub fn new(expected: HardwareId) -> Result<Self, AdapterError> {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -556,6 +561,12 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn borrowed_adapter_has_no_runner_liveness() {
+        let adapter = WdaAdapter::new(HardwareId::new("fixture-device").unwrap()).unwrap();
+        assert!(adapter.runner_liveness().is_none());
+    }
 
     #[test]
     fn input_admission_requires_owned_native_unlocked_context_and_capture_deadline() {

@@ -1,5 +1,5 @@
-use handkite_core::controller::Controller;
-use handkite_core::protocol::{DeviceBinding, HardwareId};
+use handkite_core::controller::{Controller, DeviceAdapter};
+use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
 use handkite_host::service_layout::ServiceLayout;
 use handkite_host::service_lock::ServiceLock;
 use handkite_host::wda_adapter::WdaAdapter;
@@ -171,20 +171,51 @@ fn serve_adapter(
     listener: local_socket::ServiceListener<'_>,
 ) -> Result<(), String> {
     let key = binding.key.clone();
+    let liveness = adapter.runner_liveness();
     let controller = Controller::new(binding, adapter, 5000, 5000);
-    if signals::requested() {
-        return Ok(());
+    serve_controller(
+        controller,
+        &key,
+        signals::requested,
+        || liveness.as_ref().is_some_and(|runner| runner.is_finished()),
+        |controller, should_stop| {
+            listener
+                .serve_until(controller, should_stop)
+                .map_err(|_| "local socket failed".into())
+        },
+    )
+}
+
+fn serve_controller<A: DeviceAdapter>(
+    controller: Controller<A>,
+    key: &DeviceKey,
+    shutdown: impl Fn() -> bool,
+    runner_exited: impl Fn() -> bool,
+    serve: impl FnOnce(&Controller<A>, &dyn Fn() -> bool) -> Result<(), String>,
+) -> Result<(), String> {
+    let should_stop = || shutdown() || runner_exited();
+    let result = (|| {
+        if should_stop() {
+            return Ok(());
+        }
+        let ready = controller.observe(key);
+        if should_stop() {
+            return Ok(());
+        }
+        ready.map_err(|_| "pinned device is not ready")?;
+        eprintln!("handkited ready");
+        serve(&controller, &should_stop)
+    })();
+    // Cleanup itself finishes the task, so capture unexpected loss before Drop.
+    let lost_runner = runner_exited();
+    drop(controller);
+    if shutdown() {
+        Ok(())
+    } else if lost_runner {
+        Err("owned_runner_exited".into())
+    } else {
+        result
     }
-    controller
-        .observe(&key)
-        .map_err(|_| "pinned device is not ready")?;
-    if signals::requested() {
-        return Ok(());
-    }
-    eprintln!("handkited ready");
-    listener
-        .serve_until(&controller, signals::requested)
-        .map_err(|_| "local socket failed".into())
 }
 
 fn load_before_serving(
@@ -199,3 +230,7 @@ fn load_before_serving(
 #[cfg(test)]
 #[path = "handkited/tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "handkited/recovery_tests.rs"]
+mod recovery_tests;
