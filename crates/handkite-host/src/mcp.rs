@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 mod catalog;
+mod compact;
 mod interaction;
 mod response;
 mod session;
@@ -17,6 +18,8 @@ use session::Session;
 
 #[cfg(test)]
 mod navigation_tests;
+#[cfg(test)]
+mod presentation_tests;
 
 const MAX_REQUEST: usize = 64 * 1024;
 const MAX_RESPONSE: usize = 16 * 1024 * 1024;
@@ -176,15 +179,26 @@ where
                     exchange,
                 )
             } else {
-                if !params
+                let compact = if tool == Tool::Observe {
+                    if !params.arguments.is_object() {
+                        return Some(error(id, -32602, "invalid observation arguments"));
+                    }
+                    let Ok(args) = serde_json::from_value::<ObserveArguments>(params.arguments)
+                    else {
+                        return Some(error(id, -32602, "invalid observation arguments"));
+                    };
+                    args.tree_format
+                } else if !params
                     .arguments
                     .as_object()
                     .is_some_and(serde_json::Map::is_empty)
                 {
                     return Some(error(id, -32602, "tool arguments must be empty"));
-                }
+                } else {
+                    false
+                };
                 match tool {
-                    Tool::Status | Tool::Observe => tool_result(tool, device, exchange),
+                    Tool::Status | Tool::Observe => tool_result(tool, compact, device, exchange),
                     Tool::Acquire => session.acquire(exchange),
                     Tool::Release => session.release(exchange),
                     _ => unreachable!(),
@@ -202,6 +216,29 @@ struct ToolCall {
     name: String,
     #[serde(default = "empty_arguments")]
     arguments: Value,
+}
+
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ObserveArguments {
+    #[serde(default, deserialize_with = "compact_only")]
+    tree_format: bool,
+}
+
+fn compact_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
+    let value = String::deserialize(deserializer)?;
+    if value == "compact" {
+        Ok(true)
+    } else {
+        Err(serde::de::Error::custom("invalid tree format"))
+    }
+}
+
+fn present_arguments<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<&'de serde_json::value::RawValue>, D::Error> {
+    // Missing arguments default to {}; an explicit null must remain visible.
+    <&serde_json::value::RawValue>::deserialize(deserializer).map(Some)
 }
 
 // Validate the raw frame as well: decoding to Value alone discards duplicate keys.
@@ -222,7 +259,7 @@ fn valid_tool_frame(bytes: &[u8]) -> bool {
     #[serde(deny_unknown_fields)]
     struct Arguments<'a> {
         name: String,
-        #[serde(borrow)]
+        #[serde(borrow, default, deserialize_with = "present_arguments")]
         arguments: Option<&'a serde_json::value::RawValue>,
     }
     #[derive(Deserialize)]
@@ -233,10 +270,13 @@ fn valid_tool_frame(bytes: &[u8]) -> bool {
         return false;
     };
     let arguments = envelope.params.arguments.map_or("{}", |raw| raw.get());
-    if let Some(tool) = Tool::from_name(&envelope.params.name).filter(|tool| tool.is_action()) {
-        interaction::valid_raw(tool, arguments)
-    } else {
-        serde_json::from_str::<Empty>(arguments).is_ok()
+    match Tool::from_name(&envelope.params.name) {
+        Some(tool) if tool.is_action() => interaction::valid_raw(tool, arguments),
+        Some(Tool::Observe) => {
+            arguments.trim_start().starts_with('{')
+                && serde_json::from_str::<ObserveArguments>(arguments).is_ok()
+        }
+        _ => serde_json::from_str::<Empty>(arguments).is_ok(),
     }
 }
 
@@ -244,7 +284,7 @@ fn empty_arguments() -> Value {
     json!({})
 }
 
-fn tool_result<F>(tool: Tool, device: &DeviceKey, exchange: &mut F) -> Value
+fn tool_result<F>(tool: Tool, compact: bool, device: &DeviceKey, exchange: &mut F) -> Value
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
@@ -260,7 +300,12 @@ where
     if tool == Tool::Status {
         return response::text_result(metadata);
     }
-    json!({"content": response::observation_content(observation)})
+    let content = if compact {
+        response::compact_observation_content(observation)
+    } else {
+        response::observation_content(observation)
+    };
+    json!({"content": content})
 }
 
 fn tool_error(message: &str) -> Value {

@@ -30,6 +30,13 @@ def set_payload(response, payload):
     response["result"]["content"][0]["text"] = json.dumps(payload)
 
 
+def compact_fixture():
+    return {"metadata": metadata(),
+            "accessibility_tree": "<AppiumAUT> <Button type='Button' label='Café &amp; 🦊'/> </AppiumAUT>",
+            "tree_format": "compact", "tree_format_version": 1,
+            "tree_format_reason": "requested"}
+
+
 class ObservationTests(unittest.TestCase):
     def decode(self, response, method="handkite_observe", request_id=2):
         return decode_observation(response, request_id, method, "phone")
@@ -171,6 +178,45 @@ class ObservationTests(unittest.TestCase):
                 decode_observation(fixture(), 2, method, device)
         with patch("mcp_observation.MAX_RESPONSE", 5), self.assertRaises(ValueError):
             self.decode(fixture())
+
+    def test_compact_and_full_fallback_are_content_free_and_unchanged(self):
+        for format_, reason, content in (("compact", "requested", compact_fixture()["accessibility_tree"]),
+                                         ("full", "unsupported_xml", "<unknown/>"),
+                                         ("full", "malformed_xml", "<broken>"),
+                                         ("full", "limit_exceeded", "<large/>")):
+            response = fixture()
+            set_payload(response, {"metadata": metadata(), "accessibility_tree": content,
+                                   "tree_format": format_, "tree_format_version": 1,
+                                   "tree_format_reason": reason})
+            before = deepcopy(response)
+            summary = self.decode(response)
+            self.assertEqual(summary, {"wda_ready": True, "lock": "locked",
+                                       "tree_chars": len(content), "image_bytes": 3})
+            self.assertEqual(response, before)
+
+    def test_invalid_compact_or_format_metadata_refuses(self):
+        for change in ({"tree_format": "other"}, {"tree_format": None},
+                       {"tree_format_version": True}, {"tree_format_version": 2},
+                       {"tree_format_reason": "unsupported_xml"},
+                       {"tree_format": "full"},
+                       {"accessibility_tree": {"v": 1}},
+                       {"accessibility_tree": ""}):
+            response = fixture()
+            payload = compact_fixture()
+            payload.update(change)
+            set_payload(response, payload)
+            with self.subTest(change=change), self.assertRaisesRegex(
+                    ValueError, "^mcp_observation_tree$"):
+                self.decode(response)
+
+    def test_compact_limit_and_legacy_object_refusal(self):
+        response = fixture()
+        set_payload(response, compact_fixture())
+        with patch("mcp_observation.MAX_COMPACT", 5), self.assertRaises(ValueError):
+            self.decode(response)
+        set_payload(response, {"metadata": metadata(), "accessibility_tree": {"root": []}})
+        with self.assertRaises(ValueError):
+            self.decode(response)
 
 
 if __name__ == "__main__":

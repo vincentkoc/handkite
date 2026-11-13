@@ -1,4 +1,4 @@
-"""Decode frozen <commit> MCP observations into privacy-safe summary fields.
+"""Decode full or compact MCP observations into privacy-safe summary fields.
 
 The caller supplies one parsed JSON-RPC response and its independently pinned
 request ID, tool name and device key. No transport, time or cross-call checks
@@ -11,6 +11,25 @@ import re
 
 
 MAX_RESPONSE = 16 * 1024 * 1024
+MAX_COMPACT = 2 * 1024 * 1024
+
+
+def _tree_chars(payload):
+    tree = payload.get("accessibility_tree")
+    _require(type(tree) is str and bool(tree.strip()), "tree")
+    if not any(key in payload for key in
+               ("tree_format", "tree_format_reason", "tree_format_version")):
+        return len(tree)
+    _require(type(payload.get("tree_format_version")) is int and
+             payload["tree_format_version"] == 1, "tree")
+    if payload.get("tree_format") == "full":
+        _require(payload.get("tree_format_reason") in
+                 ("malformed_xml", "unsupported_xml", "limit_exceeded"), "tree")
+    else:
+        _require(payload.get("tree_format") == "compact" and
+                 payload.get("tree_format_reason") == "requested" and
+                 len(tree.encode("utf-8")) <= MAX_COMPACT, "tree")
+    return len(tree)
 
 
 def _require(ok, category):
@@ -36,7 +55,8 @@ def decode_observation(response, expected_request_id, method, device_key):
 
     Status text is metadata directly; observe text wraps metadata and a tree,
     followed by one PNG/JPEG MIME image with nonempty strict standard base64.
-    Image codec validity is not established by this contract decoder.
+    Compact tree_chars counts its JSON presentation. Image codec validity is
+    not established by this contract decoder.
     """
     _require(method in ("handkite_status", "handkite_observe") and
              _request_id(expected_request_id) and type(device_key) is str and
@@ -72,8 +92,10 @@ def decode_observation(response, expected_request_id, method, device_key):
              state["lock"] in ("locked", "unlocked", "uncertain"), "state")
     tree_chars = image_bytes = 0
     if observed:
-        tree = payload.get("accessibility_tree")
-        _require(type(tree) is str and bool(tree.strip()), "tree")
+        try:
+            tree_chars = _tree_chars(payload)
+        except (UnicodeError, RecursionError):
+            raise ValueError("mcp_observation_tree") from None
         image = content[1]
         _require(type(image) is dict and image.get("type") == "image" and
                  image.get("mimeType") in ("image/png", "image/jpeg") and
@@ -85,6 +107,6 @@ def decode_observation(response, expected_request_id, method, device_key):
             raise ValueError("mcp_observation_image") from None
         _require(bool(decoded) and
                  base64.b64encode(decoded).decode("ascii") == image["data"], "image")
-        tree_chars, image_bytes = len(tree), len(decoded)
+        image_bytes = len(decoded)
     return {"wda_ready": True, "lock": state["lock"],
             "tree_chars": tree_chars, "image_bytes": image_bytes}

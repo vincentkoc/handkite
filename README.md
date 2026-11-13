@@ -248,6 +248,13 @@ runtime, restricted client route, agent scope, and live acceptance gates.
 
 `handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
 
+`handkite_observe` with `{}` keeps the full XML tree. Opt in with
+`{"tree_format":"compact"}` for a bounded XML tree presentation of the same
+capture; metadata, revision, capture window and image are unchanged. Unsupported,
+malformed or oversized XML returns the original full tree with a fixed fallback
+reason. This adds no actionable element IDs. See the
+[compact tree contract](RELEASE.md#compact-observation-presentation).
+
 `handkite-mcp --service` derives the device key from the protected fixed host
 config and the socket from the effective account's fixed service layout. It does
 not accept a caller-selected device or socket in this mode. This is the preferred

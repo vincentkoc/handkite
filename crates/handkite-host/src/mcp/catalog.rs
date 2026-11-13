@@ -119,6 +119,11 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
             tool.allowed(capabilities).then(|| {
                 let schema = if tool.is_action() {
                     super::interaction::schema(tool)
+                } else if tool == Tool::Observe {
+                    json!({"type":"object", "properties": {
+                        "tree_format": {"type":"string", "enum":["compact"],
+                            "description":"Optional lossless compact tree presentation; full XML is the default."}
+                    }, "additionalProperties":false})
                 } else {
                     json!({"type": "object", "properties": {}, "additionalProperties": false})
                 };

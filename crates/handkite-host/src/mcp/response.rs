@@ -37,3 +37,21 @@ pub(super) fn observation_content(observation: WireObservation) -> Vec<Value> {
         json!({"type": "image", "data": observation.screenshot_base64, "mimeType": mime}),
     ]
 }
+
+pub(super) fn compact_observation_content(observation: WireObservation) -> Vec<Value> {
+    let metadata = metadata(&observation);
+    let (tree, format, reason) = match super::compact::project(&observation.accessibility_tree) {
+        Ok(tree) => (tree, "compact", "requested"),
+        Err(reason) => (observation.accessibility_tree, "full", reason.reason()),
+    };
+    let mime = match observation.screenshot_format {
+        ImageFormat::Png => "image/png",
+        ImageFormat::Jpeg => "image/jpeg",
+    };
+    vec![
+        json!({"type":"text", "text":json!({"metadata":metadata,
+            "accessibility_tree":tree, "tree_format":format, "tree_format_version":1,
+            "tree_format_reason":reason}).to_string()}),
+        json!({"type":"image", "data":observation.screenshot_base64, "mimeType":mime}),
+    ]
+}
