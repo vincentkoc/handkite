@@ -39,20 +39,7 @@ pub fn request(method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, HttpErr
 
 /// Return `None` while a bounded response is incomplete.
 pub fn parse_response(raw: &[u8]) -> Result<Option<HttpResponse>, HttpError> {
-    let split = match raw.windows(4).position(|window| window == b"\r\n\r\n") {
-        Some(split) if split <= MAX_HEADER => split,
-        Some(_) => return Err(HttpError::HeaderTooLarge),
-        None if raw.len() <= MAX_HEADER => return Ok(None),
-        None => return Err(HttpError::HeaderTooLarge),
-    };
-    let (status, framing) = parse_head(&raw[..split])?;
-    let body = &raw[split + 4..];
-    let body = match framing {
-        Framing::Chunked => decode_chunked(body)?,
-        Framing::Length(length) if body.len() < length => None,
-        Framing::Length(length) => Some(body[..length].to_vec()),
-    };
-    Ok(body.map(|body| HttpResponse { status, body }))
+    ResponseDecoder::new().push(raw)
 }
 
 fn parse_head(head: &[u8]) -> Result<(u16, Framing), HttpError> {
@@ -101,43 +88,137 @@ fn parse_head(head: &[u8]) -> Result<(u16, Framing), HttpError> {
     Ok((status, Framing::Length(length)))
 }
 
-fn decode_chunked(body: &[u8]) -> Result<Option<Vec<u8>>, HttpError> {
-    let mut cursor = 0;
-    let mut decoded = Vec::new();
-    loop {
-        let remaining = &body[cursor..];
-        let Some(line_end) = remaining.windows(2).position(|window| window == b"\r\n") else {
-            return Ok(None);
-        };
-        if line_end > 32 {
-            return Err(HttpError::InvalidResponse);
+#[derive(Clone, Copy)]
+enum DecodeState {
+    Headers,
+    Length(usize),
+    ChunkSize,
+    ChunkBody(usize),
+    Delimiter { read: usize, last: bool },
+    Finished,
+}
+
+/// Consumes new wire bytes once; retains only framing and the decoded body.
+pub(crate) struct ResponseDecoder {
+    state: DecodeState,
+    framing: Vec<u8>,
+    body: Vec<u8>,
+    status: u16,
+}
+
+impl ResponseDecoder {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: DecodeState::Headers,
+            framing: Vec::new(),
+            body: Vec::new(),
+            status: 0,
         }
-        let line =
-            std::str::from_utf8(&remaining[..line_end]).map_err(|_| HttpError::InvalidResponse)?;
-        let hex = line.split(';').next().ok_or(HttpError::InvalidResponse)?;
-        let size = usize::from_str_radix(hex, 16).map_err(|_| HttpError::InvalidResponse)?;
-        cursor += line_end + 2;
-        if size == 0 {
-            if body.len() < cursor + 2 {
-                return Ok(None);
+    }
+
+    pub(crate) fn push(&mut self, bytes: &[u8]) -> Result<Option<HttpResponse>, HttpError> {
+        let result = self.consume(bytes);
+        if result.is_err() {
+            self.state = DecodeState::Finished;
+        }
+        result
+    }
+
+    fn finish(&mut self) -> HttpResponse {
+        self.state = DecodeState::Finished;
+        HttpResponse {
+            status: self.status,
+            body: std::mem::take(&mut self.body),
+        }
+    }
+
+    fn consume(&mut self, mut bytes: &[u8]) -> Result<Option<HttpResponse>, HttpError> {
+        loop {
+            match self.state {
+                DecodeState::Headers | DecodeState::ChunkSize => {
+                    let Some((&byte, rest)) = bytes.split_first() else {
+                        return Ok(None);
+                    };
+                    bytes = rest;
+                    self.framing.push(byte);
+                    if matches!(self.state, DecodeState::Headers) {
+                        if self.framing.len() > MAX_HEADER + 4 {
+                            return Err(HttpError::HeaderTooLarge);
+                        }
+                        if self.framing.ends_with(b"\r\n\r\n") {
+                            let (status, framing) =
+                                parse_head(&self.framing[..self.framing.len() - 4])?;
+                            self.status = status;
+                            self.state = match framing {
+                                Framing::Length(length) => DecodeState::Length(length),
+                                Framing::Chunked => DecodeState::ChunkSize,
+                            };
+                            self.framing.clear();
+                        }
+                    } else {
+                        if self.framing.len() > 34 {
+                            return Err(HttpError::InvalidResponse);
+                        }
+                        if self.framing.ends_with(b"\r\n") {
+                            let line = std::str::from_utf8(&self.framing[..self.framing.len() - 2])
+                                .map_err(|_| HttpError::InvalidResponse)?;
+                            let size =
+                                usize::from_str_radix(line.split(';').next().unwrap_or(""), 16)
+                                    .map_err(|_| HttpError::InvalidResponse)?;
+                            if size > MAX_BODY - self.body.len() {
+                                return Err(HttpError::BodyTooLarge);
+                            }
+                            self.state = if size == 0 {
+                                DecodeState::Delimiter {
+                                    read: 0,
+                                    last: true,
+                                }
+                            } else {
+                                DecodeState::ChunkBody(size)
+                            };
+                            self.framing.clear();
+                        }
+                    }
+                }
+                DecodeState::Length(0) => return Ok(Some(self.finish())),
+                DecodeState::ChunkBody(0) => {
+                    self.state = DecodeState::Delimiter {
+                        read: 0,
+                        last: false,
+                    };
+                }
+                DecodeState::Length(remaining) | DecodeState::ChunkBody(remaining) => {
+                    if bytes.is_empty() {
+                        return Ok(None);
+                    }
+                    let count = remaining.min(bytes.len());
+                    self.body.extend_from_slice(&bytes[..count]);
+                    bytes = &bytes[count..];
+                    self.state = if matches!(self.state, DecodeState::Length(_)) {
+                        DecodeState::Length(remaining - count)
+                    } else {
+                        DecodeState::ChunkBody(remaining - count)
+                    };
+                }
+                DecodeState::Delimiter { read, last } => {
+                    let Some((&byte, rest)) = bytes.split_first() else {
+                        return Ok(None);
+                    };
+                    bytes = rest;
+                    if byte != b"\r\n"[read] {
+                        return Err(HttpError::InvalidResponse);
+                    }
+                    if read == 0 {
+                        self.state = DecodeState::Delimiter { read: 1, last };
+                    } else if last {
+                        return Ok(Some(self.finish()));
+                    } else {
+                        self.state = DecodeState::ChunkSize;
+                    }
+                }
+                DecodeState::Finished => return Err(HttpError::InvalidResponse),
             }
-            if &body[cursor..cursor + 2] != b"\r\n" {
-                return Err(HttpError::InvalidResponse);
-            }
-            return Ok(Some(decoded));
         }
-        if size > MAX_BODY - decoded.len() {
-            return Err(HttpError::BodyTooLarge);
-        }
-        if body.len() < cursor + size + 2 {
-            return Ok(None);
-        }
-        decoded.extend_from_slice(&body[cursor..cursor + size]);
-        cursor += size;
-        if &body[cursor..cursor + 2] != b"\r\n" {
-            return Err(HttpError::InvalidResponse);
-        }
-        cursor += 2;
     }
 }
 
@@ -176,5 +257,121 @@ mod tests {
             request("GET", "/status\r\nEvil: true", b""),
             Err(HttpError::InvalidRequest)
         );
+    }
+
+    #[test]
+    fn every_fragment_boundary_preserves_length_and_chunked_bodies() {
+        let cases: &[(&[u8], &[u8])] = &[
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\na\r\n\0bc", b"a\r\n\0bc"),
+            (b"HTTP/1.1 201 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nab\r\n3;ext=1\r\ncde\r\n0\r\n\r\n", b"abcde"),
+            (b"HTTP/1.1 204 OK\r\nContent-Length: 0\r\n\r\n", b""),
+        ];
+        for (wire, expected) in cases {
+            for split in 0..=wire.len() {
+                let mut decoder = ResponseDecoder::new();
+                let result = decoder.push(&wire[..split]).unwrap();
+                let response = if split == wire.len() {
+                    result.unwrap()
+                } else {
+                    assert!(result.is_none());
+                    assert!(decoder.push(b"").unwrap().is_none());
+                    decoder.push(&wire[split..]).unwrap().unwrap()
+                };
+                assert_eq!(response.body, *expected);
+                assert!(decoder.push(b"anything").is_err());
+            }
+            let mut decoder = ResponseDecoder::new();
+            for (index, byte) in wire.iter().enumerate() {
+                let response = decoder.push(std::slice::from_ref(byte)).unwrap();
+                if index + 1 == wire.len() {
+                    assert_eq!(response.unwrap().body, *expected);
+                } else {
+                    assert!(response.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn malformed_frames_remain_terminal_across_fragments() {
+        let cases: &[&[u8]] = &[
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nContent-Length: 1\r\n\r\nx",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 1\r\nTransfer-Encoding: chunked\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: gzip\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nX: \xff\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFFFFFFFFFFFFFFFFFF\r\n",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n1\r\nx!",
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nTrailer: x\r\n\r\n",
+        ];
+        for wire in cases {
+            for size in [1, 7, wire.len()] {
+                let mut decoder = ResponseDecoder::new();
+                let mut failed = false;
+                for chunk in wire.chunks(size) {
+                    if decoder.push(chunk).is_err() {
+                        failed = true;
+                        break;
+                    }
+                }
+                assert!(failed, "invalid frame accepted");
+                assert!(decoder.push(b"\r\n0\r\n\r\n").is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn header_and_chunk_size_limits_hold_under_fragmentation() {
+        let mut header = b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nX: ".to_vec();
+        header.resize(MAX_HEADER, b'x');
+        header.extend_from_slice(b"\r\n\r\n");
+        let mut decoder = ResponseDecoder::new();
+        for byte in &header[..header.len() - 1] {
+            assert!(decoder.push(std::slice::from_ref(byte)).unwrap().is_none());
+        }
+        assert!(decoder.push(&header[header.len() - 1..]).unwrap().is_some());
+        header.insert(MAX_HEADER, b'x');
+        assert!(matches!(
+            parse_response(&header),
+            Err(HttpError::HeaderTooLarge)
+        ));
+
+        let prefix = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        for (digits, valid) in [(32, true), (33, false)] {
+            let mut wire = prefix.to_vec();
+            wire.extend(std::iter::repeat_n(b'0', digits));
+            wire.extend_from_slice(b"\r\n\r\n");
+            assert_eq!(parse_response(&wire).is_ok(), valid);
+        }
+    }
+
+    #[test]
+    fn body_limit_checks_include_all_chunks_before_their_payloads() {
+        let mut decoder = ResponseDecoder::new();
+        let header = format!("HTTP/1.1 200 OK\r\nContent-Length: {MAX_BODY}\r\n\r\n");
+        assert!(decoder.push(header.as_bytes()).unwrap().is_none());
+        assert_eq!(
+            decoder
+                .push(&vec![b'x'; MAX_BODY])
+                .unwrap()
+                .unwrap()
+                .body
+                .len(),
+            MAX_BODY
+        );
+
+        let prefix = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let mut decoder = ResponseDecoder::new();
+        let header = format!("{prefix}{MAX_BODY:x}\r\n");
+        assert!(decoder.push(header.as_bytes()).unwrap().is_none());
+        assert!(decoder.push(&vec![b'x'; MAX_BODY]).unwrap().is_none());
+        assert!(matches!(
+            decoder.push(b"\r\n1\r\n"),
+            Err(HttpError::BodyTooLarge)
+        ));
+        let oversized = format!("{prefix}{:x}\r\n", MAX_BODY + 1);
+        assert!(matches!(
+            parse_response(oversized.as_bytes()),
+            Err(HttpError::BodyTooLarge)
+        ));
     }
 }
