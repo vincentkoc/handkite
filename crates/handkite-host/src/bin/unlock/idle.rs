@@ -391,6 +391,8 @@ mod tests {
         for phase in [
             PinPhase::InitialSnapshot,
             PinPhase::OwnedAdmission,
+            PinPhase::WakeDispatch,
+            PinPhase::WakePostcapture,
             PinPhase::NormalConfirmation,
             PinPhase::RevealDispatch,
             PinPhase::RevealPostcapture,

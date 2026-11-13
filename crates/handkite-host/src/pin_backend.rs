@@ -18,6 +18,7 @@ const PIN_VIEW_BUDGET: Duration = Duration::from_secs(5);
 const REVEAL_SETTLE_BUDGET: Duration = Duration::from_secs(10);
 const REVEAL_SETTLE_PAUSE: Duration = Duration::from_millis(100);
 const MAX_REVEAL_CAPTURES: usize = 3;
+const OWNED_WAKE_SETTLE: Duration = Duration::from_millis(1000);
 const SUPERVISED_WAKE_SETTLE: Duration = Duration::from_millis(1500);
 
 mod owned_input;
@@ -28,6 +29,8 @@ use owned_input::InputRequests;
 pub enum PinPhase {
     InitialSnapshot,
     OwnedAdmission,
+    WakeDispatch,
+    WakePostcapture,
     NormalConfirmation,
     RevealDispatch,
     RevealPostcapture,
@@ -40,6 +43,8 @@ impl PinPhase {
         match self {
             Self::InitialSnapshot => "initial_snapshot",
             Self::OwnedAdmission => "owned_admission",
+            Self::WakeDispatch => "wake_dispatch",
+            Self::WakePostcapture => "wake_postcapture",
             Self::NormalConfirmation => "normal_confirmation",
             Self::RevealDispatch => "reveal_dispatch",
             Self::RevealPostcapture => "reveal_postcapture",
@@ -175,6 +180,7 @@ pub struct NativePasscodeBackend {
     supervised_visibility_fallback: bool,
     session_bound: bool,
     awaiting_first_digit: bool,
+    wake_attempted: bool,
     reveal_attempted: bool,
     progress_check: ProgressCheck,
     coordinate_pin_taps: bool,
@@ -230,6 +236,7 @@ impl NativePasscodeBackend {
             supervised_visibility_fallback,
             session_bound: false,
             awaiting_first_digit: false,
+            wake_attempted: false,
             reveal_attempted: false,
             progress_check: ProgressCheck::Disabled,
             coordinate_pin_taps: false,
@@ -424,6 +431,62 @@ impl NativePasscodeBackend {
         let result = dispatch(self, &Action::Tap { at });
         if self.progress_check == ProgressCheck::BeforeFirst {
             self.progress_check = ProgressCheck::Pending;
+        }
+        result
+    }
+
+    fn prepare_owned_keypad_after_wake_with(
+        &mut self,
+        now: Instant,
+        mut snapshot: impl FnMut(&mut Self) -> Result<PasscodeScreen, BackendError>,
+        mut input: impl FnMut(&mut Self, &Action) -> Result<(), BackendError>,
+        settle: impl FnOnce(Duration),
+    ) -> Result<(), BackendError> {
+        self.phase = PinPhase::OwnedAdmission;
+        if !self.session_bound
+            || !self.supervised_visibility_fallback
+            || self.input_admission.is_none()
+            || self.wake_attempted
+            || self.reveal_attempted
+        {
+            return Err(BackendError::Unavailable);
+        }
+        self.admit_input()?;
+        let prepared = self.last_view.as_ref().ok_or(BackendError::Unavailable)?;
+        if now >= prepared.fresh_until || !(prepared.normal_locked || prepared.empty_locked) {
+            self.last_view = None;
+            return Err(BackendError::Unavailable);
+        }
+        let before_wake = prepared.captured_at;
+        // An uncertain Home acknowledgement must never permit a second wake.
+        self.wake_attempted = true;
+        self.phase = PinPhase::WakeDispatch;
+        let result = (|| {
+            input(self, &Action::Home)?;
+            self.last_view = None;
+            settle(OWNED_WAKE_SETTLE);
+            self.phase = PinPhase::WakePostcapture;
+            self.admit_input()?;
+            snapshot(self)?;
+            self.admit_input()?;
+            let prepared = self.last_view.as_ref().ok_or(BackendError::Unavailable)?;
+            if Instant::now() >= prepared.fresh_until {
+                self.capture_step = PinCaptureStep::Freshness;
+                return Err(BackendError::Unavailable);
+            }
+            if prepared.captured_at <= before_wake
+                || !(prepared.normal_locked || prepared.empty_locked)
+            {
+                self.capture_step = PinCaptureStep::EmptyAdmission;
+                return Err(BackendError::Unavailable);
+            }
+            self.prepare_owned_keypad_with(Instant::now(), &mut snapshot, |backend, action| {
+                input(backend, action)
+            })
+        })();
+        if result.is_err() {
+            self.last_view = None;
+            self.progress_check = ProgressCheck::Failed;
         }
         result
     }
@@ -884,10 +947,11 @@ impl PasscodeBackend for NativePasscodeBackend {
             && self.session_bound
             && self.input_admission.is_some()
         {
-            return self.prepare_owned_keypad_with(
+            return self.prepare_owned_keypad_after_wake_with(
                 Instant::now(),
                 Self::snapshot,
                 |backend, action| backend.request_action_mode(action, false),
+                thread::sleep,
             );
         }
         if self.supervised_visibility_fallback && self.session_bound {
@@ -1522,10 +1586,11 @@ mod tests {
     }
 
     #[test]
-    fn preparation_diagnostic_stops_before_reveal_or_any_digit() {
+    fn preparation_diagnostic_stops_before_wake_reveal_or_any_digit() {
         for normal in [false, true] {
             let backend = bound_backend().with_input_admission(|| true).unwrap();
             let report = backend.diagnose_preparation_with(|backend| {
+                assert!(!backend.wake_attempted);
                 let now = Instant::now();
                 backend.snapshot_with(
                     now,
@@ -1605,6 +1670,260 @@ mod tests {
                 }
             );
             assert_eq!(report.captures, if denied { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn owned_wake_precedes_fresh_preparation_and_never_repeats() {
+        use std::cell::{Cell, RefCell};
+        for initially_normal in [false, true] {
+            for needs_reveal in [false, true] {
+                let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+                let start = Instant::now();
+                let clock = Cell::new(start);
+                let events = RefCell::new(Vec::new());
+                backend
+                    .snapshot_with(
+                        start,
+                        |_, _| {
+                            Ok(if initially_normal {
+                                normal_capture()
+                            } else {
+                                keypad_capture(true)
+                            })
+                        },
+                        || start,
+                    )
+                    .unwrap();
+                let mut captures = 0;
+                backend
+                    .prepare_owned_keypad_after_wake_with(
+                        start,
+                        |backend| {
+                            captures += 1;
+                            events.borrow_mut().push("capture");
+                            clock.set(clock.get() + Duration::from_millis(1));
+                            let at = clock.get();
+                            backend.snapshot_with(
+                                at,
+                                |_, _| {
+                                    Ok(if needs_reveal && captures < 3 {
+                                        normal_capture()
+                                    } else {
+                                        keypad_capture(true)
+                                    })
+                                },
+                                || at,
+                            )
+                        },
+                        |backend, action| {
+                            backend.request_action_with(action, clock.get(), |_, action, _| {
+                                events.borrow_mut().push(match action {
+                                    Action::Home => "home",
+                                    Action::Swipe { .. } => "swipe",
+                                    _ => panic!("preparation cannot dispatch a digit"),
+                                });
+                                Ok(())
+                            })
+                        },
+                        |delay| {
+                            assert_eq!(delay, Duration::from_millis(1000));
+                            events.borrow_mut().push("settle");
+                            clock.set(clock.get() + delay);
+                        },
+                    )
+                    .unwrap();
+                let expected = if needs_reveal {
+                    vec!["home", "settle", "capture", "capture", "swipe", "capture"]
+                } else {
+                    vec!["home", "settle", "capture"]
+                };
+                assert_eq!(*events.borrow(), expected);
+                assert!(backend.awaiting_first_digit);
+                assert!(backend.last_view.as_ref().unwrap().empty_locked);
+                assert!(
+                    backend
+                        .prepare_owned_keypad_after_wake_with(
+                            clock.get(),
+                            |_| panic!("no repeated capture"),
+                            |_, _| panic!("no repeated Home or swipe"),
+                            |_| panic!("no repeated settle"),
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_wake_refuses_unsafe_initial_views_before_input() {
+        for case in 0..8 {
+            let mut backend = bound_backend()
+                .with_input_admission(move || case != 6)
+                .unwrap();
+            let start = Instant::now();
+            let (mut screen, mut view) = normal_capture();
+            match case {
+                0 => screen.native_lock = LockState::Unlocked,
+                1 => {
+                    screen.trust_prompt = true;
+                    view.has_alert = true;
+                }
+                2 => {
+                    (screen, view) = progress_capture(1);
+                }
+                3 => backend.session_bound = false,
+                4 => backend.supervised_visibility_fallback = false,
+                5 => backend.input_admission = None,
+                6 | 7 => {}
+                _ => unreachable!(),
+            }
+            backend
+                .snapshot_with(start, |_, _| Ok((screen, view)), || start)
+                .unwrap();
+            let now = if case == 7 {
+                start + PIN_VIEW_BUDGET
+            } else {
+                start
+            };
+            assert!(
+                backend
+                    .prepare_owned_keypad_after_wake_with(
+                        now,
+                        |_| panic!("no capture after refused initial admission"),
+                        |_, _| panic!("no input after refused initial admission"),
+                        |_| panic!("no settle after refused initial admission"),
+                    )
+                    .is_err()
+            );
+            assert!(!backend.wake_attempted);
+        }
+    }
+
+    #[test]
+    fn uncertain_owned_home_never_settles_reveals_or_repeats() {
+        let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+        let start = Instant::now();
+        backend
+            .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+            .unwrap();
+        let mut writes = 0;
+        assert!(
+            backend
+                .prepare_owned_keypad_after_wake_with(
+                    start,
+                    |_| panic!("no capture after uncertain Home"),
+                    |backend, action| backend.request_action_with(action, start, |_, action, _| {
+                        assert!(matches!(action, Action::Home));
+                        writes += 1;
+                        Err(BackendError::Unavailable)
+                    }),
+                    |_| panic!("no settle after uncertain Home"),
+                )
+                .is_err()
+        );
+        assert_eq!(writes, 1);
+        assert_eq!(backend.phase(), PinPhase::WakeDispatch);
+        assert!(backend.last_view.is_none());
+        assert!(
+            backend
+                .prepare_owned_keypad_after_wake_with(
+                    start,
+                    |_| panic!("no repeated capture"),
+                    |_, _| panic!("no repeated input"),
+                    |_| panic!("no repeated settle"),
+                )
+                .is_err()
+        );
+        assert!(
+            backend
+                .press_digit_with(0, |_, _| panic!("no digit after uncertain Home"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn owned_wake_refuses_postcapture_drift_before_reveal_or_digits() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for case in 0..9 {
+            let owned = Arc::new(AtomicBool::new(true));
+            let admission = Arc::clone(&owned);
+            let mut backend = bound_backend()
+                .with_input_admission(move || admission.load(Ordering::SeqCst))
+                .unwrap();
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+                .unwrap();
+            let mut writes = 0;
+            let mut captures = 0;
+            assert!(
+                backend
+                    .prepare_owned_keypad_after_wake_with(
+                        start,
+                        |backend| {
+                            captures += 1;
+                            if case < 2 {
+                                backend.capture_step = if case == 0 {
+                                    PinCaptureStep::SourceRead
+                                } else {
+                                    PinCaptureStep::SessionAfter
+                                };
+                                return Err(BackendError::Unavailable);
+                            }
+                            let (mut screen, mut view) =
+                                progress_capture(if case == 2 { 1 } else { 0 });
+                            match case {
+                                3 => screen.native_lock = LockState::Unlocked,
+                                4 => screen.wda_lock = LockState::Uncertain,
+                                5 => {
+                                    screen.trust_prompt = true;
+                                    view.has_alert = true;
+                                }
+                                _ => {}
+                            }
+                            let at = if case == 7 {
+                                start
+                            } else {
+                                start + Duration::from_millis(1001)
+                            };
+                            let result = backend.snapshot_with(
+                                at,
+                                |_, _| Ok((screen, view)),
+                                || {
+                                    at + if case == 6 {
+                                        PIN_VIEW_BUDGET
+                                    } else {
+                                        Duration::ZERO
+                                    }
+                                },
+                            );
+                            if case == 8 {
+                                owned.store(false, Ordering::SeqCst);
+                            }
+                            result
+                        },
+                        |backend, action| backend.request_action_with(
+                            action,
+                            start,
+                            |_, action, _| {
+                                assert!(matches!(action, Action::Home));
+                                writes += 1;
+                                Ok(())
+                            }
+                        ),
+                        |_| {},
+                    )
+                    .is_err()
+            );
+            assert_eq!((writes, captures), (1, 1), "case {case}");
+            assert!(!backend.awaiting_first_digit);
+            assert!(backend.last_view.is_none());
+            assert!(
+                backend
+                    .press_digit_with(0, |_, _| panic!("no digit after drift"))
+                    .is_err()
+            );
         }
     }
 
