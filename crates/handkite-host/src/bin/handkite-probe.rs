@@ -8,7 +8,7 @@ use handkite_host::pin_backend::NativePasscodeBackend;
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_adapter::WdaAdapter;
 use handkite_host::wda_transport::UsbWda;
-use handkite_host::{native_lock, pin_screen};
+use handkite_host::{native_lock, pin_field, pin_screen};
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
@@ -337,13 +337,9 @@ async fn active_session(wda: &UsbWda) -> Result<(), String> {
         .map_err(|error| format!("{error:?}"))?;
     let json: serde_json::Value =
         serde_json::from_slice(&response.body).map_err(|_| "invalid WDA JSON")?;
-    let id = json["sessionId"].as_str().filter(|id| {
-        !id.is_empty()
-            && id.len() <= 128
-            && id
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    });
+    let id = json["sessionId"]
+        .as_str()
+        .filter(|id| pin_field::valid_id(id));
     let Some(id) = id else {
         println!("active_session=false validated=false");
         return Ok(());

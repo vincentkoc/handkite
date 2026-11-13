@@ -1,5 +1,6 @@
 use handkite_core::controller::{DeviceAdapter, RawObservation};
 use handkite_core::protocol::{Action, HardwareId, LockState, Point};
+use handkite_host::pin_field::valid_id as valid_session;
 use handkite_host::service_layout::ServiceLayout;
 use handkite_host::service_lock::ServiceLock;
 use handkite_host::usb::PinnedUsb;
@@ -1318,10 +1319,6 @@ fn session_from_response(response: HttpResponse) -> Result<String, RefusalReason
         return Err(RefusalReason::SessionUnproven);
     }
     Ok(session.to_owned())
-}
-
-fn valid_session(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
 }
 
 impl TrialDevice for Live {

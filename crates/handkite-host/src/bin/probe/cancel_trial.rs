@@ -363,8 +363,9 @@ fn run(
         return Err(Error::Unknown);
     }
     check_capture(&after, expected, session, device.now()).map_err(|_| Error::Unknown)?;
-    let size = super::reveal_keypad::normal_lock_size(&after.raw.accessibility_tree)
-        .ok_or(Error::Unknown)?;
+    let size = handkite_host::pin_screen::normal_lock_screen(&after.raw.accessibility_tree)
+        .map_err(|_| Error::Unknown)?
+        .size;
     let image = image_size(&after.raw.screenshot.bytes, size).map_err(|_| Error::Unknown)?;
     if after.started < input_started
         || size != (f64::from(second.screen.0), f64::from(second.screen.1))

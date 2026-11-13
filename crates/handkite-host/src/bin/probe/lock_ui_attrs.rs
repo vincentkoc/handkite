@@ -125,11 +125,7 @@ fn session(device: &mut impl ReadDevice) -> Result<String, Refusal> {
     let json = device.get("/status").map_err(|_| Refusal::Session)?;
     let id = json["sessionId"]
         .as_str()
-        .filter(|id| {
-            !id.is_empty()
-                && id.len() <= 128
-                && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-        })
+        .filter(|id| handkite_host::pin_field::valid_id(id))
         .ok_or(Refusal::Session)?;
     if json["value"]["ready"] != true {
         return Err(Refusal::Session);

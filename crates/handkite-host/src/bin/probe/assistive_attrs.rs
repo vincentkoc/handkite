@@ -101,13 +101,7 @@ fn fresh(capture: &LockedXml, now: Instant) -> Result<(), Refusal> {
     {
         return Err(Refusal::Freshness);
     }
-    if capture.session.is_empty()
-        || capture.session.len() > 128
-        || !capture
-            .session
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
+    if !handkite_host::pin_field::valid_id(&capture.session) {
         return Err(Refusal::Session);
     }
     Ok(())

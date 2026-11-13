@@ -1,3 +1,4 @@
+pub(crate) use crate::pin_field::valid_id as valid_session_id;
 use crate::wda_http::HttpResponse;
 use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::AdapterError;
@@ -246,14 +247,6 @@ impl WdaActions {
             action_kind: action.kind().into(),
         })
     }
-}
-
-pub(crate) fn valid_session_id(id: &str) -> bool {
-    !id.is_empty()
-        && id.len() <= 128
-        && id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
 }
 
 fn response_ok(response: HttpResponse) -> Result<Value, AdapterError> {

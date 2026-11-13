@@ -1,6 +1,7 @@
 use handkite_core::controller::{DeviceAdapter, RawObservation};
 use handkite_core::protocol::{HardwareId, LockState};
 use handkite_host::native_lock::NativeLock;
+use handkite_host::pin_field::valid_id as valid_session;
 use handkite_host::pin_screen::NormalLockScreen;
 use handkite_host::usb::PinnedUsb;
 use handkite_host::wda_action::WdaActions;
@@ -167,10 +168,6 @@ fn native_locked(native: NativeLock) -> Result<(), Refusal> {
     Ok(())
 }
 
-fn valid_session(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 128 && id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
-}
-
 fn validate(
     snapshot: &Snapshot,
     expected: &HardwareId,
@@ -228,10 +225,6 @@ fn validate(
         image: (width, height),
         proud_visible,
     })
-}
-
-pub(super) fn normal_lock_size(xml: &str) -> Option<(f64, f64)> {
-    normal_lock_screen(xml).ok().map(|screen| screen.size)
 }
 
 fn normal_lock_screen(xml: &str) -> Result<NormalLockScreen, Refusal> {

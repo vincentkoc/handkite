@@ -120,6 +120,16 @@ async fn read_with(wda: &impl WdaRequest, session: &str) -> Result<u32, FieldErr
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_and_element_ids_share_bounded_ascii_validation() {
+        for id in ["fixture-session", "A0-b9", &"x".repeat(128)] {
+            assert!(valid_id(id));
+        }
+        for id in ["", "../session", "a/b", "a_b", "é", &"x".repeat(129)] {
+            assert!(!valid_id(id));
+        }
+    }
     use crate::wda_transport::WdaError;
     use serde_json::json;
     use std::cell::{Cell, RefCell};

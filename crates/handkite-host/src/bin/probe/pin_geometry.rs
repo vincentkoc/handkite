@@ -146,13 +146,7 @@ fn check(status: &Status, expected: &HardwareId) -> Result<(), Refusal> {
     if status.usb != *expected || status.target != *expected {
         return Err(Refusal::Identity);
     }
-    if status.session.is_empty()
-        || status.session.len() > 128
-        || !status
-            .session
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
+    if !handkite_host::pin_field::valid_id(&status.session) {
         return Err(Refusal::Session);
     }
     if !status.native_locked || !status.wda_locked || !status.springboard {
