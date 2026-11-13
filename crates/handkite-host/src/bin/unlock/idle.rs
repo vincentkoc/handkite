@@ -16,7 +16,11 @@ use std::sync::{Arc, Mutex};
 #[derive(Clone, Copy)]
 pub(super) enum WorkerError {
     Unlock(UnlockError),
-    TracedUnlock(UnlockError, handkite_host::pin_backend::PinPhase),
+    TracedUnlock(
+        UnlockError,
+        handkite_host::pin_backend::PinPhase,
+        handkite_host::pin_backend::PinCaptureStep,
+    ),
     Initialization,
     GateAccess,
     Join,
@@ -181,8 +185,8 @@ pub(super) fn diagnostic(
     if let Some(index) = index {
         line.push_str(&format!(" first_unconfirmed_index={index}"));
     }
-    if let IdleAction::Completed(Err(WorkerError::TracedUnlock(_, phase))) = outcome.action {
-        line.push_str(&format!(" phase={}", phase.as_str()));
+    if let IdleAction::Completed(Err(WorkerError::TracedUnlock(_, phase, step))) = outcome.action {
+        line.push_str(&format!(" phase={} step={}", phase.as_str(), step.as_str()));
     }
     line
 }
@@ -196,7 +200,7 @@ fn action_reason(action: &IdleAction<UnlockOutcome, WorkerError>) -> (&'static s
         IdleAction::Completed(Err(WorkerError::GateAccess)) => "gate_access",
         IdleAction::Completed(Err(WorkerError::Join)) => "worker_join",
         IdleAction::Completed(Err(
-            WorkerError::Unlock(error) | WorkerError::TracedUnlock(error, _),
+            WorkerError::Unlock(error) | WorkerError::TracedUnlock(error, _, _),
         )) => match error {
             UnlockError::Disabled => "disabled",
             UnlockError::DeviceMismatch => "device_mismatch",
@@ -341,6 +345,34 @@ mod tests {
     }
 
     #[test]
+    fn owned_failure_steps_distinguish_capture_expiry_from_unready_views() {
+        use handkite_host::pin_backend::{PinCaptureStep, PinPhase};
+        for step in [
+            PinCaptureStep::SourceRead,
+            PinCaptureStep::SessionAfter,
+            PinCaptureStep::Freshness,
+            PinCaptureStep::EmptyAdmission,
+            PinCaptureStep::RevealSettleLimit,
+        ] {
+            let outcome = IdleSettingsOutcome {
+                action: IdleAction::Completed(Err(WorkerError::TracedUnlock(
+                    UnlockError::Backend(BackendError::Unavailable),
+                    PinPhase::RevealPostcapture,
+                    step,
+                ))),
+                restoration: Restoration::Verified,
+            };
+            assert_eq!(
+                diagnostic(&outcome, "backend_unavailable"),
+                format!(
+                    "unlock_idle=unknown reason=backend_unavailable action=backend_unavailable restoration=verified phase=reveal_postcapture step={}",
+                    step.as_str()
+                )
+            );
+        }
+    }
+
+    #[test]
     fn owned_phase_diagnostics_preserve_errors_restoration_and_stop_protection() {
         use handkite_host::pin_backend::PinPhase;
         for phase in [
@@ -385,13 +417,15 @@ mod tests {
                             &mut gate,
                             IdleSettingsOutcome {
                                 action: IdleAction::Completed(Err(WorkerError::TracedUnlock(
-                                    error, phase
+                                    error,
+                                    phase,
+                                    handkite_host::pin_backend::PinCaptureStep::Complete
                                 ))),
                                 restoration
                             }
                         ),
                         Err(format!(
-                            "unlock_idle=unknown reason={reason} action={action} restoration={restore}{index} phase={}",
+                            "unlock_idle=unknown reason={reason} action={action} restoration={restore}{index} phase={} step=complete",
                             phase.as_str()
                         ))
                     );

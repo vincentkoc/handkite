@@ -15,6 +15,9 @@ use std::time::{Duration, Instant};
 
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_VIEW_BUDGET: Duration = Duration::from_secs(5);
+const REVEAL_SETTLE_BUDGET: Duration = Duration::from_secs(10);
+const REVEAL_SETTLE_PAUSE: Duration = Duration::from_millis(100);
+const MAX_REVEAL_CAPTURES: usize = 3;
 const SUPERVISED_WAKE_SETTLE: Duration = Duration::from_millis(1500);
 
 mod owned_input;
@@ -57,6 +60,8 @@ pub enum PinCaptureStep {
     ParseSource,
     NativeLock,
     Freshness,
+    EmptyAdmission,
+    RevealSettleLimit,
     Complete,
 }
 
@@ -71,6 +76,8 @@ impl PinCaptureStep {
             Self::ParseSource => "parse_source",
             Self::NativeLock => "native_lock",
             Self::Freshness => "freshness",
+            Self::EmptyAdmission => "empty_admission",
+            Self::RevealSettleLimit => "reveal_settle_limit",
             Self::Complete => "complete",
         }
     }
@@ -306,6 +313,10 @@ impl NativePasscodeBackend {
         self.phase
     }
 
+    pub fn capture_step(&self) -> PinCaptureStep {
+        self.capture_step
+    }
+
     pub fn diagnostics(&self) -> Option<PinDiagnostics> {
         self.last_diagnostics
     }
@@ -457,29 +468,83 @@ impl NativePasscodeBackend {
             self.last_view = None;
             return Err(BackendError::Unavailable);
         }
+        let confirmed_at = confirmed.captured_at;
         // Consume this preparation even if the write acknowledgement is lost.
         self.reveal_attempted = true;
         self.phase = PinPhase::RevealDispatch;
         let result = (|| {
             swipe(self, &keypad_swipe(first.size)?)?;
             self.phase = PinPhase::RevealPostcapture;
-            self.awaiting_first_digit = true;
-            snapshot(self)?;
-            if !self
-                .last_view
-                .as_ref()
-                .is_some_and(|view| view.empty_locked)
-            {
-                return Err(BackendError::Unavailable);
-            }
-            self.phase = PinPhase::EmptyConfirmation;
-            Ok(())
+            self.settle_owned_reveal_with(
+                first,
+                confirmed_at,
+                &mut snapshot,
+                Instant::now,
+                thread::sleep,
+            )
         })();
         if result.is_err() {
             self.last_view = None;
             self.progress_check = ProgressCheck::Failed;
         }
         result
+    }
+
+    fn settle_owned_reveal_with(
+        &mut self,
+        normal: pin_screen::NormalLockScreen,
+        mut previous_at: Instant,
+        mut snapshot: impl FnMut(&mut Self) -> Result<PasscodeScreen, BackendError>,
+        now: impl Fn() -> Instant,
+        mut pause: impl FnMut(Duration),
+    ) -> Result<(), BackendError> {
+        let deadline = now()
+            .checked_add(REVEAL_SETTLE_BUDGET)
+            .ok_or(BackendError::Unavailable)?;
+        for attempt in 0..MAX_REVEAL_CAPTURES {
+            self.admit_input()?;
+            // Reserve the unchanged complete capture budget; never extend a
+            // capture's freshness to wait for the transition.
+            if now()
+                .checked_add(PIN_VIEW_BUDGET)
+                .is_none_or(|end| end > deadline)
+            {
+                self.capture_step = PinCaptureStep::RevealSettleLimit;
+                return Err(BackendError::Unavailable);
+            }
+            snapshot(self)?;
+            self.admit_input()?;
+            let observed_at = now();
+            let view = self.last_view.as_ref().ok_or(BackendError::Unavailable)?;
+            if observed_at >= deadline {
+                self.capture_step = PinCaptureStep::RevealSettleLimit;
+                return Err(BackendError::Unavailable);
+            }
+            if observed_at >= view.fresh_until {
+                self.capture_step = PinCaptureStep::Freshness;
+                return Err(BackendError::Unavailable);
+            }
+            if view.captured_at <= previous_at {
+                return Err(BackendError::Unavailable);
+            }
+            previous_at = view.captured_at;
+            if view.empty_locked {
+                self.awaiting_first_digit = true;
+                self.phase = PinPhase::EmptyConfirmation;
+                return Ok(());
+            }
+            // Only an unchanged, strictly proven normal lock may still be
+            // transitioning. Capture failures and every other view stop here.
+            if !view.normal_locked || view.view.normal_lock != Some(normal) {
+                self.capture_step = PinCaptureStep::EmptyAdmission;
+                return Err(BackendError::Unavailable);
+            }
+            if attempt + 1 < MAX_REVEAL_CAPTURES {
+                pause(REVEAL_SETTLE_PAUSE);
+            }
+        }
+        self.capture_step = PinCaptureStep::RevealSettleLimit;
+        Err(BackendError::Unavailable)
     }
 
     fn wake_hidden_with(
@@ -667,6 +732,7 @@ impl NativePasscodeBackend {
             && screen.secure_field_value.is_none()
             && view.normal_lock.is_some();
         if self.awaiting_first_digit && !empty_locked {
+            self.capture_step = PinCaptureStep::EmptyAdmission;
             return Err(BackendError::Unavailable);
         }
         self.last_view = Some(PreparedPinView {
@@ -1652,6 +1718,194 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn owned_reveal_waits_for_normal_to_empty_without_another_swipe() {
+        let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+        let start = Instant::now();
+        backend
+            .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+            .unwrap();
+        let mut captures = 0;
+        let mut writes = 0;
+        backend
+            .prepare_owned_keypad_with(
+                start,
+                |backend| {
+                    captures += 1;
+                    let at = start + Duration::from_millis(captures);
+                    backend.snapshot_with(
+                        at,
+                        |_, _| {
+                            Ok(if captures < 3 {
+                                normal_capture()
+                            } else {
+                                keypad_capture(true)
+                            })
+                        },
+                        || at,
+                    )
+                },
+                |backend, action| {
+                    writes += 1;
+                    backend.request_action_with(
+                        action,
+                        start + Duration::from_millis(1),
+                        |_, _, _| Ok(()),
+                    )
+                },
+            )
+            .unwrap();
+        assert_eq!((writes, captures), (1, 3));
+        assert!(backend.awaiting_first_digit);
+        assert_eq!(backend.phase(), PinPhase::EmptyConfirmation);
+        assert!(backend.last_view.as_ref().unwrap().empty_locked);
+    }
+
+    #[test]
+    fn reveal_settling_has_capture_and_overall_limits() {
+        use std::cell::Cell;
+        for capture_ms in [1, 3100] {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let mut captures = 0;
+            let result = backend.settle_owned_reveal_with(
+                normal_capture().1.normal_lock.unwrap(),
+                start,
+                |backend| {
+                    captures += 1;
+                    let at = clock.get() + Duration::from_nanos(1);
+                    clock.set(at + Duration::from_millis(capture_ms));
+                    backend.snapshot_with(at, |_, _| Ok(normal_capture()), || clock.get())
+                },
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            );
+            assert!(result.is_err());
+            assert_eq!(captures, if capture_ms == 1 { 3 } else { 2 });
+            assert_eq!(backend.capture_step(), PinCaptureStep::RevealSettleLimit);
+            assert!(!backend.awaiting_first_digit);
+            assert!(clock.get().duration_since(start) < REVEAL_SETTLE_BUDGET);
+        }
+    }
+
+    #[test]
+    fn reveal_settling_reserves_capture_budget_after_ownership_validation() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let elapsed_ms = Arc::new(AtomicU64::new(0));
+        let admission_clock = Arc::clone(&elapsed_ms);
+        let mut backend = bound_backend()
+            .with_input_admission(move || {
+                admission_clock.fetch_add(6000, Ordering::SeqCst);
+                true
+            })
+            .unwrap();
+        let start = Instant::now();
+        let result = backend.settle_owned_reveal_with(
+            normal_capture().1.normal_lock.unwrap(),
+            start,
+            |_| panic!("ownership validation consumed the capture reservation"),
+            || start + Duration::from_millis(elapsed_ms.load(Ordering::SeqCst)),
+            |_| panic!("an exhausted reservation cannot be retried"),
+        );
+        assert!(result.is_err());
+        assert_eq!(backend.capture_step(), PinCaptureStep::RevealSettleLimit);
+        assert!(!backend.awaiting_first_digit);
+    }
+
+    #[test]
+    fn reveal_settling_never_retries_capture_errors_or_unsafe_views() {
+        use std::cell::Cell;
+        for case in 0..10 {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let mut captures = 0;
+            let result = backend.settle_owned_reveal_with(
+                normal_capture().1.normal_lock.unwrap(),
+                start,
+                |backend| {
+                    captures += 1;
+                    if matches!(case, 5 | 7) {
+                        backend.capture_step = if case == 5 {
+                            PinCaptureStep::SourceRead
+                        } else {
+                            PinCaptureStep::SessionAfter
+                        };
+                        return Err(BackendError::Unavailable);
+                    }
+                    let (mut screen, mut view) = if case == 4 {
+                        normal_capture()
+                    } else {
+                        keypad_capture(false)
+                    };
+                    match case {
+                        0 => {
+                            screen.secure_field_value = Some("1 of 6 digits".into());
+                            view.secure_field_value = screen.secure_field_value.clone();
+                        }
+                        1 => {
+                            screen.trust_prompt = true;
+                            view.has_alert = true;
+                        }
+                        2 => screen.native_lock = LockState::Unlocked,
+                        3 => screen.wda_lock = LockState::Uncertain,
+                        4 => view.normal_lock.as_mut().unwrap().size.0 += 1.0,
+                        6 | 9 => {}
+                        8 => screen.native_lock = LockState::Uncertain,
+                        _ => unreachable!(),
+                    }
+                    let at = if case == 9 {
+                        start
+                    } else {
+                        start + Duration::from_nanos(1)
+                    };
+                    clock.set(
+                        at + if case == 6 {
+                            PIN_VIEW_BUDGET
+                        } else {
+                            Duration::from_millis(1)
+                        },
+                    );
+                    backend.snapshot_with(at, |_, _| Ok((screen, view)), || clock.get())
+                },
+                || clock.get(),
+                |_| panic!("unsafe capture cannot be retried"),
+            );
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(captures, 1, "case {case}");
+            assert!(!backend.awaiting_first_digit);
+            if case == 6 {
+                assert_eq!(backend.capture_step(), PinCaptureStep::Freshness);
+            }
+        }
+    }
+
+    #[test]
+    fn reveal_settling_rechecks_ownership_after_capture() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let owned = Arc::new(AtomicBool::new(true));
+        let admit = Arc::clone(&owned);
+        let mut backend = bound_backend()
+            .with_input_admission(move || admit.load(Ordering::SeqCst))
+            .unwrap();
+        let start = Instant::now();
+        let result = backend.settle_owned_reveal_with(
+            normal_capture().1.normal_lock.unwrap(),
+            start,
+            |backend| {
+                let at = start + Duration::from_nanos(1);
+                let result = backend.snapshot_with(at, |_, _| Ok(keypad_capture(false)), || at);
+                owned.store(false, Ordering::SeqCst);
+                result
+            },
+            Instant::now,
+            |_| panic!("ownership loss cannot be retried"),
+        );
+        assert!(result.is_err());
+        assert!(!backend.awaiting_first_digit);
     }
 
     #[test]
