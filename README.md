@@ -93,7 +93,13 @@ The separate `wda_runner::OwnedWdaRunner` library can start one exact installed
 that launch's test plan, a still-live task and plan, and HTTP 200 with boolean
 `value.ready: true`. One absolute startup deadline covers discovery, a separately
 time-bounded InstallationProxy lookup, and readiness. Startup cancellation and
-handle Drop abort the owned host task; `abort_and_join` also observes completion.
+handle Drop abort the owned host task. Awaited `abort_and_join` also checks the
+retained native process identity, sends at most one graceful stop when that
+process remains, and requires both process absence and a refused pinned WDA
+connection before reporting cleanup complete. The caller's service ownership
+must remain valid throughout. A changed identity, uncertain stop, or expired
+cleanup deadline fails explicitly; it never selects another process or retries
+the signal.
 Startup receipts distinguish an unproven test-plan callback, an unresolved UI
 Automation authorization wait, initialization failure, and bootstrap failure.
 Known XCTest initialization failures that carry `LocalAuthentication` or
