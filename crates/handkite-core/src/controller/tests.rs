@@ -130,7 +130,11 @@ impl DeviceAdapter for FakeAdapter {
         self.execution_admission = admission;
         if matches!(
             admission,
-            Some(ActionAdmission::NativeHome { .. } | ActionAdmission::NativeModalTap { .. })
+            Some(
+                ActionAdmission::NativeHome { .. }
+                    | ActionAdmission::NativeModalTap { .. }
+                    | ActionAdmission::NativeText { .. }
+            )
         ) {
             self.native_queries += 1;
             if self.native_lock != LockState::Unlocked {
@@ -666,6 +670,72 @@ fn default_adapter_refuses_native_modal_admission_before_execution() {
         Err(AdapterError)
     );
     assert_eq!(adapter.0.actions, 0);
+    assert_eq!(
+        adapter.execute_with_admission(
+            &Action::Text {
+                value: "fixture".into()
+            },
+            until,
+            Some(ActionAdmission::NativeText { until })
+        ),
+        Err(AdapterError)
+    );
+    assert_eq!(adapter.0.actions, 0);
+}
+
+#[test]
+fn native_text_allows_only_pixel_drift_with_fresh_unchanged_context() {
+    for change in 0..9 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut action = Action::Text {
+            value: "fixture".into(),
+        };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = b"cursor".to_vec();
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeText { until });
+            inner.adapter.native_lock = LockState::Unlocked;
+            match change {
+                1 => inner.adapter.tree_suffix = "changed".into(),
+                2 => inner.adapter.locked = true,
+                3 => inner.adapter.uncertain = true,
+                4 => inner.adapter.wda_ready = false,
+                5 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeText {
+                        until: Instant::now(),
+                    })
+                }
+                6 => inner.adapter.native_lock = LockState::Locked,
+                7 => action = Action::Home,
+                8 => inner.adapter.stale_capture = true,
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        if change == 0 {
+            assert!(result.is_ok());
+            assert_eq!(inner.adapter.actions, 1);
+            assert_eq!(inner.adapter.native_queries, 1);
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
+        } else {
+            assert!(result.is_err(), "case {change}");
+            assert_eq!(inner.adapter.actions, 0, "case {change}");
+        }
+    }
 }
 
 #[test]

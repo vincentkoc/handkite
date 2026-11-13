@@ -24,6 +24,7 @@ pub enum ActionAdmission {
     VisibleTap { at: Point, until: Instant },
     NativeModalTap { at: Point, until: Instant },
     NativeHome { until: Instant },
+    NativeText { until: Instant },
 }
 
 pub trait DeviceAdapter {
@@ -53,7 +54,11 @@ pub trait DeviceAdapter {
     ) -> Result<TransportReceipt, AdapterError> {
         if matches!(
             admission,
-            Some(ActionAdmission::NativeHome { .. } | ActionAdmission::NativeModalTap { .. })
+            Some(
+                ActionAdmission::NativeHome { .. }
+                    | ActionAdmission::NativeModalTap { .. }
+                    | ActionAdmission::NativeText { .. }
+            )
         ) {
             return Err(AdapterError);
         }
@@ -272,6 +277,13 @@ impl<A: DeviceAdapter> Controller<A> {
                 Some(until)
             }
             (Action::Home, Some(ActionAdmission::NativeHome { until }))
+                if fresh.state.lock == LockState::Unlocked
+                    && fresh.state.wda_ready
+                    && Instant::now() < until =>
+            {
+                Some(until)
+            }
+            (Action::Text { .. }, Some(ActionAdmission::NativeText { until }))
                 if fresh.state.lock == LockState::Unlocked
                     && fresh.state.wda_ready
                     && Instant::now() < until =>

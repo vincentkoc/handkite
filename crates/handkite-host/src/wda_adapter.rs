@@ -23,6 +23,7 @@ pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=a
 const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const HOME_LAUNCH_AGE: Duration = Duration::from_secs(2);
+const TEXT_INPUT_AGE: Duration = Duration::from_secs(5);
 
 pub struct WdaAdapter {
     expected: HardwareId,
@@ -434,8 +435,10 @@ impl DeviceAdapter for WdaAdapter {
         &mut self,
         action: &Action,
     ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
-        let owned_input = matches!(action, Action::Tap { .. } | Action::Home)
-            && self.owned_session.is_some()
+        let owned_input = matches!(
+            action,
+            Action::Tap { .. } | Action::Home | Action::Text { .. }
+        ) && self.owned_session.is_some()
             && self.owned_runner.is_some();
         if !matches!(action, Action::LaunchApp { .. }) && !owned_input {
             return self.observe().map(|observation| (observation, None));
@@ -468,6 +471,16 @@ impl DeviceAdapter for WdaAdapter {
                 )
                 .map(|until| ActionAdmission::VisibleTap { at: *at, until })
             })
+        } else if matches!(action, Action::Text { .. }) {
+            native_text_deadline(
+                &observation,
+                owned_input,
+                native_before,
+                native_after,
+                reported_lock,
+                captured_at,
+            )
+            .map(|until| ActionAdmission::NativeText { until })
         } else if matches!(action, Action::Home) {
             native_home_deadline(
                 &observation,
@@ -498,7 +511,8 @@ impl DeviceAdapter for WdaAdapter {
     ) -> Result<TransportReceipt, AdapterError> {
         self.validate_owned()?;
         if (matches!(action, Action::LaunchApp { .. })
-            || matches!(action, Action::Tap { .. }) && self.owned_session.is_some())
+            || matches!(action, Action::Tap { .. } | Action::Text { .. })
+                && self.owned_session.is_some())
             && native_lock::query(&self.expected).state != LockState::Unlocked
         {
             return Err(AdapterError);
@@ -523,6 +537,17 @@ impl DeviceAdapter for WdaAdapter {
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
+        if let Some(ActionAdmission::NativeText { until }) = admission {
+            if !matches!(action, Action::Text { .. })
+                || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            return self.execute(action, send_deadline);
+        }
         if let Some(ActionAdmission::NativeModalTap { at, until }) = admission {
             if !matches!(action, Action::Tap { at: actual } if *actual == at)
                 || self.owned_session.is_none()
@@ -667,6 +692,32 @@ fn visible_tap_deadline(
     captured_at.checked_add(HOME_LAUNCH_AGE)
 }
 
+fn native_text_deadline(
+    observation: &RawObservation,
+    owned: bool,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    captured_at: Instant,
+) -> Option<Instant> {
+    if !owned
+        || native_before != LockState::Unlocked
+        || native_after != LockState::Unlocked
+        || reported_lock != Some(false)
+        || observation.state.lock != LockState::Unlocked
+        || !observation.state.wda_ready
+        || observation
+            .state
+            .foreground_app
+            .as_deref()
+            .is_none_or(|app| app == "com.apple.springboard")
+        || !crate::wda_ui_admission::visible_text_input(&observation.accessibility_tree)
+    {
+        return None;
+    }
+    captured_at.checked_add(TEXT_INPUT_AGE)
+}
+
 fn native_home_deadline(
     observation: &RawObservation,
     owned: bool,
@@ -764,6 +815,47 @@ mod tests {
     fn borrowed_adapter_has_no_runner_liveness() {
         let adapter = WdaAdapter::new(HardwareId::new("fixture-device").unwrap()).unwrap();
         assert!(adapter.runner_liveness().is_none());
+    }
+
+    #[test]
+    fn text_admission_keeps_the_capture_deadline_and_native_checks() {
+        let id = HardwareId::new("fixture-device").unwrap();
+        let mut observation = RawObservation {
+            connected_usb: id.clone(), wda_target: id,
+            window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
+            state: DeviceState { lock: LockState::Unlocked, wda_ready: true,
+                foreground_app: Some("com.example.search".into()) },
+            accessibility_tree: r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeSearchField visible="true" enabled="true" x="20" y="67" width="298" height="44"/><XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/></XCUIElementTypeApplication></AppiumAUT>"#.into(),
+            screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+        };
+        let original = observation.state.clone();
+        let captured = Instant::now() - Duration::from_secs(6);
+        for change in 0..10 {
+            observation.state = original.clone();
+            let mut owned = true;
+            let mut before = LockState::Unlocked;
+            let mut after = LockState::Unlocked;
+            let mut raw = Some(false);
+            match change {
+                1 => owned = false,
+                2 => before = LockState::Locked,
+                3 => after = LockState::Uncertain,
+                4 => raw = None,
+                5 => raw = Some(true),
+                6 => observation.state.lock = LockState::Locked,
+                7 => observation.state.wda_ready = false,
+                8 => observation.state.foreground_app = Some("com.apple.springboard".into()),
+                9 => observation.state.foreground_app = None,
+                _ => {}
+            }
+            let result = native_text_deadline(&observation, owned, before, after, raw, captured);
+            if change == 0 {
+                assert_eq!(result, Some(captured + Duration::from_secs(5)));
+                assert!(result.unwrap() < Instant::now());
+            } else {
+                assert_eq!(result, None, "case {change}");
+            }
+        }
     }
 
     #[test]

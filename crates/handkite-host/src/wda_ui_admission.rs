@@ -54,22 +54,35 @@ impl Rect {
 /// Proves one unambiguous public button at this point in the complete tree.
 /// The caller checks native lock, ownership and capture freshness separately.
 pub(crate) fn visible_button(xml: &str, at: Point) -> bool {
-    parse(xml, Some(at)) == Some(())
+    parse(xml, Target::Button(at)) == Some(())
 }
 
 pub(crate) fn visible_modal_button(xml: &str, at: Point) -> bool {
-    parse_modal(xml, Some(at), true) == Some(())
+    parse(xml, Target::ModalButton(at)) == Some(())
 }
 
 pub(crate) fn safe_context(xml: &str) -> bool {
-    parse(xml, None) == Some(())
+    parse(xml, Target::Context) == Some(())
 }
 
-fn parse(xml: &str, at: Option<Point>) -> Option<()> {
-    parse_modal(xml, at, false)
+pub(crate) fn visible_text_input(xml: &str) -> bool {
+    parse(xml, Target::TextInput) == Some(())
 }
 
-fn parse_modal(xml: &str, at: Option<Point>, allow_modal: bool) -> Option<()> {
+enum Target {
+    Context,
+    Button(Point),
+    ModalButton(Point),
+    TextInput,
+}
+
+fn parse(xml: &str, target_kind: Target) -> Option<()> {
+    let at = match target_kind {
+        Target::Button(at) | Target::ModalButton(at) => Some(at),
+        _ => None,
+    };
+    let allow_modal = matches!(target_kind, Target::ModalButton(_));
+    let require_text = matches!(target_kind, Target::TextInput);
     if xml.is_empty()
         || xml.len() > 2 * 1024 * 1024
         || at.is_some_and(|at| !at.x.is_finite() || !at.y.is_finite())
@@ -84,6 +97,8 @@ fn parse_modal(xml: &str, at: Option<Point>, allow_modal: bool) -> Option<()> {
     let mut target = false;
     let mut modal = None;
     let mut target_in_modal = false;
+    let mut text_inputs = 0;
+    let mut keyboards = 0;
     loop {
         let event = reader.read_event().ok()?;
         let is_start = matches!(&event, Event::Start(_));
@@ -158,6 +173,35 @@ fn parse_modal(xml: &str, at: Option<Point>, allow_modal: bool) -> Option<()> {
                     }
                     modal = Some(rect);
                 }
+                if require_text
+                    && matches!(
+                        kind.as_str(),
+                        "XCUIElementTypeSearchField"
+                            | "XCUIElementTypeTextField"
+                            | "XCUIElementTypeTextView"
+                            | "XCUIElementTypeKeyboard"
+                    )
+                    && attrs.get("visible").map(String::as_str) != Some("false")
+                    && attrs.get("enabled").map(String::as_str) != Some("false")
+                {
+                    if attrs.get("visible").map(String::as_str) != Some("true")
+                        || attrs.get("enabled").map(String::as_str) != Some("true")
+                        || kind != "XCUIElementTypeKeyboard"
+                            && attrs.get("focused").map(String::as_str) == Some("false")
+                        || kind == "XCUIElementTypeTextView"
+                        || !stack
+                            .iter()
+                            .any(|parent| parent == "XCUIElementTypeApplication")
+                        || !screen?.encloses(Rect::read(&attrs)?)
+                    {
+                        return None;
+                    }
+                    if kind == "XCUIElementTypeKeyboard" {
+                        keyboards += 1;
+                    } else {
+                        text_inputs += 1;
+                    }
+                }
                 if kind == "XCUIElementTypeButton"
                     && attrs.get("visible").map(String::as_str) != Some("false")
                     && let Some(at) = at
@@ -199,6 +243,7 @@ fn parse_modal(xml: &str, at: Option<Point>, allow_modal: bool) -> Option<()> {
                     && stack.is_empty()
                     && screen.is_some()
                     && (at.is_none() || target)
+                    && (!require_text || text_inputs == 1 && keyboards == 1)
                     && (!allow_modal || modal.is_some() && target_in_modal))
                     .then_some(());
             }
@@ -218,6 +263,40 @@ mod tests {
     }
     fn point() -> Point {
         Point { x: 285.0, y: 505.0 }
+    }
+
+    #[test]
+    fn text_input_requires_one_editable_field_and_keyboard() {
+        let field = r#"<XCUIElementTypeSearchField visible="true" enabled="true" x="20" y="67" width="298" height="44"/>"#;
+        let keyboard = r#"<XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/>"#;
+        let body = format!("{field}{keyboard}");
+        assert!(visible_text_input(&tree(&body)));
+        assert!(visible_text_input(&tree(
+            &body.replace("SearchField", "TextField")
+        )));
+        assert!(visible_text_input(&tree(&format!(
+            "{body}<XCUIElementTypeTextView visible=\"true\" enabled=\"false\"/>"
+        ))));
+        for invalid in [
+            field.to_owned(),
+            keyboard.to_owned(),
+            format!("{body}{field}"),
+            format!("{body}{keyboard}"),
+            body.replace("SearchField", "SecureTextField"),
+            body.replace("SearchField", "TextView"),
+            body.replacen("enabled=\"true\"", "enabled=\"false\"", 1),
+            body.replacen("enabled=\"true\"", "", 1),
+            body.replacen("visible=\"true\"", "", 1),
+            body.replacen("SearchField ", "SearchField focused=\"false\" ", 1),
+            body.replace("width=\"298\"", "width=\"999\""),
+            format!("{body}<XCUIElementTypeTextView visible=\"true\"/>"),
+            format!("{body}<XCUIElementTypeSecureTextField visible=\"false\"/>"),
+            format!("{body}<XCUIElementTypeAlert/>"),
+            format!("{body}<XCUIElementTypeOther label=\"Enter Passcode\"/>"),
+            format!("{body}<broken>"),
+        ] {
+            assert!(!visible_text_input(&tree(&invalid)), "{invalid}");
+        }
     }
 
     fn modal(kind: &str, body: &str) -> String {
