@@ -22,6 +22,15 @@ from _supervised_files import (HeldFile, PathAnchor, Refused, StopSet, digest,
     runtime_lock)
 
 MODES = ("pin-once", "clock-once", "lock-once")
+RUNNER_REASONS = frozenset("""InvalidBundleId InvalidTimeout LookupFailed LookupTimedOut
+    EndpointBusy EndpointUnproven EndpointCleanupUnproven StartupTimedOut
+    PlanStartUnproven AutomationAuthorizationRequired InitializationFailed BootstrapFailed
+    RunnerExited RunnerFailed TaskFailed OwnershipLost ProcessIdentityUnproven RunnerStopUnproven
+    process_target_path process_usb_discovery process_usb_deadline process_output_create
+    process_command_spawn process_command_deadline process_command_exit process_metadata_read
+    process_metadata_limit process_metadata_decode process_metadata_contract process_inventory_schema
+    process_inventory_pid process_inventory_path process_inventory_ambiguous process_identity_changed
+    process_preexisting process_missing_after_start""".split())
 ROLES = {"config": 0o600, "binding": 0o600, "receipt": 0o600,
          "unlock_check": 0o500, "operator": 0o500, "probe": 0o500,
          "daemon": 0o500, "selected_daemon": 0o500, "selected_cli": 0o500,
@@ -410,6 +419,9 @@ def pin_result(result):
     zero = code == 0 and out == b"unlock_idle=already_unlocked\n" and not err
     zero |= code == 1 and not out and bool(re.fullmatch(
         rb"handkite-unlock-once: unlock_idle=(?:disabled|refused(?: reason=(?:service_layout|protected_config_required|service_ownership|protected_config_unavailable|runner_unconfigured|gate_unavailable|runner_unavailable))?)\n", err))
+    runner = re.fullmatch(
+        rb"handkite-unlock-once: unlock_idle=refused reason=runner_unavailable runner=([A-Za-z_]+)\n", err)
+    zero |= code == 1 and not out and bool(runner) and runner[1].decode("ascii") in RUNNER_REASONS
     return submitted, zero and not fault
 
 
@@ -432,7 +444,7 @@ def pin_diagnostic(result):
         length_mismatch residual_input incomplete incomplete_index_unproven
         unlocked_before_last_digit wrong_or_uncertain backend_disconnected backend_unavailable
         progress_mismatch gate_unproven""".split())
-    allowed = {"reason": labels | {"session_admission", "session_preflight",
+    allowed = {"runner": RUNNER_REASONS, "reason": labels | {"session_admission", "session_preflight",
         "session_creation_unproven", "owned_session_unproven"}, "action": labels,
         "restoration": {"verified", "not_needed", "unproven"},
         "phase": set("""initial_snapshot owned_admission wake_dispatch wake_postcapture

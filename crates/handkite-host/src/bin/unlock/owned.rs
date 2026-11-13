@@ -5,7 +5,7 @@ use handkite_host::pin_backend::NativePasscodeBackend;
 use handkite_host::service_layout::ServiceLayout;
 use handkite_host::service_lock::ServiceLock;
 use handkite_host::usb::PinnedUsb;
-use handkite_host::wda_runner::OwnedWdaRunner;
+use handkite_host::wda_runner::{OwnedWdaRunner, RunnerError};
 use handkite_host::wda_session::{
     OwnedSessionError, SessionClose, close_owned_session, with_owned_session_idle_settings_receipt,
 };
@@ -58,7 +58,7 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
             move || owner.validate_current().is_ok()
         })
         .await
-        .map_err(|_| "unlock_idle=refused reason=runner_unavailable")?;
+        .map_err(runner_failure)?;
         let liveness = runner.liveness();
         let wda = UsbWda::new(usb);
         let admit = || {
@@ -127,6 +127,10 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
     let result = idle::finish(&mut *gate, outcome)?;
     println!("unlock_idle={result}");
     Ok(())
+}
+
+fn runner_failure(error: RunnerError) -> String {
+    format!("unlock_idle=refused reason=runner_unavailable runner={error}")
 }
 
 fn admit_attempt(gate: &impl AttemptGate, owns: impl FnOnce() -> bool) -> Result<(), &'static str> {

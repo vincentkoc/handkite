@@ -642,6 +642,19 @@ class BrokerTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_runner_startup_reasons_are_safe_known_zero_results(self):
+        prefix = b"handkite-unlock-once: unlock_idle=refused reason=runner_unavailable runner="
+        for reason in broker.RUNNER_REASONS:
+            result = (1, b"", prefix + reason.encode() + b"\n", False)
+            self.assertEqual(broker.pin_result(result), (False, True))
+            self.assertEqual(broker.pin_diagnostic(result)["runner"], reason)
+            self.assertEqual(broker.pin_result((*result[:3], True)), (False, False))
+        for tail in (b"unknown\n", b"246810\n", b"RunnerFailed\nextra\n",
+                     b"RunnerFailed runner=RunnerFailed\n", b"RunnerFailed\xff\n"):
+            result = (1, b"", prefix + tail, False)
+            self.assertEqual(broker.pin_result(result), (False, False))
+            self.assertEqual(broker.pin_diagnostic(result)["reported_outcome"], "unclassified")
+
     def test_pin_diagnostics_report_only_allowlisted_native_fields(self):
         native = (b"handkite-unlock-once: unlock_idle=unknown reason=backend_unavailable "
                   b"action=backend_unavailable restoration=verified phase=reveal_postcapture "

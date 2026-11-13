@@ -6,6 +6,27 @@ use std::cell::{Cell, RefCell};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 
+#[test]
+fn runner_failure_keeps_a_fixed_startup_reason() {
+    use handkite_host::wda_runner::NativeProcessStep;
+    for (error, reason) in [
+        (
+            RunnerError::AutomationAuthorizationRequired,
+            "AutomationAuthorizationRequired",
+        ),
+        (RunnerError::LookupTimedOut, "LookupTimedOut"),
+        (
+            RunnerError::NativeProcess(NativeProcessStep::CommandExit),
+            "process_command_exit",
+        ),
+    ] {
+        assert_eq!(
+            runner_failure(error),
+            format!("unlock_idle=refused reason=runner_unavailable runner={reason}")
+        );
+    }
+}
+
 struct Gate(Result<bool, GateError>);
 
 impl AttemptGate for Gate {
