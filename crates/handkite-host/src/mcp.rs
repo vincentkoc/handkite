@@ -111,18 +111,40 @@ where
             Ok(request) => process(&request, device, capabilities, session, exchange),
         };
         if let Some(response) = response {
-            let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
-            if bytes.len() > MAX_RESPONSE {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "MCP response too large",
-                ));
-            }
+            let bytes = encode_response(response)?;
             output.write_all(&bytes)?;
             output.write_all(b"\n")?;
             output.flush()?;
         }
     }
+}
+
+fn encode_response(mut response: Value) -> io::Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    if bytes.len() <= MAX_RESPONSE {
+        return Ok(bytes);
+    }
+    let result = &mut response["result"];
+    if let Some(content) = result["content"]
+        .as_array_mut()
+        .filter(|items| items.len() == 3)
+    {
+        // Action replies put the receipt first, followed by the optional tree/image.
+        // Preserve known delivery even when that screen cannot fit in one frame.
+        content.truncate(1);
+        result["isError"] = json!(true);
+    } else {
+        *result = tool_error("ResponseTooLarge: observation exceeds the MCP frame limit");
+    }
+    result["structuredContent"] = json!({"code":"ResponseTooLarge"});
+    let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
+    if bytes.len() > MAX_RESPONSE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "MCP response too large",
+        ));
+    }
+    Ok(bytes)
 }
 
 fn process<F>(

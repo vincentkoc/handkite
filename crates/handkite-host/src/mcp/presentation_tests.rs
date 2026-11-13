@@ -270,3 +270,72 @@ fn representative_synthetic_wire_bytes() {
         }
     }
 }
+
+#[test]
+fn oversized_compact_fallback_returns_an_error_without_closing_the_session() {
+    let mut capture: Value = serde_json::from_slice(&captured("<unknown/>", "png")).unwrap();
+    let full_request = request(json!({}));
+    let full = process(
+        &full_request,
+        &DeviceKey::new("phone").unwrap(),
+        Capabilities::Observation,
+        &mut Session::default(),
+        &mut |_| Ok(serde_json::to_vec(&capture).unwrap()),
+    )
+    .unwrap();
+    let padding = MAX_RESPONSE - 2 - serde_json::to_vec(&full).unwrap().len();
+    capture["observation"]["screenshot_base64"] = json!(format!("AQID{}", "A".repeat(padding)));
+    let capture = serde_json::to_vec(&capture).unwrap();
+    assert!(capture.len() <= MAX_RESPONSE);
+    let mut output = Vec::new();
+    let input = format!(
+        "{}\n{}\n",
+        request(json!({"tree_format":"compact"})),
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/list"})
+    );
+    let mut calls = 0;
+    serve(
+        Cursor::new(input),
+        &mut output,
+        &DeviceKey::new("phone").unwrap(),
+        |_| {
+            calls += 1;
+            Ok(capture.clone())
+        },
+    )
+    .unwrap();
+    let replies: Vec<Value> = output
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(calls, 1);
+    assert_eq!(replies.len(), 2);
+    assert_eq!(replies[0]["result"]["isError"], true);
+    assert_eq!(
+        replies[0]["result"]["structuredContent"]["code"],
+        "ResponseTooLarge"
+    );
+    assert!(replies[1]["result"]["tools"].is_array());
+}
+
+#[test]
+fn oversized_action_keeps_the_receipt_without_replaying_or_inventing_delivery() {
+    let receipt = json!({"receipt":{"accepted":true,"action_kind":"swipe"},
+        "effect":"changed","after":{"revision":9}});
+    let response = json!({"jsonrpc":"2.0","id":4,"result":{"content":[
+        {"type":"text","text":receipt.to_string()},
+        {"type":"text","text":"tree"},
+        {"type":"image","data":"A".repeat(MAX_RESPONSE)}]}});
+    let bytes = encode_response(response).unwrap();
+    assert!(bytes.len() < MAX_RESPONSE);
+    let reply: Value = serde_json::from_slice(&bytes).unwrap();
+    let result = &reply["result"];
+    assert_eq!(result["structuredContent"]["code"], "ResponseTooLarge");
+    assert_eq!(result["isError"], true);
+    assert_eq!(result["content"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+        receipt
+    );
+}
