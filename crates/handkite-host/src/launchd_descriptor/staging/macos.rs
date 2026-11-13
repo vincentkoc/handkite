@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::fs::MetadataExt;
 
 mod files;
+pub(crate) mod registration;
 use files::{Anchors, Descriptor, FINAL, UNSAFE, bytes_match, file_policy};
 
 #[cfg(test)]

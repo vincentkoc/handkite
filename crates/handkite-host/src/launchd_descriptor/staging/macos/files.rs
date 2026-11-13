@@ -21,20 +21,47 @@ pub(super) struct Anchors {
     components: Vec<CString>,
     directories: Vec<Directory>,
     uid: u32,
+    unrelated: Vec<CString>,
 }
 
 impl Anchors {
     pub(super) fn open(layout: &ServiceLayout, expected: &[&CStr]) -> Result<Self, &'static str> {
-        let mut parts = components(&layout.staged_launchd_descriptor())?;
+        let value = Self::open_fixed(layout, false)?;
+        value.check(expected)?;
+        Ok(value)
+    }
+
+    pub(super) fn open_registration(layout: &ServiceLayout) -> Result<(Self, bool), &'static str> {
+        let mut value = Self::open_fixed(layout, true)?;
+        let names = names(value.parent())?;
+        let exists = names.iter().any(|name| name.as_c_str() == FINAL);
+        value.unrelated = names
+            .into_iter()
+            .filter(|name| name.as_c_str() != FINAL)
+            .collect();
+        value.check(if exists { &[FINAL] } else { &[] })?;
+        Ok((value, exists))
+    }
+
+    fn open_fixed(layout: &ServiceLayout, registered: bool) -> Result<Self, &'static str> {
+        let path = if registered {
+            layout.registered_launchd_descriptor()
+        } else {
+            layout.staged_launchd_descriptor()
+        };
+        let mut parts = components(&path)?;
         if parts.pop().as_deref() != Some(FINAL) {
             return Err(UNSAFE);
         }
-        let home_index = parts.len().checked_sub(4).ok_or(UNSAFE)?;
+        let home_index = parts
+            .len()
+            .checked_sub(if registered { 2 } else { 4 })
+            .ok_or(UNSAFE)?;
         let uid = unsafe { libc::geteuid() };
         let mut directories = Vec::with_capacity(parts.len() + 1);
         let mut file = open_at(libc::AT_FDCWD, c"/", true)?;
         for index in 0..=parts.len() {
-            let private = index == parts.len();
+            let private = !registered && index == parts.len();
             let account_owned = index >= home_index;
             let fingerprint = policy(&file, uid, private, account_owned)?;
             directories.push(Directory {
@@ -57,8 +84,8 @@ impl Anchors {
             components: parts,
             directories,
             uid,
+            unrelated: Vec::new(),
         };
-        value.check(expected)?;
         Ok(value)
     }
 
@@ -70,20 +97,21 @@ impl Anchors {
         let mut walked = open_at(libc::AT_FDCWD, c"/", true)?;
         let mut leaf = None;
         for (index, held) in self.directories.iter().enumerate() {
+            let leaf_directory = index == self.directories.len() - 1;
             if index != 0 {
                 walked = open_at(walked.as_raw_fd(), &self.components[index - 1], true)?;
             }
             for file in [&held.file, &walked] {
                 let current = policy(file, self.uid, held.private, held.account_owned)?;
-                let matches = if let Some(added_file) = transition.filter(|_| held.private) {
+                let matches = if let Some(added_file) = transition.filter(|_| leaf_directory) {
                     current.matches_after_entry_change(&held.fingerprint, added_file)
                 } else {
-                    directory_matches(&current, &held.fingerprint, held.private)
+                    directory_matches(&current, &held.fingerprint, leaf_directory)
                 };
                 if !matches {
                     return Err(UNSAFE);
                 }
-                if held.private {
+                if leaf_directory {
                     if leaf.as_ref().is_some_and(|old| old != &current) {
                         return Err(UNSAFE);
                     }
@@ -96,7 +124,7 @@ impl Anchors {
 
     pub(super) fn check(&self, expected: &[&CStr]) -> Result<(), &'static str> {
         self.walk(None)?;
-        inventory(self.parent(), expected)?;
+        self.inventory(expected)?;
         self.walk(None)?;
         Ok(())
     }
@@ -108,12 +136,29 @@ impl Anchors {
         added_file: bool,
     ) -> Result<(), &'static str> {
         let observed = self.walk(Some(added_file))?;
-        inventory(self.parent(), expected)?;
+        self.inventory(expected)?;
         if self.walk(Some(added_file))? != observed {
             return Err(UNSAFE);
         }
         self.directories.last_mut().ok_or(UNSAFE)?.fingerprint = observed;
         self.check(expected)
+    }
+
+    fn inventory(&self, expected: &[&CStr]) -> Result<(), &'static str> {
+        let mut expected: Vec<_> = self
+            .unrelated
+            .iter()
+            .map(|name| name.as_c_str())
+            .chain(expected.iter().copied())
+            .collect();
+        expected.sort_unstable();
+        let mut actual = names(self.parent())?;
+        actual.sort_unstable();
+        if actual.iter().map(|name| name.as_c_str()).eq(expected) {
+            Ok(())
+        } else {
+            Err(UNSAFE)
+        }
     }
 }
 
@@ -214,7 +259,7 @@ impl Descriptor {
     }
 }
 
-fn inventory(directory: &File, expected: &[&CStr]) -> Result<(), &'static str> {
+fn names(directory: &File) -> Result<Vec<CString>, &'static str> {
     let scan = open_at(directory.as_raw_fd(), c".", true)?;
     let raw = unsafe { libc::fdopendir(scan.as_raw_fd()) };
     if raw.is_null() {
@@ -228,15 +273,13 @@ fn inventory(directory: &File, expected: &[&CStr]) -> Result<(), &'static str> {
         }
     }
     let scan = Dir(raw);
-    let mut seen = vec![false; expected.len()];
+    let mut names = Vec::new();
     loop {
         unsafe { *libc::__error() = 0 };
         let entry = unsafe { libc::readdir(scan.0) };
         if entry.is_null() {
-            return if std::io::Error::last_os_error().raw_os_error() == Some(0)
-                && seen.iter().all(|value| *value)
-            {
-                Ok(())
+            return if std::io::Error::last_os_error().raw_os_error() == Some(0) {
+                Ok(names)
             } else {
                 Err(UNSAFE)
             };
@@ -245,13 +288,9 @@ fn inventory(directory: &File, expected: &[&CStr]) -> Result<(), &'static str> {
         if name == c"." || name == c".." {
             continue;
         }
-        let index = expected
-            .iter()
-            .position(|value| *value == name)
-            .ok_or(UNSAFE)?;
-        if seen[index] {
+        if names.len() >= 4096 || names.iter().any(|value: &CString| value.as_c_str() == name) {
             return Err(UNSAFE);
         }
-        seen[index] = true;
+        names.push(name.to_owned());
     }
 }

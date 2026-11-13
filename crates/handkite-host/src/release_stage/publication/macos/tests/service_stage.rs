@@ -3,6 +3,8 @@ use crate::install_config::RetainedConfig;
 use crate::launchd_descriptor::{StagePhase, staging::macos as service};
 use handkite_core::protocol::{DeviceBinding, DeviceKey, HardwareId};
 
+mod registration;
+
 const RUNNER_CONFIG: &[u8] = br#"{"device_key":"phone","usb_id":"test-device","wda_runner_bundle_id":"com.example.WDA-Runner.xctrunner"}"#;
 const STAGE_TEMP: &str = ".descriptor-33333333333333333333333333333333";
 

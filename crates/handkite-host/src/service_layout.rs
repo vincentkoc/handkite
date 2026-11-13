@@ -73,6 +73,12 @@ impl ServiceLayout {
         self.root().join("launchd/com.handkite.host.plist")
     }
 
+    /// Fixed per-account GUI LaunchAgent registration; no directory is created.
+    pub fn registered_launchd_descriptor(&self) -> PathBuf {
+        self.home
+            .join("Library/LaunchAgents/com.handkite.host.plist")
+    }
+
     /// Inspect existing directory metadata without opening config, releases, or state files.
     ///
     /// This is a point-in-time preflight, not a race-safe installation capability.

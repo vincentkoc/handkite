@@ -2,6 +2,8 @@
 
 pub(crate) mod staging;
 pub use staging::{StageFailure, StagePhase, StagedDescriptor, reopen_staged, stage};
+mod registration;
+pub use registration::{RegistrationFailure, RegistrationOutcome, register};
 
 use crate::service_layout::ServiceLayout;
 use std::path::Path;
