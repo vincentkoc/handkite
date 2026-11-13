@@ -103,16 +103,12 @@ where
                 break;
             }
         }
-        let request: Value = match serde_json::from_slice(&line) {
-            Ok(value) => value,
-            Err(_) => continue,
-        };
-        let response = if request["method"] == "tools/call" && !valid_tool_frame(&line) {
-            request
+        let response = match serde_json::from_slice::<Value>(&line) {
+            Err(_) => Some(error(Value::Null, -32700, "parse error")),
+            Ok(request) if request["method"] == "tools/call" && !valid_tool_frame(&line) => request
                 .get("id")
-                .map(|id| error(id.clone(), -32602, "invalid tool call"))
-        } else {
-            process(&request, device, capabilities, session, exchange)
+                .map(|id| error(id.clone(), -32602, "invalid tool call")),
+            Ok(request) => process(&request, device, capabilities, session, exchange),
         };
         if let Some(response) = response {
             let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
@@ -288,13 +284,22 @@ fn tool_result<F>(tool: Tool, compact: bool, device: &DeviceKey, exchange: &mut 
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
-    let Ok(Reply::Observed { observation }) =
-        exchange_reply(json!({"method": "observe", "device": device}), exchange)
-    else {
-        return tool_error("device observation unavailable");
+    let observation = match exchange_reply(json!({"method": "observe", "device": device}), exchange)
+    {
+        Ok(Reply::Observed { observation }) => observation,
+        Ok(Reply::Error { code }) => {
+            return response::with_service_code(
+                tool_error("device observation unavailable"),
+                &code,
+            );
+        }
+        _ => return tool_error("device observation unavailable"),
     };
     if &observation.device != device {
-        return tool_error("device identity mismatch");
+        return response::with_service_code(
+            tool_error("device identity mismatch"),
+            "DeviceMismatch",
+        );
     }
     let metadata = metadata(&observation);
     if tool == Tool::Status {
@@ -357,6 +362,39 @@ mod tests {
                 .iter()
                 .all(|tool| tool["name"].as_str().unwrap().starts_with("handkite_"))
         );
+    }
+
+    #[test]
+    fn malformed_json_returns_parse_error_and_preserves_the_session() {
+        let replies = run(
+            "{broken private payload\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n",
+            "",
+        );
+        assert_eq!(replies.len(), 2);
+        assert_eq!(replies[0], error(Value::Null, -32700, "parse error"));
+        assert_eq!(replies[1]["id"], 2);
+        assert!(replies[1]["result"]["tools"].is_array());
+    }
+
+    #[test]
+    fn observation_errors_expose_only_fixed_codes() {
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_status\",\"arguments\":{}}}\n";
+        for code in [
+            "Adapter",
+            "DeviceMismatch",
+            "StaleObservation",
+            "InvalidObservationWindow",
+            "private detail",
+        ] {
+            let replies = run(input, &json!({"type":"error","code":code}).to_string());
+            assert_eq!(replies[0]["result"]["isError"], true);
+            if code == "private detail" {
+                assert!(replies[0]["result"].get("structuredContent").is_none());
+                assert!(!replies[0].to_string().contains(code));
+            } else {
+                assert_eq!(replies[0]["result"]["structuredContent"]["code"], code);
+            }
+        }
     }
 
     #[test]

@@ -25,6 +25,28 @@ pub(super) fn text_result(value: Value) -> Value {
     json!({"content": [{"type": "text", "text": value.to_string()}]})
 }
 
+pub(super) fn with_service_code(mut result: Value, code: &str) -> Value {
+    if matches!(
+        code,
+        "Busy"
+            | "Randomness"
+            | "DeviceMismatch"
+            | "StaleObservation"
+            | "InvalidObservationWindow"
+            | "RevisionExhausted"
+            | "Adapter"
+            | "Poisoned"
+            | "InvalidOwner"
+            | "InvalidLease"
+            | "StaleRevision"
+            | "ViewChanged"
+            | "LockedAction"
+    ) {
+        result["structuredContent"] = json!({"code":code});
+    }
+    result
+}
+
 pub(super) fn observation_content(observation: WireObservation) -> Vec<Value> {
     let metadata = metadata(&observation);
     let mime = match observation.screenshot_format {

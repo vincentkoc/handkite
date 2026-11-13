@@ -160,24 +160,9 @@ fn uncertain_result(kind: &str) -> Value {
 }
 
 fn uncertain_service_result(kind: &str, code: &str) -> Value {
-    let mut result = uncertain_result(kind);
     // Keep delivery unknown while exposing only the controller's fixed categories.
     // Never forward arbitrary service text, which may contain private content.
-    if matches!(
-        code,
-        "Busy"
-            | "Randomness"
-            | "DeviceMismatch"
-            | "StaleObservation"
-            | "InvalidObservationWindow"
-            | "RevisionExhausted"
-            | "Adapter"
-            | "Poisoned"
-            | "InvalidOwner"
-    ) {
-        result["structuredContent"] = json!({"code": code});
-    }
-    result
+    super::response::with_service_code(uncertain_result(kind), code)
 }
 
 fn service_error(code: &str) -> Value {
