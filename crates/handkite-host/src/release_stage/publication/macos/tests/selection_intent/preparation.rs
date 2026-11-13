@@ -11,6 +11,7 @@ mod initial;
 mod job_admission;
 mod pending;
 mod retirement;
+mod update;
 
 const CANDIDATE: &str = ".selection-31313131313131313131313131313131";
 

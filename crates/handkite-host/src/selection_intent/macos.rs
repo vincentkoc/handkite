@@ -6,6 +6,7 @@ pub(crate) mod initial;
 mod journal;
 pub(crate) mod pending;
 pub(crate) mod preparation;
+pub(crate) mod transition;
 
 const MISMATCH: &str = "selection intent release or lock mismatch";
 const UNSAFE: &str = "unsafe or changed selection preparation";

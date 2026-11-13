@@ -6,7 +6,7 @@
 //! use handkite_host::selection_intent::{Intent, inspect};
 //! ```
 //!
-//! Only first-time selection has a public coordinator. Individual transaction
+//! Initial selection and explicit updates have public coordinators. Individual transaction
 //! capabilities remain private and consume independently pinned device agreement.
 //!
 //! ```compile_fail,E0603
@@ -37,6 +37,11 @@ use crate::install_plan::{ManifestDigest, Operation};
 use crate::installer_lock::InstallerLock;
 use crate::release_stage::PublishedRelease;
 use serde::{Deserialize, Serialize};
+
+mod update;
+pub use update::{
+    SelectionFailure, SelectionPhase, SelectionStage, UpdateOperation, select_update,
+};
 
 #[cfg(target_os = "macos")]
 pub(crate) mod macos;
@@ -353,7 +358,7 @@ impl PreparedSelection<'_, '_> {
 /// The consumed device agreement and release handles must retain this exact lock.
 /// Reobserve the original device after signer checks and before the first write.
 /// All errors preserve residues, with no retry, rollback, adoption, or cleanup.
-// Only the initial-selection coordinator is exposed to production callers.
+// Only guarded selection coordinators are exposed to production callers.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn prepare<'held, 'lock>(
     owner: &'lock InstallerLock,
@@ -448,7 +453,7 @@ impl CommittedSelection<'_, '_> {
 /// Reobserve before commit inventory capture; no await follows any mutation.
 /// Attempt at most one rename. Every failure consumes preparation and preserves files.
 /// No retry, rollback, journal removal, activation, or replacement evidence is accepted.
-// No production caller exists until stopped-controller admission is implemented.
+// Public coordinators preserve the private transaction's stopped-job admission.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) async fn commit<'held, 'lock>(
     prepared: PreparedSelection<'held, 'lock>,
