@@ -69,20 +69,26 @@ fn user_job_admission_requires_absence_and_preserves_private_state() {
         .iter()
         .map(|path| Fingerprint::from(fs::symlink_metadata(path).unwrap()))
         .collect();
-    for observation in [
+    for user in [
         Observation::Absent,
         Observation::Loaded,
         Observation::Unknown,
     ] {
-        owner.set_user_job_for_test(observation);
-        assert_eq!(
-            owner.require_user_job_absent(),
-            if observation == Observation::Absent {
-                Ok(())
-            } else {
-                Err(crate::installer_lock::JOB_UNAVAILABLE)
-            }
-        );
+        for gui in [
+            Observation::Absent,
+            Observation::Loaded,
+            Observation::Unknown,
+        ] {
+            owner.set_jobs_for_test([user, gui]);
+            assert_eq!(
+                owner.require_jobs_absent(),
+                if [user, gui] == [Observation::Absent; 2] {
+                    Ok(())
+                } else {
+                    Err(crate::installer_lock::JOB_UNAVAILABLE)
+                }
+            );
+        }
     }
     for (path, fingerprint) in paths.iter().zip(before) {
         assert_eq!(fs::read(path).unwrap(), b"preserve-private-state");
@@ -106,10 +112,10 @@ fn user_job_admission_rejects_lock_replacement_before_and_during_observation() {
         }
         let mut observed = false;
         assert_eq!(
-            owner.check_user_job_absent(|| {
+            owner.check_jobs_absent(|| {
                 observed = true;
                 replace();
-                Observation::Absent
+                [Observation::Absent; 2]
             }),
             Err(crate::installer_lock::UNAVAILABLE)
         );

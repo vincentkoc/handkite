@@ -80,7 +80,7 @@ pub(crate) async fn select<'lock>(
         phase: SelectionPhase::Applied,
         has_residue: true,
     };
-    owner.require_user_job_absent().map_err(|_| verify())?;
+    owner.require_jobs_absent().map_err(|_| verify())?;
     // Recheck the retained selection after the potentially blocking job observation.
     #[cfg(test)]
     if let Some(check) = hooks.final_check.as_mut() {

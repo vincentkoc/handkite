@@ -63,7 +63,7 @@ pub(crate) async fn retire<'held, 'lock>(
         }
         #[cfg(not(test))]
         committed.agreement.reobserve().await?;
-        committed.owner.require_user_job_absent()?;
+        committed.owner.require_jobs_absent()?;
         // Retain all original evidence across the await; never adopt a fresh baseline.
         committed.custody()?;
         finish_retirement(

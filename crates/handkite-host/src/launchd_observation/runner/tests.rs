@@ -3,6 +3,40 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::process::ExitStatusExt;
 
 #[test]
+fn installer_observes_both_fixed_domains_even_after_unknown_result() {
+    let mut domains = Vec::new();
+    let observed = observe_pair_with(42, |command, timeout| {
+        domains.push(
+            command
+                .get_args()
+                .map(|value| value.to_owned())
+                .collect::<Vec<_>>(),
+        );
+        assert_eq!(timeout, Duration::from_secs(5));
+        assert_eq!(command.get_envs().count(), 0);
+        if domains.len() == 1 {
+            Err(RunError::Timeout)
+        } else {
+            Ok(ExitStatus::from_raw(113 << 8))
+        }
+    });
+    assert_eq!(observed, [Observation::Unknown, Observation::Absent]);
+    assert_eq!(
+        domains,
+        [
+            vec![
+                std::ffi::OsString::from("print"),
+                "user/42/com.handkite.host".into()
+            ],
+            vec![
+                std::ffi::OsString::from("print"),
+                "gui/42/com.handkite.host".into()
+            ],
+        ]
+    );
+}
+
+#[test]
 fn builds_only_the_fixed_user_domain_query_without_environment_additions() {
     for uid in [0, 42, u32::MAX] {
         assert_eq!(

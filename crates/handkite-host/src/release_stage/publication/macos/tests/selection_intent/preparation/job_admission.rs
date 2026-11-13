@@ -3,7 +3,7 @@ use crate::launchd_observation::Observation as Job;
 use crate::selection_intent::macos::preparation::commit::{self as transaction, retirement};
 use crate::selection_intent::{CommitPhase, RetirementPhase};
 
-const REFUSED: &str = "Handkite user-domain job is loaded or unknown";
+const REFUSED: &str = "Handkite account-domain job is loaded or unknown";
 const OPERATIONS: [Operation; 3] = [
     Operation::InitialInstall,
     Operation::Upgrade,
@@ -42,7 +42,7 @@ async fn loaded_or_unknown_job_prevents_preparation_without_residues() {
             let mut previous = open(&fixture.owner, &fixture.bytes);
             let mut destination = open(&fixture.owner, &bytes);
             let before = inventory(&fixture);
-            fixture.owner.set_user_job_for_test(job);
+            fixture.owner.set_jobs_for_test([Job::Absent, job]);
             let error = prepare(
                 &fixture.owner,
                 agreement,
@@ -80,7 +80,7 @@ async fn job_appearing_after_preparation_prevents_commit_and_preserves_candidate
             .await
             .unwrap();
             let before = inventory(&fixture);
-            fixture.owner.set_user_job_for_test(job);
+            fixture.owner.set_jobs_for_test([Job::Absent, job]);
             let mut hooks = transaction::Hooks {
                 check: Some(&mut check),
                 device: Some(device::Fake::good()),
@@ -127,7 +127,7 @@ async fn job_appearing_after_commit_prevents_retirement_and_preserves_journal() 
             .await
             .unwrap();
             let before = inventory(&fixture);
-            fixture.owner.set_user_job_for_test(job);
+            fixture.owner.set_jobs_for_test([Job::Absent, job]);
             let mut hooks = retirement::Hooks {
                 check: Some(&mut check),
                 device: Some(device::Fake::good()),

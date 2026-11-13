@@ -233,7 +233,7 @@ pub(crate) async fn prepare<'held, 'lock>(
         }
         #[cfg(not(test))]
         agreement.reobserve().await?;
-        owner.require_user_job_absent()?;
+        owner.require_jobs_absent()?;
         // All filesystem mutations below stay synchronous through completion.
         checkpoint(&retained, &mut agreement, None)?;
         write_preparation(

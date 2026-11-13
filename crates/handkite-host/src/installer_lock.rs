@@ -9,7 +9,7 @@ mod macos;
 
 const UNAVAILABLE: &str = "installer lock unavailable or unsafe";
 #[cfg(target_os = "macos")]
-const JOB_UNAVAILABLE: &str = "Handkite user-domain job is loaded or unknown";
+const JOB_UNAVAILABLE: &str = "Handkite account-domain job is loaded or unknown";
 
 pub struct InstallerLock {
     #[cfg(target_os = "macos")]
@@ -17,7 +17,7 @@ pub struct InstallerLock {
     #[cfg(target_os = "macos")]
     layout: ServiceLayout,
     #[cfg(all(test, target_os = "macos"))]
-    user_job: std::cell::Cell<Option<crate::launchd_observation::Observation>>,
+    user_job: std::cell::Cell<Option<[crate::launchd_observation::Observation; 2]>>,
     #[cfg(not(target_os = "macos"))]
     _unsupported: (),
 }
@@ -46,28 +46,28 @@ impl InstallerLock {
         &self.layout
     }
 
-    /// Observe the fixed user-domain job while retaining exclusive lock ownership.
+    /// Observe the fixed user and GUI-domain jobs while retaining exclusive lock ownership.
     /// This does not exclude controllers in other domains or those ignoring the lock.
     #[cfg(target_os = "macos")]
-    pub(crate) fn require_user_job_absent(&self) -> Result<(), &'static str> {
-        self.check_user_job_absent(|| {
+    pub(crate) fn require_jobs_absent(&self) -> Result<(), &'static str> {
+        self.check_jobs_absent(|| {
             #[cfg(test)]
             if let Some(observation) = self.user_job.get() {
                 return observation;
             }
-            crate::launchd_observation::observe()
+            crate::launchd_observation::installer_jobs()
         })
     }
 
     #[cfg(target_os = "macos")]
-    fn check_user_job_absent(
+    fn check_jobs_absent(
         &self,
-        observe: impl FnOnce() -> crate::launchd_observation::Observation,
+        observe: impl FnOnce() -> [crate::launchd_observation::Observation; 2],
     ) -> Result<(), &'static str> {
         self.revalidate()?;
         let observation = observe();
         self.revalidate()?;
-        if observation != crate::launchd_observation::Observation::Absent {
+        if observation != [crate::launchd_observation::Observation::Absent; 2] {
             return Err(JOB_UNAVAILABLE);
         }
         Ok(())
@@ -78,7 +78,12 @@ impl InstallerLock {
         &self,
         observation: crate::launchd_observation::Observation,
     ) {
-        self.user_job.set(Some(observation));
+        self.set_jobs_for_test([observation, crate::launchd_observation::Observation::Absent]);
+    }
+
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn set_jobs_for_test(&self, jobs: [crate::launchd_observation::Observation; 2]) {
+        self.user_job.set(Some(jobs));
     }
 
     /// Recheck held descriptors and a fresh root-anchored path while owning the lock.

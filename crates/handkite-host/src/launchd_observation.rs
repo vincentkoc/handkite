@@ -25,6 +25,18 @@ pub fn observe() -> Observation {
     }
 }
 
+/// Observe the exact job in both account domains; neither result is process proof.
+pub(crate) fn installer_jobs() -> [Observation; 2] {
+    #[cfg(target_os = "macos")]
+    {
+        runner::observe_pair_with(unsafe { libc::geteuid() }, runner::run_command)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        [Observation::Unknown; 2]
+    }
+}
+
 #[cfg(any(target_os = "macos", test))]
 mod runner {
     use super::Observation;
@@ -44,8 +56,23 @@ mod runner {
         uid: u32,
         run: impl FnOnce(&mut Command, Duration) -> Result<ExitStatus, RunError>,
     ) -> Observation {
+        observe_domain(uid, "user", run)
+    }
+
+    pub(super) fn observe_pair_with(
+        uid: u32,
+        mut run: impl FnMut(&mut Command, Duration) -> Result<ExitStatus, RunError>,
+    ) -> [Observation; 2] {
+        ["user", "gui"].map(|domain| observe_domain(uid, domain, &mut run))
+    }
+
+    fn observe_domain(
+        uid: u32,
+        domain: &str,
+        run: impl FnOnce(&mut Command, Duration) -> Result<ExitStatus, RunError>,
+    ) -> Observation {
         let mut command = Command::new("/bin/launchctl");
-        command.args(["print", &format!("user/{uid}/com.handkite.host")]);
+        command.args(["print", &format!("{domain}/{uid}/com.handkite.host")]);
         protect_child(&mut command);
         match run(&mut command, TIMEOUT) {
             Ok(status) if status.code() == Some(0) => Observation::Loaded,
@@ -63,13 +90,16 @@ mod runner {
     }
 
     #[derive(Debug, PartialEq, Eq)]
-    enum RunError {
+    pub(super) enum RunError {
         Spawn,
         Wait,
         Timeout,
     }
 
-    fn run_command(command: &mut Command, timeout: Duration) -> Result<ExitStatus, RunError> {
+    pub(super) fn run_command(
+        command: &mut Command,
+        timeout: Duration,
+    ) -> Result<ExitStatus, RunError> {
         let mut child = command.spawn().map_err(|_| RunError::Spawn)?;
         wait_child(&mut child, timeout)
     }
