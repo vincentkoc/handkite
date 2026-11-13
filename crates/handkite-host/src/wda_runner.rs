@@ -306,7 +306,7 @@ impl OwnedWdaRunner {
                         Err(_) => Err(RunnerError::TaskFailed),
                     }
                 }
-                Err(_) => return Err(RunnerError::TaskFailed),
+                Err(_) => Err(RunnerError::TaskFailed),
             }
         } else {
             Ok(())
