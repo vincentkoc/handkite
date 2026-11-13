@@ -635,7 +635,7 @@ not qualify a Cancel tap or PIN entry.
 
 `handkite-unlock-once --config /path/to/config.json [--supervised-visibility-fallback]` accepts only the selected device key `phone`. Its stop marker is `Library/Application Support/Handkite/state/iphone/UNLOCK-DISABLED` under the effective user's OS account home, resolved with `getpwuid_r`, independent of `HOME` and the working directory. There is no `--state-dir` override.
 
-The home and each state ancestor must already exist, be owned by that user, and have no group or other write access. Symlinks are rejected, and the final `iphone` directory must be mode 0700. Unlock never creates or migrates these directories. An existing marker blocks execution before PIN input or backend initialization; it requires owner inspection, and this command cannot clear an earlier attempt's marker. Qualified staged-candidate PIN cycles are recorded in [validation](VALIDATION.md); that evidence does not authorize another attempt or qualify the installed runtime.
+The home and each state ancestor must already exist, be owned by that user, and have no group or other write access. Symlinks are rejected, and the final `iphone` directory must be mode 0700. Unlock never creates or migrates these directories. An existing marker blocks execution before PIN input or backend initialization; the bare command cannot clear an earlier attempt's marker. Clear it only after inspecting the device, either yourself or through the [supervised broker](RELEASE.md#pin-unlock).
 
 The explicit `--temporary-idle-settings` variant temporarily uses idle settings
 `1.0` and `0.2`, then verifies restoration of the original values. It requires
