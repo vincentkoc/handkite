@@ -155,6 +155,34 @@ async fn capture_reads<S, L, N: Send + 'static>(
     tokio::join!(source, lock, native)
 }
 
+type TimedRead<T, E> = (Result<T, E>, u128);
+
+async fn read_source_and_progress(
+    wda: &impl WdaRequest,
+    session: Option<&str>,
+) -> (
+    TimedRead<crate::wda_http::HttpResponse, WdaError>,
+    Option<TimedRead<u32, pin_field::FieldError>>,
+) {
+    // Read source and field in one capture window. Await both even if either
+    // fails; agreement and the original capture deadline still gate input.
+    tokio::join!(
+        async {
+            let started = Instant::now();
+            let result = wda
+                .request("GET", PIN_SOURCE, b"", Duration::from_secs(10))
+                .await;
+            (result, started.elapsed().as_millis())
+        },
+        async {
+            let session = session?;
+            let started = Instant::now();
+            let result = pin_field::read(wda, session).await;
+            Some((result, started.elapsed().as_millis()))
+        }
+    )
+}
+
 struct PreparedPinView {
     view: ParsedPasscodeView,
     fresh_until: Instant,
@@ -1127,15 +1155,18 @@ impl NativePasscodeBackend {
         self.capture_timings.session_before_ms = step_started.elapsed().as_millis();
         prepared.map_err(|_| BackendError::Unavailable)?;
         let expected = self.expected.clone();
-        let ((source, source_ms), (reported_lock, lock_ms), native) =
+        let progress_session = if self.progress_check == ProgressCheck::Pending {
+            Some(
+                self.actions
+                    .prepared_session()
+                    .ok_or(BackendError::Unavailable)?,
+            )
+        } else {
+            None
+        };
+        let (((source, source_ms), direct), (reported_lock, lock_ms), native) =
             self.runtime.block_on(capture_reads(
-                async {
-                    let started = Instant::now();
-                    let result = wda
-                        .request("GET", PIN_SOURCE, b"", Duration::from_secs(10))
-                        .await;
-                    (result, started.elapsed().as_millis())
-                },
+                read_source_and_progress(&wda, progress_session),
                 async {
                     let started = Instant::now();
                     let result = wda
@@ -1154,20 +1185,14 @@ impl NativePasscodeBackend {
         }
         self.capture_timings.source_ms = source_ms;
         self.capture_timings.lock_ms = lock_ms;
+        self.capture_timings.direct_field_ms = direct.as_ref().map_or(0, |(_, elapsed)| *elapsed);
         self.capture_step = PinCaptureStep::SourceRead;
         let source = response_value(source.map_err(wda_error)?)?;
         self.capture_step = PinCaptureStep::LockRead;
         let reported_lock = response_value(reported_lock.map_err(wda_error)?)?;
         self.wda_reported_lock = PinReportedLock::from_bool(reported_lock.as_bool());
-        let direct = if self.progress_check == ProgressCheck::Pending {
+        let direct = if let Some((direct, _)) = direct {
             self.capture_step = PinCaptureStep::DirectField;
-            let session = self
-                .actions
-                .prepared_session()
-                .ok_or(BackendError::Unavailable)?;
-            let step_started = Instant::now();
-            let direct = self.runtime.block_on(pin_field::read(&wda, session));
-            self.capture_timings.direct_field_ms = step_started.elapsed().as_millis();
             Some(direct.map_err(|_| BackendError::Unavailable)?)
         } else {
             None
@@ -2218,6 +2243,118 @@ mod tests {
                     "/wda/screen"
                 ]
             );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn source_and_progress_overlap_and_join_both_failure_paths() {
+        use crate::wda_http::HttpResponse;
+        use serde_json::json;
+        use std::cell::{Cell, RefCell};
+
+        struct Reads {
+            progress: bool,
+            source_fails: bool,
+            field_fails: bool,
+            started: Cell<u8>,
+            calls: RefCell<Vec<String>>,
+        }
+        impl WdaRequest for Reads {
+            async fn request(
+                &self,
+                method: &str,
+                path: &str,
+                body: &[u8],
+                _: Duration,
+            ) -> Result<HttpResponse, WdaError> {
+                self.calls.borrow_mut().push(path.into());
+                let value = match path {
+                    PIN_SOURCE => {
+                        assert_eq!(method, "GET");
+                        self.started.set(self.started.get() | 1);
+                        tokio::task::yield_now().await;
+                        assert_eq!(self.started.get() & 2 != 0, self.progress);
+                        if self.source_fails {
+                            return Err(WdaError::AfterSent);
+                        }
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        json!("<fixture />")
+                    }
+                    "/status" => {
+                        self.started.set(self.started.get() | 2);
+                        tokio::task::yield_now().await;
+                        assert_ne!(self.started.get() & 1, 0);
+                        json!({"ready": true})
+                    }
+                    "/session/fixture-session" => json!({}),
+                    "/session/fixture-session/elements" => {
+                        assert_eq!(method, "POST");
+                        assert_eq!(body, pin_field::QUERY);
+                        if self.field_fails {
+                            return Err(WdaError::AfterSent);
+                        }
+                        json!([{"ELEMENT":"fixture-field"}])
+                    }
+                    "/session/fixture-session/element/fixture-field/attribute/value" => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        json!("1 of 6 digits")
+                    }
+                    _ => panic!("unexpected request"),
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&json!({
+                        "sessionId":"fixture-session", "value":value
+                    }))
+                    .unwrap(),
+                })
+            }
+        }
+
+        for progress in [false, true] {
+            for source_fails in [false, true] {
+                for field_fails in [false, true] {
+                    let reads = Reads {
+                        progress,
+                        source_fails,
+                        field_fails,
+                        started: Cell::new(0),
+                        calls: RefCell::new(Vec::new()),
+                    };
+                    let started = tokio::time::Instant::now();
+                    let (source, field) =
+                        read_source_and_progress(&reads, progress.then_some("fixture-session"))
+                            .await;
+                    assert_eq!(source.0.is_err(), source_fails);
+                    assert_eq!(
+                        field.as_ref().map(|(r, _)| r.is_err()),
+                        progress.then_some(field_fails)
+                    );
+                    let needs_wait = !source_fails || progress && !field_fails;
+                    assert_eq!(
+                        started.elapsed(),
+                        Duration::from_secs(u64::from(needs_wait))
+                    );
+                    let calls = reads.calls.borrow();
+                    assert_eq!(
+                        calls
+                            .iter()
+                            .filter(|path| path.as_str() == PIN_SOURCE)
+                            .count(),
+                        1
+                    );
+                    assert_eq!(
+                        calls.len(),
+                        if !progress {
+                            1
+                        } else if field_fails {
+                            4
+                        } else {
+                            7
+                        }
+                    );
+                }
+            }
         }
     }
 

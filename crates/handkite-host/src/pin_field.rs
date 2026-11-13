@@ -1,7 +1,6 @@
 use crate::wda_action::WdaRequest;
 use crate::wda_http::HttpResponse;
 use crate::wda_settings::validate_session;
-use crate::wda_transport::UsbWda;
 use handkite_core::passcode::PasscodeProgress;
 use serde::Deserialize;
 use std::time::Duration;
@@ -82,7 +81,7 @@ pub fn count(raw: &str) -> Result<u32, FieldError> {
         .map_err(|_| FieldError::Progress)
 }
 
-pub(crate) async fn read(wda: &UsbWda, session: &str) -> Result<u32, FieldError> {
+pub(crate) async fn read(wda: &impl WdaRequest, session: &str) -> Result<u32, FieldError> {
     read_with(wda, session).await
 }
 
