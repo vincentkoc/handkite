@@ -236,6 +236,43 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaises(OSError):
             os.fstat(profiles[0].fd)
 
+    def test_exact_role_aliases_share_reads_but_recheck_fresh_contents(self):
+        f = self.fixture()
+        f.value["files"]["unlock_check"] = dict(f.value["files"]["operator"])
+        f.value["files"]["daemon"] = dict(f.value["files"]["selected_daemon"])
+        f.write(f.profile_path, encoded(f.value), 0o600)
+        p, stops = f.open()
+        self.addCleanup(p.close)
+        self.addCleanup(stops.close)
+        self.assertIs(p.files["unlock_check"], p.files["operator"])
+        self.assertIs(p.files["daemon"], p.files["selected_daemon"])
+        # Equal contents at different paths still retain distinct custody.
+        self.assertIsNot(p.files["operator"], p.files["probe"])
+        with patch.object(files, "read_bytes", wraps=files.read_bytes) as reads:
+            p.recheck()
+            self.assertEqual(reads.call_count, len(broker.ROLES) - 2)
+        operator = Path(p.path("operator"))
+        operator.chmod(0o700)
+        operator.write_bytes(b"changed executable\n")
+        operator.chmod(0o500)
+        with self.assertRaises(files.Refused):
+            p.recheck()
+
+    def test_alias_with_different_expected_identity_or_digest_refuses(self):
+        for changed in ("sha256", "fingerprint"):
+            with self.subTest(changed=changed):
+                f = self.fixture()
+                alias = dict(f.value["files"]["operator"])
+                if changed == "sha256":
+                    alias[changed] = "0" * 64
+                else:
+                    alias[changed] = list(alias[changed])
+                    alias[changed][1] += 1
+                f.value["files"]["unlock_check"] = alias
+                f.write(f.profile_path, encoded(f.value), 0o600)
+                with self.assertRaises(files.Refused):
+                    f.open()
+
     def test_failed_rename_validation_retains_descriptors_for_cleanup(self):
         for restoring in (False, True):
             for failure in ("stat", "metadata"):

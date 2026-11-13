@@ -55,6 +55,7 @@ class Profile:
             fixed.update({role: self.root + "/releases/" + self.target + "/" + name
                           for role, name in (("selected_daemon", "handkited"),
                           ("selected_cli", "handkitectl"), ("selected_mcp", "handkite-mcp"))})
+            retained = {}
             for role, permission in ROLES.items():
                 entry = value["files"][role]
                 fields(entry, ("path", "sha256", "fingerprint"))
@@ -63,9 +64,12 @@ class Profile:
                 cap = {"config": 4096, "binding": 4096, "receipt": 131072,
                        "manifest": 16384, "staged_descriptor": 16384,
                        "registered_descriptor": 16384, "runtime_lock": 0}.get(role, 20*1024*1024)
-                self.files[role] = HeldFile(entry["path"], home, permission,
-                    digest(entry["sha256"]), pin(entry["fingerprint"]),
-                    cap)
+                require(type(entry["path"]) is str, "account_path")
+                sha, expected = digest(entry["sha256"]), pin(entry["fingerprint"])
+                key = (entry["path"], permission, sha, expected, cap)
+                if key not in retained:
+                    retained[key] = HeldFile(entry["path"], home, permission, sha, expected, cap)
+                self.files[role] = retained[key]
                 require(role == "runtime_lock" or self.files[role].original[6] > 0,
                         "empty_input")
             require(self.files["manifest"].sha == self.target, "manifest_digest")
@@ -101,7 +105,7 @@ class Profile:
 
     def recheck(self):
         self.check()
-        for held in self.files.values():
+        for held in dict.fromkeys(self.files.values()):
             held.check()
         self.selection.check()
         require(fp(os.stat("current", dir_fd=self.selection.parent, follow_symlinks=False)) ==
@@ -112,7 +116,7 @@ class Profile:
         return self.value["files"][role]["path"]
 
     def close(self):
-        for held in self.files.values():
+        for held in dict.fromkeys(self.files.values()):
             held.close()
         if hasattr(self, "selection"):
             self.selection.close()
