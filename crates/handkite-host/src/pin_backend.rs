@@ -137,6 +137,7 @@ pub struct PinPreparationDiagnostic {
     pub snapshot: Option<PinDiagnostics>,
     pub timings: PinCaptureTimings,
     pub wda_reported_lock: PinReportedLock,
+    pub refusal: &'static str,
 }
 
 // Await every read, including native query completion after a failed WDA read.
@@ -186,9 +187,11 @@ pub struct NativePasscodeBackend {
     progress_check: ProgressCheck,
     coordinate_pin_taps: bool,
     input_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
+    capture_count: usize,
+    preparation_refusal: &'static str,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 pub struct PinDiagnostics {
     pub snapshot_ms: u128,
     pub screen_size: bool,
@@ -242,6 +245,8 @@ impl NativePasscodeBackend {
             progress_check: ProgressCheck::Disabled,
             coordinate_pin_taps: false,
             input_admission: None,
+            capture_count: 0,
+            preparation_refusal: "none",
         })
     }
 
@@ -267,6 +272,55 @@ impl NativePasscodeBackend {
     /// preparation checks as unlock, stopping before a normal-lock reveal.
     pub fn diagnose_preparation(self) -> PinPreparationDiagnostic {
         self.diagnose_preparation_with(Self::snapshot)
+    }
+
+    /// Runs owned wake/reveal preparation and the final empty check, never PIN input.
+    pub fn prepare_keypad_only(self) -> PinPreparationDiagnostic {
+        self.prepare_keypad_only_with(Self::snapshot, Self::show_keypad)
+    }
+
+    fn prepare_keypad_only_with(
+        mut self,
+        mut snapshot: impl FnMut(&mut Self) -> Result<PasscodeScreen, BackendError>,
+        prepare: impl FnOnce(&mut Self) -> Result<(), BackendError>,
+    ) -> PinPreparationDiagnostic {
+        let started = Instant::now();
+        let result = (|| {
+            snapshot(&mut self)?;
+            prepare(&mut self)?;
+            snapshot(&mut self)?;
+            if !self
+                .last_view
+                .as_ref()
+                .is_some_and(|view| view.empty_locked)
+            {
+                return Err(BackendError::Unavailable);
+            }
+            Ok(())
+        })();
+        PinPreparationDiagnostic {
+            outcome: if result.is_ok() {
+                "empty_confirmed"
+            } else {
+                "backend_unavailable"
+            },
+            phase: self.phase,
+            capture_step: self.capture_step,
+            elapsed_ms: started.elapsed().as_millis(),
+            captures: self.capture_count,
+            normal_locked: self
+                .last_view
+                .as_ref()
+                .is_some_and(|view| view.normal_locked),
+            empty_locked: self
+                .last_view
+                .as_ref()
+                .is_some_and(|view| view.empty_locked),
+            snapshot: self.last_diagnostics,
+            timings: self.capture_timings,
+            wda_reported_lock: self.wda_reported_lock,
+            refusal: self.preparation_refusal,
+        }
     }
 
     fn diagnose_preparation_with(
@@ -314,6 +368,7 @@ impl NativePasscodeBackend {
             snapshot: self.last_diagnostics,
             timings: self.capture_timings,
             wda_reported_lock: self.wda_reported_lock,
+            refusal: self.preparation_refusal,
         }
     }
 
@@ -601,6 +656,7 @@ impl NativePasscodeBackend {
             // Only an unchanged, strictly proven normal lock may still be
             // transitioning. Capture failures and every other view stop here.
             if !view.normal_locked || view.view.normal_lock != Some(normal) {
+                self.preparation_refusal = self.reveal_refusal(normal);
                 self.capture_step = PinCaptureStep::EmptyAdmission;
                 return Err(BackendError::Unavailable);
             }
@@ -610,6 +666,45 @@ impl NativePasscodeBackend {
         }
         self.capture_step = PinCaptureStep::RevealSettleLimit;
         Err(BackendError::Unavailable)
+    }
+
+    fn reveal_refusal(&self, normal: pin_screen::NormalLockScreen) -> &'static str {
+        let Some(snapshot) = self.last_diagnostics else {
+            return "unclassified";
+        };
+        if !snapshot.native_locked || !snapshot.wda_locked || !snapshot.visible_locked {
+            return "lock_agreement";
+        }
+        if !snapshot.prior_unlock {
+            return "prior_unlock";
+        }
+        if snapshot.alert {
+            return "alert";
+        }
+        let Some(view) = &self.last_view else {
+            return "unclassified";
+        };
+        if let Some(after) = view.view.normal_lock {
+            if after.size != normal.size {
+                return "normal_dimensions_changed";
+            }
+            if after.proud_visible != normal.proud_visible {
+                return "normal_visibility_changed";
+            }
+        }
+        if view
+            .view
+            .secure_field_value
+            .as_deref()
+            .and_then(|value| PasscodeProgress::parse(value, 6).ok())
+            .is_some_and(|progress| progress.entered > 0)
+        {
+            return "nonempty";
+        }
+        if snapshot.field_seen || snapshot.keys_seen > 0 {
+            return "keypad_incomplete";
+        }
+        "normal_unproven"
     }
 
     fn wake_hidden_with(
@@ -765,6 +860,7 @@ impl NativePasscodeBackend {
         ) -> Result<(PasscodeScreen, ParsedPasscodeView), BackendError>,
         now: impl FnOnce() -> Instant,
     ) -> Result<PasscodeScreen, BackendError> {
+        self.capture_count += 1;
         self.last_view = None;
         self.last_diagnostics = None;
         self.capture_timings = PinCaptureTimings::default();
@@ -1672,6 +1768,133 @@ mod tests {
                 }
             );
             assert_eq!(report.captures, if denied { 1 } else { 2 });
+        }
+    }
+
+    #[test]
+    fn prepare_keypad_only_uses_owned_inputs_and_retains_rejected_capture() {
+        use std::cell::Cell;
+        fn capture(
+            backend: &mut NativePasscodeBackend,
+            start: Instant,
+            count: &Cell<usize>,
+            mismatch: bool,
+        ) -> Result<PasscodeScreen, BackendError> {
+            let index = count.get() + 1;
+            count.set(index);
+            let at = start + Duration::from_millis(index as u64);
+            backend.snapshot_with(
+                at,
+                |backend, _| {
+                    let (screen, mut view) = if index < 4 || mismatch {
+                        normal_capture()
+                    } else {
+                        keypad_capture(true)
+                    };
+                    if mismatch && index == 4 {
+                        view.normal_lock.as_mut().unwrap().proud_visible ^= true;
+                    }
+                    backend.last_diagnostics = Some(PinDiagnostics {
+                        native_locked: true,
+                        wda_locked: true,
+                        visible_locked: true,
+                        prior_unlock: true,
+                        normal_marker: view.normal_lock.is_some(),
+                        ..Default::default()
+                    });
+                    Ok((screen, view))
+                },
+                || at,
+            )
+        }
+        for mismatch in [false, true] {
+            let backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            let captures = Cell::new(0);
+            let mut inputs = Vec::new();
+            let report = backend.prepare_keypad_only_with(
+                |backend| capture(backend, start, &captures, mismatch),
+                |backend| {
+                    backend.prepare_owned_keypad_after_wake_with(
+                        start,
+                        |backend| capture(backend, start, &captures, mismatch),
+                        |backend, action| {
+                            backend.request_action_with(action, start, |_, action, _| {
+                                inputs.push(match action {
+                                    Action::Home => "home",
+                                    Action::Swipe { .. } => "swipe",
+                                    _ => panic!("preparation cannot send a digit"),
+                                });
+                                Ok(())
+                            })
+                        },
+                        |_| {},
+                    )
+                },
+            );
+            assert_eq!(inputs, ["home", "swipe"]);
+            assert_eq!(report.captures, if mismatch { 4 } else { 5 });
+            assert!(report.snapshot.is_some());
+            assert_eq!(
+                report.outcome,
+                if mismatch {
+                    "backend_unavailable"
+                } else {
+                    "empty_confirmed"
+                }
+            );
+            assert_eq!(
+                report.refusal,
+                if mismatch {
+                    "normal_visibility_changed"
+                } else {
+                    "none"
+                }
+            );
+            assert_eq!(report.empty_locked, !mismatch);
+        }
+    }
+
+    #[test]
+    fn reveal_refusal_uses_only_fixed_capture_categories() {
+        for (case, expected) in [
+            (0, "lock_agreement"),
+            (1, "alert"),
+            (2, "nonempty"),
+            (3, "normal_dimensions_changed"),
+            (4, "normal_visibility_changed"),
+            (5, "keypad_incomplete"),
+            (6, "normal_unproven"),
+        ] {
+            let mut backend = bound_backend();
+            let (screen, mut view) = normal_capture();
+            let before = view.normal_lock.unwrap();
+            let mut facts = PinDiagnostics {
+                native_locked: true,
+                wda_locked: true,
+                visible_locked: true,
+                prior_unlock: true,
+                ..Default::default()
+            };
+            match case {
+                0 => facts.native_locked = false,
+                1 => facts.alert = true,
+                2 => view.secure_field_value = Some("1 of 6 digits".into()),
+                3 => view.normal_lock.as_mut().unwrap().size.0 += 1.0,
+                4 => view.normal_lock.as_mut().unwrap().proud_visible ^= true,
+                5 => {
+                    view.normal_lock = None;
+                    facts.field_seen = true;
+                }
+                6 => view.normal_lock = None,
+                _ => unreachable!(),
+            }
+            let now = Instant::now();
+            backend
+                .snapshot_with(now, |_, _| Ok((screen, view)), || now)
+                .unwrap();
+            backend.last_diagnostics = Some(facts);
+            assert_eq!(backend.reveal_refusal(before), expected);
         }
     }
 

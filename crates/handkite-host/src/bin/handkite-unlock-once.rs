@@ -23,6 +23,12 @@ fn run() -> Result<(), String> {
     let args: Vec<String> = std::env::args().collect();
     if args
         .get(1)
+        .is_some_and(|arg| arg == "--prepare-keypad-only")
+    {
+        return diagnose::prepare(diagnose::prepare_config_path(&args)?);
+    }
+    if args
+        .get(1)
         .is_some_and(|arg| arg == "--diagnose-preparation")
     {
         return diagnose::run(diagnose::config_path(&args)?);
