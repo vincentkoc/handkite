@@ -335,6 +335,10 @@ class BrokerTests(unittest.TestCase):
             self.assertTrue(f.active.exists())
             self.assertEqual(len(list(f.state.glob("*.hold"))), 7)
             self.assertNotIn("246810", output.stream.getvalue())
+            events = [json.loads(line) for line in output.stream.getvalue().splitlines()]
+            self.assertEqual(events[1]["diagnostic"]["reported_outcome"],
+                             "unclassified" if result and result[0] == 1 else "code_submitted")
+            self.assertEqual(events[-1]["diagnostic"]["stage"], "operator_result")
             with self.assertRaises(files.Refused):
                 f.open()
 
@@ -474,6 +478,10 @@ class BrokerTests(unittest.TestCase):
                 self.assertEqual(code, 0 if seam is None else 3)
                 self.assertEqual((fake.calls, fake.cleanups), (1, 1))
                 self.assertEqual(f.receipt, f.snapshot())
+                if seam:
+                    last = json.loads(output.stream.getvalue().splitlines()[-1])
+                    self.assertEqual(last["diagnostic"]["stage"],
+                                     "operator" if seam == "action_failure" else "cleanup")
 
     def test_contenders_cannot_both_dispatch_across_preflight_lock_and_rename(self):
         f = self.fixture()
@@ -634,6 +642,42 @@ class BrokerTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_pin_diagnostics_report_only_allowlisted_native_fields(self):
+        native = (b"handkite-unlock-once: unlock_idle=unknown reason=backend_unavailable "
+                  b"action=backend_unavailable restoration=verified phase=reveal_postcapture "
+                  b"step=empty_admission first_unconfirmed_index=1 progress=unchanged\n")
+        detail = broker.pin_diagnostic((1, b"", native, False))
+        self.assertEqual(detail, {"exit_code": 1, "child_integrity": "checked",
+            "reported_outcome": "unknown", "reason": "backend_unavailable",
+            "action": "backend_unavailable", "restoration": "verified",
+            "phase": "reveal_postcapture", "step": "empty_admission",
+            "first_unconfirmed_index": "1", "progress": "unchanged"})
+        fault = (0, b"unlock_idle=code_submitted\n", b"", True)
+        self.assertEqual(broker.pin_diagnostic(fault)["child_integrity"], "unproven")
+        self.assertEqual(broker.pin_result(fault), (False, False))
+        for outcome, reason in (("refused", "session_admission"),
+                                ("refused", "session_preflight"),
+                                ("unknown", "session_creation_unproven"),
+                                ("unknown", "owned_session_unproven")):
+            stderr = ("handkite-unlock-once: unlock_idle=" + outcome + " reason=" + reason + "\n").encode()
+            detail = broker.pin_diagnostic((1, b"", stderr, False))
+            self.assertEqual(detail["reason"], reason)
+            self.assertEqual(detail["reported_outcome"], outcome)
+
+    def test_pin_diagnostics_drop_private_unknown_duplicate_and_multiline_output(self):
+        prefix = b"handkite-unlock-once: unlock_idle=unknown "
+        for out, err in [(b"246810\n", b""), (b"", b"private failure 246810\n"),
+                         (b"", prefix + b"reason=246810\n"),
+                         (b"", prefix + b"reason=disabled secret=246810\n"),
+                         (b"", prefix + b"reason=disabled reason=disabled\n"),
+                         (b"", prefix + b"reason=disabled\n246810\n"),
+                         (b"", prefix + b"first_unconfirmed_index=7\n"),
+                         (b"", prefix + b"reason=disabled\xff\n")]:
+            detail = broker.pin_diagnostic((1, out, err, False))
+            self.assertEqual(detail, {"exit_code": 1, "child_integrity": "checked",
+                                     "reported_outcome": "unclassified"})
+            self.assertNotIn("246810", json.dumps(detail))
+
     def test_endpoint_fragmentation_uses_one_deadline_per_query(self):
         native = broker.Native.__new__(broker.Native)
         native.p = SimpleNamespace(config={"usb_id": "fixture-device"})

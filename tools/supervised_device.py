@@ -133,10 +133,13 @@ class Output:
     def __init__(self, stream):
         self.stream, self.failed = stream, False
 
-    def emit(self, mode, phase, result, dispatches=0):
+    def emit(self, mode, phase, result, dispatches=0, diagnostic=None):
         try:
-            self.stream.write(json.dumps({"mode": mode, "phase": phase,
-                "result": result, "dispatch_count": dispatches}, separators=(",", ":")) + "\n")
+            value = {"mode": mode, "phase": phase, "result": result,
+                     "dispatch_count": dispatches}
+            if diagnostic is not None:
+                value["diagnostic"] = diagnostic
+            self.stream.write(json.dumps(value, separators=(",", ":")) + "\n")
             self.stream.flush()
         except (OSError, ValueError):
             self.failed = True
@@ -410,6 +413,56 @@ def pin_result(result):
     return submitted, zero and not fault
 
 
+def pin_diagnostic(result):
+    code, out, err, fault = result
+    summary = {"exit_code": code if type(code) is int and -255 <= code <= 255 else None,
+               "child_integrity": "unproven" if fault else "checked",
+               "reported_outcome": "unclassified"}
+    if not err and out in (b"unlock_idle=code_submitted\n", b"unlock_idle=already_unlocked\n"):
+        summary["reported_outcome"] = out.removeprefix(b"unlock_idle=").strip().decode("ascii")
+        return summary
+    if out or not err.startswith(b"handkite-unlock-once: unlock_idle="):
+        return summary
+    # Only native enum labels may cross this boundary; never forward child text.
+    labels = set("""service_layout protected_config_required service_ownership
+        protected_config_unavailable runner_unconfigured gate_unavailable runner_unavailable
+        owned_cleanup_unproven clear_request_unproven gate_clear_failed restoration_unproven
+        settings_not_run code_submitted already_unlocked backend_initialization gate_access
+        worker_join disabled device_mismatch manual_required no_keypad unreadable_progress
+        length_mismatch residual_input incomplete incomplete_index_unproven
+        unlocked_before_last_digit wrong_or_uncertain backend_disconnected backend_unavailable
+        progress_mismatch gate_unproven""".split())
+    allowed = {"reason": labels | {"session_admission", "session_preflight",
+        "session_creation_unproven", "owned_session_unproven"}, "action": labels,
+        "restoration": {"verified", "not_needed", "unproven"},
+        "phase": set("""initial_snapshot owned_admission wake_dispatch wake_postcapture
+            wake_admission normal_confirmation reveal_dispatch reveal_postcapture
+            empty_confirmation digit_input""".split()),
+        "step": set("""session_before source_read lock_read direct_field session_after
+            parse_source native_lock viewport_read freshness empty_admission
+            reveal_settle_limit complete""".split()),
+        "progress": {"unchanged", "unexpected"},
+        "first_unconfirmed_index": set("123456")}
+    try:
+        line = err.removeprefix(b"handkite-unlock-once: ").decode("ascii")
+        if not line.endswith("\n") or "\n" in line[:-1]:
+            return summary
+        fields = [part.split("=") for part in line[:-1].split(" ")]
+        if any(len(pair) != 2 for pair in fields):
+            return summary
+        values = dict(fields)
+        if len(values) != len(fields) or values.pop("unlock_idle", None) not in {
+                "disabled", "refused", "unknown"}:
+            return summary
+        if any(key not in allowed or value not in allowed[key] for key, value in values.items()):
+            return summary
+        summary["reported_outcome"] = fields[0][1]
+        summary.update(values)
+    except UnicodeDecodeError:
+        pass
+    return summary
+
+
 def private_pin_pipe(fd):
     before = os.fstat(fd)
     # Darwin creates anonymous pipes as 0660 and rejects fchmod; no directory
@@ -423,14 +476,17 @@ def private_pin_pipe(fd):
 
 def supervise(profile, backend, stops, output, stdin):
     mode, dispatched, rotated = profile.mode, 0, False
+    stage = "preflight"
     cleanup_started, post_attempted = False, False
     def cleanup_once():
-        nonlocal cleanup_started
+        nonlocal cleanup_started, stage
+        stage = "cleanup"
         require(not cleanup_started, "cleanup_already_attempted")
         cleanup_started = True
         backend.cleanup()
     def post_native():
-        nonlocal post_attempted
+        nonlocal post_attempted, stage
+        stage = "native_after"
         require(not post_attempted, "native_after_already_attempted")
         post_attempted = True
         return backend.native()
@@ -447,10 +503,12 @@ def supervise(profile, backend, stops, output, stdin):
         with runtime_lock(profile.files["runtime_lock"]):
             pass
         require(backend.endpoint() == 3, "endpoint_busy")
+        stage = "native_before"
         state, boot = backend.native()
         require(state in ("Locked", "Unlocked") and boot, "native_precondition")
         if mode == "pin-once":
             require(state == "Locked", "native_not_locked")
+            stage = "stop_rotation"
             with runtime_lock(profile.files["runtime_lock"]):
                 profile.recheck()
                 backend.jobs()
@@ -459,8 +517,10 @@ def supervise(profile, backend, stops, output, stdin):
                 rotated = True
                 stops.rotate()
             dispatched = 1
+            stage = "operator"
             result = backend.pin(stdin)
-            output.emit(mode, "operator", "returned", dispatched)
+            stage = "operator_result"
+            output.emit(mode, "operator", "returned", dispatched, pin_diagnostic(result))
             submitted, zero = pin_result(result)
             submitted &= not output.failed
             zero &= not output.failed
@@ -472,19 +532,23 @@ def supervise(profile, backend, stops, output, stdin):
                 if zero:
                     require(after in ("Locked", "Unlocked") and prior_unlock,
                             "native_zero_unproven")
+                    stage = "stop_restoration"
                     with runtime_lock(profile.files["runtime_lock"]):
                         profile.recheck()
                         backend.jobs()
                         stops.accept_cleared_attempt()
                         stops.restore()
+                stage = "operator_result"
                 raise Refused("known_zero" if zero else "review_required")
             cleanup_once()
             require(post_native() == ("Unlocked", True), "native_unlock_unproven")
+            stage = "stop_restoration"
             with runtime_lock(profile.files["runtime_lock"]):
                 profile.recheck()
                 backend.jobs()
                 stops.accept_cleared_attempt()
                 stops.restore()
+            stage = "receipt_check"
             backend.receipt()
         elif mode == "clock-once":
             require(state == "Unlocked", "native_not_unlocked")
@@ -492,6 +556,7 @@ def supervise(profile, backend, stops, output, stdin):
             stops.check()
             require(not output.failed, "output_failed")
             dispatched = 1
+            stage = "operator"
             backend.clock()
             cleanup_once()
             require(post_native() == ("Unlocked", True), "native_clock_unproven")
@@ -501,15 +566,18 @@ def supervise(profile, backend, stops, output, stdin):
                 stops.check()
                 require(not output.failed, "output_failed")
                 dispatched = 1
+                stage = "operator"
                 backend.lock()
             cleanup_once()
             require(post_native() == ("Locked", True), "native_lock_unproven")
+        stage = "final_custody"
         profile.recheck()
         stops.check()
         require(not output.failed, "output_failed")
         output.emit(mode, "complete", "confirmed", dispatched)
         return 0 if not output.failed else 3
     except Exception:
+        failed_stage = stage
         if rotated:
             try:
                 stops.block()
@@ -526,7 +594,7 @@ def supervise(profile, backend, stops, output, stdin):
             except Exception:
                 pass
         # No restart, replacement child, or inferred success after lost output.
-        output.emit(mode, "stopped", "review_required", dispatched)
+        output.emit(mode, "stopped", "review_required", dispatched, {"stage": failed_stage})
         return 3
 
 
@@ -549,7 +617,7 @@ def main(argv=None):
         stops = StopSet(home, exact_json(profile.files["receipt"].check()))
         return supervise(profile, backend, stops, output, sys.stdin.fileno())
     except Exception:
-        output.emit(mode, "admission", "review_required")
+        output.emit(mode, "admission", "review_required", diagnostic={"stage": "profile_admission"})
         return 3
     finally:
         if stops:
