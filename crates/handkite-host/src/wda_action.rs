@@ -61,10 +61,18 @@ impl WdaActions {
     }
 
     async fn validate_existing(&mut self, wda: &impl WdaRequest) -> Result<(), AdapterError> {
-        let response = wda
-            .request("GET", "/status", b"", Duration::from_secs(10))
-            .await
-            .map_err(|_| AdapterError)?;
+        let status = wda.request("GET", "/status", b"", Duration::from_secs(10));
+        let (response, validation) = if let Some(id) = self.session.as_deref() {
+            let path = format!("/session/{id}");
+            let (status, session) = tokio::join!(
+                status,
+                wda.request("GET", &path, b"", Duration::from_secs(10))
+            );
+            (status, Some(session))
+        } else {
+            (status.await, None)
+        };
+        let response = response.map_err(|_| AdapterError)?;
         let json = response_ok(response)?;
         let id = json["sessionId"].as_str().ok_or(AdapterError)?;
         if !valid_session_id(id) {
@@ -74,10 +82,14 @@ impl WdaActions {
             return Err(AdapterError);
         }
         let path = format!("/session/{id}");
-        let validation = wda
-            .request("GET", &path, b"", Duration::from_secs(10))
-            .await
-            .map_err(|_| AdapterError)?;
+        let validation = match validation {
+            Some(response) => response,
+            None => {
+                wda.request("GET", &path, b"", Duration::from_secs(10))
+                    .await
+            }
+        }
+        .map_err(|_| AdapterError)?;
         response_ok(validation)?;
         self.session = Some(id.into());
         Ok(())
@@ -390,6 +402,67 @@ mod tests {
         ]
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn bound_validation_overlaps_reads_and_rejects_either_failure_before_input() {
+        struct Reads {
+            barrier: tokio::sync::Barrier,
+            case: usize,
+        }
+        impl WdaRequest for Reads {
+            async fn request(
+                &self,
+                method: &str,
+                path: &str,
+                body: &[u8],
+                _: Duration,
+            ) -> Result<HttpResponse, WdaError> {
+                assert_eq!(method, "GET", "invalid reads must prevent input");
+                assert!(body.is_empty());
+                self.barrier.wait().await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let body = match path {
+                    "/status" => match self.case {
+                        1 => json!({"sessionId":"changed", "value":{}}),
+                        2 => return Err(WdaError::NotConnected),
+                        _ => json!({"sessionId":"fixture-session", "value":{}}),
+                    },
+                    "/session/fixture-session" => match self.case {
+                        3 => json!({"value":{"error":"invalid session id"}}),
+                        _ => json!({"value":{}}),
+                    },
+                    _ => panic!("unexpected read"),
+                };
+                Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&body).unwrap(),
+                })
+            }
+        }
+        for case in 0..4 {
+            let reads = Reads {
+                barrier: tokio::sync::Barrier::new(2),
+                case,
+            };
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            let started = tokio::time::Instant::now();
+            let result = tokio::time::timeout(Duration::from_secs(3), async {
+                if case == 0 {
+                    actions.validate_existing(&reads).await
+                } else {
+                    actions
+                        .execute_with_existing_session(&reads, &Action::Home)
+                        .await
+                        .map(|_| ())
+                }
+            })
+            .await
+            .expect("both reads must be polled together");
+            assert_eq!(result.is_ok(), case == 0);
+            assert_eq!(started.elapsed(), Duration::from_secs(1));
+            assert_eq!(actions.session.as_deref(), Some("fixture-session"));
+        }
+    }
+
     #[tokio::test]
     async fn home_activation_validates_bound_session_and_sends_one_global_request() {
         for reply in [
@@ -453,7 +526,10 @@ mod tests {
                 .is_err()
         );
         wda.done();
-        let wda = Script::new(vec![status(json!("different-session"))]);
+        let wda = Script::new(vec![
+            status(json!("different-session")),
+            response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+        ]);
         assert!(
             WdaActions::bound_to_existing("fixture-session")
                 .unwrap()
@@ -549,7 +625,10 @@ mod tests {
         );
         wda.done();
         for steps in [
-            vec![status(json!("different-valid-session"))],
+            vec![
+                status(json!("different-valid-session")),
+                response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+            ],
             vec![
                 status(json!("fixture-session")),
                 response("GET", "/session/fixture-session", 404, json!({"value":{}})),
@@ -632,7 +711,10 @@ mod tests {
                 duration_ms: 300,
             },
         ] {
-            let wda = Script::new(vec![status(json!("different-valid-session"))]);
+            let wda = Script::new(vec![
+                status(json!("different-valid-session")),
+                response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+            ]);
             let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
             assert!(
                 actions
@@ -642,7 +724,10 @@ mod tests {
             );
             wda.done();
         }
-        let wda = Script::new(vec![status(json!("different-valid-session"))]);
+        let wda = Script::new(vec![
+            status(json!("different-valid-session")),
+            response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+        ]);
         let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
         assert!(actions.wake_with_existing_session(&wda).await.is_err());
         wda.done();
@@ -653,6 +738,12 @@ mod tests {
     async fn bound_input_revalidates_after_a_previous_success_without_retry() {
         let mut steps = valid_action();
         steps.push(status(json!("replacement-session")));
+        steps.push(response(
+            "GET",
+            "/session/fixture-session",
+            200,
+            json!({"value":{}}),
+        ));
         let wda = Script::new(steps);
         let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
         assert!(
@@ -736,8 +827,14 @@ mod tests {
     #[tokio::test]
     async fn daemon_never_replaces_a_missing_changed_or_stale_pinned_session() {
         let cases = vec![
-            vec![status(Value::Null)],
-            vec![status(json!("replacement-session"))],
+            vec![
+                status(Value::Null),
+                response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+            ],
+            vec![
+                status(json!("replacement-session")),
+                response("GET", "/session/fixture-session", 200, json!({"value":{}})),
+            ],
             vec![
                 status(json!("fixture-session")),
                 response(
@@ -760,6 +857,12 @@ mod tests {
             let mut steps = valid_action();
             steps.extend(failure);
             steps.push(status(json!("replacement-session")));
+            steps.push(response(
+                "GET",
+                "/session/fixture-session",
+                200,
+                json!({"value":{}}),
+            ));
             let wda = Script::new(steps);
             let mut actions = WdaActions::default();
             actions

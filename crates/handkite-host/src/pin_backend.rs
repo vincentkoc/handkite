@@ -1020,13 +1020,10 @@ async fn read_normal_reveal(
 ) -> Result<(), PinCaptureStep> {
     let (viewport, locked, native) = capture_reads(
         async {
-            let screen = wda
-                .request("GET", "/wda/screen", b"", PIN_VIEW_BUDGET)
-                .await;
-            let orientation = wda
-                .request("GET", orientation_path, b"", PIN_VIEW_BUDGET)
-                .await;
-            (screen, orientation)
+            tokio::join!(
+                wda.request("GET", "/wda/screen", b"", PIN_VIEW_BUDGET),
+                wda.request("GET", orientation_path, b"", PIN_VIEW_BUDGET)
+            )
         },
         wda.request("GET", "/wda/locked", b"", PIN_VIEW_BUDGET),
         native,
@@ -2117,10 +2114,11 @@ mod tests {
     async fn fast_normal_reveal_reads_only_viewport_orientation_and_lock() {
         use crate::wda_http::HttpResponse;
         use serde_json::json;
-        use std::cell::RefCell;
+        use std::cell::{Cell, RefCell};
         struct Reads {
             case: usize,
             paths: RefCell<Vec<String>>,
+            started: Cell<u8>,
         }
         impl WdaRequest for Reads {
             async fn request(
@@ -2133,6 +2131,16 @@ mod tests {
                 assert_eq!(method, "GET");
                 assert!(body.is_empty());
                 self.paths.borrow_mut().push(path.into());
+                let bit = match path {
+                    "/wda/screen" => 1,
+                    "/session/fixture-session/orientation" => 2,
+                    _ => 0,
+                };
+                self.started.set(self.started.get() | bit);
+                tokio::task::yield_now().await;
+                if bit != 0 {
+                    assert_eq!(self.started.get(), 3, "viewport reads must overlap");
+                }
                 if self.case == 9 && path == "/wda/screen" {
                     return Err(WdaError::NotConnected);
                 }
@@ -2167,6 +2175,7 @@ mod tests {
             let reads = Reads {
                 case,
                 paths: RefCell::new(Vec::new()),
+                started: Cell::new(0),
             };
             let result = read_normal_reveal(
                 &reads,
