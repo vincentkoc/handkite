@@ -85,6 +85,11 @@ fn default_bytes_unchanged_and_compact_reuses_exact_capture() {
 fn fallback_keeps_the_same_full_tree_and_image() {
     for (tree, reason) in [
         ("<AppiumAUT>", "malformed_xml"),
+        (" \n<?xml version='1.0'?><AppiumAUT/>", "malformed_xml"),
+        (
+            "<?xml version='1.0'encoding='UTF-8'?><AppiumAUT/>",
+            "malformed_xml",
+        ),
         ("<AppiumAUT private='value'/>", "unsupported_xml"),
         (
             &format!("<AppiumAUT>{}</AppiumAUT>", "x".repeat(65537)),

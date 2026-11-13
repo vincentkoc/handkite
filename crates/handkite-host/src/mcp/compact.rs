@@ -157,6 +157,21 @@ fn role(tag: &[u8]) -> Result<&str, Fallback> {
         .ok_or(Fallback::Unsupported)
 }
 
+fn attribute_separator(event: &BytesStart<'_>, key: &[u8]) -> Result<(), Fallback> {
+    let offset = (key.as_ptr() as usize)
+        .checked_sub(event.as_ref().as_ptr() as usize)
+        .ok_or(Fallback::Malformed)?;
+    if offset == 0
+        || !matches!(
+            event.as_ref().get(offset - 1),
+            Some(b' ' | b'\t' | b'\r' | b'\n')
+        )
+    {
+        return Err(Fallback::Malformed);
+    }
+    Ok(())
+}
+
 // Return the source range of the raw type value, preserving all other bytes.
 // quick-xml borrows attribute slices from BytesStart; range checks fail closed.
 fn element(
@@ -168,6 +183,7 @@ fn element(
     let mut replacement = None;
     for attr in event.attributes() {
         let attr = attr.map_err(|_| Fallback::Malformed)?;
+        attribute_separator(event, attr.key.as_ref())?;
         let key = std::str::from_utf8(attr.key.as_ref()).map_err(|_| Fallback::Malformed)?;
         if !ATTRIBUTES.contains(&key) {
             return Err(Fallback::Unsupported);
@@ -204,15 +220,18 @@ pub(super) fn project(xml: &str) -> Result<String, Fallback> {
     if xml.len() > MAX_BYTES {
         return Err(Fallback::Limit);
     }
-    let mut reader = Reader::from_str(xml);
+    let input = xml.strip_prefix('\u{feff}').unwrap_or(xml);
+    let offset = xml.len() - input.len();
+    let mut reader = Reader::from_str(input);
     reader.config_mut().check_end_names = true;
     let mut output = String::with_capacity(xml.len());
+    output.push_str(&xml[..offset]);
     let mut stack: Vec<usize> = Vec::new();
     let (mut roots, mut nodes, mut declared) = (0, 0, false);
     loop {
-        let start = reader.buffer_position() as usize;
+        let start = offset + reader.buffer_position() as usize;
         let event = reader.read_event().map_err(|_| Fallback::Malformed)?;
-        let end = reader.buffer_position() as usize;
+        let end = offset + reader.buffer_position() as usize;
         let chunk = xml.get(start..end).ok_or(Fallback::Malformed)?;
         let is_start = matches!(&event, Event::Start(_));
         match event {
@@ -291,6 +310,9 @@ pub(super) fn project(xml: &str) -> Result<String, Fallback> {
                 output.push_str(chunk);
             }
             Event::Decl(decl) if nodes == 0 && !declared => {
+                if start != 0 && !(start == 3 && xml.starts_with('\u{feff}')) {
+                    return Err(Fallback::Malformed);
+                }
                 if decl.version().map_err(|_| Fallback::Malformed)?.as_ref() != b"1.0"
                     || decl
                         .encoding()
@@ -305,6 +327,7 @@ pub(super) fn project(xml: &str) -> Result<String, Fallback> {
                 let mut last = 0;
                 for attr in declaration.attributes() {
                     let attr = attr.map_err(|_| Fallback::Malformed)?;
+                    attribute_separator(&declaration, attr.key.as_ref())?;
                     let position = match attr.key.as_ref() {
                         b"version" => 1,
                         b"encoding" => 2,
@@ -354,6 +377,10 @@ mod tests {
             "<AppiumAUT>text]]>text</AppiumAUT>",
             "&#32;<AppiumAUT/>",
             "<?xml version='1.0' version='1.0'?><AppiumAUT/>",
+            " <?xml version='1.0'?><AppiumAUT/>",
+            "\n<?xml version='1.0'?><AppiumAUT/>",
+            "<?xml version='1.0'encoding='UTF-8'?><AppiumAUT/>",
+            "<XCUIElementTypeButton label='a'enabled='true'/>",
             "<XCUIElementTypeButton>&unknown;</XCUIElementTypeButton>",
             "<XCUIElementTypeButton>&#0;</XCUIElementTypeButton>",
             "<XCUIElementTypeButton/><XCUIElementTypeButton/>",
@@ -376,6 +403,17 @@ mod tests {
         ] {
             assert_eq!(project(xml), Err(Fallback::Unsupported), "{xml}");
         }
+    }
+
+    #[test]
+    fn whitespace_without_declaration_and_separated_attributes_remain_valid() {
+        assert_eq!(project(" \n<AppiumAUT/>"), Ok(" \n<AppiumAUT/>".into()));
+        let xml = "<?xml\tversion='1.0'\nencoding='UTF-8'\rstandalone='yes'?><AppiumAUT/>";
+        assert_eq!(project(xml), Ok(xml.into()));
+        let xml = "\u{feff}<?xml version='1.0'?><AppiumAUT/>";
+        assert_eq!(project(xml), Ok(xml.into()));
+        let xml = "\u{feff}<XCUIElementTypeButton/>";
+        assert_eq!(project(xml), Ok("\u{feff}<Button/>".into()));
     }
 
     #[test]
