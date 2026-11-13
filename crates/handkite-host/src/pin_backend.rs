@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_VIEW_BUDGET: Duration = Duration::from_secs(5);
 const REVEAL_SETTLE_BUDGET: Duration = Duration::from_secs(10);
+const REVEAL_INITIAL_SETTLE: Duration = Duration::from_millis(1500);
 const REVEAL_SETTLE_PAUSE: Duration = Duration::from_millis(100);
 const MAX_REVEAL_CAPTURES: usize = 3;
 const OWNED_WAKE_SETTLE: Duration = Duration::from_millis(1000);
@@ -564,6 +565,7 @@ impl NativePasscodeBackend {
         let deadline = now()
             .checked_add(REVEAL_SETTLE_BUDGET)
             .ok_or(BackendError::Unavailable)?;
+        pause(REVEAL_INITIAL_SETTLE);
         for attempt in 0..MAX_REVEAL_CAPTURES {
             self.admit_input()?;
             // Reserve the unchanged complete capture budget; never extend a
@@ -2083,6 +2085,56 @@ mod tests {
     }
 
     #[test]
+    fn reveal_initial_settle_precedes_capture_and_rechecks_admission_budget() {
+        use std::cell::Cell;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for case in 0..3 {
+            let paused = Arc::new(AtomicBool::new(false));
+            let admission_pause = Arc::clone(&paused);
+            let mut backend = bound_backend()
+                .with_input_admission(move || {
+                    assert!(admission_pause.load(Ordering::SeqCst));
+                    case != 1
+                })
+                .unwrap();
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            let mut captures = 0;
+            let result = backend.settle_owned_reveal_with(
+                normal_capture().1.normal_lock.unwrap(),
+                start,
+                |backend| {
+                    captures += 1;
+                    assert!(paused.load(Ordering::SeqCst));
+                    assert_eq!(clock.get().duration_since(start), REVEAL_INITIAL_SETTLE);
+                    let at = clock.get();
+                    backend.snapshot_with(at, |_, _| Ok(keypad_capture(false)), || at)
+                },
+                || clock.get(),
+                |delay| {
+                    assert!(!paused.swap(true, Ordering::SeqCst));
+                    assert_eq!(delay, Duration::from_millis(1500));
+                    clock.set(
+                        start
+                            + if case == 2 {
+                                Duration::from_secs(6)
+                            } else {
+                                delay
+                            },
+                    );
+                },
+            );
+            assert_eq!(result.is_ok(), case == 0);
+            assert_eq!(captures, usize::from(case == 0));
+            assert_eq!(backend.awaiting_first_digit, case == 0);
+            assert!(paused.load(Ordering::SeqCst));
+            if case == 2 {
+                assert_eq!(backend.capture_step(), PinCaptureStep::RevealSettleLimit);
+            }
+        }
+    }
+
+    #[test]
     fn reveal_settling_has_capture_and_overall_limits() {
         use std::cell::Cell;
         for capture_ms in [1, 3100] {
@@ -2127,7 +2179,10 @@ mod tests {
             start,
             |_| panic!("ownership validation consumed the capture reservation"),
             || start + Duration::from_millis(elapsed_ms.load(Ordering::SeqCst)),
-            |_| panic!("an exhausted reservation cannot be retried"),
+            |delay| {
+                assert_eq!(delay, REVEAL_INITIAL_SETTLE);
+                elapsed_ms.fetch_add(delay.as_millis() as u64, Ordering::SeqCst);
+            },
         );
         assert!(result.is_err());
         assert_eq!(backend.capture_step(), PinCaptureStep::RevealSettleLimit);
@@ -2142,6 +2197,7 @@ mod tests {
             let start = Instant::now();
             let clock = Cell::new(start);
             let mut captures = 0;
+            let paused = Cell::new(false);
             let result = backend.settle_owned_reveal_with(
                 normal_capture().1.normal_lock.unwrap(),
                 start,
@@ -2191,7 +2247,10 @@ mod tests {
                     backend.snapshot_with(at, |_, _| Ok((screen, view)), || clock.get())
                 },
                 || clock.get(),
-                |_| panic!("unsafe capture cannot be retried"),
+                |delay| {
+                    assert!(!paused.replace(true), "unsafe capture cannot be retried");
+                    assert_eq!(delay, REVEAL_INITIAL_SETTLE);
+                },
             );
             assert!(result.is_err(), "case {case}");
             assert_eq!(captures, 1, "case {case}");
@@ -2221,7 +2280,7 @@ mod tests {
                 result
             },
             Instant::now,
-            |_| panic!("ownership loss cannot be retried"),
+            |delay| assert_eq!(delay, REVEAL_INITIAL_SETTLE),
         );
         assert!(result.is_err());
         assert!(!backend.awaiting_first_digit);
