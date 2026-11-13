@@ -47,10 +47,27 @@ impl OwnedStartupError {
         match self {
             Self::ShutdownRequested => "shutdown_requested",
             Self::RuntimeUnavailable => "runtime_unavailable",
-            Self::Runner(RunnerError::AutomationAuthorizationRequired) => {
-                "automation_authorization_required"
-            }
-            Self::Runner(_) => "runner_startup_failed",
+            Self::Runner(error) => match error {
+                RunnerError::InvalidBundleId => "runner_invalid_bundle_id",
+                RunnerError::InvalidTimeout => "runner_invalid_timeout",
+                RunnerError::LookupFailed => "runner_lookup_failed",
+                RunnerError::LookupTimedOut => "runner_lookup_timed_out",
+                RunnerError::EndpointBusy => "runner_endpoint_busy",
+                RunnerError::EndpointUnproven => "runner_endpoint_unproven",
+                RunnerError::EndpointCleanupUnproven => "runner_endpoint_cleanup_unproven",
+                RunnerError::StartupTimedOut => "runner_startup_timed_out",
+                RunnerError::PlanStartUnproven => "runner_plan_start_unproven",
+                RunnerError::AutomationAuthorizationRequired => "automation_authorization_required",
+                RunnerError::InitializationFailed => "runner_initialization_failed",
+                RunnerError::BootstrapFailed => "runner_bootstrap_failed",
+                RunnerError::RunnerExited => "runner_exited",
+                RunnerError::RunnerFailed => "runner_failed",
+                RunnerError::TaskFailed => "runner_task_failed",
+                RunnerError::OwnershipLost => "runner_ownership_lost",
+                RunnerError::ProcessIdentityUnproven => "runner_process_identity_unproven",
+                RunnerError::RunnerStopUnproven => "runner_stop_unproven",
+                RunnerError::NativeProcess(step) => step.as_str(),
+            },
             Self::SessionUnavailable => "session_unavailable",
         }
     }
@@ -1081,14 +1098,29 @@ mod tests {
     }
 
     #[test]
-    fn owned_startup_keeps_automation_authorization_distinct() {
+    fn owned_startup_preserves_actionable_fixed_categories() {
         assert_eq!(
             OwnedStartupError::Runner(RunnerError::AutomationAuthorizationRequired).category(),
             "automation_authorization_required"
         );
         assert_eq!(
             OwnedStartupError::Runner(RunnerError::InitializationFailed).category(),
-            "runner_startup_failed"
+            "runner_initialization_failed"
+        );
+        assert_eq!(
+            OwnedStartupError::Runner(RunnerError::EndpointBusy).category(),
+            "runner_endpoint_busy"
+        );
+        assert_eq!(
+            OwnedStartupError::Runner(RunnerError::NativeProcess(
+                crate::wda_runner::NativeProcessStep::Preexisting
+            ))
+            .category(),
+            "process_preexisting"
+        );
+        assert_eq!(
+            OwnedStartupError::Runner(RunnerError::PlanStartUnproven).category(),
+            "runner_plan_start_unproven"
         );
     }
 
