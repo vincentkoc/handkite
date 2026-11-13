@@ -42,10 +42,10 @@ create its state directory and supply a PIN source. See
 
 ### Running the service
 
-Build the service candidates using the pinned [Mac release inputs](RELEASE.md). Stage the existing directory layout described below and place a JSON config such as `{"device_key":"phone","usb_id":"<PINNED_USB_ID>"}` in its regular mode-0600 `config/host.json`. With a normal account `HOME`, run:
+Build the service candidates using the pinned [Mac release inputs](RELEASE.md). Stage the existing directory layout described below and place a JSON config such as `{"device_key":"phone","usb_id":"<PINNED_USB_ID>","wda_runner_bundle_id":"com.example.HandkiteRunner.xctrunner"}` in its regular mode-0600 `config/host.json`. After verifying the configured runner is installed and handing off exclusive device ownership, run:
 
 ```sh
-handkited
+handkited --owned-wda
 handkitectl --socket "$HOME/Library/Application Support/Handkite/runtime/handkite.sock" observe phone
 ```
 
@@ -65,7 +65,7 @@ it must be at most 255 ASCII bytes and contain at least two nonempty prefix
 components of letters, digits, or hyphens before `.xctrunner`. An installed
 runner may append one dot and a ten-character uppercase letter/digit team suffix.
 No other suffix is accepted.
-Omit it for existing read-only service use; `null` and malformed IDs are rejected.
+Omit it only when intentionally attaching to an externally managed ready WDA; `null` and malformed IDs are rejected.
 Keep the actual ID only in the protected host config. The library API
 `install_config::load_protected_config` returns the binding and optional ID
 through the same anchored reader. `RetainedConfig::wda_runner_bundle_id` exposes
@@ -162,7 +162,7 @@ service configuration satisfies the protected startup checks.
 
 For `act`, `receipt.accepted` is `true` or `false` for a known acknowledgment, or `null` when delivery is unknown. A lock action sends the session-scoped WDA `/wda/lock` request once, then queries native lock state once even if the WDA acknowledgment was lost. No Shortcut is required. Its `native_lock` field is `locked`, `unlocked`, or `uncertain`; non-lock actions return `null`. Only native `locked` produces `effect: "lock_confirmed"`. This confirms the postcondition, not that the request caused a transition. A changed screenshot cannot confirm a lock. The optional `after` capture can be absent even when native lock is confirmed.
 
-Lock retains the existing lease, pinned-identity, revision, and unlocked-screen preconditions. The action POST cannot send bytes after the earlier of observation freshness and lease expiry. Native querying has a five-second command timeout and an eight-second process budget. The complete result, including post-action capture, has no shared deadline, so the local client's 65-second read timeout can still expire before a result arrives. A timeout leaves delivery and lock state unknown to that caller; inspect fresh native state before deciding what to do. The controller never automatically resends a lock action. This behavior is covered offline; a live Handkite lock cycle remains unqualified.
+Lock retains the existing lease, pinned-identity, revision, and unlocked-screen preconditions. The action POST cannot send bytes after the earlier of observation freshness and lease expiry. Native querying has a five-second command timeout and an eight-second process budget. The complete result, including post-action capture, has no shared deadline, so the local client's 65-second read timeout can still expire before a result arrives. A timeout leaves delivery and lock state unknown to that caller; inspect fresh native state before deciding what to do. The controller never automatically resends a lock action.
 
 ## Staged Mac service layout
 
