@@ -237,7 +237,10 @@ mod tests {
         let mut first = FileAttemptGate::new(dir.marker()).unwrap();
         assert_eq!(
             unlock_once(&mut phone, &mut first, &binding, &key, &code, policy),
-            Err(UnlockError::Incomplete { digit: 1 })
+            Err(UnlockError::Incomplete {
+                digit: 1,
+                progress: handkite_core::unlock::IncompleteProgress::Unchanged
+            })
         );
         drop(first);
         let mut reopened = FileAttemptGate::new(dir.marker()).unwrap();

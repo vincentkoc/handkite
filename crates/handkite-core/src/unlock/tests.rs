@@ -303,6 +303,34 @@ fn dropped_and_doubled_digits_stop_before_a_submission() {
 }
 
 #[test]
+fn first_incomplete_progress_is_classified_without_another_press() {
+    for progress in [
+        IncompleteProgress::Unchanged,
+        IncompleteProgress::Unexpected,
+    ] {
+        let mut phone = FakePhone::new();
+        match progress {
+            IncompleteProgress::Unchanged => phone.drop_at = Some(1),
+            IncompleteProgress::Unexpected => phone.double_at = Some(1),
+        }
+        let mut gate = MemoryGate::default();
+        assert_eq!(
+            run(&mut phone, &mut gate, "123456"),
+            Err(UnlockError::Incomplete { digit: 1, progress })
+        );
+        assert_eq!(phone.presses, 1);
+        assert_eq!(phone.failed_attempts, 0);
+        assert!(gate.disabled);
+        assert_eq!((gate.marks, gate.clears), (1, 0));
+        assert_eq!(
+            run(&mut phone, &mut gate, "123456"),
+            Err(UnlockError::Disabled)
+        );
+        assert_eq!(phone.presses, 1);
+    }
+}
+
+#[test]
 fn doubled_digit_that_reaches_full_length_disables_the_next_attempt() {
     let mut phone = FakePhone::new();
     phone.double_at = Some(5);
@@ -323,7 +351,10 @@ fn a_dropped_final_digit_is_incomplete() {
     let mut gate = MemoryGate::default();
     assert_eq!(
         run(&mut phone, &mut gate, "123456"),
-        Err(UnlockError::Incomplete { digit: 6 })
+        Err(UnlockError::Incomplete {
+            digit: 6,
+            progress: IncompleteProgress::Unchanged
+        })
     );
     assert_eq!(phone.failed_attempts, 0);
     assert!(gate.disabled);

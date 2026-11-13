@@ -1,6 +1,7 @@
 use handkite_core::protocol::DeviceBinding;
 use handkite_core::unlock::{
-    AttemptGate, BackendError, GateError, UnlockError, UnlockOutcome, UnlockPolicy, unlock_once,
+    AttemptGate, BackendError, GateError, IncompleteProgress, UnlockError, UnlockOutcome,
+    UnlockPolicy, unlock_once,
 };
 use handkite_host::file_gate::FileAttemptGate;
 use handkite_host::pin_backend::NativePasscodeBackend;
@@ -188,6 +189,17 @@ pub(super) fn diagnostic(
     if let IdleAction::Completed(Err(WorkerError::TracedUnlock(_, phase, step))) = outcome.action {
         line.push_str(&format!(" phase={} step={}", phase.as_str(), step.as_str()));
     }
+    if let IdleAction::Completed(Err(
+        WorkerError::Unlock(UnlockError::Incomplete { progress, .. })
+        | WorkerError::TracedUnlock(UnlockError::Incomplete { progress, .. }, _, _),
+    )) = outcome.action
+    {
+        let progress = match progress {
+            IncompleteProgress::Unchanged => "unchanged",
+            IncompleteProgress::Unexpected => "unexpected",
+        };
+        line.push_str(&format!(" progress={progress}"));
+    }
     line
 }
 
@@ -211,6 +223,7 @@ fn action_reason(action: &IdleAction<UnlockOutcome, WorkerError>) -> (&'static s
             UnlockError::ResidualInput => "residual_input",
             UnlockError::Incomplete {
                 digit: index @ 1..=6,
+                ..
             } => return ("incomplete", Some(*index as u8)),
             UnlockError::Incomplete { .. } => "incomplete_index_unproven",
             UnlockError::UnlockedBeforeLastDigit => "unlocked_before_last_digit",
@@ -391,7 +404,10 @@ mod tests {
                     "",
                 ),
                 (
-                    UnlockError::Incomplete { digit: 1 },
+                    UnlockError::Incomplete {
+                        digit: 1,
+                        progress: handkite_core::unlock::IncompleteProgress::Unchanged,
+                    },
                     "incomplete",
                     " first_unconfirmed_index=1",
                 ),
@@ -412,6 +428,11 @@ mod tests {
                     } else {
                         "unproven"
                     };
+                    let progress = if matches!(error, UnlockError::Incomplete { .. }) {
+                        " progress=unchanged"
+                    } else {
+                        ""
+                    };
                     assert_eq!(
                         finish(
                             &mut gate,
@@ -425,7 +446,7 @@ mod tests {
                             }
                         ),
                         Err(format!(
-                            "unlock_idle=unknown reason={reason} action={action} restoration={restore}{index} phase={} step=complete",
+                            "unlock_idle=unknown reason={reason} action={action} restoration={restore}{index} phase={} step=complete{progress}",
                             phase.as_str()
                         ))
                     );
@@ -449,7 +470,10 @@ mod tests {
                     &mut gate,
                     IdleSettingsOutcome {
                         action: IdleAction::Completed(Err(WorkerError::Unlock(
-                            UnlockError::Incomplete { digit },
+                            UnlockError::Incomplete {
+                                digit,
+                                progress: IncompleteProgress::Unchanged,
+                            },
                         ))),
                         restoration,
                     },
@@ -476,11 +500,44 @@ mod tests {
                 assert_eq!(
                     output,
                     format!(
-                        "unlock_idle=unknown reason={reason} action={action} restoration={restore}{suffix}"
+                        "unlock_idle=unknown reason={reason} action={action} restoration={restore}{suffix} progress=unchanged"
                     )
                 );
                 assert!(gate.inner.disabled);
                 assert_eq!(gate.inner.clears, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn incomplete_progress_is_fixed_for_traced_and_untraced_failures() {
+        use handkite_host::pin_backend::{PinCaptureStep, PinPhase};
+        for (progress, label) in [
+            (IncompleteProgress::Unchanged, "unchanged"),
+            (IncompleteProgress::Unexpected, "unexpected"),
+        ] {
+            let error = UnlockError::Incomplete { digit: 1, progress };
+            for traced in [false, true] {
+                let error = if traced {
+                    WorkerError::TracedUnlock(error, PinPhase::DigitInput, PinCaptureStep::Complete)
+                } else {
+                    WorkerError::Unlock(error)
+                };
+                let outcome = IdleSettingsOutcome {
+                    action: IdleAction::Completed(Err(error)),
+                    restoration: Restoration::Verified,
+                };
+                let phase = if traced {
+                    " phase=digit_input step=complete"
+                } else {
+                    ""
+                };
+                assert_eq!(
+                    failure(&outcome).unwrap(),
+                    format!(
+                        "unlock_idle=unknown reason=incomplete action=incomplete restoration=verified first_unconfirmed_index=1{phase} progress={label}"
+                    )
+                );
             }
         }
     }
@@ -539,7 +596,10 @@ mod tests {
                         action: IdleAction::Completed(if submitted {
                             Ok(UnlockOutcome::CodeSubmitted)
                         } else {
-                            Err(WorkerError::Unlock(UnlockError::Incomplete { digit: 1 }))
+                            Err(WorkerError::Unlock(UnlockError::Incomplete {
+                                digit: 1,
+                                progress: handkite_core::unlock::IncompleteProgress::Unchanged,
+                            }))
                         }),
                         restoration,
                     },

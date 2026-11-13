@@ -151,6 +151,8 @@ fn only_confirmed_submission_and_full_cleanup_clear_the_owned_durable_marker() {
                                     } else {
                                         Err(WorkerError::Unlock(UnlockError::Incomplete {
                                             digit: 1,
+                                            progress:
+                                                handkite_core::unlock::IncompleteProgress::Unchanged,
                                         }))
                                     }),
                                     restoration,
@@ -206,6 +208,7 @@ fn cleanup_failures_report_only_fixed_categories_and_bounded_position() {
         outcome: Ok(IdleSettingsOutcome {
             action: IdleAction::Completed(Err(WorkerError::Unlock(UnlockError::Incomplete {
                 digit: 1,
+                progress: handkite_core::unlock::IncompleteProgress::Unchanged,
             }))),
             restoration: Restoration::Verified,
         }),
@@ -215,7 +218,7 @@ fn cleanup_failures_report_only_fixed_categories_and_bounded_position() {
     };
     assert_eq!(
         checked_outcome(completed, true).err(),
-        Some("unlock_idle=unknown reason=owned_cleanup_unproven action=incomplete restoration=verified first_unconfirmed_index=1".into())
+        Some("unlock_idle=unknown reason=owned_cleanup_unproven action=incomplete restoration=verified first_unconfirmed_index=1 progress=unchanged".into())
     );
     let completed = Completion {
         outcome: Err(OwnedSessionError::CreationUnknown),

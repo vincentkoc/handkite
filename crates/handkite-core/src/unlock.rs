@@ -74,15 +74,26 @@ pub enum UnlockOutcome {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IncompleteProgress {
+    Unchanged,
+    Unexpected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UnlockError {
     Disabled,
     DeviceMismatch,
     ManualRequired,
     NoKeypad,
     UnreadableProgress,
-    LengthMismatch { observed_total: u32 },
+    LengthMismatch {
+        observed_total: u32,
+    },
     ResidualInput,
-    Incomplete { digit: u32 },
+    Incomplete {
+        digit: u32,
+        progress: IncompleteProgress,
+    },
     UnlockedBeforeLastDigit,
     WrongOrUncertain,
     Backend(BackendError),
@@ -262,6 +273,7 @@ pub fn unlock_once<B: PasscodeBackend, G: AttemptGate>(
                 FinalState::Incomplete => {
                     return Err(UnlockError::Incomplete {
                         digit: index as u32 + 1,
+                        progress: IncompleteProgress::Unchanged,
                     });
                 }
             }
@@ -271,6 +283,11 @@ pub fn unlock_once<B: PasscodeBackend, G: AttemptGate>(
             Step::Count(next) if next >= before && next < code.len() => {
                 return Err(UnlockError::Incomplete {
                     digit: index as u32 + 1,
+                    progress: if next == before {
+                        IncompleteProgress::Unchanged
+                    } else {
+                        IncompleteProgress::Unexpected
+                    },
                 });
             }
             Step::Unlocked => {
