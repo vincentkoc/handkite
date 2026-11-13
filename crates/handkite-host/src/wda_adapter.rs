@@ -446,7 +446,7 @@ impl DeviceAdapter for WdaAdapter {
         let native_after = native_lock::query(&self.expected).state;
         self.validate_owned()?;
         let admission = if let Action::Tap { at } = action {
-            visible_tap_deadline(
+            native_modal_tap_deadline(
                 &observation,
                 owned_input,
                 native_before,
@@ -455,7 +455,19 @@ impl DeviceAdapter for WdaAdapter {
                 *at,
                 captured_at,
             )
-            .map(|until| ActionAdmission::VisibleTap { at: *at, until })
+            .map(|until| ActionAdmission::NativeModalTap { at: *at, until })
+            .or_else(|| {
+                visible_tap_deadline(
+                    &observation,
+                    owned_input,
+                    native_before,
+                    native_after,
+                    reported_lock,
+                    *at,
+                    captured_at,
+                )
+                .map(|until| ActionAdmission::VisibleTap { at: *at, until })
+            })
         } else if matches!(action, Action::Home) {
             native_home_deadline(
                 &observation,
@@ -511,6 +523,17 @@ impl DeviceAdapter for WdaAdapter {
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
+        if let Some(ActionAdmission::NativeModalTap { at, until }) = admission {
+            if !matches!(action, Action::Tap { at: actual } if *actual == at)
+                || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            return self.execute(action, send_deadline);
+        }
         if let Some(ActionAdmission::NativeHome { until }) = admission {
             if !matches!(action, Action::Home)
                 || self.owned_session.is_none()
@@ -592,6 +615,29 @@ fn classify_lock(app: &str, tree: &str, reported: Option<bool>) -> LockState {
         return LockState::Unlocked;
     }
     LockState::Uncertain
+}
+
+fn native_modal_tap_deadline(
+    observation: &RawObservation,
+    owned: bool,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    at: Point,
+    captured_at: Instant,
+) -> Option<Instant> {
+    if !owned
+        || native_before != LockState::Unlocked
+        || native_after != LockState::Unlocked
+        || reported_lock != Some(false)
+        || observation.state.lock != LockState::Uncertain
+        || !observation.state.wda_ready
+        || observation.state.foreground_app.as_deref() != Some("com.apple.springboard")
+        || !crate::wda_ui_admission::visible_modal_button(&observation.accessibility_tree, at)
+    {
+        return None;
+    }
+    captured_at.checked_add(HOME_LAUNCH_AGE)
 }
 
 fn visible_tap_deadline(
@@ -718,6 +764,53 @@ mod tests {
     fn borrowed_adapter_has_no_runner_liveness() {
         let adapter = WdaAdapter::new(HardwareId::new("fixture-device").unwrap()).unwrap();
         assert!(adapter.runner_liveness().is_none());
+    }
+
+    #[test]
+    fn native_modal_tap_requires_owned_unlocked_springboard_and_keeps_home_refused() {
+        let id = HardwareId::new("fixture-device").unwrap();
+        let mut observation = RawObservation {
+            connected_usb: id.clone(), wda_target: id,
+            window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
+            state: DeviceState { lock: LockState::Uncertain, wda_ready: true,
+                foreground_app: Some("com.apple.springboard".into()) },
+            accessibility_tree: r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeAlert visible="true" enabled="true" x="30" y="100" width="330" height="650"><XCUIElementTypeButton label="Decline" visible="true" enabled="true" x="50" y="680" width="290" height="50"/></XCUIElementTypeAlert></XCUIElementTypeApplication></AppiumAUT>"#.into(),
+            screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+        };
+        let at = Point { x: 195.0, y: 705.0 };
+        let captured = Instant::now();
+        for change in 0..10 {
+            let mut owned = true;
+            let mut before = LockState::Unlocked;
+            let mut after = LockState::Unlocked;
+            let mut raw = Some(false);
+            match change {
+                1 => owned = false,
+                2 => before = LockState::Locked,
+                3 => after = LockState::Uncertain,
+                4 => raw = None,
+                5 => raw = Some(true),
+                6 => observation.state.lock = LockState::Locked,
+                7 => observation.state.wda_ready = false,
+                8 => observation.state.foreground_app = Some("com.example.app".into()),
+                9 => observation.accessibility_tree = "<root/>".into(),
+                _ => {}
+            }
+            let result =
+                native_modal_tap_deadline(&observation, owned, before, after, raw, at, captured);
+            if change == 0 {
+                assert_eq!(result, Some(captured + Duration::from_secs(2)));
+                assert_eq!(
+                    native_home_deadline(&observation, owned, before, after, raw, captured),
+                    None
+                );
+            } else {
+                assert_eq!(result, None, "case {change}");
+            }
+            observation.state.lock = LockState::Uncertain;
+            observation.state.wda_ready = true;
+            observation.state.foreground_app = Some("com.apple.springboard".into());
+        }
     }
 
     #[test]

@@ -128,7 +128,10 @@ impl DeviceAdapter for FakeAdapter {
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
         self.execution_admission = admission;
-        if matches!(admission, Some(ActionAdmission::NativeHome { .. })) {
+        if matches!(
+            admission,
+            Some(ActionAdmission::NativeHome { .. } | ActionAdmission::NativeModalTap { .. })
+        ) {
             self.native_queries += 1;
             if self.native_lock != LockState::Unlocked {
                 return Err(AdapterError);
@@ -561,6 +564,108 @@ fn visible_tap_allows_only_pixel_drift_with_matching_fresh_typed_evidence() {
             assert_eq!(inner.adapter.actions, 0);
         }
     }
+}
+
+#[test]
+fn native_modal_tap_requires_exact_action_state_tree_and_live_native_unlock() {
+    let at = Point { x: 20.0, y: 30.0 };
+    for change in 0..11 {
+        let (controller, key) = controller();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.app = "com.apple.springboard".into();
+            inner.adapter.uncertain = true;
+            inner.adapter.native_lock = LockState::Unlocked;
+        }
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut action = Action::Tap { at };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = vec![1];
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeModalTap { at, until });
+            match change {
+                1 => {
+                    action = Action::Tap {
+                        at: Point { x: 21.0, y: 30.0 },
+                    }
+                }
+                2 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeModalTap {
+                        at,
+                        until: Instant::now() - Duration::from_secs(1),
+                    })
+                }
+                3 => inner.adapter.tree_suffix = "changed".into(),
+                4 => inner.adapter.wda_ready = false,
+                5 => inner.adapter.locked = true,
+                6 => inner.adapter.uncertain = false,
+                7 => inner.adapter.app = "com.example.app".into(),
+                8 => inner.adapter.native_lock = LockState::Locked,
+                9 => action = Action::Home,
+                10 => {
+                    action = Action::Text {
+                        value: "fixture".into(),
+                    }
+                }
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        if change == 0 {
+            assert!(result.is_ok());
+            assert_eq!(inner.adapter.actions, 1);
+            assert_eq!(inner.adapter.native_queries, 1);
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
+        } else {
+            assert!(result.is_err(), "case {change}");
+            assert_eq!(inner.adapter.actions, 0, "case {change}");
+        }
+    }
+}
+
+#[test]
+fn default_adapter_refuses_native_modal_admission_before_execution() {
+    struct DefaultAdapter(FakeAdapter);
+    impl DeviceAdapter for DefaultAdapter {
+        fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
+            self.0.identities()
+        }
+        fn observe(&mut self) -> Result<RawObservation, AdapterError> {
+            self.0.observe()
+        }
+        fn execute(
+            &mut self,
+            action: &Action,
+            deadline: Instant,
+        ) -> Result<TransportReceipt, AdapterError> {
+            self.0.execute(action, deadline)
+        }
+    }
+    let mut adapter = DefaultAdapter(FakeAdapter::new());
+    let at = Point { x: 20.0, y: 30.0 };
+    let until = Instant::now() + Duration::from_secs(2);
+    assert_eq!(
+        adapter.execute_with_admission(
+            &Action::Tap { at },
+            until,
+            Some(ActionAdmission::NativeModalTap { at, until })
+        ),
+        Err(AdapterError)
+    );
+    assert_eq!(adapter.0.actions, 0);
 }
 
 #[test]

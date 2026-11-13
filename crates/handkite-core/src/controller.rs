@@ -22,6 +22,7 @@ pub struct AdapterError;
 pub enum ActionAdmission {
     HomeLaunch { until: Instant },
     VisibleTap { at: Point, until: Instant },
+    NativeModalTap { at: Point, until: Instant },
     NativeHome { until: Instant },
 }
 
@@ -43,14 +44,17 @@ pub trait DeviceAdapter {
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError>;
     /// Receives only validated private admission used by this action check.
-    /// NativeHome requires an additional native unlock check before sending.
+    /// Native admissions require an additional native unlock check before sending.
     fn execute_with_admission(
         &mut self,
         action: &Action,
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
-        if matches!(admission, Some(ActionAdmission::NativeHome { .. })) {
+        if matches!(
+            admission,
+            Some(ActionAdmission::NativeHome { .. } | ActionAdmission::NativeModalTap { .. })
+        ) {
             return Err(AdapterError);
         }
         self.execute(action, send_deadline)
@@ -241,7 +245,19 @@ impl<A: DeviceAdapter> Controller<A> {
         let admitted_home_launch = matches!(&request.action, Action::LaunchApp { .. })
             && fresh.state.lock == LockState::Uncertain
             && home_launch_until.is_some_and(|until| Instant::now() < until);
+        let admitted_modal_tap = matches!(
+            (&request.action, admission),
+            (Action::Tap { at }, Some(ActionAdmission::NativeModalTap { at: admitted, until }))
+                if *at == admitted
+                    && fresh.state.lock == LockState::Uncertain
+                    && fresh.state.wda_ready
+                    && fresh.state.foreground_app.as_deref() == Some("com.apple.springboard")
+                    && Instant::now() < until
+        );
         let pixel_drift_until = match (&request.action, admission) {
+            (_, Some(ActionAdmission::NativeModalTap { until, .. })) if admitted_modal_tap => {
+                Some(until)
+            }
             (
                 Action::Tap { at },
                 Some(ActionAdmission::VisibleTap {
@@ -283,6 +299,7 @@ impl<A: DeviceAdapter> Controller<A> {
         if !matches!(&request.action, Action::Home)
             && fresh.state.lock != LockState::Unlocked
             && !admitted_home_launch
+            && !admitted_modal_tap
         {
             inner.last = Some(fresh);
             return Err(ControllerError::LockedAction);

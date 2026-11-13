@@ -57,11 +57,19 @@ pub(crate) fn visible_button(xml: &str, at: Point) -> bool {
     parse(xml, Some(at)) == Some(())
 }
 
+pub(crate) fn visible_modal_button(xml: &str, at: Point) -> bool {
+    parse_modal(xml, Some(at), true) == Some(())
+}
+
 pub(crate) fn safe_context(xml: &str) -> bool {
     parse(xml, None) == Some(())
 }
 
 fn parse(xml: &str, at: Option<Point>) -> Option<()> {
+    parse_modal(xml, at, false)
+}
+
+fn parse_modal(xml: &str, at: Option<Point>, allow_modal: bool) -> Option<()> {
     if xml.is_empty()
         || xml.len() > 2 * 1024 * 1024
         || at.is_some_and(|at| !at.x.is_finite() || !at.y.is_finite())
@@ -74,6 +82,8 @@ fn parse(xml: &str, at: Option<Point>) -> Option<()> {
     let mut declared = false;
     let mut screen = None;
     let mut target = false;
+    let mut modal = None;
+    let mut target_in_modal = false;
     loop {
         let event = reader.read_event().ok()?;
         let is_start = matches!(&event, Event::Start(_));
@@ -89,12 +99,7 @@ fn parse(xml: &str, at: Option<Point>) -> Option<()> {
                     }
                 }
                 let kind = std::str::from_utf8(node.name().as_ref()).ok()?.to_owned();
-                if matches!(
-                    kind.as_str(),
-                    "XCUIElementTypeAlert"
-                        | "XCUIElementTypeSheet"
-                        | "XCUIElementTypeSecureTextField"
-                ) {
+                if matches!(kind.as_str(), "XCUIElementTypeSecureTextField") {
                     return None;
                 }
                 let mut attrs = Attributes::new();
@@ -133,6 +138,26 @@ fn parse(xml: &str, at: Option<Point>) -> Option<()> {
                     }
                     screen = Some(rect);
                 }
+                if matches!(
+                    kind.as_str(),
+                    "XCUIElementTypeAlert" | "XCUIElementTypeSheet"
+                ) {
+                    if !allow_modal
+                        || modal.is_some()
+                        || attrs.get("visible").map(String::as_str) != Some("true")
+                        || attrs.get("enabled").map(String::as_str) != Some("true")
+                        || !stack
+                            .iter()
+                            .any(|parent| parent == "XCUIElementTypeApplication")
+                    {
+                        return None;
+                    }
+                    let rect = Rect::read(&attrs)?;
+                    if !screen?.encloses(rect) {
+                        return None;
+                    }
+                    modal = Some(rect);
+                }
                 if kind == "XCUIElementTypeButton"
                     && attrs.get("visible").map(String::as_str) != Some("false")
                     && let Some(at) = at
@@ -153,6 +178,9 @@ fn parse(xml: &str, at: Option<Point>) -> Option<()> {
                             return None;
                         }
                         target = true;
+                        target_in_modal = stack.iter().any(|parent| {
+                            parent == "XCUIElementTypeAlert" || parent == "XCUIElementTypeSheet"
+                        }) && modal.is_some_and(|modal| modal.encloses(rect));
                     }
                 }
                 if is_start {
@@ -170,7 +198,8 @@ fn parse(xml: &str, at: Option<Point>) -> Option<()> {
                 return (roots == 1
                     && stack.is_empty()
                     && screen.is_some()
-                    && (at.is_none() || target))
+                    && (at.is_none() || target)
+                    && (!allow_modal || modal.is_some() && target_in_modal))
                     .then_some(());
             }
             _ => return None,
@@ -189,6 +218,42 @@ mod tests {
     }
     fn point() -> Point {
         Point { x: 285.0, y: 505.0 }
+    }
+
+    fn modal(kind: &str, body: &str) -> String {
+        format!(
+            r#"<{kind} visible="true" enabled="true" x="200" y="400" width="120" height="200">{body}</{kind}>"#
+        )
+    }
+
+    #[test]
+    fn modal_tap_requires_one_visible_modal_and_an_enclosed_button() {
+        for kind in ["XCUIElementTypeAlert", "XCUIElementTypeSheet"] {
+            let body = modal(kind, BUTTON);
+            assert!(visible_modal_button(&tree(&body), point()));
+            assert!(!visible_button(&tree(&body), point()));
+            assert!(!safe_context(&tree(&body)));
+            for changed in [
+                modal(kind, "") + BUTTON,
+                body.repeat(2),
+                modal(kind, &body),
+                body.replace("visible=\"true\"", "visible=\"false\""),
+                body.replace("enabled=\"true\"", "enabled=\"false\""),
+                body.replace("width=\"120\"", "width=\"NaN\""),
+                body.replace("width=\"120\"", "width=\"300\""),
+                body.replace("width=\"120\"", "width=\"80\""),
+                modal(kind, &BUTTON.repeat(2)),
+                modal(kind, &BUTTON.replace("label=\"Clear text\"", "label=\" \"")),
+                body.clone() + "<XCUIElementTypeSecureTextField/>",
+                body.clone() + "<node name=\"passcode-view\"/>",
+                body.clone() + "<node name=\"proud-lock\"/>",
+                body.clone() + "<node label=\"Enter Passcode\"/>",
+                body.clone() + "<node name=\"call-to-action-label\"/>",
+            ] {
+                assert!(!visible_modal_button(&tree(&changed), point()), "{changed}");
+            }
+        }
+        assert!(!visible_modal_button(&tree(BUTTON), point()));
     }
 
     #[test]
