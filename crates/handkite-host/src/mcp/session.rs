@@ -144,7 +144,7 @@ impl Session {
                 ) {
                     service_error(&code)
                 } else {
-                    uncertain_result(kind)
+                    uncertain_service_result(kind, &code)
                 }
             }
             _ => uncertain_result(kind),
@@ -156,6 +156,27 @@ fn uncertain_result(kind: &str) -> Value {
     let mut result = text_result(json!({"receipt": {"accepted": null, "action_kind": kind},
         "effect": "unconfirmed", "after": null, "delivery": "unknown"}));
     result["isError"] = json!(true);
+    result
+}
+
+fn uncertain_service_result(kind: &str, code: &str) -> Value {
+    let mut result = uncertain_result(kind);
+    // Keep delivery unknown while exposing only the controller's fixed categories.
+    // Never forward arbitrary service text, which may contain private content.
+    if matches!(
+        code,
+        "Busy"
+            | "Randomness"
+            | "DeviceMismatch"
+            | "StaleObservation"
+            | "InvalidObservationWindow"
+            | "RevisionExhausted"
+            | "Adapter"
+            | "Poisoned"
+            | "InvalidOwner"
+    ) {
+        result["structuredContent"] = json!({"code": code});
+    }
     result
 }
 
@@ -172,4 +193,27 @@ fn service_error(code: &str) -> Value {
         "LockedAction" => "LockedAction: action requires an unlocked phone",
         _ => "device service rejected the request",
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uncertain_service_errors_expose_only_fixed_diagnostic_codes() {
+        for code in ["StaleObservation", "InvalidObservationWindow", "Adapter"] {
+            let reply = uncertain_service_result("tap", code);
+            assert_eq!(reply["structuredContent"]["code"], code);
+            assert_eq!(reply["isError"], true);
+            let payload: Value =
+                serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(payload["receipt"]["accepted"], Value::Null);
+            assert_eq!(payload["delivery"], "unknown");
+        }
+        for code in ["private screen content", "Adapter: private detail", ""] {
+            let reply = uncertain_service_result("tap", code);
+            assert!(reply.get("structuredContent").is_none());
+            assert!(!reply.to_string().contains("private"));
+        }
+    }
 }

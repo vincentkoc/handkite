@@ -850,6 +850,14 @@ fn uncertain_action_delivery_is_reported_without_replay() {
         assert_eq!(payload(&reply)["receipt"]["accepted"], Value::Null);
         assert_eq!(payload(&reply)["effect"], "unconfirmed");
         assert_eq!(payload(&reply)["delivery"], "unknown");
+        assert_eq!(
+            reply["result"]["structuredContent"]["code"],
+            if lose_socket_reply {
+                Value::Null
+            } else {
+                json!("Adapter")
+            }
+        );
         assert_eq!(fixture.state.lock().unwrap().actions, ["home"]);
         assert_eq!(
             fixture
