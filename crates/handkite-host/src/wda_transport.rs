@@ -152,7 +152,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             socket.flush().await.map_err(|_| WdaError::AfterSent)?;
         }
-        let mut raw = Vec::new();
+        let mut decoder = wda_http::ResponseDecoder::new();
+        let mut received = 0;
         let mut chunk = [0u8; 64 * 1024];
         loop {
             let count = socket
@@ -162,11 +163,11 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
             if count == 0 {
                 return Err(WdaError::AfterSent);
             }
-            if raw.len() + count > MAX_WIRE {
+            if received + count > MAX_WIRE {
                 return Err(WdaError::AfterSent);
             }
-            raw.extend_from_slice(&chunk[..count]);
-            match wda_http::parse_response(&raw) {
+            received += count;
+            match decoder.push(&chunk[..count]) {
                 Ok(Some(response)) => return Ok(response),
                 Ok(None) => {}
                 Err(_) => return Err(WdaError::AfterSent),
@@ -188,6 +189,50 @@ mod tests {
     use std::rc::Rc;
     use std::task::Context;
     use tokio::io::ReadBuf;
+
+    #[tokio::test]
+    async fn fragmented_responses_send_exactly_one_request() {
+        for (wire, expected) in [
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello".as_slice(), Some(b"hello".as_slice())),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhe\r\n3\r\nllo\r\n0\r\n\r\n".as_slice(), Some(b"hello".as_slice())),
+            (b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhell".as_slice(), None),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nheX".as_slice(), None),
+            (b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\n\r".as_slice(), None),
+        ] {
+            let (socket, mut peer) = tokio::io::duplex(1);
+            let server = tokio::spawn(async move {
+                let mut request = [0; 7];
+                peer.read_exact(&mut request).await.unwrap();
+                assert_eq!(&request, b"request");
+                for byte in wire {
+                    if peer.write_all(std::slice::from_ref(byte)).await.is_err() {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+                peer.shutdown().await.unwrap();
+                let mut extra = Vec::new();
+                peer.read_to_end(&mut extra).await.unwrap();
+                assert!(extra.is_empty());
+            });
+            let result = exchange(
+                async { Ok(socket) },
+                b"request",
+                Duration::from_secs(1),
+                None,
+                None,
+                Instant::now,
+            ).await;
+            if let Some(expected) = expected {
+                let response = result.unwrap();
+                assert_eq!(response.status, 200);
+                assert_eq!(response.body, expected);
+            } else {
+                assert!(matches!(result, Err(WdaError::AfterSent)));
+            }
+            server.await.unwrap();
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn connection_timeout_sends_no_request() {
