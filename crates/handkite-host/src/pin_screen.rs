@@ -1,6 +1,7 @@
 use handkite_core::protocol::{LockState, Point};
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+use std::borrow::Cow;
 
 mod normal_lock;
 pub use normal_lock::{NormalLockScreen, normal_lock_screen};
@@ -64,12 +65,12 @@ impl Rect {
     }
 }
 
-struct Node {
-    kind: String,
-    name: Option<String>,
-    label: Option<String>,
-    value: Option<String>,
-    bundle_id: Option<String>,
+struct Node<'a> {
+    kind: &'a str,
+    name: Option<Cow<'a, str>>,
+    label: Option<Cow<'a, str>>,
+    value: Option<Cow<'a, str>>,
+    bundle_id: Option<Cow<'a, str>>,
     point: Option<Point>,
     rect: Option<Rect>,
     size: Option<(f64, f64)>,
@@ -77,10 +78,8 @@ struct Node {
     enabled: Option<bool>,
 }
 
-fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseError> {
-    let kind = std::str::from_utf8(element.name().as_ref())
-        .map_err(|_| ParseError)?
-        .to_owned();
+fn node<'a>(reader: &Reader<&[u8]>, element: &'a BytesStart<'_>) -> Result<Node<'a>, ParseError> {
+    let kind = std::str::from_utf8(element.name().into_inner()).map_err(|_| ParseError)?;
     let mut name = None;
     let mut label = None;
     let mut value = None;
@@ -97,10 +96,10 @@ fn node(reader: &Reader<&[u8]>, element: &BytesStart<'_>) -> Result<Node, ParseE
             .decode_and_unescape_value(reader.decoder())
             .map_err(|_| ParseError)?;
         match attribute.key.as_ref() {
-            b"name" => name = Some(decoded.into_owned()),
-            b"label" => label = Some(decoded.into_owned()),
-            b"value" => value = Some(decoded.into_owned()),
-            b"bundleId" => bundle_id = Some(decoded.into_owned()),
+            b"name" => name = Some(decoded),
+            b"label" => label = Some(decoded),
+            b"value" => value = Some(decoded),
+            b"bundleId" => bundle_id = Some(decoded),
             b"x" => x = decoded.parse::<f64>().ok(),
             b"y" => y = decoded.parse::<f64>().ok(),
             b"width" => width = decoded.parse::<f64>().ok(),
@@ -216,7 +215,7 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
                 let node = node(&reader, &element)?;
                 if node.kind == "XCUIElementTypeApplication" && screen_size.is_none() {
                     screen_size = node.size;
-                    foreground_app = node.bundle_id.clone();
+                    foreground_app = node.bundle_id.map(Cow::into_owned);
                 }
                 if node.kind == "XCUIElementTypeIcon" {
                     home_icons += 1;
@@ -259,7 +258,7 @@ pub fn parse(xml: &str) -> Result<ParsedPasscodeView, ParseError> {
                             screen_size.is_some_and(|screen| rect.inside(screen))
                         })
                     {
-                        field = node.value;
+                        field = node.value.map(Cow::into_owned);
                     }
                 } else if node.kind == "XCUIElementTypeKey" {
                     if let Some(name) = node.name
@@ -413,6 +412,24 @@ mod tests {
                 .visible_lock,
             LockState::Uncertain
         );
+    }
+
+    #[test]
+    fn decoded_attributes_keep_keypad_and_field_semantics() {
+        let xml = fixture()
+            .replace("name=\"1\"", "name=\"&#49;\"")
+            .replace("value=\"0 of 6 digits\"", "value=\"0 of &#54; digits\"");
+        let parsed = parse(&xml).unwrap();
+        assert!(parsed.keypad.is_some());
+        assert_eq!(parsed.secure_field_value.as_deref(), Some("0 of 6 digits"));
+    }
+
+    #[test]
+    fn unused_attributes_still_reject_bad_entities_and_duplicates() {
+        for extra in ["unused=\"&unknown;\"", "unused=\"a\" unused=\"b\""] {
+            let xml = fixture().replace("name=\"1\"", &format!("name=\"1\" {extra}"));
+            assert!(parse(&xml).is_err());
+        }
     }
 
     #[test]
