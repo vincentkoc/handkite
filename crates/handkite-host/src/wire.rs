@@ -10,6 +10,9 @@ use std::time::Duration;
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    Status {
+        device: DeviceKey,
+    },
     Observe {
         device: DeviceKey,
     },
@@ -31,6 +34,9 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
+    Status {
+        status: WireStatus,
+    },
     Observed {
         observation: WireObservation,
     },
@@ -50,6 +56,25 @@ pub enum Reply {
     ViewChanged {
         changed: ViewChange,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WireStatus {
+    pub device: DeviceKey,
+    pub revision: Revision,
+    pub window: ObservationWindow,
+    pub state: DeviceState,
+}
+
+impl From<Observation> for WireStatus {
+    fn from(value: Observation) -> Self {
+        Self {
+            device: value.device,
+            revision: value.revision,
+            window: value.window,
+            state: value.state,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +113,13 @@ fn valid_owner(owner: &str) -> bool {
 
 pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) -> Reply {
     let result = match request {
+        Request::Status { device } => {
+            controller
+                .observe(&device)
+                .map(|observation| Reply::Status {
+                    status: observation.into(),
+                })
+        }
         Request::Observe { device } => {
             controller
                 .observe(&device)
@@ -128,6 +160,9 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
         },
     })
 }
+
+#[cfg(test)]
+mod status_tests;
 
 #[cfg(test)]
 mod tests {

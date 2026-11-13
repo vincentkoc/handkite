@@ -13,7 +13,7 @@ mod response;
 mod session;
 pub use catalog::Capabilities;
 use catalog::Tool;
-use response::{exchange_reply, metadata};
+use response::exchange_reply;
 use session::Session;
 
 #[cfg(test)]
@@ -306,9 +306,22 @@ fn tool_result<F>(tool: Tool, compact: bool, device: &DeviceKey, exchange: &mut 
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
-    let observation = match exchange_reply(json!({"method": "observe", "device": device}), exchange)
-    {
-        Ok(Reply::Observed { observation }) => observation,
+    let method = if tool == Tool::Status {
+        "status"
+    } else {
+        "observe"
+    };
+    let observation = match exchange_reply(json!({"method": method, "device": device}), exchange) {
+        Ok(Reply::Status { status }) if tool == Tool::Status => {
+            if &status.device != device {
+                return response::with_service_code(
+                    tool_error("device identity mismatch"),
+                    "DeviceMismatch",
+                );
+            }
+            return response::text_result(json!(status));
+        }
+        Ok(Reply::Observed { observation }) if tool == Tool::Observe => observation,
         Ok(Reply::Error { code }) => {
             return response::with_service_code(
                 tool_error("device observation unavailable"),
@@ -322,10 +335,6 @@ where
             tool_error("device identity mismatch"),
             "DeviceMismatch",
         );
-    }
-    let metadata = metadata(&observation);
-    if tool == Tool::Status {
-        return response::text_result(metadata);
     }
     let content = if compact {
         response::compact_observation_content(observation)
@@ -357,7 +366,12 @@ mod tests {
             &device,
             |request| {
                 let request: Value = serde_json::from_slice(request).unwrap();
-                assert_eq!(request, json!({"method": "observe", "device": "phone"}));
+                assert_eq!(request["device"], "phone");
+                assert!(matches!(
+                    request["method"].as_str(),
+                    Some("status" | "observe")
+                ));
+                assert_eq!(request.as_object().unwrap().len(), 2);
                 Ok(response.as_bytes().to_vec())
             },
         )
@@ -423,13 +437,13 @@ mod tests {
     fn one_observation_yields_metadata_tree_and_image() {
         let observed = r#"{"type":"observed","observation":{"device":"phone","revision":3,"window":{"started_unix_ms":1,"finished_unix_ms":2},"state":{"lock":"locked","wda_ready":true,"foreground_app":null},"accessibility_tree":"<screen/>","screenshot_format":"png","screenshot_base64":"AQID"}}"#;
         let replies = run(
-            "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_status\",\"arguments\":{}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_observe\",\"arguments\":{}}}\n",
+            "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_observe\",\"arguments\":{}}}\n",
             observed,
         );
-        assert_eq!(replies[0]["result"]["content"].as_array().unwrap().len(), 1);
-        assert_eq!(replies[1]["result"]["content"][1]["data"], "AQID");
+        assert_eq!(replies[0]["result"]["content"].as_array().unwrap().len(), 2);
+        assert_eq!(replies[0]["result"]["content"][1]["data"], "AQID");
         assert!(
-            replies[1]["result"]["content"][0]["text"]
+            replies[0]["result"]["content"][0]["text"]
                 .as_str()
                 .unwrap()
                 .contains("<screen/>")
@@ -519,7 +533,7 @@ mod tests {
     }
     #[test]
     fn status_projects_typed_metadata_without_response_extensions() {
-        let observed = r#"{"type":"observed","lease":"private-token","observation":{"device":"phone","revision":3,"window":{"started_unix_ms":1,"finished_unix_ms":2,"secret":"private-token"},"state":{"lock":"locked","wda_ready":true,"foreground_app":null,"secret":"private-token"},"accessibility_tree":"<private-screen/>","screenshot_format":"png","screenshot_base64":"AQID"}}"#;
+        let observed = r#"{"type":"status","lease":"private-token","status":{"device":"phone","revision":3,"window":{"started_unix_ms":1,"finished_unix_ms":2,"secret":"private-token"},"state":{"lock":"locked","wda_ready":true,"foreground_app":null,"secret":"private-token"},"accessibility_tree":"<private-screen/>","screenshot_base64":"AQID"}}"#;
         let replies = run(
             "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_status\",\"arguments\":{}}}\n",
             observed,
@@ -528,5 +542,80 @@ mod tests {
         assert!(!output.contains("private-token"));
         assert!(!output.contains("private-screen"));
         assert!(!output.contains("AQID"));
+    }
+
+    #[test]
+    fn status_uses_one_metadata_exchange_with_the_same_public_payload() {
+        let device = DeviceKey::new("phone").unwrap();
+        let metadata = json!({"device":"phone", "revision":3,
+            "window":{"started_unix_ms":1,"finished_unix_ms":2},
+            "state":{"lock":"locked","wda_ready":true,"foreground_app":null}});
+        let mut calls = 0;
+        let mut output = Vec::new();
+        serve(
+            Cursor::new(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_status\",\"arguments\":{}}}\n"),
+            &mut output,
+            &device,
+            |request| {
+                calls += 1;
+                assert_eq!(serde_json::from_slice::<Value>(request).unwrap(),
+                    json!({"method":"status","device":"phone"}));
+                Ok(serde_json::to_vec(&json!({"type":"status","status":metadata})).unwrap())
+            },
+        ).unwrap();
+        assert_eq!(calls, 1);
+        let expected = json!({"jsonrpc":"2.0","id":1,
+            "result":response::text_result(metadata)});
+        assert_eq!(
+            output,
+            [serde_json::to_vec(&expected).unwrap(), vec![b'\n']].concat()
+        );
+    }
+
+    #[test]
+    fn status_refuses_wrong_or_malformed_replies_without_fallback() {
+        let input = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"handkite_status\",\"arguments\":{}}}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
+        let metadata = json!({"device":"phone", "revision":3,
+            "window":{"started_unix_ms":1,"finished_unix_ms":2},
+            "state":{"lock":"locked","wda_ready":true,"foreground_app":null}});
+        let mut wrong_device = metadata.clone();
+        wrong_device["device"] = json!("other");
+        let mut observed = metadata;
+        observed["accessibility_tree"] = json!("<private-screen/>");
+        observed["screenshot_format"] = json!("png");
+        observed["screenshot_base64"] = json!("AQID");
+        for reply in [
+            json!({"type":"status","status":wrong_device}).to_string(),
+            json!({"type":"observed","observation":observed}).to_string(),
+            r#"{"type":"status","status":null}"#.into(),
+            "private malformed reply".into(),
+        ] {
+            let mut calls = 0;
+            let mut output = Vec::new();
+            serve(
+                Cursor::new(input),
+                &mut output,
+                &DeviceKey::new("phone").unwrap(),
+                |request| {
+                    calls += 1;
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(request).unwrap(),
+                        json!({"method":"status","device":"phone"})
+                    );
+                    Ok(reply.as_bytes().to_vec())
+                },
+            )
+            .unwrap();
+            assert_eq!(calls, 1);
+            let replies: Vec<Value> = output
+                .split(|byte| *byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(replies[0]["result"]["isError"], true);
+            assert!(!replies[0].to_string().contains("private"));
+            assert_eq!(replies[1]["id"], 2);
+            assert!(replies[1]["result"]["tools"].is_array());
+        }
     }
 }

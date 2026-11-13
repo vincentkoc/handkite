@@ -514,7 +514,7 @@ fn socket_transcript_returns_post_action_screen_without_another_observation() {
             .iter()
             .map(|request| request["method"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["observe", "acquire", "act", "act", "release"]
+        ["status", "acquire", "act", "act", "release"]
     );
     for request in fixture
         .requests
@@ -826,7 +826,7 @@ fn accepted_unchanged_view_and_failed_capture_are_errors_over_socket() {
                 .iter()
                 .map(|request| request["method"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["observe", "acquire", "act"]
+            ["status", "acquire", "act"]
         );
         session.cleanup(&mut |bytes| fixture.exchange(bytes));
     }
