@@ -130,8 +130,7 @@ aborting the host task. Acknowledgement does not prove endpoint ownership or
 device-process termination; abrupt process termination may skip Drop entirely.
 The module does not install a runner. It returns fixed error categories, discards
 callback logs, and configures no logging subscriber; upstream `idevice` tracing
-must stay inside the caller's private boundary. Live startup and shutdown remain
-unqualified.
+must stay inside the caller's private boundary.
 
 The daemon installs SIGTERM/SIGINT handlers before device startup. Each handler
 only sets a shutdown flag. The socket listener stops accepting new work within
@@ -183,15 +182,17 @@ The library's `ServiceLayout::current_account()` derives fixed paths from the ef
 
 The pure `launchd_descriptor::render` helper emits the intended supervised
 descriptor for this fixed selection path. Its sole daemon argument is
-`--owned-wda`, so activation requires a protected installed runner ID. It writes or loads nothing; current
-release selection and activation remain unimplemented. See the descriptor
-contract and activation preconditions in [Mac release inputs](RELEASE.md).
+`--owned-wda`, so activation requires a protected installed runner ID. Rendering
+writes or loads nothing. Separate operators implement initial selection, guarded
+upgrade/rollback, and protected GUI LaunchAgents registration. Registration does
+not bootstrap a job. See their contracts and activation preconditions in
+[Mac release inputs](RELEASE.md).
 
-`validate_existing_directories()` requires every listed parent directory to exist. The home, Library, Application Support, Handkite root, and state directory must belong to the effective user and reject group/other write access. Config, releases, runtime, and launchd directories must additionally be mode 0700. Ancestors above the home must belong to root or that user and reject group/other writes. Symlinks and non-directory components fail closed. This metadata preflight is a point-in-time check; a future installer must use anchored directory descriptors to prevent path replacement races and validate each file separately.
+`validate_existing_directories()` requires every listed parent directory to exist. The home, Library, Application Support, Handkite root, and state directory must belong to the effective user and reject group/other write access. Config, releases, runtime, and launchd directories must additionally be mode 0700. Ancestors above the home must belong to root or that user and reject group/other writes. Symlinks and non-directory components fail closed. This metadata preflight is a point-in-time check; the installer operators additionally retain anchored directory descriptors and validate individual files.
 
 `ServiceLock::acquire` validates this layout, opens the runtime directory without following symlinks, and holds a nonblocking exclusive OS lock on a regular, single-link, owner-only mode-0600 file. The lock has one fixed name for the account's pinned-device service; device aliases cannot create separate ownership domains. The file is never truncated or removed, and process exit releases ownership without deleting state. Metadata and inode checks reject replaced locks or runtime directories. This is cooperative process ownership within the protected service account, not isolation from code already running as that account.
 
-Daemon startup now uses the layout and process lock, but no live installation is qualified. Layout validation creates no files; lock acquisition creates only the process lock in an existing runtime directory, and daemon startup binds its fixed socket. No startup step creates directories, config, releases, descriptors, or stop markers. The descriptor is outside launchd's automatically loaded directories. Signed builds, release selection, rollback commands, and launchd supervision remain pending. The existing `state/iphone/UNLOCK-DISABLED` gate keeps its current path, permission rules, and behavior; layout checks never open or migrate it.
+Daemon startup uses the layout and process lock. Layout validation creates no files; lock acquisition creates only the process lock in an existing runtime directory, and daemon startup binds its fixed socket. No startup step creates directories, config, releases, descriptors, or stop markers. The staged descriptor stays outside automatically loaded directories; explicit registration publishes its protected copy to `~/Library/LaunchAgents/com.handkite.host.plist`.
 
 ## Release verification diagnostic
 
@@ -516,7 +517,8 @@ keeps its existing unknown result.
 There is no automatic retry, transport fallback, app launch, session creation,
 PIN input, stop-marker change, or service installation. A separate invocation
 requires fresh operator judgment. Offline fixtures qualify this command's
-control flow only; live touch delivery and PIN entry remain unqualified.
+control flow only; route-specific live evidence is recorded separately in
+[validation](VALIDATION.md).
 
 ## PIN stop gate
 
@@ -613,7 +615,7 @@ not qualify a Cancel tap or PIN entry.
 
 `handkite-unlock-once --config /path/to/config.json [--supervised-visibility-fallback]` accepts only the selected device key `phone`. Its stop marker is `Library/Application Support/Handkite/state/iphone/UNLOCK-DISABLED` under the effective user's OS account home, resolved with `getpwuid_r`, independent of `HOME` and the working directory. There is no `--state-dir` override.
 
-The home and each state ancestor must already exist, be owned by that user, and have no group or other write access. Symlinks are rejected, and the final `iphone` directory must be mode 0700. Unlock never creates or migrates these directories. An existing marker blocks execution before PIN input or backend initialization; it requires owner inspection, and this command cannot clear an earlier attempt's marker. The failed supervised trial remains blocked, and Handkite PIN entry is still unqualified.
+The home and each state ancestor must already exist, be owned by that user, and have no group or other write access. Symlinks are rejected, and the final `iphone` directory must be mode 0700. Unlock never creates or migrates these directories. An existing marker blocks execution before PIN input or backend initialization; it requires owner inspection, and this command cannot clear an earlier attempt's marker. Qualified staged-candidate PIN cycles are recorded in [validation](VALIDATION.md); that evidence does not authorize another attempt or qualify the installed runtime.
 
 The explicit `--temporary-idle-settings` variant temporarily uses idle settings
 `1.0` and `0.2`, then verifies restoration of the original values. It requires
@@ -629,7 +631,7 @@ or proof of physical delivery. A marked gate remains disabled on failure.
 
 `--owned-wda-session` additionally requires `--temporary-idle-settings` and
 `--supervised-visibility-fallback`. It requires the fixed protected service config
-with a runner bundle ID and device key `iphone`, and retains `ServiceLock` before
+with a runner bundle ID and device key `phone`, and retains `ServiceLock` before
 reading stdin or contacting the device. It checks the durable stop gate before
 stdin and runner launch, then starts and retains its own XCTest runner on a
 continuously driven runtime. Runner, lock, and gate admission run before session
@@ -645,15 +647,16 @@ attempts one identity-checked close for the exact receipt, and aborts and joins
 the host runner while retaining the lock. A failed creation supplies no close
 target. Only a confirmed code submission with verified restoration, acknowledged
 close, retained ownership, and successful runner join may clear this attempt's
-marker. Uncertain cleanup preserves it. Close acknowledgement and host-task join
-do not prove device-side runner termination or endpoint ownership. External
+marker. Uncertain cleanup preserves it. Close acknowledgement alone does not
+prove device-side termination; awaited runner cleanup also requires exact native
+process absence and pinned endpoint refusal. External
 exclusivity is still required; WDA has no atomic lease, and process termination
 can prevent restoration. Existing default modes remain unchanged.
 
-Live admission remains blocked until the baseline daemon that owns the WDA runner
-is quiesced through a reviewed handoff, then the no-PIN Clock route above is
-qualified. Offline fixtures do not authorize another PIN attempt or clearing an
-existing marker.
+Each live invocation still requires a reviewed handoff from any existing runner
+owner and fresh admission checks. Staged-candidate Clock/PIN/lock qualification
+does not establish installed-service startup or recovery. Offline fixtures do
+not authorize another PIN attempt or clearing an existing marker.
 
 In the session-bound variant, the first snapshot after the first digit tap also
 reads the secure field directly once. Both six-digit counts must agree before
