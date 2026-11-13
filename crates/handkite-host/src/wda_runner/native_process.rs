@@ -211,7 +211,7 @@ fn argv(device: &HardwareId, pid: Option<u32>, output: &Path) -> Command {
     command
         .arg("--device")
         .arg(device.as_str())
-        .args(["--timeout", "3", "--json-output"])
+        .args(["--timeout", "5", "--json-output"])
         .arg(output)
         .arg("--quiet")
         .stdin(Stdio::null())
@@ -423,6 +423,7 @@ mod tests {
                 args.windows(2)
                     .any(|pair| pair == ["--device", "fixture-device"])
             );
+            assert!(args.windows(2).any(|pair| pair == ["--timeout", "5"]));
             assert!(!args.contains(&"--kill"));
             if pid.is_some() {
                 assert!(args.windows(2).any(|pair| pair == ["--pid", "20"]));
