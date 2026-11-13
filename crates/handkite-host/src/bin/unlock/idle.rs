@@ -362,6 +362,7 @@ mod tests {
         use handkite_host::pin_backend::{PinCaptureStep, PinPhase};
         for step in [
             PinCaptureStep::SourceRead,
+            PinCaptureStep::ViewportRead,
             PinCaptureStep::SessionAfter,
             PinCaptureStep::Freshness,
             PinCaptureStep::EmptyAdmission,
@@ -393,6 +394,7 @@ mod tests {
             PinPhase::OwnedAdmission,
             PinPhase::WakeDispatch,
             PinPhase::WakePostcapture,
+            PinPhase::WakeAdmission,
             PinPhase::NormalConfirmation,
             PinPhase::RevealDispatch,
             PinPhase::RevealPostcapture,
