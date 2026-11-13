@@ -15,6 +15,11 @@ pub struct HttpResponse {
     pub body: Vec<u8>,
 }
 
+enum Framing {
+    Length(usize),
+    Chunked,
+}
+
 pub fn request(method: &str, path: &str, body: &[u8]) -> Result<Vec<u8>, HttpError> {
     if !matches!(method, "GET" | "POST" | "DELETE")
         || !path.starts_with('/')
@@ -40,7 +45,18 @@ pub fn parse_response(raw: &[u8]) -> Result<Option<HttpResponse>, HttpError> {
         None if raw.len() <= MAX_HEADER => return Ok(None),
         None => return Err(HttpError::HeaderTooLarge),
     };
-    let head = std::str::from_utf8(&raw[..split]).map_err(|_| HttpError::InvalidResponse)?;
+    let (status, framing) = parse_head(&raw[..split])?;
+    let body = &raw[split + 4..];
+    let body = match framing {
+        Framing::Chunked => decode_chunked(body)?,
+        Framing::Length(length) if body.len() < length => None,
+        Framing::Length(length) => Some(body[..length].to_vec()),
+    };
+    Ok(body.map(|body| HttpResponse { status, body }))
+}
+
+fn parse_head(head: &[u8]) -> Result<(u16, Framing), HttpError> {
+    let head = std::str::from_utf8(head).map_err(|_| HttpError::InvalidResponse)?;
     let mut lines = head.split("\r\n");
     let status = lines
         .next()
@@ -75,22 +91,14 @@ pub fn parse_response(raw: &[u8]) -> Result<Option<HttpResponse>, HttpError> {
     if chunked && length.is_some() {
         return Err(HttpError::InvalidResponse);
     }
-    let body = &raw[split + 4..];
     if chunked {
-        return decode_chunked(body)
-            .map(|decoded| decoded.map(|body| HttpResponse { status, body }));
+        return Ok((status, Framing::Chunked));
     }
     let length = length.ok_or(HttpError::MissingFraming)?;
     if length > MAX_BODY {
         return Err(HttpError::BodyTooLarge);
     }
-    if body.len() < length {
-        return Ok(None);
-    }
-    Ok(Some(HttpResponse {
-        status,
-        body: body[..length].to_vec(),
-    }))
+    Ok((status, Framing::Length(length)))
 }
 
 fn decode_chunked(body: &[u8]) -> Result<Option<Vec<u8>>, HttpError> {
