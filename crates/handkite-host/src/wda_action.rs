@@ -5,8 +5,6 @@ use handkite_core::protocol::{Action, Point, TransportReceipt};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-const LOCK_SHORTCUT: &str = "shortcuts://run-shortcut?name=OpenClaw%20Lock%20Screen";
-
 pub(crate) trait WdaRequest {
     async fn request(
         &self,
@@ -284,7 +282,7 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
             let chars: Vec<String> = value.chars().map(String::from).collect();
             Ok(("/wda/keys", json!({"value": chars})))
         }
-        Action::Lock => Ok(("/url", json!({"url": LOCK_SHORTCUT}))),
+        Action::Lock => Ok(("/wda/lock", json!({}))),
         Action::Tap { at } if point_valid(*at) => Ok((
             "/actions",
             touch_action(vec![
@@ -815,10 +813,39 @@ mod tests {
     }
 
     #[test]
-    fn lock_uses_the_verified_shortcut() {
+    fn lock_uses_the_native_session_endpoint() {
         let (path, body) = payload(&Action::Lock).unwrap();
-        assert_eq!(path, "/url");
-        assert_eq!(body["url"], LOCK_SHORTCUT);
+        assert_eq!(path, "/wda/lock");
+        assert_eq!(body, json!({}));
+    }
+
+    #[tokio::test]
+    async fn native_lock_posts_once_to_bound_session_even_when_ack_is_lost() {
+        for acknowledged in [false, true] {
+            let mut steps = vec![
+                status(json!("fixture-session")),
+                response("GET", "/session/fixture-session", 200, json!({"value": {}})),
+            ];
+            steps.push(Step {
+                method: "POST",
+                path: "/session/fixture-session/wda/lock",
+                response: if acknowledged {
+                    Ok(HttpResponse {
+                        status: 200,
+                        body: serde_json::to_vec(&json!({"value": null})).unwrap(),
+                    })
+                } else {
+                    Err(WdaError::NotConnected)
+                },
+            });
+            let wda = Script(RefCell::new(steps.into()), Some(json!({})));
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            let result = actions
+                .execute_with_existing_session(&wda, &Action::Lock)
+                .await;
+            assert_eq!(result.is_ok(), acknowledged);
+            wda.done();
+        }
     }
 
     #[test]
