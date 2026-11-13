@@ -147,7 +147,9 @@ pub(super) fn valid_raw(tool: Tool, raw: &str) -> bool {
 
 pub(super) fn schema(tool: Tool) -> Value {
     let revision = json!({"type":"integer","minimum":0,"maximum":u64::MAX});
-    let point = json!({"type":"object","properties":{
+    let point = json!({"type":"object",
+        "description":"WDA viewport coordinates in logical points, passed unchanged; not screenshot pixels. No screenshot-to-action transform is supplied.",
+        "properties":{
         "x":{"type":"number","minimum":0,"maximum":10_000},
         "y":{"type":"number","minimum":0,"maximum":10_000}},
         "required":["x","y"],"additionalProperties":false});
@@ -190,6 +192,21 @@ pub(super) fn schema(tool: Tool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tap_and_swipe_share_fractional_viewport_point_schema() {
+        let tap = schema(Tool::Tap);
+        let swipe = schema(Tool::Swipe);
+        let point = &tap["properties"]["at"];
+        assert_eq!(point, &swipe["properties"]["from"]);
+        assert_eq!(point, &swipe["properties"]["to"]);
+        assert_eq!(point["properties"]["x"]["type"], "number");
+        assert_eq!(point["properties"]["y"]["type"], "number");
+        let description = point["description"].as_str().unwrap();
+        assert!(description.contains("logical points, passed unchanged"));
+        assert!(description.contains("not screenshot pixels"));
+        assert!(description.contains("No screenshot-to-action transform"));
+    }
 
     #[test]
     fn each_tool_translates_to_one_typed_action() {
