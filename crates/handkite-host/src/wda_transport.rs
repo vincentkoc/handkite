@@ -94,8 +94,14 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     admission: Option<&(dyn Fn() -> bool + Send + Sync)>,
     now: impl Fn() -> Instant,
 ) -> Result<HttpResponse, WdaError> {
-    let mut socket = connect.await?;
-    tokio::time::timeout(deadline, async {
+    let expires = tokio::time::Instant::now() + deadline;
+    let mut socket = tokio::time::timeout_at(expires, connect)
+        .await
+        .map_err(|_| WdaError::NotConnected)??;
+    if tokio::time::Instant::now() >= expires {
+        return Err(WdaError::ExpiredBeforeSend);
+    }
+    tokio::time::timeout_at(expires, async {
         if write_deadline.is_some() || admission.is_some() {
             let mut sent = 0;
             while sent < request.len() {
@@ -182,6 +188,54 @@ mod tests {
     use std::rc::Rc;
     use std::task::Context;
     use tokio::io::ReadBuf;
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_timeout_sends_no_request() {
+        let started = tokio::time::Instant::now();
+        let (socket, mut peer) = tokio::io::duplex(4096);
+        let connect = async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(socket)
+        };
+        let result = exchange(
+            connect,
+            b"request",
+            Duration::from_secs(5),
+            None,
+            None,
+            Instant::now,
+        )
+        .await;
+        assert!(matches!(result, Err(WdaError::NotConnected)));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_and_response_share_one_timeout() {
+        let started = tokio::time::Instant::now();
+        let (socket, mut peer) = tokio::io::duplex(4096);
+        let connect = async move {
+            tokio::time::sleep(Duration::from_secs(4)).await;
+            Ok(socket)
+        };
+        let result = exchange(
+            connect,
+            b"request",
+            Duration::from_secs(5),
+            None,
+            None,
+            Instant::now,
+        )
+        .await;
+        assert!(matches!(result, Err(WdaError::TimedOutAfterSent)));
+        assert_eq!(started.elapsed(), Duration::from_secs(5));
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert_eq!(sent, b"request");
+    }
 
     #[tokio::test]
     async fn delayed_discovery_or_connect_cannot_send_an_expired_post() {
