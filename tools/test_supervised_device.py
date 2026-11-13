@@ -642,6 +642,22 @@ class BrokerTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_pin_capture_timings_accept_only_fixed_buckets_without_changing_outcome(self):
+        prefix = (b"handkite-unlock-once: unlock_idle=unknown reason=backend_unavailable "
+                  b"action=backend_unavailable restoration=verified phase=digit_input step=freshness ")
+        stages = ("session_before", "source", "lock", "direct_field", "session_after", "parse", "native")
+        labels = "lt_1ms lt_10ms lt_100ms lt_1s lt_5s lt_10s lt_30s lt_120s ge_120s".split()
+        for stage in stages:
+            for label in labels:
+                result = (1, b"", prefix + f"{stage}_time={label}\n".encode(), False)
+                self.assertEqual(broker.pin_diagnostic(result)[stage + "_time"], label)
+                self.assertEqual(broker.pin_result(result), (False, False))
+        for field in ("source_time=246810", "source_time=lt_5s source_time=lt_5s",
+                      "secret_time=lt_5s", "source_time=lt_5s\nprivate"):
+            result = (1, b"", prefix + field.encode() + b"\n", False)
+            self.assertEqual(broker.pin_diagnostic(result)["reported_outcome"], "unclassified")
+            self.assertEqual(broker.pin_result(result), (False, False))
+
     def test_runner_startup_reasons_are_safe_known_zero_results(self):
         prefix = b"handkite-unlock-once: unlock_idle=refused reason=runner_unavailable runner="
         for reason in broker.RUNNER_REASONS:

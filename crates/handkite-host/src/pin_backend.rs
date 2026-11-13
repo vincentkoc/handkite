@@ -392,6 +392,10 @@ impl NativePasscodeBackend {
         self.capture_step
     }
 
+    pub fn capture_timings(&self) -> PinCaptureTimings {
+        self.capture_timings
+    }
+
     pub fn diagnostics(&self) -> Option<PinDiagnostics> {
         self.last_diagnostics
     }

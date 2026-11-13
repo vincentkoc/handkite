@@ -455,6 +455,9 @@ def pin_diagnostic(result):
             reveal_settle_limit complete""".split()),
         "progress": {"unchanged", "unexpected"},
         "first_unconfirmed_index": set("123456")}
+    timing_labels = set("lt_1ms lt_10ms lt_100ms lt_1s lt_5s lt_10s lt_30s lt_120s ge_120s".split())
+    for stage in ("session_before", "source", "lock", "direct_field", "session_after", "parse", "native"):
+        allowed[stage + "_time"] = timing_labels
     try:
         line = err.removeprefix(b"handkite-unlock-once: ").decode("ascii")
         if not line.endswith("\n") or "\n" in line[:-1]:

@@ -21,6 +21,7 @@ pub(super) enum WorkerError {
         UnlockError,
         handkite_host::pin_backend::PinPhase,
         handkite_host::pin_backend::PinCaptureStep,
+        Option<handkite_host::pin_backend::PinCaptureTimings>,
     ),
     Initialization,
     GateAccess,
@@ -186,12 +187,27 @@ pub(super) fn diagnostic(
     if let Some(index) = index {
         line.push_str(&format!(" first_unconfirmed_index={index}"));
     }
-    if let IdleAction::Completed(Err(WorkerError::TracedUnlock(_, phase, step))) = outcome.action {
+    if let IdleAction::Completed(Err(WorkerError::TracedUnlock(_, phase, step, timings))) =
+        outcome.action
+    {
         line.push_str(&format!(" phase={} step={}", phase.as_str(), step.as_str()));
+        if let Some(timings) = timings {
+            for (name, elapsed) in [
+                ("session_before_time", timings.session_before_ms),
+                ("source_time", timings.source_ms),
+                ("lock_time", timings.lock_ms),
+                ("direct_field_time", timings.direct_field_ms),
+                ("session_after_time", timings.session_after_ms),
+                ("parse_time", timings.parse_ms),
+                ("native_time", timings.native_ms),
+            ] {
+                line.push_str(&format!(" {name}={}", timing_bucket(elapsed)));
+            }
+        }
     }
     if let IdleAction::Completed(Err(
         WorkerError::Unlock(UnlockError::Incomplete { progress, .. })
-        | WorkerError::TracedUnlock(UnlockError::Incomplete { progress, .. }, _, _),
+        | WorkerError::TracedUnlock(UnlockError::Incomplete { progress, .. }, _, _, _),
     )) = outcome.action
     {
         let progress = match progress {
@@ -203,6 +219,20 @@ pub(super) fn diagnostic(
     line
 }
 
+fn timing_bucket(elapsed_ms: u128) -> &'static str {
+    match elapsed_ms {
+        0 => "lt_1ms",
+        1..=9 => "lt_10ms",
+        10..=99 => "lt_100ms",
+        100..=999 => "lt_1s",
+        1_000..=4_999 => "lt_5s",
+        5_000..=9_999 => "lt_10s",
+        10_000..=29_999 => "lt_30s",
+        30_000..=119_999 => "lt_120s",
+        _ => "ge_120s",
+    }
+}
+
 fn action_reason(action: &IdleAction<UnlockOutcome, WorkerError>) -> (&'static str, Option<u8>) {
     let reason = match action {
         IdleAction::NotRun(_) => "settings_not_run",
@@ -212,7 +242,7 @@ fn action_reason(action: &IdleAction<UnlockOutcome, WorkerError>) -> (&'static s
         IdleAction::Completed(Err(WorkerError::GateAccess)) => "gate_access",
         IdleAction::Completed(Err(WorkerError::Join)) => "worker_join",
         IdleAction::Completed(Err(
-            WorkerError::Unlock(error) | WorkerError::TracedUnlock(error, _, _),
+            WorkerError::Unlock(error) | WorkerError::TracedUnlock(error, _, _, _),
         )) => match error {
             UnlockError::Disabled => "disabled",
             UnlockError::DeviceMismatch => "device_mismatch",
@@ -358,6 +388,55 @@ mod tests {
     }
 
     #[test]
+    fn capture_timings_preserve_failure_and_only_emit_fixed_buckets() {
+        use handkite_host::pin_backend::{PinCaptureStep, PinCaptureTimings, PinPhase};
+        for (elapsed, label) in [
+            (0, "lt_1ms"),
+            (1, "lt_10ms"),
+            (9, "lt_10ms"),
+            (10, "lt_100ms"),
+            (99, "lt_100ms"),
+            (100, "lt_1s"),
+            (999, "lt_1s"),
+            (1000, "lt_5s"),
+            (4999, "lt_5s"),
+            (5000, "lt_10s"),
+            (9999, "lt_10s"),
+            (10000, "lt_30s"),
+            (29999, "lt_30s"),
+            (30000, "lt_120s"),
+            (119999, "lt_120s"),
+            (120000, "ge_120s"),
+            (u128::MAX, "ge_120s"),
+        ] {
+            assert_eq!(timing_bucket(elapsed), label);
+        }
+        let outcome = IdleSettingsOutcome {
+            action: IdleAction::Completed(Err(WorkerError::TracedUnlock(
+                UnlockError::Backend(BackendError::Unavailable),
+                PinPhase::DigitInput,
+                PinCaptureStep::Freshness,
+                Some(PinCaptureTimings {
+                    source_ms: 5010,
+                    native_ms: 7999,
+                    ..Default::default()
+                }),
+            ))),
+            restoration: Restoration::Verified,
+        };
+        let mut gate = DeferredGate::new(Gate {
+            disabled: true,
+            clears: 0,
+        });
+        let error = finish(&mut gate, outcome).unwrap_err();
+        assert!(error.starts_with("unlock_idle=unknown reason=backend_unavailable action=backend_unavailable restoration=verified phase=digit_input step=freshness "));
+        assert!(error.contains(" source_time=lt_10s "));
+        assert!(error.ends_with(" native_time=lt_10s"));
+        assert!(gate.inner.disabled);
+        assert_eq!(gate.inner.clears, 0);
+    }
+
+    #[test]
     fn owned_failure_steps_distinguish_capture_expiry_from_unready_views() {
         use handkite_host::pin_backend::{PinCaptureStep, PinPhase};
         for step in [
@@ -373,6 +452,7 @@ mod tests {
                     UnlockError::Backend(BackendError::Unavailable),
                     PinPhase::RevealPostcapture,
                     step,
+                    None,
                 ))),
                 restoration: Restoration::Verified,
             };
@@ -444,7 +524,8 @@ mod tests {
                                 action: IdleAction::Completed(Err(WorkerError::TracedUnlock(
                                     error,
                                     phase,
-                                    handkite_host::pin_backend::PinCaptureStep::Complete
+                                    handkite_host::pin_backend::PinCaptureStep::Complete,
+                                    None,
                                 ))),
                                 restoration
                             }
@@ -523,7 +604,12 @@ mod tests {
             let error = UnlockError::Incomplete { digit: 1, progress };
             for traced in [false, true] {
                 let error = if traced {
-                    WorkerError::TracedUnlock(error, PinPhase::DigitInput, PinCaptureStep::Complete)
+                    WorkerError::TracedUnlock(
+                        error,
+                        PinPhase::DigitInput,
+                        PinCaptureStep::Complete,
+                        None,
+                    )
                 } else {
                     WorkerError::Unlock(error)
                 };

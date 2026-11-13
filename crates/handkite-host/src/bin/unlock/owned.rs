@@ -99,7 +99,12 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
                         UnlockPolicy::default(),
                     )
                     .map_err(|error| {
-                        WorkerError::TracedUnlock(error, backend.phase(), backend.capture_step())
+                        WorkerError::TracedUnlock(
+                            error,
+                            backend.phase(),
+                            backend.capture_step(),
+                            Some(backend.capture_timings()),
+                        )
                     })
                 })
                 .await
