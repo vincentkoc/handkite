@@ -332,32 +332,48 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
 
 #[test]
 fn interaction_requires_explicit_profile_and_control_without_socket_input() {
-    let action = call(
-        "handkite_tap",
-        json!({"expected_revision":1,"at":{"x":20,"y":30}}),
-    );
-    for capability in [
-        Capabilities::Observation,
-        Capabilities::Navigation,
-        Capabilities::ObservationAndNavigation,
+    for (name, arguments) in [
+        (
+            "handkite_tap",
+            json!({"expected_revision":1,"at":{"x":20,"y":30}}),
+        ),
+        (
+            "handkite_double_tap",
+            json!({"expected_revision":1,"at":{"x":20,"y":30}}),
+        ),
+        (
+            "handkite_long_press",
+            json!({"expected_revision":1,"at":{"x":20,"y":30},"duration_ms":750}),
+        ),
+        (
+            "handkite_key",
+            json!({"expected_revision":1,"key":"backspace"}),
+        ),
     ] {
+        let action = call(name, arguments);
+        for capability in [
+            Capabilities::Observation,
+            Capabilities::Navigation,
+            Capabilities::ObservationAndNavigation,
+        ] {
+            let reply = process(
+                &action,
+                &device(),
+                capability,
+                &mut Session::default(),
+                &mut |_| panic!("socket reached"),
+            );
+            assert_eq!(reply.unwrap()["error"]["code"], -32602);
+        }
         let reply = process(
             &action,
             &device(),
-            capability,
+            Capabilities::ObservationNavigationInteraction,
             &mut Session::default(),
             &mut |_| panic!("socket reached"),
         );
-        assert_eq!(reply.unwrap()["error"]["code"], -32602);
+        assert_eq!(reply.unwrap()["result"]["isError"], true);
     }
-    let reply = process(
-        &action,
-        &device(),
-        Capabilities::ObservationNavigationInteraction,
-        &mut Session::default(),
-        &mut |_| panic!("socket reached"),
-    );
-    assert_eq!(reply.unwrap()["result"]["isError"], true);
 }
 
 #[test]
