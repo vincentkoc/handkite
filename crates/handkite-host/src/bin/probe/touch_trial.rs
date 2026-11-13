@@ -148,6 +148,7 @@ impl ReceiptFailure {
                     RunnerError::LookupTimedOut => "runner_lookup_timed_out",
                     RunnerError::EndpointBusy => "runner_endpoint_busy",
                     RunnerError::EndpointUnproven => "runner_endpoint_unproven",
+                    RunnerError::EndpointCleanupUnproven => "runner_endpoint_cleanup_unproven",
                     RunnerError::StartupTimedOut => "runner_startup_timed_out",
                     RunnerError::PlanStartUnproven => "runner_plan_start_unproven",
                     RunnerError::AutomationAuthorizationRequired => {
@@ -2146,6 +2147,10 @@ mod tests {
             (RunnerError::LookupTimedOut, "runner_lookup_timed_out"),
             (RunnerError::EndpointBusy, "runner_endpoint_busy"),
             (RunnerError::EndpointUnproven, "runner_endpoint_unproven"),
+            (
+                RunnerError::EndpointCleanupUnproven,
+                "runner_endpoint_cleanup_unproven",
+            ),
             (RunnerError::StartupTimedOut, "runner_startup_timed_out"),
             (RunnerError::PlanStartUnproven, "runner_plan_start_unproven"),
             (

@@ -99,7 +99,10 @@ async fn read_only_liveness_survives_handoff_to_blocking_worker() {
     let worker = tokio::task::spawn_blocking(move || liveness);
     let liveness = worker.await.unwrap();
     assert!(!liveness.is_finished());
-    runner.abort_and_join().await.unwrap();
+    runner
+        .abort_and_join_with(|| async { Ok(()) })
+        .await
+        .unwrap();
     assert!(liveness.is_finished());
 }
 
@@ -394,7 +397,10 @@ async fn completed_automation_wait_can_reach_a_proven_plan() {
     )
     .await
     .unwrap();
-    runner.abort_and_join().await.unwrap();
+    runner
+        .abort_and_join_with(|| async { Ok(()) })
+        .await
+        .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
 
@@ -451,7 +457,10 @@ async fn started_plan_polls_until_strict_ready_and_keeps_task_owned() {
     assert_eq!(probes.load(Ordering::SeqCst), 3);
     assert!(!runner.is_finished());
     assert_eq!(dropped.load(Ordering::SeqCst), 0);
-    runner.abort_and_join().await.unwrap();
+    runner
+        .abort_and_join_with(|| async { Ok(()) })
+        .await
+        .unwrap();
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
 
@@ -690,9 +699,142 @@ async fn cancelling_abort_and_join_keeps_the_abort_guard() {
     )
     .await
     .unwrap();
-    let mut shutdown = Box::pin(runner.abort_and_join());
+    let mut shutdown = Box::pin(runner.abort_and_join_with(|| async { Ok(()) }));
     assert!(futures_util::poll!(shutdown.as_mut()).is_pending());
     drop(shutdown);
     tokio::task::yield_now().await;
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_waits_for_delayed_endpoint_refusal_after_host_join() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let runner = OwnedWdaRunner::start_task(
+        |listener| live(listener, dropped.clone()),
+        || async { ready() },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    let started = Instant::now();
+    let mut probes = 0;
+    runner
+        .abort_and_join_with(|| {
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            probes += 1;
+            let result = if probes < 3 {
+                Err(RunnerError::EndpointBusy)
+            } else {
+                Ok(())
+            };
+            async move { result }
+        })
+        .await
+        .unwrap();
+    assert_eq!(probes, 3);
+    assert_eq!(Instant::now() - started, 2 * POLL_INTERVAL);
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_refuses_open_unknown_or_unresponsive_endpoint() {
+    for case in 0..4 {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let runner = OwnedWdaRunner::start_task(
+            |listener| live(listener, dropped.clone()),
+            || async { ready() },
+            deadline(),
+        )
+        .await
+        .unwrap();
+        let started = Instant::now();
+        let result = runner
+            .abort_and_join_with(|| async move {
+                match case {
+                    0 => Err(RunnerError::EndpointBusy),
+                    1 => Err(RunnerError::EndpointUnproven),
+                    2 => Err(RunnerError::LookupFailed),
+                    3 => pending().await,
+                    _ => unreachable!(),
+                }
+            })
+            .await;
+        assert_eq!(result, Err(RunnerError::EndpointCleanupUnproven));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            Instant::now() - started,
+            if case == 0 || case == 3 {
+                SHUTDOWN_TIMEOUT
+            } else {
+                Duration::ZERO
+            }
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn shutdown_checks_endpoint_even_when_host_task_already_finished() {
+    for failed in [false, true] {
+        for vacant in [false, true] {
+            let (finish, finished) = oneshot::channel();
+            let runner = OwnedWdaRunner::start_task(
+                |mut listener| async move {
+                    listener.did_begin_executing_test_plan().await.unwrap();
+                    finished.await.unwrap();
+                    if failed {
+                        Err(RunnerError::RunnerFailed)
+                    } else {
+                        Ok(())
+                    }
+                },
+                || async { ready() },
+                deadline(),
+            )
+            .await
+            .unwrap();
+            finish.send(()).unwrap();
+            tokio::task::yield_now().await;
+            assert!(runner.is_finished());
+            let mut probes = 0;
+            let result = runner
+                .abort_and_join_with(|| {
+                    probes += 1;
+                    async move {
+                        if vacant {
+                            Ok(())
+                        } else {
+                            Err(RunnerError::EndpointUnproven)
+                        }
+                    }
+                })
+                .await;
+            assert_eq!(probes, 1);
+            assert_eq!(
+                result,
+                if !vacant {
+                    Err(RunnerError::EndpointCleanupUnproven)
+                } else if failed {
+                    Err(RunnerError::RunnerFailed)
+                } else {
+                    Ok(())
+                }
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn shutdown_without_pinned_endpoint_never_claims_cleanup() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let runner = OwnedWdaRunner::start_task(
+        |listener| live(listener, dropped.clone()),
+        || async { ready() },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        runner.abort_and_join().await,
+        Err(RunnerError::EndpointCleanupUnproven)
+    );
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }

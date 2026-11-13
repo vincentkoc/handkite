@@ -23,6 +23,7 @@ const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const VACANCY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 
 /// Fixed categories only: no upstream error, device identifier, or test log.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -33,6 +34,7 @@ pub enum RunnerError {
     LookupTimedOut,
     EndpointBusy,
     EndpointUnproven,
+    EndpointCleanupUnproven,
     StartupTimedOut,
     PlanStartUnproven,
     AutomationAuthorizationRequired,
@@ -45,11 +47,12 @@ pub enum RunnerError {
 
 /// Owns the host XCTest task, including while startup or shutdown is cancelled.
 ///
-/// Drop requests cancellation; use `abort_and_join` to observe task completion.
-/// Neither operation proves that the device-side process has terminated.
+/// Drop requests host cancellation only. `abort_and_join` also requires a fresh
+/// pinned endpoint refusal; it does not send a device-side termination request.
 #[must_use = "keep the handle alive for the lifetime of the XCTest task"]
 pub struct OwnedWdaRunner {
     task: Option<JoinHandle<Result<(), RunnerError>>>,
+    usb: Option<PinnedUsb>,
 }
 
 /// Read-only task liveness for a blocking action worker. It cannot cancel the runner.
@@ -95,8 +98,8 @@ impl OwnedWdaRunner {
             deadline,
         )
         .await?;
-        let wda = UsbWda::new(usb);
-        Self::start_task(
+        let wda = UsbWda::new(usb.clone());
+        let mut runner = Self::start_task(
             move |mut listener| async move {
                 XCUITestService::new(provider)
                     .run(config, &mut listener, None)
@@ -111,7 +114,9 @@ impl OwnedWdaRunner {
             },
             deadline,
         )
-        .await
+        .await?;
+        runner.usb = Some(usb);
+        Ok(runner)
     }
 
     /// A point-in-time host task observation; it is not an HTTP health check.
@@ -123,18 +128,55 @@ impl OwnedWdaRunner {
         RunnerLiveness(self.task.as_ref().expect("owned task").abort_handle())
     }
 
-    /// Request cancellation and join the host task without detaching on cancellation.
-    pub async fn abort_and_join(mut self) -> Result<(), RunnerError> {
-        let Some(task) = self.task.as_mut() else {
-            return Ok(());
+    /// Join the cancelled host task and observe pinned endpoint refusal within
+    /// one deadline. Cancellation keeps the abort guard; it never proves cleanup.
+    pub async fn abort_and_join(self) -> Result<(), RunnerError> {
+        let usb = self.usb.clone();
+        self.abort_and_join_with(move || {
+            let usb = usb.clone();
+            async move { endpoint_vacant(&usb.ok_or(RunnerError::EndpointCleanupUnproven)?).await }
+        })
+        .await
+    }
+
+    async fn abort_and_join_with<P, PF>(mut self, mut probe: P) -> Result<(), RunnerError>
+    where
+        P: FnMut() -> PF,
+        PF: Future<Output = Result<(), RunnerError>>,
+    {
+        let deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+        let joined = if let Some(task) = self.task.as_mut() {
+            task.abort();
+            let result = timeout_at(deadline, task).await;
+            match result {
+                Ok(result) => {
+                    self.task.take();
+                    match result {
+                        Ok(result) => result,
+                        Err(error) if error.is_cancelled() => Ok(()),
+                        Err(_) => Err(RunnerError::TaskFailed),
+                    }
+                }
+                Err(_) => return Err(RunnerError::TaskFailed),
+            }
+        } else {
+            Ok(())
         };
-        task.abort();
-        let result = task.await;
-        self.task.take();
-        match result {
-            Ok(result) => result,
-            Err(error) if error.is_cancelled() => Ok(()),
-            Err(_) => Err(RunnerError::TaskFailed),
+        loop {
+            if Instant::now() >= deadline {
+                return Err(RunnerError::EndpointCleanupUnproven);
+            }
+            let observed = timeout_at(deadline, probe()).await;
+            if Instant::now() >= deadline {
+                return Err(RunnerError::EndpointCleanupUnproven);
+            }
+            match observed {
+                Ok(Ok(())) => return joined,
+                Ok(Err(RunnerError::EndpointBusy)) => {
+                    sleep_until(deadline.min(Instant::now() + POLL_INTERVAL)).await;
+                }
+                _ => return Err(RunnerError::EndpointCleanupUnproven),
+            }
         }
     }
 
@@ -156,6 +198,7 @@ impl OwnedWdaRunner {
         // Install the abort-on-drop owner before the first await after spawn.
         let mut runner = Self {
             task: Some(tokio::spawn(run(PlanListener { phase }))),
+            usb: None,
         };
         if let Err(error) = runner.wait_ready(receiver, probe, deadline).await {
             let _ = runner.abort_and_join().await;

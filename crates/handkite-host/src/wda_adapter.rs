@@ -424,7 +424,7 @@ impl Drop for WdaAdapter {
                 tokio::time::timeout(Duration::from_secs(5), runner.abort_and_join()).await
             }) != Ok(Ok(()))
             {
-                eprintln!("handkite: owned runner host task termination unproven");
+                eprintln!("handkite: owned runner cleanup unproven");
             }
         }
         runtime.shutdown_timeout(Duration::from_secs(5));

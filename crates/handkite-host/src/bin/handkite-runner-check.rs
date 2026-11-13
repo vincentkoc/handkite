@@ -113,6 +113,7 @@ fn runner_reason(error: RunnerError) -> &'static str {
         RunnerError::LookupTimedOut => "lookup_timed_out",
         RunnerError::EndpointBusy => "endpoint_busy",
         RunnerError::EndpointUnproven => "endpoint_unproven",
+        RunnerError::EndpointCleanupUnproven => "endpoint_cleanup_unproven",
         RunnerError::StartupTimedOut => "startup_timed_out",
         RunnerError::PlanStartUnproven => "plan_start_unproven",
         RunnerError::AutomationAuthorizationRequired => "automation_authorization_required",
@@ -132,6 +133,7 @@ mod tests {
     fn startup_errors_have_fixed_private_safe_reasons() {
         for error in [
             RunnerError::EndpointBusy,
+            RunnerError::EndpointCleanupUnproven,
             RunnerError::PlanStartUnproven,
             RunnerError::AutomationAuthorizationRequired,
             RunnerError::InitializationFailed,
