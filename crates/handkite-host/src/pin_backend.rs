@@ -653,9 +653,14 @@ impl NativePasscodeBackend {
                 self.phase = PinPhase::EmptyConfirmation;
                 return Ok(());
             }
-            // Only an unchanged, strictly proven normal lock may still be
-            // transitioning. Capture failures and every other view stop here.
-            if !view.normal_locked || view.view.normal_lock != Some(normal) {
+            // The lock marker may change visibility during the reveal. Only
+            // strict normal lock with unchanged geometry may keep settling.
+            if !view.normal_locked
+                || view
+                    .view
+                    .normal_lock
+                    .is_none_or(|after| after.size != normal.size)
+            {
                 self.preparation_refusal = self.reveal_refusal(normal);
                 self.capture_step = PinCaptureStep::EmptyAdmission;
                 return Err(BackendError::Unavailable);
@@ -1792,7 +1797,7 @@ mod tests {
                         keypad_capture(true)
                     };
                     if mismatch && index == 4 {
-                        view.normal_lock.as_mut().unwrap().proud_visible ^= true;
+                        view.normal_lock.as_mut().unwrap().size.0 += 1.0;
                     }
                     backend.last_diagnostics = Some(PinDiagnostics {
                         native_locked: true,
@@ -1846,7 +1851,7 @@ mod tests {
             assert_eq!(
                 report.refusal,
                 if mismatch {
-                    "normal_visibility_changed"
+                    "normal_dimensions_changed"
                 } else {
                     "none"
                 }
@@ -2265,16 +2270,16 @@ mod tests {
     }
 
     #[test]
-    fn owned_reveal_waits_for_normal_to_empty_without_another_swipe() {
-        let mut backend = bound_backend().with_input_admission(|| true).unwrap();
-        let start = Instant::now();
-        backend
-            .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
-            .unwrap();
-        let mut captures = 0;
-        let mut writes = 0;
-        backend
-            .prepare_owned_keypad_with(
+    fn owned_reveal_settles_visibility_changes_but_not_dimensions() {
+        for end in 0..3 {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            backend
+                .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+                .unwrap();
+            let mut captures = 0;
+            let mut writes = 0;
+            let result = backend.prepare_owned_keypad_with(
                 start,
                 |backend| {
                     captures += 1;
@@ -2282,8 +2287,15 @@ mod tests {
                     backend.snapshot_with(
                         at,
                         |_, _| {
-                            Ok(if captures < 3 {
-                                normal_capture()
+                            Ok(if captures < 3 || end != 0 {
+                                let (screen, mut view) = normal_capture();
+                                if captures >= 2 {
+                                    view.normal_lock.as_mut().unwrap().proud_visible ^= true;
+                                    if end == 2 {
+                                        view.normal_lock.as_mut().unwrap().size.0 += 1.0;
+                                    }
+                                }
+                                (screen, view)
                             } else {
                                 keypad_capture(true)
                             })
@@ -2299,12 +2311,25 @@ mod tests {
                         |_, _, _| Ok(()),
                     )
                 },
-            )
-            .unwrap();
-        assert_eq!((writes, captures), (1, 3));
-        assert!(backend.awaiting_first_digit);
-        assert_eq!(backend.phase(), PinPhase::EmptyConfirmation);
-        assert!(backend.last_view.as_ref().unwrap().empty_locked);
+            );
+            assert_eq!(result.is_ok(), end == 0);
+            assert_eq!((writes, captures), (1, [3, 4, 2][end]));
+            assert_eq!(backend.awaiting_first_digit, end == 0);
+            if end == 0 {
+                assert_eq!(backend.phase(), PinPhase::EmptyConfirmation);
+                assert!(backend.last_view.as_ref().unwrap().empty_locked);
+            } else {
+                assert_eq!(backend.phase(), PinPhase::RevealPostcapture);
+                assert_eq!(
+                    backend.capture_step(),
+                    if end == 1 {
+                        PinCaptureStep::RevealSettleLimit
+                    } else {
+                        PinCaptureStep::EmptyAdmission
+                    }
+                );
+            }
+        }
     }
 
     #[test]
