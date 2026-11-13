@@ -254,7 +254,11 @@ fn response_ok(response: HttpResponse) -> Result<Value, AdapterError> {
         return Err(AdapterError);
     }
     let body: Value = serde_json::from_slice(&response.body).map_err(|_| AdapterError)?;
-    if body["value"].get("error").is_some() {
+    if !body
+        .as_object()
+        .is_some_and(|body| body.contains_key("value"))
+        || body["value"].get("error").is_some()
+    {
         return Err(AdapterError);
     }
     Ok(body)
@@ -322,6 +326,34 @@ mod tests {
     use handkite_core::protocol::HardwareId;
     use std::cell::RefCell;
     use std::collections::VecDeque;
+
+    #[test]
+    fn acknowledgments_require_a_wda_value_envelope() {
+        for body in [
+            json!({}),
+            Value::Null,
+            json!([]),
+            json!(true),
+            json!({"value":{"error":"unknown error"}}),
+        ] {
+            assert!(
+                response_ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&body).unwrap()
+                })
+                .is_err()
+            );
+        }
+        for body in [json!({"value":null}), json!({"value":{}})] {
+            assert!(
+                response_ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&body).unwrap()
+                })
+                .is_ok()
+            );
+        }
+    }
 
     struct Step {
         method: &'static str,
@@ -1012,5 +1044,56 @@ mod tests {
                 wda.done();
             }
         }
+    }
+
+    #[tokio::test]
+    async fn malformed_touch_acknowledgments_never_confirm_delivery_or_retry() {
+        for body in [json!({}), Value::Null] {
+            let wda = Script::new(vec![response(
+                "POST",
+                "/session/fixture-session/wda/tap",
+                200,
+                body,
+            )]);
+            let mut wda = wda;
+            wda.1 = Some(json!({"x":250.0,"y":740.0}));
+            assert!(
+                WdaActions::tap_on(&wda, "fixture-session", Point { x: 250.0, y: 740.0 })
+                    .await
+                    .is_err()
+            );
+            wda.done();
+        }
+    }
+
+    #[tokio::test]
+    async fn swipe_preserves_direction_duration_and_sends_one_gesture() {
+        let mut wda = Script::new(vec![response(
+            "POST",
+            "/session/fixture-session/actions",
+            200,
+            json!({"value":null}),
+        )]);
+        wda.1 = Some(touch_action(vec![
+            json!({"type":"pointerMove","duration":0,"x":195.5,"y":700.0}),
+            json!({"type":"pointerDown","button":0}),
+            json!({"type":"pause","duration":50}),
+            json!({"type":"pointerMove","duration":450,"x":195.5,"y":240.0}),
+            json!({"type":"pointerUp","button":0}),
+        ]));
+        let receipt = WdaActions::execute_on(
+            &wda,
+            &Action::Swipe {
+                from: Point { x: 195.5, y: 700.0 },
+                to: Point { x: 195.5, y: 240.0 },
+                duration_ms: 450,
+            },
+            "fixture-session",
+        )
+        .await
+        .unwrap();
+        assert_eq!(receipt.accepted, Some(true));
+        assert_eq!(receipt.action_kind, "swipe");
+        wda.done();
     }
 }
