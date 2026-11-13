@@ -27,6 +27,10 @@ If Xcode reports `errSecInternalComponent` while signing, inspect keychain acces
 
 From a native Terminal in the intended Mac account, run `python3 -B tools/wda/keychain_status.py`. It disables keychain prompts only in that process and reports `locked`, `unlocked`, or `unavailable` without displaying the account or certificate. An `unlocked` result still does not prove that codesign may use a particular private key. A locked result from SSH describes only the SSH security session.
 
+For renewal, reuse the exact retained signer and source route with its independently pinned identity and a fresh output directory. The security session that performs the build must be able to use that exact private key; readiness in another SSH or GUI session does not establish this, and a completed owner wrapper must not be replayed against its existing output.
+
+Rebuilding or re-signing with an existing profile does not extend its validity or the signing certificate's expiry. Extending validity requires a newly issued profile and, when the certificate expires, a newly issued certificate; independently verify the new assets, identity pins, device coverage, entitlements and signed output before a separately guarded installation. This does not authorize Apple account changes or provisioning updates.
+
 After the build, obtain the exact expected runner bundle ID and an independently trusted signing-certificate SHA-1 fingerprint. The verifier requires those pins; it does not infer them from the generated files:
 
 ```sh
