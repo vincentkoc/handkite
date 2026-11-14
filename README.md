@@ -223,8 +223,6 @@ revalidates the held pair. It never changes `releases/current` or starts a
 controller. A failed or uncertain publication leaves its residues untouched;
 there is no retry or cleanup. Output contains only a fixed status, phase, and
 whether a residue candidate exists. See the [publication command contract](RELEASE.md#release-publication-command).
-The CLI and underlying stages passed local fixtures only; no signed release
-has been published on the personal Mac.
 
 ## Device agreement diagnostic
 
@@ -273,13 +271,39 @@ capability remains observation only.
 
 The host can explicitly add `--capabilities navigation` or `--capabilities observation,navigation`. Navigation permits only `handkite_acquire_control`, `handkite_release_control`, `handkite_home`, and `handkite_launch_clock`. Home and Clock require an unsigned integer `expected_revision` and reject every other argument. Clock always means `com.apple.mobiletimer`. Navigation alone does not grant either observation tool. There are no lock, unlock, or PIN tools.
 
-The separate `observation,navigation,interaction` profile adds `handkite_tap`, `handkite_swipe`, `handkite_text`, and `handkite_launch_app`. It is opt-in at host startup and does not change the existing profiles. Every action requires a current unsigned observation revision and explicit control. Points must be finite coordinates from 0 through 10,000; swipes last 1 through 5,000 ms. Text is limited to 4,096 UTF-8 bytes and excludes control characters. App identifiers are bounded ASCII bundle identifiers. Arguments reject unknown or duplicate fields, including nested point fields. Each call dispatches once, with unknown delivery reported without replay. These tools can perform real purchases or send messages; grant this profile only to a trusted personal agent with approval bound to the concrete action. The included OpenClaw recipe remains disabled and observation-only.
+The separate `observation,navigation,interaction` profile adds `handkite_tap`,
+`handkite_swipe`, `handkite_text`, `handkite_launch_app`, `handkite_double_tap`,
+`handkite_long_press`, `handkite_key`, and `handkite_click_button`. It is opt-in
+at host startup and does not change the existing profiles. Every action requires
+a current unsigned observation revision and explicit control. Points must be
+finite coordinates from 0 through 10,000; swipes and long presses last 1 through
+5,000 ms. Text is limited to 4,096 UTF-8 bytes and excludes control characters.
+App identifiers are bounded ASCII bundle identifiers. Arguments reject unknown
+or duplicate fields, including nested target fields. Each call dispatches once,
+with unknown delivery reported without replay. These tools can perform real
+purchases or send messages; grant this profile only to a trusted personal agent
+with approval bound to the concrete action. The included OpenClaw recipe remains
+disabled and observation-only.
+
+`handkite_click_button` takes an observed `target` with exact `label`, `x`, `y`,
+`width` and `height`. It resolves one visible, enabled, session-bound Button,
+verifies its attributes, and clicks that identity once. It can address an overlay
+button whose coordinates overlap an underlying row; ambiguous ordinary taps
+remain refused. Missing, duplicated or changed targets do not fall back to a tap.
+
+`handkite_key` accepts `backspace`, `enter`, `tab` or `escape`. By default it
+requires the exact observed image. Optional `selection: "current"` explicitly
+uses iOS's current editing selection, with an eligible field and keyboard,
+unchanged tree/state, native unlock and the original deadline. It tolerates
+cursor-only screenshot drift but does not prove or preserve a previously
+observed selection range. Enter can submit a form; Backspace can delete its
+current selection. Arrow keys and modifier shortcuts are unsupported.
 
 Tap and swipe coordinates are WDA viewport coordinates in logical points,
 passed unchanged, including fractional values. They are not screenshot pixels.
 Handkite supplies no screenshot-to-action transform or inferred scale/rotation.
 
-An app launch from Home tolerates changes in screenshot or tree bytes only when a fresh private Home check proves native unlock before and after capture, WDA reports unlocked, and device state matches the requested observation. Revision, identity, lease, and send deadlines still apply. Other actions retain exact view matching except for the owned-button tap admission below. `StaleRevision` means the requested revision is no longer current; `ViewChanged` means the fresh screen context failed the action check. Both reject input before transport.
+An app launch from Home tolerates changes in screenshot or tree bytes only when a fresh private Home check proves native unlock before and after capture, WDA reports unlocked, and device state matches the requested observation. Revision, identity, lease, and send deadlines still apply. The explicit owned-runner admissions documented here and in [release inputs](RELEASE.md) preserve their narrower checks; other actions require an exact view match. `StaleRevision` means the requested revision is no longer current; `ViewChanged` means the fresh screen context failed the action check. Both reject input before transport.
 
 A `ViewChanged` refusal includes `structuredContent.changed` with boolean `state`, `accessibility_tree`, and `screenshot` fields. These identify the changed components without returning their contents. They do not authorize a retry or relax the comparison. Invalid diagnostic replies retain the unknown-delivery result.
 
