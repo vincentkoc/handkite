@@ -191,13 +191,14 @@ mod tests {
 
     #[test]
     fn outline_keeps_identity_states_bounds_and_exact_values() {
-        let xml = r#"<AppiumAUT><XCUIElementTypeApplication name="Settings" x="0" y="0" width="393" height="852"><XCUIElementTypeOther><XCUIElementTypeButton name="Close" label="Close" enabled="true" visible="true" selected="false" x="338" y="489" width="38" height="38"/><XCUIElementTypeTextField value="  Café &amp; 🦊  " placeholderValue="" focused="false"/></XCUIElementTypeOther></XCUIElementTypeApplication></AppiumAUT>"#;
+        let xml = r#"<AppiumAUT><XCUIElementTypeApplication name="Settings" processId="0042" x="0" y="0" width="393" height="852"><XCUIElementTypeOther><XCUIElementTypeButton name="Close" label="Close" enabled="true" visible="true" selected="false" x="338" y="489" width="38" height="38"/><XCUIElementTypeTextField value="  Café &amp; 🦊  " placeholderValue="" focused="false"/></XCUIElementTypeOther></XCUIElementTypeApplication></AppiumAUT>"#;
         let outline = project(xml).unwrap();
         assert!(
             outline
                 .text
                 .contains("Application rect=[\"0\",\"0\",\"393\",\"852\"] name=\"Settings\"")
         );
+        assert!(outline.text.contains("processId=\"0042\""));
         assert!(outline.text.contains("Button name=label=\"Close\" rect=[\"338\",\"489\",\"38\",\"38\"] enabled=\"true\" selected=\"false\" visible=\"true\""));
         assert!(
             outline

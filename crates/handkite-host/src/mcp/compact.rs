@@ -25,6 +25,7 @@ const ATTRIBUTES: &[&str] = &[
     "height",
     "bundleId",
     "pid",
+    "processId",
     "placeholderValue",
     "nativeFrame",
     "nativeAccessibilityElement",
@@ -364,6 +365,15 @@ mod tests {
         let xml = "<?xml version='1.0'?>\n<AppiumAUT>\n <XCUIElementTypeApplication type = 'XCUIElementTypeApplication' name='Café &amp; 🦊'><XCUIElementTypeButton label = \"A &quot;✓&quot;\" value='&#x3b1;' enabled='true' selected='false' x='01.0' y='-2' width='30' height='40'/> α &lt; β &#33;\n<XCUIElementTypeOther type='XCUIElementTypeOth&#101;r'></XCUIElementTypeOther> </XCUIElementTypeApplication>\n</AppiumAUT> ";
         let expected = "<?xml version='1.0'?>\n<AppiumAUT>\n <Application type = 'Application' name='Café &amp; 🦊'><Button label = \"A &quot;✓&quot;\" value='&#x3b1;' enabled='true' selected='false' x='01.0' y='-2' width='30' height='40'/> α &lt; β &#33;\n<Other type='Other'></Other> </Application>\n</AppiumAUT> ";
         assert_eq!(project(xml).unwrap(), expected);
+    }
+
+    #[test]
+    fn application_process_id_is_preserved() {
+        let xml = "<?xml version='1.0'?><AppiumAUT><XCUIElementTypeApplication type='XCUIElementTypeApplication' processId='0042'/></AppiumAUT>";
+        assert_eq!(
+            project(xml).unwrap(),
+            "<?xml version='1.0'?><AppiumAUT><Application type='Application' processId='0042'/></AppiumAUT>"
+        );
     }
 
     #[test]
