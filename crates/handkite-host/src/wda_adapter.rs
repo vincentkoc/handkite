@@ -3,8 +3,12 @@ use crate::usb::PinnedUsb;
 use crate::wda_action::{WdaActions, WdaRequest};
 use crate::wda_http::HttpResponse;
 use crate::wda_runner::{OwnedWdaRunner, RunnerError, RunnerLiveness};
-use crate::wda_session::{SessionClose, close_owned_session, create_owned_session};
+use crate::wda_session::{
+    SessionClose, close_owned_session, create_owned_session, restore_owned_idle_settings,
+    start_owned_idle_settings,
+};
 use crate::wda_settings::validate_session;
+use crate::wda_settings::{IdleSettingsLease, Restoration};
 use crate::wda_transport::UsbWda;
 use base64::Engine;
 use handkite_core::controller::{ActionAdmission, AdapterError, DeviceAdapter, RawObservation};
@@ -50,6 +54,7 @@ pub struct WdaAdapter {
     actions: WdaActions,
     owned_runner: Option<OwnedWdaRunner>,
     owned_session: Option<String>,
+    owned_idle: Option<IdleSettingsLease>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -58,6 +63,8 @@ pub enum OwnedStartupError {
     RuntimeUnavailable,
     Runner(RunnerError),
     SessionUnavailable,
+    IdleSettingsUnavailable,
+    IdleRestorationUnproven,
 }
 
 impl OwnedStartupError {
@@ -88,6 +95,8 @@ impl OwnedStartupError {
                 RunnerError::NativeProcess(step) => step.as_str(),
             },
             Self::SessionUnavailable => "session_unavailable",
+            Self::IdleSettingsUnavailable => "session_idle_settings_unavailable",
+            Self::IdleRestorationUnproven => "session_idle_restoration_unproven",
         }
     }
 }
@@ -110,6 +119,7 @@ impl WdaAdapter {
             actions: WdaActions::default(),
             owned_runner: None,
             owned_session: None,
+            owned_idle: None,
         })
     }
 
@@ -159,6 +169,7 @@ impl WdaAdapter {
             actions: WdaActions::default(),
             owned_runner: Some(runner),
             owned_session: None,
+            owned_idle: None,
         };
         let liveness = adapter
             .owned_runner
@@ -185,6 +196,28 @@ impl WdaAdapter {
             .map_err(|_| OwnedStartupError::SessionUnavailable)?;
         if should_stop() || liveness.is_finished() {
             return Err(OwnedStartupError::SessionUnavailable);
+        }
+        let settings_wda = UsbWda::new(adapter.usb.clone()).with_write_admission(Some(
+            adapter
+                .owned_runner
+                .as_ref()
+                .expect("owned runner")
+                .write_admission()
+                .ok_or(OwnedStartupError::IdleSettingsUnavailable)?,
+        ));
+        adapter.owned_idle = Some(
+            adapter
+                .runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(start_owned_idle_settings(&settings_wda, &session))
+                .map_err(|(_, restoration)| match restoration {
+                    Restoration::Unproven(_) => OwnedStartupError::IdleRestorationUnproven,
+                    _ => OwnedStartupError::IdleSettingsUnavailable,
+                })?,
+        );
+        if should_stop() || liveness.is_finished() {
+            return Err(OwnedStartupError::ShutdownRequested);
         }
         Ok(adapter)
     }
@@ -779,14 +812,30 @@ impl Drop for WdaAdapter {
     fn drop(&mut self) {
         let runtime = self.runtime.take().expect("adapter runtime");
         if let Some(runner) = self.owned_runner.take() {
+            let wda = runner.write_admission().map(|admission| {
+                UsbWda::new(self.usb.clone()).with_write_admission(Some(admission))
+            });
+            if let Some(lease) = self.owned_idle.take() {
+                let restored = match wda.as_ref() {
+                    Some(wda) if !runner.is_finished() => {
+                        runtime.block_on(restore_owned_idle_settings(wda, lease))
+                            == Restoration::Verified
+                    }
+                    _ => false,
+                };
+                if !restored {
+                    eprintln!("handkite: owned idle settings restoration unproven");
+                }
+            }
             if let Some(session) = self.owned_session.take() {
-                if runner.is_finished() {
-                    eprintln!("handkite: owned runner exited before session close");
-                } else if runtime.block_on(close_owned_session(
-                    &UsbWda::new(self.usb.clone()),
-                    &session,
-                )) != SessionClose::Acknowledged
-                {
+                let closed = match wda.as_ref() {
+                    Some(wda) if !runner.is_finished() => {
+                        runtime.block_on(close_owned_session(wda, &session))
+                            == SessionClose::Acknowledged
+                    }
+                    _ => false,
+                };
+                if !closed {
                     eprintln!("handkite: owned session close unproven");
                 }
             }

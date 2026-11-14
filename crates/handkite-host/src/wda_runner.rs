@@ -236,6 +236,12 @@ impl OwnedWdaRunner {
         RunnerLiveness(self.task.as_ref().expect("owned task").abort_handle())
     }
 
+    pub(crate) fn write_admission(&self) -> Option<Arc<dyn Fn() -> bool + Send + Sync>> {
+        let owns = self.ownership.clone()?;
+        let live = RunnerLiveness(self.task.as_ref()?.abort_handle());
+        Some(Arc::new(move || owns() && !live.is_finished()))
+    }
+
     /// Join the cancelled host task and observe pinned endpoint refusal within
     /// one deadline. Cancellation keeps the abort guard; it never proves cleanup.
     pub async fn abort_and_join(mut self) -> Result<(), RunnerError> {

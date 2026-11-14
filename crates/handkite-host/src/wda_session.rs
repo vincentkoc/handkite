@@ -107,6 +107,32 @@ pub async fn create_owned_session(
     create_session(wda, admit).await
 }
 
+pub(crate) async fn start_owned_idle_settings(
+    wda: &impl WdaRequest,
+    session: &str,
+) -> Result<wda_settings::IdleSettingsLease, (wda_settings::SettingsError, wda_settings::Restoration)>
+{
+    let guarded = OwnedRequests {
+        wda,
+        session,
+        stopped: Cell::new(false),
+    };
+    wda_settings::IdleSettingsLease::start(&guarded, session).await
+}
+
+pub(crate) async fn restore_owned_idle_settings(
+    wda: &impl WdaRequest,
+    lease: wda_settings::IdleSettingsLease,
+) -> wda_settings::Restoration {
+    let session = lease.session().to_owned();
+    let guarded = OwnedRequests {
+        wda,
+        session: &session,
+        stopped: Cell::new(false),
+    };
+    lease.restore(&guarded).await
+}
+
 /// Requires a reviewed handoff from every other WDA owner for the whole call.
 /// `admit` must check the PIN stop gate for unlock; it runs again immediately
 /// before the sole creation POST. Clock qualification needs no PIN or stop gate.
@@ -537,6 +563,51 @@ mod tests {
             assert_eq!(fake.requests.borrow().len(), 3);
             assert_eq!(fake.requests.borrow()[2].0, "DELETE");
         }
+    }
+
+    #[tokio::test]
+    async fn owned_idle_lease_restores_before_session_close() {
+        let fake = Fake::ready();
+        fake.current.set("owned-session");
+        let lease = start_owned_idle_settings(&fake, "owned-session")
+            .await
+            .unwrap_or_else(|_| panic!("idle setup failed"));
+        assert_eq!(fake.settings.borrow()["waitForIdleTimeout"], 1.0);
+        assert_eq!(fake.settings.borrow()["animationCoolOffTimeout"], 0.2);
+        assert_eq!(fake.posts(), vec!["/session/owned-session/appium/settings"]);
+        assert_eq!(
+            restore_owned_idle_settings(&fake, lease).await,
+            Restoration::Verified
+        );
+        assert_eq!(fake.settings.borrow()["waitForIdleTimeout"], 10);
+        assert_eq!(
+            close_session(&fake, "owned-session").await,
+            SessionClose::Acknowledged
+        );
+        let requests = fake.requests.borrow();
+        let writes: Vec<_> = requests
+            .iter()
+            .filter(|(method, _)| method != "GET")
+            .collect();
+        assert_eq!(writes.len(), 3);
+        assert_eq!(writes[0].0, "POST");
+        assert_eq!(writes[1].0, "POST");
+        assert_eq!(writes[2].0, "DELETE");
+    }
+
+    #[tokio::test]
+    async fn owned_idle_lease_refuses_foreign_session_without_restoration_write() {
+        let fake = Fake::ready();
+        fake.current.set("owned-session");
+        let lease = start_owned_idle_settings(&fake, "owned-session")
+            .await
+            .unwrap_or_else(|_| panic!("idle setup failed"));
+        fake.current.set("replacement");
+        assert!(matches!(
+            restore_owned_idle_settings(&fake, lease).await,
+            Restoration::Unproven(_)
+        ));
+        assert_eq!(fake.posts().len(), 1);
     }
 
     #[tokio::test]

@@ -106,6 +106,34 @@ async fn read_only_liveness_survives_handoff_to_blocking_worker() {
     assert!(liveness.is_finished());
 }
 
+#[tokio::test]
+async fn settings_write_admission_tracks_ownership_and_runner_liveness() {
+    use std::sync::atomic::AtomicBool;
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let mut runner = OwnedWdaRunner::start_task(
+        |listener| live(listener, dropped.clone()),
+        || async { ready() },
+        deadline(),
+    )
+    .await
+    .unwrap();
+    assert!(runner.write_admission().is_none());
+    let owned = Arc::new(AtomicBool::new(true));
+    let guard_owned = Arc::clone(&owned);
+    runner.ownership = Some(Arc::new(move || guard_owned.load(Ordering::SeqCst)));
+    let admission = runner.write_admission().unwrap();
+    assert!(admission());
+    owned.store(false, Ordering::SeqCst);
+    assert!(!admission());
+    owned.store(true, Ordering::SeqCst);
+    assert!(admission());
+    runner
+        .abort_and_join_with(|| async { Ok(()) })
+        .await
+        .unwrap();
+    assert!(!admission());
+}
+
 #[tokio::test(start_paused = true)]
 async fn public_start_rejects_invalid_inputs_before_device_lookup() {
     let usb = PinnedUsb::new(HardwareId::new("test-device").unwrap());

@@ -351,6 +351,30 @@ mod tests {
         assert!(sent.is_empty());
     }
 
+    #[tokio::test]
+    async fn lost_write_admission_during_connect_sends_no_bytes() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let owned = AtomicBool::new(true);
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let admit = || owned.load(Ordering::SeqCst);
+        let result = exchange(
+            async {
+                owned.store(false, Ordering::SeqCst);
+                Ok(socket)
+            },
+            b"request",
+            Duration::from_secs(1),
+            None,
+            Some(&admit),
+            Instant::now,
+        )
+        .await;
+        assert!(matches!(result, Err(WdaError::NotConnected)));
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
+    }
+
     #[tokio::test(start_paused = true)]
     async fn admission_time_cannot_extend_input_deadline() {
         let started = Instant::now();

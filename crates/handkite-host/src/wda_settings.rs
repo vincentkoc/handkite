@@ -108,6 +108,45 @@ pub struct IdleSettingsOutcome<T, E> {
     pub restoration: Restoration,
 }
 
+/// The caller must await restoration before closing the bound session.
+#[must_use]
+pub(crate) struct IdleSettingsLease {
+    session: String,
+    original: Settings,
+}
+
+impl IdleSettingsLease {
+    pub(crate) fn session(&self) -> &str {
+        &self.session
+    }
+
+    pub(crate) async fn start(
+        wda: &impl WdaRequest,
+        session: &str,
+    ) -> Result<Self, (SettingsError, Restoration)> {
+        let original = preimage(wda, session)
+            .await
+            .map_err(|reason| (reason, Restoration::NotNeeded))?;
+        let lease = Self {
+            session: session.to_owned(),
+            original,
+        };
+        let receipt = write(wda, session, TEMPORARY).await;
+        let verified = verify_temporary(wda, session).await;
+        match receipt.and(verified) {
+            Ok(()) => Ok(lease),
+            Err(reason) => Err((reason, lease.restore(wda).await)),
+        }
+    }
+
+    pub(crate) async fn restore(self, wda: &impl WdaRequest) -> Restoration {
+        match restore(wda, &self.session, &self.original).await {
+            Ok(()) => Restoration::Verified,
+            Err(reason) => Restoration::Unproven(reason),
+        }
+    }
+}
+
 /// Only the two validated numeric settings; no session or other response data.
 pub struct IdleTimeouts(Settings);
 
@@ -185,25 +224,17 @@ where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Result<T, E>>,
 {
-    let original = match preimage(wda, session).await {
-        Ok(original) => original,
-        Err(reason) => {
+    let lease = match IdleSettingsLease::start(wda, session).await {
+        Ok(lease) => lease,
+        Err((reason, restoration)) => {
             return IdleSettingsOutcome {
                 action: IdleAction::NotRun(reason),
-                restoration: Restoration::NotNeeded,
+                restoration,
             };
         }
     };
-    let receipt = write(wda, session, TEMPORARY).await;
-    let verified = verify_temporary(wda, session).await;
-    let action = match receipt.and(verified) {
-        Ok(()) => IdleAction::Completed(action().await),
-        Err(reason) => IdleAction::NotRun(reason),
-    };
-    let restoration = match restore(wda, session, &original).await {
-        Ok(()) => Restoration::Verified,
-        Err(reason) => Restoration::Unproven(reason),
-    };
+    let action = IdleAction::Completed(action().await);
+    let restoration = lease.restore(wda).await;
     IdleSettingsOutcome {
         action,
         restoration,
@@ -603,6 +634,21 @@ mod tests {
 
     const ROUNDTRIP: &str =
         r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":0.20000000000000001}"#;
+
+    #[tokio::test]
+    async fn idle_lease_keeps_settings_until_explicit_restoration() {
+        let mut steps = configured(ORIGINAL);
+        steps.push(settings(TARGET));
+        steps.extend(restoration(ORIGINAL, TARGET));
+        let fake = Fake::new(steps);
+        let lease = IdleSettingsLease::start(&fake, SESSION)
+            .await
+            .unwrap_or_else(|_| panic!("setup failed"));
+        assert!(read(&fake, SESSION).await.unwrap().is_temporary());
+        assert_eq!(fake.posts.get(), 1);
+        assert_eq!(lease.restore(&fake).await, Restoration::Verified);
+        fake.done(2);
+    }
 
     #[tokio::test]
     async fn temporary_roundtrip_verifies_and_restores_without_relaxing_originals() {
