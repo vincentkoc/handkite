@@ -505,9 +505,9 @@ Preparation failures retain their case, step, request identity, fixed change
 flags and failing predicate names, without predicate values. An unmeasured
 setup failure cannot disappear from the report.
 
-Swipe cleanup now uses `settle: 3` observations before and after its inverse
+Swipe cleanup now uses `settle: 5` observations before and after its inverse
 gesture. This accepts two consecutive matching device, state, full-tree and
-image frames within three reads, then uses the newest revision. It sends no
+image frames within five reads, then uses the newest revision. It sends no
 input when the view remains unsettled. These reads count toward cleanup time,
 not the measured forward gesture. The plan hash changes with this fixture
 correction; retain earlier reports and identify it when comparing their

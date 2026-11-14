@@ -126,7 +126,7 @@ class BenchmarkTests(unittest.TestCase):
                     for key in ("device", "state", "tree", "image")})
 
     def test_settle_cannot_hide_input_or_expand_a_measured_request(self):
-        for tool, count in (("handkite_swipe", 3), ("handkite_observe", 4), ("handkite_observe", True)):
+        for tool, count in (("handkite_swipe", 3), ("handkite_observe", 6), ("handkite_observe", True)):
             fixture = plan()
             fixture["cases"][0]["cleanup"] = [{"tool":tool, "settle":count}]
             with self.assertRaisesRegex(BenchError, "invalid_settle"):

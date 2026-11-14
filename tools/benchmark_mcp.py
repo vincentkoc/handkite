@@ -485,7 +485,7 @@ def validate_plan(plan):
                     "invalid_step")
             require(isinstance(step.get("arguments", {}), dict), "invalid_arguments")
             if "settle" in step:
-                require(type(step["settle"]) is int and step["settle"] == 3
+                require(type(step["settle"]) is int and 3 <= step["settle"] <= 5
                         and step["tool"] == "handkite_observe" and not step.get("arguments")
                         and "selector" not in step and step is not case["measure"], "invalid_settle")
             for key in ("expect", "when"):

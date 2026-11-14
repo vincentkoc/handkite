@@ -400,7 +400,7 @@
       "cleanup": [
         {
           "tool": "handkite_observe",
-          "settle": 3,
+          "settle": 5,
           "expect": {
             "app": "com.apple.Preferences",
             "lock": "unlocked"
@@ -423,7 +423,7 @@
         {
           "tool": "handkite_observe",
           "arguments": {},
-          "settle": 3,
+          "settle": 5,
           "expect": {
             "text": {
               "type": "StaticText",
