@@ -647,11 +647,24 @@ impl NativePasscodeBackend {
                 self.capture_step = PinCaptureStep::Freshness;
                 return Err(BackendError::Unavailable);
             }
-            if prepared.captured_at <= reveal.captured_at
-                || prepared.view.screen_size != Some(reveal.normal.size)
-                || !(prepared.empty_locked
-                    || prepared.normal_locked && prepared.view.normal_lock == Some(reveal.normal))
+            // Waking may change lock-icon visibility; dimensions must still match.
+            let refusal = if prepared.captured_at <= reveal.captured_at {
+                "capture_not_newer"
+            } else if prepared.view.screen_size != Some(reveal.normal.size)
+                || prepared.normal_locked
+                    && prepared
+                        .view
+                        .normal_lock
+                        .is_none_or(|normal| normal.size != reveal.normal.size)
             {
+                "normal_dimensions_changed"
+            } else if !(prepared.empty_locked || prepared.normal_locked) {
+                "normal_unproven"
+            } else {
+                "none"
+            };
+            if refusal != "none" {
+                self.preparation_refusal = refusal;
                 self.capture_step = PinCaptureStep::EmptyAdmission;
                 return Err(BackendError::Unavailable);
             }
@@ -2050,7 +2063,11 @@ mod tests {
                         at,
                         |_, _| {
                             Ok(if captures <= 2 {
-                                normal_capture()
+                                let (screen, mut view) = normal_capture();
+                                if captures == 2 {
+                                    view.normal_lock.as_mut().unwrap().proud_visible = false;
+                                }
+                                (screen, view)
                             } else {
                                 keypad_capture(true)
                             })
@@ -2245,7 +2262,7 @@ mod tests {
                     let (mut screen, mut view) = normal_capture();
                     if captures == 2 {
                         match case {
-                            0 => view.normal_lock.as_mut().unwrap().proud_visible = false,
+                            0 => view.normal_lock.as_mut().unwrap().size.0 += 1.0,
                             1 => view.screen_size = Some((401.0, 800.0)),
                             2 => screen.wda_lock = LockState::Uncertain,
                             3 => screen.native_lock = LockState::Unlocked,
@@ -2277,6 +2294,15 @@ mod tests {
             );
             assert!(result.is_err(), "case {case}");
             assert_eq!((captures, inputs), (2, 1));
+            assert_eq!(
+                backend.preparation_refusal,
+                match case {
+                    0 | 1 => "normal_dimensions_changed",
+                    5 => "capture_not_newer",
+                    6 | 7 => "none",
+                    _ => "normal_unproven",
+                }
+            );
             assert!(!backend.reveal_attempted);
             assert!(!backend.awaiting_first_digit);
             assert!(backend.last_view.is_none());
