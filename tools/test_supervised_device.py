@@ -667,6 +667,8 @@ class PureTests(unittest.TestCase):
 
     def test_runner_startup_reasons_are_safe_known_zero_results(self):
         prefix = b"handkite-unlock-once: unlock_idle=refused reason=runner_unavailable runner="
+        self.assertTrue({"AutomationAuthorizationRequired", "AutomationInitializationFailed",
+                         "AutomationWaitTimedOut"}.issubset(broker.RUNNER_REASONS))
         for reason in broker.RUNNER_REASONS:
             result = (1, b"", prefix + reason.encode() + b"\n", False)
             self.assertEqual(broker.pin_result(result), (False, True))

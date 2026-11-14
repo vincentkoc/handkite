@@ -88,7 +88,10 @@ pub enum RunnerError {
     EndpointCleanupUnproven,
     StartupTimedOut,
     PlanStartUnproven,
-    AutomationAuthorizationRequired,
+    /// Initialization failed during or mentioning automation setup; no setting is inferred.
+    AutomationInitializationFailed,
+    /// The plan stayed in the observed automation wait until the startup deadline.
+    AutomationWaitTimedOut,
     InitializationFailed,
     BootstrapFailed,
     RunnerExited,
@@ -531,8 +534,6 @@ fn startup_exit_with_state(
 ) -> RunnerError {
     if let Some(error) = state.failure {
         error
-    } else if state.phase == PlanPhase::Starting && state.automation_waiting {
-        RunnerError::AutomationAuthorizationRequired
     } else {
         startup_exit(result)
     }
@@ -567,7 +568,7 @@ fn startup_timeout_error(state: PlanState) -> RunnerError {
         error
     } else if state.phase == PlanPhase::Starting {
         if state.automation_waiting {
-            RunnerError::AutomationAuthorizationRequired
+            RunnerError::AutomationWaitTimedOut
         } else {
             RunnerError::PlanStartUnproven
         }
@@ -581,7 +582,7 @@ fn initialization_failure(message: &str, automation_waiting: bool) -> RunnerErro
         || message.contains("enabling automation mode")
         || message.contains("com.apple.LocalAuthentication")
     {
-        RunnerError::AutomationAuthorizationRequired
+        RunnerError::AutomationInitializationFailed
     } else {
         RunnerError::InitializationFailed
     }

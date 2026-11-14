@@ -57,7 +57,8 @@ impl OwnedStartupError {
                 RunnerError::EndpointCleanupUnproven => "runner_endpoint_cleanup_unproven",
                 RunnerError::StartupTimedOut => "runner_startup_timed_out",
                 RunnerError::PlanStartUnproven => "runner_plan_start_unproven",
-                RunnerError::AutomationAuthorizationRequired => "automation_authorization_required",
+                RunnerError::AutomationWaitTimedOut => "automation_wait_timed_out",
+                RunnerError::AutomationInitializationFailed => "automation_initialization_failed",
                 RunnerError::InitializationFailed => "runner_initialization_failed",
                 RunnerError::BootstrapFailed => "runner_bootstrap_failed",
                 RunnerError::RunnerExited => "runner_exited",
@@ -1100,8 +1101,12 @@ mod tests {
     #[test]
     fn owned_startup_preserves_actionable_fixed_categories() {
         assert_eq!(
-            OwnedStartupError::Runner(RunnerError::AutomationAuthorizationRequired).category(),
-            "automation_authorization_required"
+            OwnedStartupError::Runner(RunnerError::AutomationWaitTimedOut).category(),
+            "automation_wait_timed_out"
+        );
+        assert_eq!(
+            OwnedStartupError::Runner(RunnerError::AutomationInitializationFailed).category(),
+            "automation_initialization_failed"
         );
         assert_eq!(
             OwnedStartupError::Runner(RunnerError::InitializationFailed).category(),

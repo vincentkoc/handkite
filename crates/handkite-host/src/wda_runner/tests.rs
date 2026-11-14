@@ -225,7 +225,7 @@ async fn automation_wait_is_bounded_and_done_does_not_establish_plan() {
             Some(if done {
                 RunnerError::PlanStartUnproven
             } else {
-                RunnerError::AutomationAuthorizationRequired
+                RunnerError::AutomationWaitTimedOut
             })
         );
         assert_eq!(Instant::now(), expires);
@@ -288,32 +288,38 @@ async fn explicit_startup_failures_are_terminal_and_hide_raw_messages() {
 }
 
 #[tokio::test]
-async fn task_exit_preserves_pending_automation_diagnosis() {
-    let probes = AtomicUsize::new(0);
-    let result = OwnedWdaRunner::start_task(
-        |mut listener| async move {
-            listener
-                .log_debug_message("entering wait loop for enabling automation mode")
-                .await
-                .unwrap();
-            Err(RunnerError::RunnerFailed)
-        },
-        || {
-            probes.fetch_add(1, Ordering::SeqCst);
-            async { ready() }
-        },
-        deadline(),
-    )
-    .await;
-    assert_eq!(
-        result.err(),
-        Some(RunnerError::AutomationAuthorizationRequired)
-    );
-    assert_eq!(probes.load(Ordering::SeqCst), 0);
+async fn task_exit_preserves_failure_after_automation_wait() {
+    for failure in [
+        None,
+        Some(RunnerError::RunnerFailed),
+        Some(RunnerError::LookupTimedOut),
+    ] {
+        let probes = AtomicUsize::new(0);
+        let result = OwnedWdaRunner::start_task(
+            |mut listener| async move {
+                listener
+                    .log_debug_message("entering wait loop for enabling automation mode")
+                    .await
+                    .unwrap();
+                failure.map_or(Ok(()), Err)
+            },
+            || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                async { ready() }
+            },
+            deadline(),
+        )
+        .await;
+        assert_eq!(
+            result.err(),
+            Some(failure.unwrap_or(RunnerError::RunnerExited))
+        );
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+    }
 }
 
 #[tokio::test]
-async fn automation_initialization_failures_keep_the_permission_category() {
+async fn automation_initialization_failures_are_distinct_from_wait_timeouts() {
     for mode in 0..3 {
         let probes = AtomicUsize::new(0);
         let result = OwnedWdaRunner::start_task(
@@ -353,7 +359,7 @@ async fn automation_initialization_failures_keep_the_permission_category() {
         .await;
         assert_eq!(
             result.err(),
-            Some(RunnerError::AutomationAuthorizationRequired)
+            Some(RunnerError::AutomationInitializationFailed)
         );
         assert_eq!(probes.load(Ordering::SeqCst), 0);
     }

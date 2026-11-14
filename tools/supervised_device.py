@@ -24,7 +24,8 @@ from _supervised_files import (HeldFile, PathAnchor, Refused, StopSet, digest,
 MODES = ("pin-once", "clock-once", "lock-once")
 RUNNER_REASONS = frozenset("""InvalidBundleId InvalidTimeout LookupFailed LookupTimedOut
     EndpointBusy EndpointUnproven EndpointCleanupUnproven StartupTimedOut
-    PlanStartUnproven AutomationAuthorizationRequired InitializationFailed BootstrapFailed
+    PlanStartUnproven AutomationAuthorizationRequired AutomationInitializationFailed
+    AutomationWaitTimedOut InitializationFailed BootstrapFailed
     RunnerExited RunnerFailed TaskFailed OwnershipLost ProcessIdentityUnproven RunnerStopUnproven
     process_target_path process_usb_discovery process_usb_deadline process_output_create
     process_command_spawn process_command_deadline process_command_exit process_metadata_read

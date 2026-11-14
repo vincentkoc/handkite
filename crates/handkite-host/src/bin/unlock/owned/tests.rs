@@ -11,8 +11,8 @@ fn runner_failure_keeps_a_fixed_startup_reason() {
     use handkite_host::wda_runner::NativeProcessStep;
     for (error, reason) in [
         (
-            RunnerError::AutomationAuthorizationRequired,
-            "AutomationAuthorizationRequired",
+            RunnerError::AutomationInitializationFailed,
+            "AutomationInitializationFailed",
         ),
         (RunnerError::LookupTimedOut, "LookupTimedOut"),
         (
