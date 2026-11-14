@@ -483,8 +483,12 @@ python3 tools/benchmark_mcp.py run \
 python3 tools/benchmark_mcp.py compare /private/path/before.json /private/path/after.json
 ```
 
-Each case runs one warmup and at least twenty measured trials. Preparation and
-cleanup are timed separately. The report includes nearest-rank p50/p95,
+Each case runs one warmup and at least twenty measured trials. Select remaining
+cases with
+`--cases launch observe_image observe_tree` before `-- COMMAND`. This preserves
+the canonical plan and each case's preparation and cleanup; a partial report
+cannot pass the full regression gate. Preparation and cleanup are timed
+separately. The report includes nearest-rank p50/p95,
 response sizes, build identities and per-stage timings, without screenshots,
 trees, typed text or device identifiers. Failed actions stop the campaign;
 input is never retried. One read-only observation can diagnose uncertain input.

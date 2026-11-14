@@ -480,7 +480,7 @@ def matches(screen, expected, previous=None):
 
 
 class Campaign:
-    def __init__(self, peer, plan, count, warmups, preflight=None):
+    def __init__(self, peer, plan, count, warmups, preflight=None, selected_cases=None):
         self.peer, self.plan, self.count, self.warmups = peer, plan, count, warmups
         self.screen = None
         self.device = None
@@ -490,6 +490,9 @@ class Campaign:
         self.failure_context = None
         self.phase, self.case, self.step_index = "initialize", None, None
         self.preflight = preflight
+        self.selected_cases = list(CASES) if selected_cases is None else selected_cases
+        require(bool(self.selected_cases) and len(set(self.selected_cases)) == len(self.selected_cases)
+                and set(self.selected_cases) <= set(CASES), "invalid_selected_cases")
 
     def renew(self):
         if self.lease_started is not None:
@@ -563,6 +566,8 @@ class Campaign:
                 self.preflight()
             # Keep scenario ordering fixed across baseline and candidate runs.
             for case in self.plan["cases"]:
+                if case["name"] not in self.selected_cases:
+                    continue
                 self.case = case["name"]
                 for ordinal in range(self.warmups + self.count):
                     sample = {"case": case["name"], "ordinal": ordinal - self.warmups + 1,
@@ -674,6 +679,8 @@ def main():
     run.add_argument("--count", type=int, default=20)
     run.add_argument("--warmups", type=int, default=1)
     run.add_argument("--calibrate", action="store_true", help="one trial per case; cannot qualify the gate")
+    run.add_argument("--cases", nargs="+", choices=CASES,
+                     help="run selected cohorts only; a partial report cannot pass the full gate")
     run.add_argument("command", nargs=argparse.REMAINDER)
     diff = commands.add_parser("compare")
     diff.add_argument("before", type=Path)
@@ -714,7 +721,7 @@ def main():
                     return
                 time.sleep(.025)
             raise BenchError("timing_not_enabled")
-        campaign = Campaign(peer, plan, args.count, args.warmups, preflight)
+        campaign = Campaign(peer, plan, args.count, args.warmups, preflight, args.cases)
         try:
             campaign.run()
         finally:
@@ -741,6 +748,7 @@ def main():
             campaign.failure = campaign.failure or str(error)
         report = {"version": 1, "plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
                   "calibration": args.calibrate,
+                  "selected_cases": campaign.selected_cases,
                   "service_build": args.service_build, "client_build": args.client_build,
                   "service_pid": args.service_pid, "trace_valid": trace_valid,
                   "trace_error": trace_error,

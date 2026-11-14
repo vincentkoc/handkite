@@ -1,4 +1,6 @@
 import copy
+import contextlib
+import io
 import json
 import sys
 import unittest
@@ -30,6 +32,35 @@ def plan():
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_partial_campaign_preserves_plan_and_case_lifecycle(self):
+        class FakePeer:
+            healthy = True
+            def __init__(self):
+                self.calls = []
+            def initialize(self):
+                pass
+            def tool(self, tool, arguments):
+                call = dict(id=len(self.calls), operation=len(self.calls), elapsed_ms=1,
+                            response_bytes=1, tool=tool)
+                self.calls.append(call)
+                return screen_result(), call
+        fixture = plan()
+        fixture["cases"][-1].update(prepare=[{"tool": "handkite_observe"}],
+                                    cleanup=[{"tool": "handkite_observe"}])
+        original = copy.deepcopy(fixture)
+        peer = FakePeer()
+        campaign = Campaign(peer, fixture, 1, 1, selected_cases=["observe_tree"])
+        with contextlib.redirect_stdout(io.StringIO()):
+            campaign.run()
+        self.assertIsNone(campaign.failure)
+        self.assertEqual(fixture, original)
+        self.assertEqual([s["case"] for s in campaign.samples], ["observe_tree"] * 2)
+        self.assertEqual([s["warmup"] for s in campaign.samples], [True, False])
+        self.assertEqual(sum(c["tool"] == "handkite_observe" for c in peer.calls), 7)
+        for selected in ([], ["tap", "tap"], ["unknown"]):
+            with self.assertRaisesRegex(BenchError, "invalid_selected_cases"):
+                Campaign(peer, fixture, 1, 0, selected_cases=selected)
+
     def test_nearest_rank_percentiles_and_invalid_samples(self):
         self.assertEqual(quantiles(list(range(1, 21))), {"n": 20, "p50": 10, "p95": 19})
         self.assertEqual(quantiles([9]), {"n": 1, "p50": 9, "p95": 9})
