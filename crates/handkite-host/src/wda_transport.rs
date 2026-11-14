@@ -94,10 +94,29 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
     admission: Option<&(dyn Fn() -> bool + Send + Sync)>,
     now: impl Fn() -> Instant,
 ) -> Result<HttpResponse, WdaError> {
-    let expires = tokio::time::Instant::now() + deadline;
-    let mut socket = tokio::time::timeout_at(expires, connect)
+    let timer_started = tokio::time::Instant::now();
+    let started = now();
+    if write_deadline.is_some_and(|until| started >= until) {
+        return Err(WdaError::ExpiredBeforeSend);
+    }
+    if admission.is_some_and(|admit| !admit()) {
+        return Err(WdaError::NotConnected);
+    }
+    if write_deadline.is_some_and(|until| now() >= until) {
+        return Err(WdaError::ExpiredBeforeSend);
+    }
+    let expires = timer_started + deadline;
+    let input_expires = write_deadline.map(|until| timer_started + until.duration_since(started));
+    let connect_expires = input_expires.map_or(expires, |until| until.min(expires));
+    let mut socket = tokio::time::timeout_at(connect_expires, connect)
         .await
-        .map_err(|_| WdaError::NotConnected)??;
+        .map_err(|_| {
+            if input_expires.is_some_and(|until| until <= expires) {
+                WdaError::ExpiredBeforeSend
+            } else {
+                WdaError::NotConnected
+            }
+        })??;
     if tokio::time::Instant::now() >= expires {
         return Err(WdaError::ExpiredBeforeSend);
     }
@@ -288,6 +307,85 @@ mod tests {
             }
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn expired_input_does_not_start_connection() {
+        let polled = Cell::new(false);
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let connect = async {
+            polled.set(true);
+            Ok(socket)
+        };
+        let result = exchange(
+            connect,
+            b"request",
+            Duration::from_secs(30),
+            Some(Instant::now()),
+            None,
+            Instant::now,
+        )
+        .await;
+        assert!(matches!(result, Err(WdaError::ExpiredBeforeSend)));
+        assert!(!polled.get());
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn admission_time_cannot_extend_input_deadline() {
+        let started = Instant::now();
+        let clock = std::sync::Mutex::new(started);
+        let deadline = started + Duration::from_millis(100);
+        let polled = Cell::new(false);
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let admit = || {
+            *clock.lock().unwrap() = deadline;
+            true
+        };
+        let result = exchange(
+            async {
+                polled.set(true);
+                Ok(socket)
+            },
+            b"request",
+            Duration::from_secs(30),
+            Some(deadline),
+            Some(&admit),
+            || *clock.lock().unwrap(),
+        )
+        .await;
+        assert!(matches!(result, Err(WdaError::ExpiredBeforeSend)));
+        assert!(!polled.get());
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn connection_wait_uses_remaining_input_budget() {
+        let started = tokio::time::Instant::now();
+        let wall = Instant::now();
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let connect = async move {
+            tokio::time::sleep(Duration::from_secs(10)).await;
+            Ok(socket)
+        };
+        let result = exchange(
+            connect,
+            b"request",
+            Duration::from_secs(30),
+            Some(wall + Duration::from_millis(100)),
+            None,
+            || wall + started.elapsed(),
+        )
+        .await;
+        assert!(matches!(result, Err(WdaError::ExpiredBeforeSend)));
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert!(sent.is_empty());
     }
 
     #[tokio::test(start_paused = true)]
