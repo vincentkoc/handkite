@@ -318,8 +318,8 @@ App identifiers are bounded ASCII bundle identifiers. Arguments reject unknown
 or duplicate fields, including nested target fields. Each call dispatches once,
 with unknown delivery reported without replay. These tools can perform real
 purchases or send messages; grant this profile only to a trusted personal agent
-with approval bound to the concrete action. The included OpenClaw recipe remains
-disabled and observation-only.
+with approval bound to the concrete action. OpenClaw integration is deferred;
+the former separate deployment is retired.
 
 `handkite_click_button` takes an observed `target` with exact `label`, `x`, `y`,
 `width` and `height`. It resolves one visible, enabled, session-bound Button or MenuItem,
