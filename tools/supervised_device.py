@@ -637,6 +637,9 @@ def supervise(profile, backend, stops, output, stdin):
 
 def main(argv=None):
     argv = sys.argv[1:] if argv is None else argv
+    check_only = bool(argv and argv[-1] == "--check-profile")
+    if check_only:
+        argv = argv[:-1]
     output, profile, stops = Output(sys.stdout), None, None
     if not (len(argv) == 5 and argv[0] in MODES and argv[1:4] ==
             ["--profile-fd", "3", "--profile-sha256"] and
@@ -644,17 +647,25 @@ def main(argv=None):
         output.emit("unknown", "admission", "invalid")
         return 2
     mode = argv[0]
+    stage = "profile_admission"
     try:
         require(sys.platform == "darwin", "platform")
         require(os.lseek(3, 0, os.SEEK_CUR) == 0, "profile_offset")
         home = pwd.getpwuid(os.geteuid()).pw_dir
         profile = Profile(3, argv[4], mode, home)
         backend = Native(profile)
+        stage = "receipt_check"
         backend.receipt()
+        stage = "stop_check"
         stops = StopSet(home, exact_json(profile.files["receipt"].check()))
+        if check_only:
+            profile.recheck()
+            stops.check()
+            output.emit(mode, "preflight", "checked")
+            return 3 if output.failed else 0
         return supervise(profile, backend, stops, output, sys.stdin.fileno())
     except Exception:
-        output.emit(mode, "admission", "review_required", diagnostic={"stage": "profile_admission"})
+        output.emit(mode, "admission", "review_required", diagnostic={"stage": stage})
         return 3
     finally:
         if stops:

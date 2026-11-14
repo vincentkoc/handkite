@@ -656,6 +656,62 @@ class BrokerTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_profile_preflight_checks_native_receipt_without_entering_supervision(self):
+        for mode in broker.MODES:
+            profile, backend, stops = (unittest.mock.Mock() for _ in range(3))
+            profile.files = {"receipt": unittest.mock.Mock()}
+            profile.files["receipt"].check.return_value = b"{}"
+            output = io.StringIO()
+            with patch.object(broker.sys, "platform", "darwin"), \
+                 patch.object(broker.os, "lseek", return_value=0), \
+                 patch.object(broker.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir="/fixture")), \
+                 patch.object(broker, "Profile", return_value=profile), \
+                 patch.object(broker, "Native", return_value=backend), \
+                 patch.object(broker, "StopSet", return_value=stops), \
+                 patch.object(broker, "supervise") as supervise, \
+                 patch.object(broker, "private_pin_pipe") as pin_pipe, \
+                 patch.object(broker.sys, "stdout", output):
+                code = broker.main([mode, "--profile-fd", "3", "--profile-sha256", "a" * 64,
+                                    "--check-profile"])
+            self.assertEqual(code, 0)
+            self.assertEqual(json.loads(output.getvalue()), {
+                "mode": mode, "phase": "preflight", "result": "checked", "dispatch_count": 0})
+            backend.receipt.assert_called_once_with()
+            profile.recheck.assert_called_once_with()
+            stops.check.assert_called_once_with()
+            profile.close.assert_called_once_with()
+            stops.close.assert_called_once_with()
+            supervise.assert_not_called()
+            pin_pipe.assert_not_called()
+            for name in ("jobs", "controllers", "native", "pin", "clock", "lock", "cleanup"):
+                getattr(backend, name).assert_not_called()
+
+    def test_profile_preflight_reports_exact_failed_stage_without_private_detail(self):
+        for failed, expected in (("profile", "profile_admission"),
+                                 ("receipt", "receipt_check"), ("stops", "stop_check")):
+            profile, backend, stops = (unittest.mock.Mock() for _ in range(3))
+            profile.files = {"receipt": unittest.mock.Mock()}
+            profile.files["receipt"].check.return_value = b"{}"
+            output = io.StringIO()
+            with patch.object(broker.sys, "platform", "darwin"), \
+                 patch.object(broker.os, "lseek", return_value=0), \
+                 patch.object(broker.pwd, "getpwuid", return_value=SimpleNamespace(pw_dir="/fixture")), \
+                 patch.object(broker, "Profile", return_value=profile) as constructor, \
+                 patch.object(broker, "Native", return_value=backend), \
+                 patch.object(broker, "StopSet", return_value=stops) as stop_constructor, \
+                 patch.object(broker, "supervise") as supervise, \
+                 patch.object(broker.sys, "stdout", output):
+                {"profile": constructor, "receipt": backend.receipt,
+                 "stops": stop_constructor}[failed].side_effect = files.Refused("private-detail")
+                code = broker.main(["pin-once", "--profile-fd", "3", "--profile-sha256",
+                                    "a" * 64, "--check-profile"])
+            self.assertEqual(code, 3)
+            event = json.loads(output.getvalue())
+            self.assertEqual(event["diagnostic"], {"stage": expected})
+            self.assertEqual(event["dispatch_count"], 0)
+            self.assertNotIn("private-detail", output.getvalue())
+            supervise.assert_not_called()
+
     def test_child_failure_labels_never_promote_or_disclose_unknown_details(self):
         result = (0, b"unlock_idle=code_submitted\n", b"", True)
         for reason in broker.CHILD_FAILURES:
