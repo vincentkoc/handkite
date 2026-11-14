@@ -119,6 +119,15 @@ class BenchmarkTests(unittest.TestCase):
         self.assertTrue(matches(after, {"tree_changed": True}, before))
         self.assertFalse(matches(before, {"tree_changed": True}, before))
 
+    def test_refused_action_has_no_tree_projection_stage(self):
+        rows = [{"stage": name} for name in ("mcp_request", "mcp_serialization", "mcp_write",
+                "mcp_service_decode", "mcp_service_exchange")]
+        validate_client_stages(rows, observed=False)
+        with self.assertRaisesRegex(BenchError, "incomplete_client_trace"):
+            validate_client_stages(rows)
+        with self.assertRaisesRegex(BenchError, "incomplete_client_trace"):
+            validate_client_stages(rows[:-1], observed=False)
+
     def test_plan_requires_all_six_cases_and_never_accepts_pin_or_lifecycle_tools(self):
         self.assertEqual(validate_plan(plan()), plan())
         for tool in ("handkite_unlock", "handkite_home", "exec"):

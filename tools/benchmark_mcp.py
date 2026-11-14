@@ -616,10 +616,12 @@ class Campaign:
                 self.lease_started = None
 
 
-def validate_client_stages(rows):
-    require({"mcp_request", "mcp_serialization", "mcp_write", "mcp_service_decode",
-             "mcp_tree_projection", "mcp_service_exchange"}
-            <= {row.get("stage") for row in rows}, "incomplete_client_trace")
+def validate_client_stages(rows, observed=True):
+    required = {"mcp_request", "mcp_serialization", "mcp_write", "mcp_service_decode",
+                "mcp_service_exchange"}
+    if observed:
+        required.add("mcp_tree_projection")
+    require(required <= {row.get("stage") for row in rows}, "incomplete_client_trace")
 
 
 def attach_stages(campaign, service_rows, expected_pid):
@@ -647,7 +649,7 @@ def attach_stages(campaign, service_rows, expected_pid):
             continue
         op = sample["operation"]
         require(op in correspondence, "missing_service_operation")
-        validate_client_stages(client_by_op[op])
+        validate_client_stages(client_by_op[op], observed=sample["outcome"] == "pass")
         service = service_by_op[correspondence[op]]
         require({"service_request", "service_serialization", "service_write"}
                 <= {row.get("stage") for row in service}, "incomplete_service_trace")
@@ -729,16 +731,19 @@ def main():
                     rows.append(row)
             except BenchError:
                 continue
+        trace_error = None
         try:
             attach_stages(campaign, rows, args.service_pid)
             trace_valid = True
         except BenchError as error:
             trace_valid = False
+            trace_error = str(error)
             campaign.failure = campaign.failure or str(error)
         report = {"version": 1, "plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
                   "calibration": args.calibrate,
                   "service_build": args.service_build, "client_build": args.client_build,
                   "service_pid": args.service_pid, "trace_valid": trace_valid,
+                  "trace_error": trace_error,
                   "failure": campaign.failure, "samples": campaign.samples,
                   "failure_context": campaign.failure_context, "calls": peer.calls,
                   "summary": summarize(campaign.samples)}
