@@ -461,6 +461,7 @@ impl DeviceAdapter for WdaAdapter {
                 | Action::LongPress { .. }
                 | Action::Home
                 | Action::Text { .. }
+                | Action::KeyCurrent { .. }
         ) && self.owned_session.is_some()
             && self.owned_runner.is_some();
         if !matches!(action, Action::LaunchApp { .. }) && !owned_input {
@@ -510,6 +511,16 @@ impl DeviceAdapter for WdaAdapter {
             .then(|| captured_at.checked_add(TEXT_INPUT_AGE))
             .flatten()
             .map(|until| ActionAdmission::NativeButton { until })
+        } else if let Action::KeyCurrent { key } = action {
+            native_text_deadline(
+                &observation,
+                owned_input,
+                native_before,
+                native_after,
+                reported_lock,
+                captured_at,
+            )
+            .map(|until| ActionAdmission::NativeKey { key: *key, until })
         } else if matches!(action, Action::Text { .. }) {
             native_text_deadline(
                 &observation,
@@ -570,6 +581,7 @@ impl DeviceAdapter for WdaAdapter {
                     | Action::LongPress { .. }
                     | Action::Text { .. }
                     | Action::Key { .. }
+                    | Action::KeyCurrent { .. }
             ) && self.owned_session.is_some())
             && native_lock::query(&self.expected).state != LockState::Unlocked
         {
@@ -595,6 +607,20 @@ impl DeviceAdapter for WdaAdapter {
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
+        if let Some(ActionAdmission::NativeKey { key, until }) = admission {
+            if !matches!(action, Action::KeyCurrent { key: actual } if *actual == key)
+                || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            return self.execute(action, send_deadline);
+        }
+        if matches!(action, Action::KeyCurrent { .. }) {
+            return Err(AdapterError);
+        }
         if let Action::ClickButton { target } = action {
             let Some(ActionAdmission::NativeButton { until }) = admission else {
                 return Err(AdapterError);

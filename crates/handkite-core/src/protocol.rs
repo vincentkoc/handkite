@@ -199,6 +199,10 @@ pub enum Action {
     Key {
         key: KeyboardKey,
     },
+    /// Applies to the current editing selection, without preserving its old range.
+    KeyCurrent {
+        key: KeyboardKey,
+    },
     Home,
     LaunchApp {
         bundle_id: String,
@@ -224,7 +228,7 @@ impl Action {
             Self::LongPress { .. } => "long_press",
             Self::Swipe { .. } => "swipe",
             Self::Text { .. } => "text",
-            Self::Key { .. } => "key",
+            Self::Key { .. } | Self::KeyCurrent { .. } => "key",
             Self::Home => "home",
             Self::LaunchApp { .. } => "launch_app",
             Self::Lock => "lock",

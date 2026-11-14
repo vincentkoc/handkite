@@ -136,6 +136,7 @@ impl DeviceAdapter for FakeAdapter {
                     | ActionAdmission::NativeText { .. }
                     | ActionAdmission::NativeTextGesture { .. }
                     | ActionAdmission::NativeButton { .. }
+                    | ActionAdmission::NativeKey { .. }
             )
         ) {
             self.native_queries += 1;
@@ -741,6 +742,69 @@ fn native_text_allows_only_pixel_drift_with_fresh_unchanged_context() {
         } else {
             assert!(result.is_err(), "case {change}");
             assert_eq!(inner.adapter.actions, 0, "case {change}");
+        }
+    }
+}
+
+#[test]
+fn current_selection_key_is_explicit_and_bound_to_key_and_context() {
+    use crate::protocol::KeyboardKey;
+    for case in 0..8 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut action = Action::KeyCurrent {
+            key: KeyboardKey::Backspace,
+        };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = b"blink".to_vec();
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeKey {
+                key: KeyboardKey::Backspace,
+                until,
+            });
+            inner.adapter.native_lock = LockState::Unlocked;
+            match case {
+                1 => {
+                    action = Action::Key {
+                        key: KeyboardKey::Backspace,
+                    }
+                }
+                2 => {
+                    action = Action::KeyCurrent {
+                        key: KeyboardKey::Enter,
+                    }
+                }
+                3 => inner.adapter.tree_suffix = "changed-value-or-selection".into(),
+                4 => inner.adapter.native_lock = LockState::Locked,
+                5 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeKey {
+                        key: KeyboardKey::Backspace,
+                        until: Instant::now(),
+                    })
+                }
+                6 => inner.adapter.stale_capture = true,
+                7 => inner.adapter.wda_ready = false,
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(result.is_ok(), case == 0, "case {case}");
+        assert_eq!(inner.adapter.actions, usize::from(case == 0), "case {case}");
+        if case == 0 {
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
         }
     }
 }

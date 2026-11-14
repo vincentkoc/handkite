@@ -20,13 +20,34 @@ pub struct AdapterError;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActionAdmission {
-    HomeLaunch { until: Instant },
-    VisibleTap { at: Point, until: Instant },
-    NativeModalTap { at: Point, until: Instant },
-    NativeHome { until: Instant },
-    NativeText { until: Instant },
-    NativeTextGesture { at: Point, until: Instant },
-    NativeButton { until: Instant },
+    HomeLaunch {
+        until: Instant,
+    },
+    VisibleTap {
+        at: Point,
+        until: Instant,
+    },
+    NativeModalTap {
+        at: Point,
+        until: Instant,
+    },
+    NativeHome {
+        until: Instant,
+    },
+    NativeText {
+        until: Instant,
+    },
+    NativeTextGesture {
+        at: Point,
+        until: Instant,
+    },
+    NativeButton {
+        until: Instant,
+    },
+    NativeKey {
+        key: crate::protocol::KeyboardKey,
+        until: Instant,
+    },
 }
 
 pub trait DeviceAdapter {
@@ -62,6 +83,7 @@ pub trait DeviceAdapter {
                     | ActionAdmission::NativeText { .. }
                     | ActionAdmission::NativeTextGesture { .. }
                     | ActionAdmission::NativeButton { .. }
+                    | ActionAdmission::NativeKey { .. }
             )
         ) {
             return Err(AdapterError);
@@ -298,6 +320,19 @@ impl<A: DeviceAdapter> Controller<A> {
                 if fresh.state.lock == LockState::Unlocked
                     && fresh.state.wda_ready
                     && Instant::now() < until =>
+            {
+                Some(until)
+            }
+            (
+                Action::KeyCurrent { key },
+                Some(ActionAdmission::NativeKey {
+                    key: admitted,
+                    until,
+                }),
+            ) if *key == admitted
+                && fresh.state.lock == LockState::Unlocked
+                && fresh.state.wda_ready
+                && Instant::now() < until =>
             {
                 Some(until)
             }

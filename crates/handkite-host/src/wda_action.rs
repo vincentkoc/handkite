@@ -381,7 +381,7 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
                 json!({"type":"pointerUp","button":0}),
             ]),
         )),
-        Action::Key { key } => {
+        Action::Key { key } | Action::KeyCurrent { key } => {
             let value = match key {
                 KeyboardKey::Backspace => "\u{e003}",
                 KeyboardKey::Enter => "\u{e007}",
@@ -1150,12 +1150,18 @@ mod tests {
             Action::Key {
                 key: KeyboardKey::Escape,
             },
+            Action::KeyCurrent {
+                key: KeyboardKey::Backspace,
+            },
+            Action::KeyCurrent {
+                key: KeyboardKey::Enter,
+            },
         ];
         for action in actions {
             let (path, body) = payload(&action).unwrap();
             assert_eq!(path, "/actions");
             let steps = body["actions"][0]["actions"].as_array().unwrap();
-            if let Action::Key { key } = action {
+            if let Action::Key { key } | Action::KeyCurrent { key } = action {
                 let expected = match key {
                     KeyboardKey::Backspace => "\u{e003}",
                     KeyboardKey::Enter => "\u{e007}",

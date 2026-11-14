@@ -58,6 +58,13 @@ struct LongPressArguments {
 struct KeyArguments {
     expected_revision: Revision,
     key: KeyboardKey,
+    selection: Option<KeySelection>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum KeySelection {
+    Current,
 }
 
 #[derive(Deserialize)]
@@ -141,7 +148,11 @@ pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> 
         }
         Tool::Key => {
             let args: KeyArguments = serde_json::from_value(value).map_err(|_| ())?;
-            Ok((args.expected_revision, Action::Key { key: args.key }))
+            let action = match args.selection {
+                None => Action::Key { key: args.key },
+                Some(KeySelection::Current) => Action::KeyCurrent { key: args.key },
+            };
+            Ok((args.expected_revision, action))
         }
         Tool::Swipe => {
             let args: SwipeArguments = serde_json::from_value(value).map_err(|_| ())?;
@@ -267,6 +278,10 @@ pub(super) fn schema(tool: Tool) -> Value {
                 json!({"type":"string","enum":["backspace","enter","tab","escape"]}),
             );
             required.push("key");
+            properties.insert("selection".into(), json!({
+                "type":"string", "enum":["current"],
+                "description":"Opt in to applying the key to iOS's current editing selection. Does not preserve or prove the earlier caret/range. Omit for exact-image admission."
+            }));
         }
         Tool::LaunchApp => {
             properties.insert(
@@ -283,6 +298,25 @@ pub(super) fn schema(tool: Tool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn current_selection_key_requires_explicit_opt_in() {
+        let request = json!({"expected_revision":7,"key":"backspace"});
+        let (_, strict) = parse(Tool::Key, request.clone()).unwrap();
+        assert!(matches!(strict, Action::Key { .. }));
+        let mut current = request.clone();
+        current["selection"] = json!("current");
+        let (_, current) = parse(Tool::Key, current).unwrap();
+        assert!(matches!(
+            current,
+            Action::KeyCurrent {
+                key: KeyboardKey::Backspace
+            }
+        ));
+        let mut bad = request;
+        bad["selection"] = json!("preserve");
+        assert!(parse(Tool::Key, bad).is_err());
+    }
 
     #[test]
     fn semantic_button_requires_exact_typed_arguments() {
