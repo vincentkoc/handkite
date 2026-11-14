@@ -16,6 +16,7 @@ use std::path::Path;
 /// and ownership before activation. Rendering grants none of that authority.
 pub fn render(layout: &ServiceLayout) -> Result<String, &'static str> {
     let program = xml_path(&layout.current_release_executable())?;
+    let stderr = xml_path(&layout.stderr_log())?;
     Ok(format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <plist version="1.0">
@@ -39,6 +40,8 @@ pub fn render(layout: &ServiceLayout) -> Result<String, &'static str> {
   <integer>180</integer>
   <key>EnableGlobbing</key>
   <false/>
+  <key>StandardErrorPath</key>
+  <string>{stderr}</string>
 </dict>
 </plist>
 "#
@@ -126,7 +129,8 @@ mod tests {
                 "RunAtLoad": true,
                 "KeepAlive": true,
                 "ExitTimeOut": 180,
-                "EnableGlobbing": false
+                "EnableGlobbing": false,
+                "StandardErrorPath": "/fixture/account/Library/Application Support/Handkite/runtime/handkited.stderr.log"
             })
         );
         assert_eq!(
@@ -157,7 +161,11 @@ mod tests {
                 parsed["ProgramArguments"],
                 serde_json::json!([layout.current_release_executable(), "--owned-wda"])
             );
-            assert_eq!(parsed.as_object().unwrap().len(), 8);
+            assert_eq!(
+                parsed["StandardErrorPath"],
+                layout.stderr_log().to_str().unwrap()
+            );
+            assert_eq!(parsed.as_object().unwrap().len(), 9);
         }
     }
 

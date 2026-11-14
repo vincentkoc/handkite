@@ -59,6 +59,10 @@ impl ServiceLayout {
         self.runtime_directory().join("handkite.lock")
     }
 
+    pub fn stderr_log(&self) -> PathBuf {
+        self.runtime_directory().join("handkited.stderr.log")
+    }
+
     pub fn state_directory(&self) -> PathBuf {
         self.root().join("state")
     }
@@ -201,6 +205,10 @@ pub(crate) mod tests {
             assert_eq!(layout.runtime_directory(), root.join("runtime"));
             assert_eq!(layout.socket(), root.join("runtime/handkite.sock"));
             assert_eq!(layout.process_lock(), root.join("runtime/handkite.lock"));
+            assert_eq!(
+                layout.stderr_log(),
+                root.join("runtime/handkited.stderr.log")
+            );
             assert_eq!(layout.state_directory(), root.join("state"));
             assert_eq!(
                 layout.anisette_state_directory(),
