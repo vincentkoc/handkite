@@ -151,7 +151,7 @@ pub struct PinPreparationDiagnostic {
     pub session_check: Option<PinSessionCheck>,
 }
 
-/// Fixed metadata for the latest wake admission read; never contains WDA values.
+/// Fixed metadata for the latest session validation; never contains WDA values.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PinSessionCheck {
     pub step: PinCaptureStep,
@@ -632,20 +632,35 @@ impl NativePasscodeBackend {
                     .ok_or(BackendError::Unavailable)?
                     .into(),
             };
-            // Confirm the full UI before Home. Between Home and swipe, only
-            // session/lock/viewport reads run; a full source read delays reveal.
-            // Post-Home alert/nonempty checks move to the full post-reveal
-            // capture, which must still prove strict empty before any digit.
             self.wake_attempted = true;
             self.phase = PinPhase::WakeDispatch;
             input(self, &Action::Home, reveal.fresh_until)?;
             pause(OWNED_WAKE_SETTLE);
-            self.phase = PinPhase::WakeAdmission;
+            self.phase = PinPhase::WakePostcapture;
             self.admit_input()?;
-            if now() >= reveal.fresh_until {
+            // Home and settling consume the old capture's budget. Only a new
+            // full capture may establish the deadline for the next input.
+            snapshot(self)?;
+            self.admit_input()?;
+            let prepared = self.last_view.take().ok_or(BackendError::Unavailable)?;
+            if now() >= prepared.fresh_until {
                 self.capture_step = PinCaptureStep::Freshness;
                 return Err(BackendError::Unavailable);
             }
+            if prepared.captured_at <= reveal.captured_at
+                || prepared.view.screen_size != Some(reveal.normal.size)
+                || !(prepared.empty_locked
+                    || prepared.normal_locked && prepared.view.normal_lock == Some(reveal.normal))
+            {
+                self.capture_step = PinCaptureStep::EmptyAdmission;
+                return Err(BackendError::Unavailable);
+            }
+            let reveal = NormalReveal {
+                captured_at: prepared.captured_at,
+                fresh_until: prepared.fresh_until,
+                ..reveal
+            };
+            self.phase = PinPhase::WakeAdmission;
             check(self, &reveal)?;
             self.capture_step = PinCaptureStep::InputAdmission;
             self.admit_input()?;
@@ -656,6 +671,12 @@ impl NativePasscodeBackend {
             if now() >= reveal.fresh_until {
                 self.capture_step = PinCaptureStep::Freshness;
                 return Err(BackendError::Unavailable);
+            }
+            if prepared.empty_locked {
+                self.last_view = Some(prepared);
+                self.awaiting_first_digit = true;
+                self.phase = PinPhase::EmptyConfirmation;
+                return Ok(());
             }
             self.reveal_attempted = true;
             self.phase = PinPhase::RevealDispatch;
@@ -680,7 +701,7 @@ impl NativePasscodeBackend {
         result
     }
 
-    fn check_normal_reveal(&mut self, reveal: &NormalReveal) -> Result<(), BackendError> {
+    fn check_reveal_viewport(&mut self, reveal: &NormalReveal) -> Result<(), BackendError> {
         self.capture_step = PinCaptureStep::SessionMatch;
         if !self.actions.prepared_session_matches(&reveal.session) {
             return Err(BackendError::Unavailable);
@@ -688,19 +709,15 @@ impl NativePasscodeBackend {
         let wda = UsbWda::new(self.usb.clone())
             .with_write_deadline(reveal.fresh_until)
             .with_write_admission(self.input_admission.clone());
-        self.check_reveal_session(&wda, PinCaptureStep::SessionBefore, reveal.fresh_until)?;
         let orientation_path = format!("/session/{}/orientation", reveal.session);
-        let expected = self.expected.clone();
-        if let Err(step) = self.runtime.block_on(read_normal_reveal(
+        if let Err(step) = self.runtime.block_on(read_reveal_viewport(
             &wda,
             &orientation_path,
             reveal.normal.size,
-            move || native_lock::query(&expected),
         )) {
             self.capture_step = step;
             return Err(BackendError::Unavailable);
         }
-        self.check_reveal_session(&wda, PinCaptureStep::SessionAfter, reveal.fresh_until)?;
         self.capture_step = PinCaptureStep::SessionMatch;
         if !self.actions.prepared_session_matches(&reveal.session) {
             return Err(BackendError::Unavailable);
@@ -708,7 +725,7 @@ impl NativePasscodeBackend {
         Ok(())
     }
 
-    fn check_reveal_session(
+    fn check_session(
         &mut self,
         wda: &UsbWda,
         step: PinCaptureStep,
@@ -1108,23 +1125,15 @@ fn normal_reveal_viewport_matches(
                 && (w, h) == expected)
 }
 
-async fn read_normal_reveal(
+async fn read_reveal_viewport(
     wda: &impl WdaRequest,
     orientation_path: &str,
     expected_size: (f64, f64),
-    native: impl FnOnce() -> native_lock::NativeLock + Send + 'static,
 ) -> Result<(), PinCaptureStep> {
-    let (viewport, locked, native) = capture_reads(
-        async {
-            tokio::join!(
-                wda.request("GET", "/wda/screen", b"", PIN_VIEW_BUDGET),
-                wda.request("GET", orientation_path, b"", PIN_VIEW_BUDGET)
-            )
-        },
-        wda.request("GET", "/wda/locked", b"", PIN_VIEW_BUDGET),
-        native,
-    )
-    .await;
+    let viewport = tokio::join!(
+        wda.request("GET", "/wda/screen", b"", PIN_VIEW_BUDGET),
+        wda.request("GET", orientation_path, b"", PIN_VIEW_BUDGET)
+    );
     let value = |result: Result<_, _>, step| {
         result
             .map_err(wda_error)
@@ -1135,13 +1144,6 @@ async fn read_normal_reveal(
     let orientation = value(viewport.1, PinCaptureStep::ViewportRead)?;
     if !normal_reveal_viewport_matches(&screen, &orientation, expected_size) {
         return Err(PinCaptureStep::ViewportRead);
-    }
-    if value(locked, PinCaptureStep::LockRead)?.as_bool() != Some(true) {
-        return Err(PinCaptureStep::LockRead);
-    }
-    let native = native.map_err(|_| PinCaptureStep::NativeLock)?;
-    if native.state != LockState::Locked || native.unlocked_since_boot != Some(true) {
-        return Err(PinCaptureStep::NativeLock);
     }
     Ok(())
 }
@@ -1301,7 +1303,11 @@ impl NativePasscodeBackend {
         let wda = UsbWda::new(self.usb.clone());
         self.capture_step = PinCaptureStep::SessionBefore;
         let step_started = Instant::now();
-        let prepared = self.runtime.block_on(self.actions.prepare_existing(&wda));
+        let prepared = self.check_session(
+            &wda,
+            PinCaptureStep::SessionBefore,
+            started + PIN_VIEW_BUDGET,
+        );
         self.capture_timings.session_before_ms = step_started.elapsed().as_millis();
         prepared.map_err(|_| BackendError::Unavailable)?;
         let expected = self.expected.clone();
@@ -1350,7 +1356,11 @@ impl NativePasscodeBackend {
         if self.session_bound {
             self.capture_step = PinCaptureStep::SessionAfter;
             let step_started = Instant::now();
-            let prepared = self.runtime.block_on(self.actions.prepare_existing(&wda));
+            let prepared = self.check_session(
+                &wda,
+                PinCaptureStep::SessionAfter,
+                started + PIN_VIEW_BUDGET,
+            );
             self.capture_timings.session_after_ms = step_started.elapsed().as_millis();
             prepared.map_err(|_| BackendError::Unavailable)?;
         }
@@ -1445,7 +1455,7 @@ impl PasscodeBackend for NativePasscodeBackend {
                     |backend, action, deadline| {
                         backend.dispatch_action_before(action, false, deadline)
                     },
-                    Self::check_normal_reveal,
+                    Self::check_reveal_viewport,
                     Instant::now,
                     thread::sleep,
                 );
@@ -2017,7 +2027,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_normal_reveal_confirms_before_home_and_keeps_original_deadline() {
+    fn owned_normal_reveal_refreshes_after_home_with_a_new_capture() {
         use std::cell::{Cell, RefCell};
         let mut backend = bound_backend().with_input_admission(|| true).unwrap();
         let start = Instant::now();
@@ -2039,7 +2049,7 @@ mod tests {
                     backend.snapshot_with(
                         at,
                         |_, _| {
-                            Ok(if captures == 1 {
+                            Ok(if captures <= 2 {
                                 normal_capture()
                             } else {
                                 keypad_capture(true)
@@ -2050,9 +2060,12 @@ mod tests {
                 },
                 |backend, action, fresh_until| {
                     assert!(backend.last_view.is_none());
-                    assert_eq!(fresh_until, deadline);
                     match action {
-                        Action::Home => events.borrow_mut().push("home"),
+                        Action::Home => {
+                            assert_eq!(fresh_until, deadline);
+                            events.borrow_mut().push("home");
+                            clock.set(clock.get() + Duration::from_secs(4));
+                        }
                         Action::Swipe {
                             from,
                             to,
@@ -2060,6 +2073,8 @@ mod tests {
                         } => {
                             assert_eq!(*from, Point { x: 200.0, y: 792.0 });
                             assert_eq!(*to, Point { x: 200.0, y: 360.0 });
+                            assert!(clock.get() > deadline);
+                            assert_eq!(fresh_until, clock.get() + PIN_VIEW_BUDGET);
                             assert_eq!(*duration_ms, 250);
                             events.borrow_mut().push("swipe");
                         }
@@ -2069,8 +2084,8 @@ mod tests {
                 },
                 |backend, reveal| {
                     assert!(backend.last_view.is_none());
-                    assert_eq!(reveal.captured_at, confirmed_at);
-                    assert_eq!(reveal.fresh_until, deadline);
+                    assert!(reveal.captured_at > deadline);
+                    assert_eq!(reveal.fresh_until, reveal.captured_at + PIN_VIEW_BUDGET);
                     events.borrow_mut().push("guard");
                     Ok(())
                 },
@@ -2092,6 +2107,7 @@ mod tests {
                 "capture",
                 "home",
                 "wake_wait",
+                "capture",
                 "guard",
                 "swipe",
                 "reveal_wait",
@@ -2114,7 +2130,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_normal_reveal_refuses_changed_confirmation_before_home() {
+    fn owned_normal_reveal_refuses_changed_confirmation_before_home() {
         for case in 0..9 {
             let mut backend = bound_backend().with_input_admission(|| true).unwrap();
             let start = Instant::now();
@@ -2161,7 +2177,114 @@ mod tests {
     }
 
     #[test]
-    fn fast_normal_reveal_stops_on_failure_expiry_or_lost_ownership() {
+    fn owned_normal_reveal_accepts_fresh_empty_without_swiping() {
+        use std::cell::Cell;
+        let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+        let start = Instant::now();
+        let clock = Cell::new(start);
+        backend
+            .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+            .unwrap();
+        let mut captures = 0;
+        let mut inputs = 0;
+        let mut viewport_checks = 0;
+        backend
+            .prepare_owned_normal_with(
+                |backend| {
+                    captures += 1;
+                    clock.set(clock.get() + Duration::from_millis(1));
+                    let at = clock.get();
+                    backend.snapshot_with(
+                        at,
+                        |_, _| {
+                            Ok(if captures == 1 {
+                                normal_capture()
+                            } else {
+                                keypad_capture(false)
+                            })
+                        },
+                        || at,
+                    )
+                },
+                |_, action, _| {
+                    assert!(matches!(action, Action::Home));
+                    inputs += 1;
+                    Ok(())
+                },
+                |_, _| {
+                    viewport_checks += 1;
+                    Ok(())
+                },
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            )
+            .unwrap();
+        assert_eq!((captures, inputs, viewport_checks), (2, 1, 1));
+        assert!(backend.awaiting_first_digit);
+        assert!(!backend.reveal_attempted);
+        assert!(backend.last_view.as_ref().unwrap().empty_locked);
+    }
+
+    #[test]
+    fn owned_normal_reveal_refuses_post_wake_drift_before_swipe() {
+        use std::cell::Cell;
+        for case in 0..10 {
+            let mut backend = bound_backend().with_input_admission(|| true).unwrap();
+            let start = Instant::now();
+            let clock = Cell::new(start);
+            backend
+                .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
+                .unwrap();
+            let mut captures = 0;
+            let mut inputs = 0;
+            let result = backend.prepare_owned_normal_with(
+                |backend| {
+                    captures += 1;
+                    clock.set(clock.get() + Duration::from_millis(1));
+                    let mut at = clock.get();
+                    let (mut screen, mut view) = normal_capture();
+                    if captures == 2 {
+                        match case {
+                            0 => view.normal_lock.as_mut().unwrap().proud_visible = false,
+                            1 => view.screen_size = Some((401.0, 800.0)),
+                            2 => screen.wda_lock = LockState::Uncertain,
+                            3 => screen.native_lock = LockState::Unlocked,
+                            4 => screen.before_first_unlock = true,
+                            5 => at = start + Duration::from_millis(1),
+                            6 => return Err(BackendError::Unavailable),
+                            7 => {
+                                backend.actions =
+                                    WdaActions::bound_to_existing("changed-session").unwrap()
+                            }
+                            8 => {
+                                screen.trust_prompt = true;
+                                view.has_alert = true;
+                            }
+                            9 => screen.visible_lock = LockState::Uncertain,
+                            _ => unreachable!(),
+                        }
+                    }
+                    backend.snapshot_with(at, |_, _| Ok((screen, view)), || clock.get())
+                },
+                |_, action, _| {
+                    assert!(matches!(action, Action::Home));
+                    inputs += 1;
+                    Ok(())
+                },
+                |_, _| Ok(()),
+                || clock.get(),
+                |delay| clock.set(clock.get() + delay),
+            );
+            assert!(result.is_err(), "case {case}");
+            assert_eq!((captures, inputs), (2, 1));
+            assert!(!backend.reveal_attempted);
+            assert!(!backend.awaiting_first_digit);
+            assert!(backend.last_view.is_none());
+        }
+    }
+
+    #[test]
+    fn owned_normal_reveal_stops_on_failure_expiry_or_lost_ownership() {
         use std::cell::Cell;
         use std::sync::atomic::{AtomicBool, Ordering};
         for case in 0..8 {
@@ -2176,11 +2299,19 @@ mod tests {
                 .snapshot_with(start, |_, _| Ok(normal_capture()), || start)
                 .unwrap();
             let mut inputs = 0;
+            let mut captures = 0;
             let result = backend.prepare_owned_normal_with(
                 |backend| {
-                    let at = start + Duration::from_millis(1);
-                    clock.set(at);
-                    backend.snapshot_with(at, |_, _| Ok(normal_capture()), || at)
+                    captures += 1;
+                    let at = if case == 1 && captures == 2 {
+                        start
+                    } else {
+                        clock.get() + Duration::from_millis(1)
+                    };
+                    if case != 1 || captures == 1 {
+                        clock.set(at);
+                    }
+                    backend.snapshot_with(at, |_, _| Ok(normal_capture()), || clock.get())
                 },
                 |backend, action, deadline| {
                     assert!(backend.last_view.is_none());
@@ -2202,7 +2333,7 @@ mod tests {
                         owned.store(false, Ordering::SeqCst);
                     }
                     if case == 5 {
-                        clock.set(start + Duration::from_secs(6));
+                        clock.set(start + Duration::from_secs(10));
                     }
                     if case == 7 {
                         backend.actions = WdaActions::bound_to_existing("changed-session").unwrap();
@@ -2210,7 +2341,8 @@ mod tests {
                     Ok(())
                 },
                 || clock.get(),
-                |_| {
+                |delay| {
+                    clock.set(clock.get() + delay);
                     if case == 1 {
                         clock.set(start + Duration::from_secs(6));
                     }
@@ -2241,7 +2373,7 @@ mod tests {
     }
 
     #[test]
-    fn fast_normal_reveal_never_admits_digits_from_an_unsafe_postcapture() {
+    fn owned_normal_reveal_never_admits_digits_from_an_unsafe_postcapture() {
         use std::cell::Cell;
         for case in 0..3 {
             let mut backend = bound_backend().with_input_admission(|| true).unwrap();
@@ -2288,7 +2420,7 @@ mod tests {
                 |delay| clock.set(clock.get() + delay),
             );
             assert!(result.is_err(), "case {case}");
-            assert_eq!(inputs, 2);
+            assert_eq!(inputs, 1);
             assert_eq!(captures, 2);
             assert!(!backend.awaiting_first_digit);
             assert!(backend.last_view.is_none());
@@ -2301,7 +2433,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fast_normal_reveal_reads_only_viewport_orientation_and_lock() {
+    async fn reveal_viewport_reads_overlap_and_refuse_drift() {
         use crate::wda_http::HttpResponse;
         use serde_json::json;
         use std::cell::{Cell, RefCell};
@@ -2331,7 +2463,7 @@ mod tests {
                 if bit != 0 {
                     assert_eq!(self.started.get(), 3, "viewport reads must overlap");
                 }
-                if self.case == 9 && path == "/wda/screen" {
+                if self.case == 5 && path == "/wda/screen" {
                     return Err(WdaError::NotConnected);
                 }
                 let value = match path {
@@ -2348,11 +2480,6 @@ mod tests {
                             json!("PORTRAIT")
                         }
                     }
-                    "/wda/locked" => match self.case {
-                        5 => json!(false),
-                        6 => json!(null),
-                        _ => json!(true),
-                    },
                     _ => panic!("unexpected read"),
                 };
                 Ok(HttpResponse {
@@ -2361,46 +2488,24 @@ mod tests {
                 })
             }
         }
-        for case in 0..12 {
+        for case in 0..6 {
             let reads = Reads {
                 case,
                 paths: RefCell::new(Vec::new()),
                 started: Cell::new(0),
             };
-            let result = read_normal_reveal(
+            let result = read_reveal_viewport(
                 &reads,
                 "/session/fixture-session/orientation",
                 (400.0, 800.0),
-                move || native_lock::NativeLock {
-                    state: match case {
-                        7 => LockState::Uncertain,
-                        10 => LockState::Unlocked,
-                        _ => LockState::Locked,
-                    },
-                    unlocked_since_boot: match case {
-                        8 => None,
-                        11 => Some(false),
-                        _ => Some(true),
-                    },
-                },
             )
             .await;
             assert_eq!(result.is_ok(), case == 0, "case {case}");
-            if case == 5 || case == 6 {
-                assert_eq!(result, Err(PinCaptureStep::LockRead));
-            }
-            if matches!(case, 7 | 8 | 10 | 11) {
-                assert_eq!(result, Err(PinCaptureStep::NativeLock));
-            }
             let mut paths = reads.paths.into_inner();
             paths.sort();
             assert_eq!(
                 paths,
-                [
-                    "/session/fixture-session/orientation",
-                    "/wda/locked",
-                    "/wda/screen"
-                ]
+                ["/session/fixture-session/orientation", "/wda/screen"]
             );
         }
     }

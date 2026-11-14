@@ -202,7 +202,7 @@ fn finish(
         let timings = report.timings;
         if let Some(check) = report.session_check {
             println!(
-                "preparation=observed phase=wake_session_check step={} endpoint={} reason={} elapsed_ms={} deadline_expired_at_start={} deadline_expired_at_end={}",
+                "preparation=observed phase=session_check step={} endpoint={} reason={} elapsed_ms={} deadline_expired_at_start={} deadline_expired_at_end={}",
                 check.step.as_str(),
                 check.endpoint,
                 check.reason,
