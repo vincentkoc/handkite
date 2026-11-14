@@ -336,30 +336,34 @@ pub(crate) async fn validate_session(
     {
         return Err(SettingsError::SessionUnproven);
     }
-    let status: Envelope<Value> = response(
-        wda,
-        session,
-        "GET",
-        "/status",
-        b"",
-        SettingsError::SessionUnproven,
-    )
-    .await?;
+    let path = format!("/session/{session}");
+    let (status, validation) = tokio::join!(
+        biased;
+        response::<Value>(
+            wda,
+            session,
+            "GET",
+            "/status",
+            b"",
+            SettingsError::SessionUnproven,
+        ),
+        response::<Value>(
+            wda,
+            session,
+            "GET",
+            &path,
+            b"",
+            SettingsError::SessionUnproven,
+        ),
+    );
+    let status = status?;
     if status.session_id.as_deref() != Some(session)
         || status.value["ready"].as_bool() != Some(true)
         || status.value.get("error").is_some()
     {
         return Err(SettingsError::SessionUnproven);
     }
-    let validation: Envelope<Value> = response(
-        wda,
-        session,
-        "GET",
-        &format!("/session/{session}"),
-        b"",
-        SettingsError::SessionUnproven,
-    )
-    .await?;
+    let validation = validation?;
     if !validation.value.is_object() || validation.value.get("error").is_some() {
         return Err(SettingsError::SessionUnproven);
     }
@@ -570,11 +574,14 @@ mod tests {
         ]
     }
 
-    fn changed_session() -> Step {
-        get(
-            "/status",
-            r#"{"sessionId":"replacement","value":{"ready":true}}"#,
-        )
+    fn changed_session() -> Vec<Step> {
+        vec![
+            get(
+                "/status",
+                r#"{"sessionId":"replacement","value":{"ready":true}}"#,
+            ),
+            get("/session/fixture-session", r#"{"value":{}}"#),
+        ]
     }
 
     fn settings(values: &str) -> Step {
@@ -634,6 +641,69 @@ mod tests {
 
     const ROUNDTRIP: &str =
         r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":0.20000000000000001}"#;
+
+    #[tokio::test]
+    async fn session_validation_starts_both_reads_before_waiting() {
+        struct ConcurrentReads(tokio::sync::Barrier);
+
+        impl WdaRequest for ConcurrentReads {
+            async fn request(
+                &self,
+                method: &str,
+                path: &str,
+                body: &[u8],
+                deadline: Duration,
+            ) -> Result<HttpResponse, WdaError> {
+                assert_eq!(method, "GET");
+                assert!(body.is_empty());
+                assert_eq!(deadline, DEADLINE);
+                let body = match path {
+                    "/status" => {
+                        br#"{"sessionId":"fixture-session","value":{"ready":true}}"#.to_vec()
+                    }
+                    "/session/fixture-session" => br#"{"value":{}}"#.to_vec(),
+                    _ => panic!("unexpected request"),
+                };
+                self.0.wait().await;
+                Ok(HttpResponse { status: 200, body })
+            }
+        }
+
+        let reader = ConcurrentReads(tokio::sync::Barrier::new(2));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), validate_session(&reader, SESSION)).await,
+            Ok(Ok(()))
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_session_validation_still_refuses_invalid_responses() {
+        for endpoint in [0, 1] {
+            for body in [
+                "{",
+                r#"{"value":null}"#,
+                r#"{"value":{"error":"fixture-error"}}"#,
+                r#"{"sessionId":"foreign-session","value":{}}"#,
+            ] {
+                let mut steps = session();
+                steps[endpoint] = get(steps[endpoint].path, body);
+                let fake = Fake::new(steps);
+                assert_eq!(
+                    validate_session(&fake, SESSION).await,
+                    Err(SettingsError::SessionUnproven)
+                );
+                fake.done(0);
+            }
+            let mut steps = session();
+            steps[endpoint].response = Err(WdaError::NotConnected);
+            let fake = Fake::new(steps);
+            assert_eq!(
+                validate_session(&fake, SESSION).await,
+                Err(SettingsError::SessionUnproven)
+            );
+            fake.done(0);
+        }
+    }
 
     #[tokio::test]
     async fn idle_lease_keeps_settings_until_explicit_restoration() {
@@ -784,13 +854,15 @@ mod tests {
     #[tokio::test]
     async fn known_recovery_session_drift_refuses_before_post_and_is_unknown_after() {
         let mut before = read_only_preflight();
-        before.extend([settings(TARGET), changed_session()]);
+        before.push(settings(TARGET));
+        before.extend(changed_session());
         let fake = Fake::new(before);
         assert_eq!(recover(&fake).await, KnownIdleRecovery::Refused);
         fake.done(0);
 
         let mut after = recovery_preflight(TARGET, TARGET);
-        after.extend([post(ORIGINAL), settings(ORIGINAL), changed_session()]);
+        after.extend([post(ORIGINAL), settings(ORIGINAL)]);
+        after.extend(changed_session());
         let fake = Fake::new(after);
         assert_eq!(recover(&fake).await, KnownIdleRecovery::Unknown);
         fake.done(1);
@@ -814,14 +886,15 @@ mod tests {
     #[tokio::test]
     async fn read_only_snapshot_refuses_changed_or_wrong_session_without_posts() {
         let mut before = vec![session().remove(0)];
-        before.push(changed_session());
+        before.extend(changed_session());
         let mut during = read_only_preflight();
         during.push(get(
             SETTINGS,
             &format!(r#"{{"sessionId":"replacement","value":{ORIGINAL}}}"#),
         ));
         let mut after = read_only_preflight();
-        after.extend([settings(ORIGINAL), changed_session()]);
+        after.push(settings(ORIGINAL));
+        after.extend(changed_session());
         for steps in [before, during, after] {
             let fake = Fake::new(steps);
             assert!(matches!(
@@ -1009,7 +1082,7 @@ mod tests {
             }
             steps.push(readback);
             if failure == SettingsError::SessionUnproven {
-                steps.push(changed_session());
+                steps.extend(changed_session());
             } else if failure != SettingsError::ReadUnproven {
                 steps.extend(session());
             }
@@ -1025,7 +1098,8 @@ mod tests {
     #[tokio::test]
     async fn changed_session_before_either_mutation_fails_closed() {
         let mut steps = session();
-        steps.extend([settings(ORIGINAL), settings(ORIGINAL), changed_session()]);
+        steps.extend([settings(ORIGINAL), settings(ORIGINAL)]);
+        steps.extend(changed_session());
         let fake = Fake::new(steps);
         let (result, calls) = invoke(&fake, false).await;
         assert_eq!(
@@ -1042,7 +1116,7 @@ mod tests {
                 steps.extend(session());
                 steps.push(settings(TARGET));
             }
-            steps.push(changed_session());
+            steps.extend(changed_session());
             let fake = Fake::new(steps);
             let (result, calls) = invoke(&fake, false).await;
             assert_eq!(result.action, IdleAction::Completed(Ok(7)));
@@ -1058,12 +1132,9 @@ mod tests {
     #[tokio::test]
     async fn session_change_during_set_verification_blocks_action_and_foreign_restore() {
         let mut steps = preflight(ORIGINAL);
-        steps.extend([
-            post(TARGET),
-            settings(TARGET),
-            changed_session(),
-            changed_session(),
-        ]);
+        steps.extend([post(TARGET), settings(TARGET)]);
+        steps.extend(changed_session());
+        steps.extend(changed_session());
         let fake = Fake::new(steps);
         let (result, calls) = invoke(&fake, false).await;
         assert_eq!(
@@ -1146,7 +1217,10 @@ mod tests {
             r#"{"sessionId":"fixture-session","value":{"ready":false}}"#,
             r#"{"sessionId":"replacement","value":{"ready":true}}"#,
         ] {
-            let fake = Fake::new(vec![get("/status", status)]);
+            let fake = Fake::new(vec![
+                get("/status", status),
+                get("/session/fixture-session", r#"{"value":{}}"#),
+            ]);
             assert_eq!(
                 invoke(&fake, false).await.0.action,
                 IdleAction::NotRun(SettingsError::SessionUnproven)
