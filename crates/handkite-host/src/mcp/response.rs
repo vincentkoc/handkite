@@ -9,10 +9,14 @@ where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
     let request = serde_json::to_vec(&request).map_err(|_| ())?;
-    let bytes = exchange(&request).map_err(|_| ())?;
+    let bytes = {
+        let _timing = crate::timing::Span::new("mcp_service_exchange");
+        exchange(&request).map_err(|_| ())?
+    };
     if bytes.len() > MAX_RESPONSE {
         return Err(());
     }
+    let _timing = crate::timing::Span::new("mcp_service_decode");
     serde_json::from_slice(&bytes).map_err(|_| ())
 }
 
@@ -55,6 +59,7 @@ pub(super) fn project_payload(
     format: super::presentation::TreeFormat,
 ) -> Value {
     use super::presentation::TreeFormat;
+    let _timing = crate::timing::Span::new("mcp_tree_projection");
     let metadata = metadata(observation);
     let original = std::mem::take(&mut observation.accessibility_tree);
     match format {

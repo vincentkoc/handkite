@@ -90,6 +90,7 @@ pub struct WireObservation {
 
 impl From<Observation> for WireObservation {
     fn from(value: Observation) -> Self {
+        let _timing = crate::timing::Span::new("wire_image_encode");
         Self {
             device: value.device,
             revision: value.revision,
@@ -112,6 +113,7 @@ fn valid_owner(owner: &str) -> bool {
 }
 
 pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) -> Reply {
+    let _timing = crate::timing::Span::new("controller_dispatch");
     let result = match request {
         Request::Status { device } => {
             controller

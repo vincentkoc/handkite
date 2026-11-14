@@ -80,12 +80,21 @@ impl UsbWda {
         body: &[u8],
         deadline: Duration,
     ) -> Result<HttpResponse, WdaError> {
+        let _timing = crate::timing::Span::new(if method == "GET" {
+            "wda_read_request"
+        } else {
+            "wda_write_request"
+        });
         let request = wda_http::request(method, path, body).map_err(WdaError::InvalidRequest)?;
         // Read-only preflight must finish before the input budget expires too.
         // Once input is sent, retain its full response window and uncertainty rules.
         let deadline = response_budget(method, deadline, self.write_deadline, Instant::now());
         let connect = async {
-            let provider = self.usb.provider().await.map_err(WdaError::Usb)?;
+            let provider = {
+                let _timing = crate::timing::Span::new("usb_discovery");
+                self.usb.provider().await.map_err(WdaError::Usb)?
+            };
+            let _timing = crate::timing::Span::new("usb_connect");
             let device = tokio::time::timeout(CONNECT_TIMEOUT, provider.connect(WDA_PORT))
                 .await
                 .map_err(|_| WdaError::NotConnected)?
@@ -139,6 +148,7 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         return Err(WdaError::ExpiredBeforeSend);
     }
     tokio::time::timeout_at(expires, async {
+        let send_timing = crate::timing::Span::new("wda_send");
         if write_deadline.is_some() || admission.is_some() {
             let mut sent = 0;
             while sent < request.len() {
@@ -189,6 +199,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         } else {
             socket.flush().await.map_err(|_| WdaError::AfterSent)?;
         }
+        drop(send_timing);
+        let _timing = crate::timing::Span::new("wda_response");
         let mut decoder = wda_http::ResponseDecoder::new();
         let mut received = 0;
         // Keep concurrent transport futures small enough for the runtime stack.

@@ -106,6 +106,7 @@ impl WdaActions {
         &mut self,
         wda: &impl WdaRequest,
     ) -> Result<(), SessionValidationError> {
+        let _timing = crate::timing::Span::new("action_session_checks");
         let status = wda.request("GET", "/status", b"", Duration::from_secs(10));
         let (response, validation) = if let Some(id) = self.session.as_deref() {
             let path = format!("/session/{id}");

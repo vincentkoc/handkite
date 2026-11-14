@@ -78,6 +78,7 @@ pub fn query(id: &HardwareId) -> NativeLock {
 }
 
 pub(crate) fn query_until(id: &HardwareId, deadline: Instant) -> NativeLock {
+    let _timing = crate::timing::Span::new("native_lock");
     query_inner(id, deadline.min(Instant::now() + Duration::from_secs(8)))
         .unwrap_or_else(NativeLock::uncertain)
 }

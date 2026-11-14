@@ -232,6 +232,7 @@ impl WdaAdapter {
     }
 
     fn validate_owned_with_deadline(&self, deadline: Option<Instant>) -> Result<(), AdapterError> {
+        let _timing = crate::timing::Span::new("owned_session_checks");
         if deadline.is_some_and(|until| Instant::now() >= until) {
             return Err(AdapterError);
         }
@@ -283,7 +284,16 @@ impl WdaAdapter {
         &self,
         source_path: &str,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
-        self.capture_checked_recorded(source_path, None)
+        if crate::timing::enabled() {
+            let started = Instant::now();
+            let mut timings = CaptureTimings::default();
+            let result = self.capture_checked_recorded(source_path, Some(&mut timings));
+            timings.finish(started, result.is_ok());
+            crate::timing::capture(timings);
+            result
+        } else {
+            self.capture_checked_recorded(source_path, None)
+        }
     }
 
     /// One normal capture, with no output or input and no change to ownership checks.

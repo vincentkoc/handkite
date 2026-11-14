@@ -220,6 +220,7 @@ fn handle_checked<A: DeviceAdapter>(
     if should_stop() {
         return Ok(());
     }
+    let _operation = crate::timing::Span::operation("service_request");
     let reply = match request {
         Ok(bytes) => match serde_json::from_slice::<Request>(&bytes) {
             Ok(request) if !should_stop() => dispatch(controller, request),
@@ -232,7 +233,10 @@ fn handle_checked<A: DeviceAdapter>(
             code: "InvalidRequest".into(),
         },
     };
-    let bytes = serde_json::to_vec(&reply).map_err(io::Error::other)?;
+    let bytes = {
+        let _timing = crate::timing::Span::new("service_serialization");
+        serde_json::to_vec(&reply).map_err(io::Error::other)?
+    };
     let deadline = Instant::now() + RESPONSE_BUDGET;
     if bytes.len() > MAX_RESPONSE {
         return write_reply_until(
@@ -242,6 +246,7 @@ fn handle_checked<A: DeviceAdapter>(
             deadline,
         );
     }
+    let _timing = crate::timing::Span::new("service_write");
     write_reply_until(stream, &bytes, should_stop, deadline)
 }
 

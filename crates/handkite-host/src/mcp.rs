@@ -105,6 +105,7 @@ where
                 break;
             }
         }
+        let _operation = crate::timing::Span::operation("mcp_request");
         let response = match serde_json::from_slice::<Value>(&line) {
             Err(_) => Some(error(Value::Null, -32700, "parse error")),
             Ok(request) if request["method"] == "tools/call" && !valid_tool_frame(&line) => request
@@ -117,6 +118,7 @@ where
             if !screen_kept {
                 session.presentation.clear();
             }
+            let _timing = crate::timing::Span::new("mcp_write");
             output.write_all(&bytes)?;
             output.write_all(b"\n")?;
             output.flush()?;
@@ -125,6 +127,7 @@ where
 }
 
 fn encode_response(mut response: Value) -> io::Result<(Vec<u8>, bool)> {
+    let _timing = crate::timing::Span::new("mcp_serialization");
     let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
     if bytes.len() <= MAX_RESPONSE {
         return Ok((bytes, true));
