@@ -30,6 +30,7 @@ const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessibl
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const HOME_LAUNCH_AGE: Duration = Duration::from_secs(2);
 const HOME_COMPLETION_BUDGET: Duration = Duration::from_secs(5);
+const HOME_PROOF_TAIL: Duration = Duration::from_secs(1);
 const TEXT_INPUT_AGE: Duration = Duration::from_secs(5);
 
 async fn before_input_deadline<T>(
@@ -557,7 +558,8 @@ impl DeviceAdapter for WdaAdapter {
         }
         let _confirmation = crate::timing::Span::new("home_confirmation");
         let until = Instant::now() + HOME_COMPLETION_BUDGET;
-        let result = wait_for_home(until, &Instant::now, |until| {
+        let proof_until = until + HOME_PROOF_TAIL;
+        let result = wait_for_home(until, proof_until, &Instant::now, |until, proof_until| {
             let _attempt = crate::timing::Span::new("home_confirmation_attempt");
             self.validate_owned_with_deadline(Some(until))
                 .inspect_err(|_| {
@@ -565,6 +567,19 @@ impl DeviceAdapter for WdaAdapter {
                 })?;
             let before = native_lock::query_until(&self.expected, until).state;
             crate::timing::outcome("home_native_before_unlocked", before == LockState::Unlocked);
+            if before != LockState::Unlocked {
+                return Err(AdapterError);
+            }
+            // WDA chooses the source application when /source starts. Wait for
+            // Home before requesting the tree, so transition frames cannot pair
+            // the old application's tree with SpringBoard metadata.
+            let home_ready = self
+                .runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(wait_for_home_app(&UsbWda::new(self.usb.clone()), until));
+            crate::timing::outcome("home_active_app_ready", home_ready.is_ok());
+            home_ready?;
             let started = crate::timing::enabled().then(Instant::now);
             let mut timings = started.map(|_| CaptureTimings::default());
             let capture =
@@ -580,9 +595,9 @@ impl DeviceAdapter for WdaAdapter {
                 crate::timing::capture(timings);
             }
             let (raw, captured, reported) = capture?;
-            let after = native_lock::query_until(&self.expected, until).state;
+            let after = native_lock::query_until(&self.expected, proof_until).state;
             crate::timing::outcome("home_native_after_unlocked", after == LockState::Unlocked);
-            self.validate_owned_with_deadline(Some(until))
+            self.validate_owned_with_deadline(Some(proof_until))
                 .inspect_err(|_| {
                     crate::timing::outcome("home_owned_after", false);
                 })?;
@@ -1107,21 +1122,41 @@ fn native_home_deadline(
 
 fn wait_for_home(
     until: Instant,
+    proof_until: Instant,
     now: &impl Fn() -> Instant,
-    mut capture: impl FnMut(Instant) -> Result<(RawObservation, bool), AdapterError>,
+    mut capture: impl FnMut(Instant, Instant) -> Result<(RawObservation, bool), AdapterError>,
 ) -> Result<RawObservation, AdapterError> {
     loop {
         if now() >= until {
             return Err(AdapterError);
         }
-        let (observation, home) = capture(until)?;
-        if now() >= until {
+        let (observation, home) = capture(until, proof_until)?;
+        if now() >= proof_until {
             return Err(AdapterError);
         }
         if home {
             return Ok(observation);
         }
     }
+}
+
+async fn wait_for_home_app(wda: &impl WdaRequest, until: Instant) -> Result<(), AdapterError> {
+    let _timing = crate::timing::Span::new("home_active_app_wait");
+    before_input_deadline(until, async {
+        loop {
+            let response = wda
+                .request("GET", "/wda/activeAppInfo", b"", Duration::from_secs(5))
+                .await
+                .map_err(|_| AdapterError)?;
+            let value = response_value(response)?;
+            match value["bundleId"].as_str().filter(|app| !app.is_empty()) {
+                Some("com.apple.springboard") => return Ok(()),
+                Some(_) => tokio::time::sleep(Duration::from_millis(25)).await,
+                None => return Err(AdapterError),
+            }
+        }
+    })
+    .await
 }
 
 fn home_completion(
@@ -1281,8 +1316,10 @@ mod tests {
         let mut captures = 0;
         let result = wait_for_home(
             until,
+            until,
             &|| start + Duration::from_millis(elapsed.get()),
-            |deadline| {
+            |deadline, proof_deadline| {
+                assert_eq!(proof_deadline, until);
                 assert_eq!(deadline, until);
                 captures += 1;
                 elapsed.set(elapsed.get() + 1);
@@ -1301,8 +1338,10 @@ mod tests {
         assert!(
             wait_for_home(
                 until,
+                until,
                 &|| start + Duration::from_millis(elapsed.get()),
-                |deadline| {
+                |deadline, proof_deadline| {
+                    assert_eq!(proof_deadline, until);
                     assert_eq!(deadline, until);
                     captures += 1;
                     elapsed.set(elapsed.get() + 1);
@@ -1321,7 +1360,7 @@ mod tests {
         let now = std::cell::Cell::new(start);
         let mut captures = 0;
         assert!(
-            wait_for_home(until, &|| now.get(), |_| {
+            wait_for_home(until, until, &|| now.get(), |_, _| {
                 captures += 1;
                 Err(AdapterError)
             })
@@ -1329,13 +1368,116 @@ mod tests {
         );
         assert_eq!(captures, 1);
         assert!(
-            wait_for_home(until, &|| now.get(), |_| {
+            wait_for_home(until, until, &|| now.get(), |_, _| {
                 now.set(until);
                 Ok((home_sample(true), true))
             })
             .is_err()
         );
-        assert!(wait_for_home(until, &|| now.get(), |_| panic!("expired capture polled")).is_err());
+        assert!(
+            wait_for_home(until, until, &|| now.get(), |_, _| panic!(
+                "expired capture polled"
+            ))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn home_proof_tail_cannot_start_another_capture() {
+        let start = Instant::now();
+        let acquisition = start + HOME_COMPLETION_BUDGET;
+        let proof = acquisition + HOME_PROOF_TAIL;
+        let now = std::cell::Cell::new(start);
+        for (reached, finished, accepted) in [
+            (true, acquisition + Duration::from_millis(500), true),
+            (true, proof, false),
+            (false, acquisition, false),
+        ] {
+            now.set(start);
+            let mut captures = 0;
+            let result =
+                wait_for_home(acquisition, proof, &|| now.get(), |capture_by, prove_by| {
+                    assert_eq!(capture_by, acquisition);
+                    assert_eq!(prove_by, proof);
+                    captures += 1;
+                    now.set(finished);
+                    Ok((home_sample(reached), reached))
+                });
+            assert_eq!(result.is_ok(), accepted);
+            assert_eq!(captures, 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn home_app_wait_is_read_only_and_stops_on_invalid_evidence() {
+        struct Apps(std::cell::RefCell<std::collections::VecDeque<serde_json::Value>>);
+        impl WdaRequest for Apps {
+            async fn request(
+                &self,
+                method: &str,
+                path: &str,
+                body: &[u8],
+                _deadline: Duration,
+            ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+                assert_eq!(
+                    (method, path, body),
+                    ("GET", "/wda/activeAppInfo", b"".as_slice())
+                );
+                let value = self.0.borrow_mut().pop_front().expect("unexpected retry");
+                Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&serde_json::json!({"value": value})).unwrap(),
+                })
+            }
+        }
+        for (apps, accepted) in [
+            (
+                vec![
+                    serde_json::json!({"bundleId":"com.example.notes"}),
+                    serde_json::json!({"bundleId":"com.apple.springboard"}),
+                ],
+                true,
+            ),
+            (vec![serde_json::json!({"bundleId":""})], false),
+            (vec![serde_json::json!({"error":"unknown error"})], false),
+        ] {
+            let wda = Apps(std::cell::RefCell::new(apps.into()));
+            assert_eq!(
+                wait_for_home_app(&wda, Instant::now() + Duration::from_secs(1))
+                    .await
+                    .is_ok(),
+                accepted
+            );
+            assert!(wda.0.borrow().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn home_app_wait_bounds_stalled_reads_and_skips_expired_reads() {
+        struct Pending(std::cell::Cell<usize>);
+        impl WdaRequest for Pending {
+            async fn request(
+                &self,
+                _: &str,
+                _: &str,
+                _: &[u8],
+                _: Duration,
+            ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+                self.0.set(self.0.get() + 1);
+                std::future::pending().await
+            }
+        }
+        let wda = Pending(std::cell::Cell::new(0));
+        assert!(wait_for_home_app(&wda, Instant::now()).await.is_err());
+        assert_eq!(wda.0.get(), 0);
+        let start = tokio::time::Instant::now();
+        assert!(
+            wait_for_home_app(&wda, Instant::now() + Duration::from_millis(100))
+                .await
+                .is_err()
+        );
+        assert_eq!(wda.0.get(), 1);
+        assert!(start.elapsed() <= Duration::from_millis(101));
     }
 
     #[tokio::test]
