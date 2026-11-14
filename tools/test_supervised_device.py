@@ -342,6 +342,20 @@ class BrokerTests(unittest.TestCase):
             with self.assertRaises(files.Refused):
                 f.open()
 
+    def test_child_failure_diagnostic_preserves_stop_and_blocks_replay(self):
+        f = self.fixture(6)
+        with patch.object(Fake, "pin_fault_reason", "child_argv", create=True):
+            code, fake, output = self.attempt(
+                f, result=(0, b"unlock_idle=code_submitted\n", b"", True))
+        events = [json.loads(line) for line in output.stream.getvalue().splitlines()]
+        self.assertEqual(events[1]["diagnostic"]["child_failure"], "child_argv")
+        self.assertEqual((code, fake.calls, fake.cleanups), (3, 1, 1))
+        self.assertEqual(events[-1]["result"], "review_required")
+        self.assertTrue(f.active.exists())
+        self.assertEqual(len(list(f.state.glob("*.hold"))), 7)
+        with self.assertRaises(files.Refused):
+            f.open()
+
     def test_crash_seams_leave_receipt_invalid_without_replay(self):
         for seam in ("before_spawn", "after_input", "before_restore"):
             f = self.fixture()
@@ -642,6 +656,69 @@ class BrokerTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_child_failure_labels_never_promote_or_disclose_unknown_details(self):
+        result = (0, b"unlock_idle=code_submitted\n", b"", True)
+        for reason in broker.CHILD_FAILURES:
+            detail = broker.pin_diagnostic(result, reason)
+            self.assertEqual(detail["child_failure"], reason)
+            self.assertEqual(detail["child_integrity"], "unproven")
+            self.assertEqual(broker.pin_result(result), (False, False))
+            zero = (0, b"unlock_idle=already_unlocked\n", b"", True)
+            self.assertEqual(broker.pin_result(zero), (False, False))
+        for reason in (None, "private-path", [], 1):
+            self.assertNotIn("child_failure", broker.pin_diagnostic(result, reason))
+        self.assertNotIn("child_failure", broker.pin_diagnostic((*result[:3], False), "child_argv"))
+
+    def test_child_records_first_fixed_identity_failure(self):
+        for error, expected in ((files.Refused("child_argv"), "child_argv"),
+                                (files.Refused("private-path"), "child_check"),
+                                (OSError("private-path"), "child_check")):
+            child = broker.Child.__new__(broker.Child)
+            child.fault, child.fault_reason = False, None
+            child.fault_lock = threading.Lock()
+            child.identity_fault(error)
+            child.record_fault("output_join")
+            self.assertTrue(child.fault)
+            self.assertEqual(child.fault_reason, expected)
+
+    def test_child_output_faults_identify_stream_without_retaining_output(self):
+        for stream in ("stdout", "stderr"):
+            for suffix, reads in (("limit", [b"x" * 65537, b""]),
+                                  ("read", OSError("private-output"))):
+                child = broker.Child.__new__(broker.Child)
+                child.fault, child.fault_reason = False, None
+                child.fault_lock = threading.Lock()
+                child.data = {"stdout": bytearray(), "stderr": bytearray()}
+                with patch.object(broker.os, "read", side_effect=reads):
+                    child.drain(unittest.mock.Mock(), stream)
+                self.assertEqual(child.fault_reason, stream + "_" + suffix)
+                self.assertEqual(child.data[stream], b"")
+
+    def test_native_pin_keeps_fault_diagnostic_without_changing_result(self):
+        native = broker.Native.__new__(broker.Native)
+        native.p = SimpleNamespace(path=lambda role: "/fixture/" + role,
+            root="/fixture", files={"operator": SimpleNamespace(check=lambda: None)})
+        native.env = {}
+        result = (0, b"unlock_idle=code_submitted\n", b"", True)
+        child = unittest.mock.Mock(fault_reason="child_argv")
+        child.wait.return_value = result
+        with patch.object(broker, "Child", return_value=child):
+            self.assertEqual(native.pin(7), result)
+        self.assertEqual(native.pin_fault_reason, "child_argv")
+
+    def test_child_output_join_timeout_remains_faulted(self):
+        child = broker.Child.__new__(broker.Child)
+        child.process = unittest.mock.Mock()
+        child.process.poll.return_value = child.process.returncode = 0
+        child.threads = [unittest.mock.Mock()]
+        child.threads[0].is_alive.return_value = True
+        child.data = {"stdout": bytearray(), "stderr": bytearray()}
+        child.fault, child.fault_reason = False, None
+        child.fault_lock = threading.Lock()
+        self.assertEqual(child.wait(), (0, b"", b"", True))
+        self.assertEqual(child.fault_reason, "output_join")
+        child.process.stdout.close.assert_not_called()
+
     def test_pin_capture_timings_accept_only_fixed_buckets_without_changing_outcome(self):
         prefix = (b"handkite-unlock-once: unlock_idle=unknown reason=backend_unavailable "
                   b"action=backend_unavailable restoration=verified phase=digit_input step=freshness ")
@@ -848,7 +925,8 @@ class PureTests(unittest.TestCase):
         child.identity = unittest.mock.Mock(side_effect=[None, files.Refused("identity"), None])
         child.threads = []
         child.data = {"stdout": bytearray(b"fixture"), "stderr": bytearray()}
-        child.fault = False
+        child.fault, child.fault_reason = False, None
+        child.fault_lock = threading.Lock()
         self.assertEqual(child.wait(), (0, b"fixture", b"", True))
         self.assertEqual(child.identity.call_count, 3)
         self.assertEqual(child.process.wait.call_args_list,

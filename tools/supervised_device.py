@@ -22,6 +22,8 @@ from _supervised_files import (HeldFile, PathAnchor, Refused, StopSet, digest,
     runtime_lock)
 
 MODES = ("pin-once", "clock-once", "lock-once")
+CHILD_FAILURES = frozenset("""child_exited child_identity child_argv child_check
+    stdout_read stderr_read stdout_limit stderr_limit output_join""".split())
 RUNNER_REASONS = frozenset("""InvalidBundleId InvalidTimeout LookupFailed LookupTimedOut
     EndpointBusy EndpointUnproven EndpointCleanupUnproven StartupTimedOut
     PlanStartUnproven AutomationAuthorizationRequired AutomationInitializationFailed
@@ -163,6 +165,8 @@ class Child:
             stderr=subprocess.PIPE, cwd=cwd, env=env, close_fds=True, bufsize=0)
         self.birth = None
         self.fault = False
+        self.fault_reason = None
+        self.fault_lock = threading.Lock()
         self.data = {"stdout": bytearray(), "stderr": bytearray()}
         self.threads = []
         for name in self.data:
@@ -174,8 +178,19 @@ class Child:
             try:
                 self.birth = proc(self.process.pid)[2:]
                 self.identity()
-            except Exception:
-                self.fault = True
+            except Exception as error:
+                self.identity_fault(error)
+
+    def record_fault(self, reason):
+        with self.fault_lock:
+            self.fault = True
+            if self.fault_reason is None:
+                self.fault_reason = reason
+
+    def identity_fault(self, error):
+        reason = str(error) if isinstance(error, Refused) else None
+        self.record_fault(reason if reason in
+            ("child_exited", "child_identity", "child_argv") else "child_check")
 
     def drain(self, stream, name):
         try:
@@ -186,9 +201,9 @@ class Child:
                 if len(self.data[name]) + len(chunk) <= 65536:
                     self.data[name].extend(chunk)
                 else:
-                    self.fault = True
+                    self.record_fault(name + "_limit")
         except Exception:
-            self.fault = True
+            self.record_fault(name + "_read")
 
     def identity(self):
         require(self.process.poll() is None and self.birth is not None, "child_exited")
@@ -207,16 +222,17 @@ class Child:
         while self.process.poll() is None:
             try:
                 self.identity()
-            except Exception:
+            except Exception as error:
                 if self.process.poll() is None:
-                    self.fault = True
+                    self.identity_fault(error)
             try:
                 self.process.wait(timeout=0.25)
             except subprocess.TimeoutExpired:
                 pass
         for thread in self.threads:
             thread.join(5)
-        self.fault |= any(thread.is_alive() for thread in self.threads)
+        if any(thread.is_alive() for thread in self.threads):
+            self.record_fault("output_join")
         if not any(thread.is_alive() for thread in self.threads):
             self.process.stdout.close()
             self.process.stderr.close()
@@ -326,7 +342,9 @@ class Native:
         self.child = Child([self.p.path("operator"), "--config", self.p.path("config"),
             "--owned-wda-session", "--temporary-idle-settings", "--supervised-visibility-fallback"],
             self.env, stdin, self.p.root, self.p.files["operator"].check)
-        return self.child.wait()
+        result = self.child.wait()
+        self.pin_fault_reason = self.child.fault_reason
+        return result
 
     def clock(self):
         self.child = Child([self.p.path("probe"), "touch-trial-owned-auto-clock", "--config",
@@ -426,11 +444,13 @@ def pin_result(result):
     return submitted, zero and not fault
 
 
-def pin_diagnostic(result):
+def pin_diagnostic(result, fault_reason=None):
     code, out, err, fault = result
     summary = {"exit_code": code if type(code) is int and -255 <= code <= 255 else None,
                "child_integrity": "unproven" if fault else "checked",
                "reported_outcome": "unclassified"}
+    if fault and type(fault_reason) is str and fault_reason in CHILD_FAILURES:
+        summary["child_failure"] = fault_reason
     if not err and out in (b"unlock_idle=code_submitted\n", b"unlock_idle=already_unlocked\n"):
         summary["reported_outcome"] = out.removeprefix(b"unlock_idle=").strip().decode("ascii")
         return summary
@@ -536,7 +556,8 @@ def supervise(profile, backend, stops, output, stdin):
             stage = "operator"
             result = backend.pin(stdin)
             stage = "operator_result"
-            output.emit(mode, "operator", "returned", dispatched, pin_diagnostic(result))
+            output.emit(mode, "operator", "returned", dispatched,
+                        pin_diagnostic(result, getattr(backend, "pin_fault_reason", None)))
             submitted, zero = pin_result(result)
             submitted &= not output.failed
             zero &= not output.failed
