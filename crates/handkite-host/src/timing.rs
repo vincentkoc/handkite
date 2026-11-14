@@ -26,6 +26,13 @@ pub(crate) fn enabled() -> bool {
 #[derive(serde::Serialize)]
 #[serde(untagged)]
 enum Record {
+    Outcome {
+        handkite_timing: u8,
+        pid: u32,
+        operation: u64,
+        stage: &'static str,
+        ok: bool,
+    },
     Span {
         handkite_timing: u8,
         pid: u32,
@@ -119,6 +126,18 @@ pub(crate) fn capture(capture: CaptureTimings) {
         operation: OPERATION.load(Ordering::Relaxed),
         capture,
     });
+}
+
+pub(crate) fn outcome(stage: &'static str, ok: bool) {
+    if enabled() {
+        emit(Record::Outcome {
+            handkite_timing: 1,
+            pid: std::process::id(),
+            operation: OPERATION.load(Ordering::Relaxed),
+            stage,
+            ok,
+        });
+    }
 }
 
 #[cfg(test)]

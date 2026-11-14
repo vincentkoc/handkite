@@ -555,23 +555,46 @@ impl DeviceAdapter for WdaAdapter {
         {
             return self.observe();
         }
+        let _confirmation = crate::timing::Span::new("home_confirmation");
         let until = Instant::now() + HOME_COMPLETION_BUDGET;
-        wait_for_home(until, &Instant::now, |until| {
-            self.validate_owned_with_deadline(Some(until))?;
+        let result = wait_for_home(until, &Instant::now, |until| {
+            let _attempt = crate::timing::Span::new("home_confirmation_attempt");
+            self.validate_owned_with_deadline(Some(until))
+                .inspect_err(|_| {
+                    crate::timing::outcome("home_owned_before", false);
+                })?;
             let before = native_lock::query_until(&self.expected, until).state;
-            let (raw, captured, reported) = self
-                .runtime
-                .as_ref()
-                .expect("adapter runtime")
-                .block_on(before_input_deadline(
-                    until,
-                    Self::capture(&self.usb, &self.expected, SCREEN_SOURCE, None),
-                ))?;
+            crate::timing::outcome("home_native_before_unlocked", before == LockState::Unlocked);
+            let started = crate::timing::enabled().then(Instant::now);
+            let mut timings = started.map(|_| CaptureTimings::default());
+            let capture =
+                self.runtime
+                    .as_ref()
+                    .expect("adapter runtime")
+                    .block_on(before_input_deadline(
+                        until,
+                        Self::capture(&self.usb, &self.expected, SCREEN_SOURCE, timings.as_mut()),
+                    ));
+            if let (Some(started), Some(mut timings)) = (started, timings) {
+                timings.finish(started, capture.is_ok());
+                crate::timing::capture(timings);
+            }
+            let (raw, captured, reported) = capture?;
             let after = native_lock::query_until(&self.expected, until).state;
-            self.validate_owned_with_deadline(Some(until))?;
-            let home = home_completion(&raw, before, after, reported, captured)?;
-            Ok((raw, home))
-        })
+            crate::timing::outcome("home_native_after_unlocked", after == LockState::Unlocked);
+            self.validate_owned_with_deadline(Some(until))
+                .inspect_err(|_| {
+                    crate::timing::outcome("home_owned_after", false);
+                })?;
+            let home = home_completion(&raw, before, after, reported, captured);
+            crate::timing::outcome("home_evidence", home.is_ok());
+            if let Ok(reached) = &home {
+                crate::timing::outcome("home_reached", *reached);
+            }
+            Ok((raw, home?))
+        });
+        crate::timing::outcome("home_confirmation", result.is_ok());
+        result
     }
 
     fn observe_for_action(
