@@ -70,6 +70,29 @@
       },
       "cleanup": [
         {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": true,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": true,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            },
+            "tree_changed": false
+          }
+        },
+        {
           "tool": "handkite_click_button",
           "selector": {
             "type": "Button",
@@ -153,6 +176,22 @@
           "tool": "handkite_tap",
           "arguments": {
             "at": {
+              "x": 55,
+              "y": 136
+            }
+          },
+          "expect": {
+            "keyboard": true,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_tap",
+          "arguments": {
+            "at": {
               "x": 350,
               "y": 136
             }
@@ -187,6 +226,29 @@
       },
       "cleanup": [
         {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": true,
+            "text": {
+              "type": "TextView",
+              "value": "AlphaX\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": true,
+            "text": {
+              "type": "TextView",
+              "value": "AlphaX\n"
+            },
+            "tree_changed": false
+          }
+        },
+        {
           "tool": "handkite_key",
           "arguments": {
             "key": "backspace",
@@ -197,6 +259,29 @@
               "type": "TextView",
               "value": "Alpha\n"
             }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": true,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": true,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            },
+            "tree_changed": false
           }
         },
         {
@@ -259,6 +344,18 @@
             "text": {
               "type": "StaticText",
               "label": "Airplane Mode"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "app": "com.apple.Preferences",
+            "lock": "unlocked",
+            "text": {
+              "type": "StaticText",
+              "label": "Battery"
             }
           }
         }

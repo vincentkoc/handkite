@@ -6,7 +6,7 @@ import unittest
 from benchmark_mcp import (BenchError, Campaign, CASES, Peer, compare, elements,
                            operation_stages, parse_screen, quantiles, summarize,
                            trace_rows, validate_plan, validate_measured_stages,
-                           validate_client_stages, CAPTURE_NAMES)
+                           validate_client_stages, CAPTURE_NAMES, matches)
 
 
 def screen_result(tree="<XCUIElementTypeApplication/>"):
@@ -110,6 +110,14 @@ class BenchmarkTests(unittest.TestCase):
         for missing in rows:
             with self.assertRaisesRegex(BenchError, "incomplete_client_trace"):
                 validate_client_stages([row for row in rows if row is not missing])
+
+    def test_tree_stability_expectation_accepts_only_matching_fresh_trees(self):
+        before = parse_screen(screen_result())
+        after = parse_screen(screen_result("<Different/>"))
+        self.assertTrue(matches(before, {"tree_changed": False}, before))
+        self.assertFalse(matches(after, {"tree_changed": False}, before))
+        self.assertTrue(matches(after, {"tree_changed": True}, before))
+        self.assertFalse(matches(before, {"tree_changed": True}, before))
 
     def test_plan_requires_all_six_cases_and_never_accepts_pin_or_lifecycle_tools(self):
         self.assertEqual(validate_plan(plan()), plan())

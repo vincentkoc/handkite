@@ -458,8 +458,10 @@ def matches(screen, expected, previous=None):
                     "invalid_row_geometry")
             if difference < minimum:
                 return False
-        if key == "tree_changed" and (previous is None or screen["tree"] == previous["tree"]):
-            return False
+        if key == "tree_changed":
+            require(type(value) is bool, "invalid_tree_change_expectation")
+            if previous is None or (screen["tree"] != previous["tree"]) != value:
+                return False
         require(key in {"app", "app_not", "lock", "keyboard", "text", "row_moved", "tree_changed"},
                 "unknown_expectation")
     return True
