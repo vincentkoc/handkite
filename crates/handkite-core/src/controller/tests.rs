@@ -155,6 +155,7 @@ impl DeviceAdapter for FakeAdapter {
             admission,
             Some(
                 ActionAdmission::NativeHome { .. }
+                    | ActionAdmission::NativeSwipe { .. }
                     | ActionAdmission::NativeModalTap { .. }
                     | ActionAdmission::NativeText { .. }
                     | ActionAdmission::NativeTextGesture { .. }
@@ -1152,6 +1153,89 @@ fn native_home_admission_tolerates_only_pixels_and_is_passed_to_execution() {
 }
 
 #[test]
+fn native_swipe_requires_exact_action_fresh_context_and_native_unlock() {
+    let from = Point { x: 195.0, y: 650.0 };
+    let to = Point { x: 195.0, y: 250.0 };
+    for change in 0..12 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = vec![1];
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeSwipe {
+                from,
+                to,
+                duration_ms: 500,
+                until,
+            });
+            inner.adapter.native_lock = LockState::Unlocked;
+            match change {
+                1 => inner.adapter.tree_suffix = "changed".into(),
+                2 => inner.adapter.app = "com.example.other".into(),
+                3 => inner.adapter.locked = true,
+                4 => inner.adapter.uncertain = true,
+                5 => inner.adapter.tap_admission = None,
+                6 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeSwipe {
+                        from,
+                        to,
+                        duration_ms: 501,
+                        until,
+                    })
+                }
+                7 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeSwipe {
+                        from: to,
+                        to: from,
+                        duration_ms: 500,
+                        until,
+                    })
+                }
+                8 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeSwipe {
+                        from,
+                        to,
+                        duration_ms: 500,
+                        until: Instant::now() - Duration::from_secs(1),
+                    })
+                }
+                9 => inner.adapter.native_lock = LockState::Locked,
+                10 => inner.adapter.native_lock = LockState::Uncertain,
+                11 => inner.adapter.stale_capture = true,
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action: Action::Swipe {
+                    from,
+                    to,
+                    duration_ms: 500,
+                },
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        if change == 0 {
+            assert_eq!(result.unwrap().effect, ObservedEffect::Unconfirmed);
+            assert_eq!(inner.adapter.actions, 1);
+            assert_eq!(inner.adapter.native_queries, 1);
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
+        } else {
+            assert!(result.is_err(), "case {change}");
+            assert_eq!(inner.adapter.actions, 0, "case {change}");
+        }
+    }
+}
+
+#[test]
 fn home_completion_keeps_acknowledgment_when_observation_fails() {
     for fail in [false, true] {
         let (controller, key) = controller();
@@ -1388,6 +1472,8 @@ fn visual_drift_still_blocks_other_actions() {
             duration_ms: 100,
         },
     ] {
+        let expected_gesture =
+            matches!(action, Action::Swipe { .. }).then_some(GestureAdmission::Missing);
         let (controller, key) = controller();
         let before = controller.observe(&key).unwrap();
         {
@@ -1416,7 +1502,7 @@ fn visual_drift_still_blocks_other_actions() {
                 state: false,
                 accessibility_tree: true,
                 screenshot: true,
-                gesture_admission: None,
+                gesture_admission: expected_gesture,
             }))
         );
         assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);

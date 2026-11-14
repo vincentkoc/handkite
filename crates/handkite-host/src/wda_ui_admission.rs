@@ -73,6 +73,13 @@ pub(crate) fn safe_context(xml: &str) -> bool {
     parse(xml, Target::Context) == Some(())
 }
 
+pub(crate) fn swipe_context(xml: &str, from: Point, to: Point) -> bool {
+    [from.x, from.y, to.x, to.y]
+        .iter()
+        .all(|value| value.is_finite())
+        && parse(xml, Target::SwipeContext { from, to }) == Some(())
+}
+
 pub(crate) fn visible_text_input(xml: &str) -> bool {
     parse(xml, Target::TextInput) == Some(())
 }
@@ -88,6 +95,7 @@ pub(crate) fn visible_text_target(xml: &str, at: Point) -> bool {
 
 enum Target<'a> {
     Context,
+    SwipeContext { from: Point, to: Point },
     Button(Point),
     ModalButton(Point),
     TextInput,
@@ -170,6 +178,11 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                     }
                     let rect = Rect::read(&attrs)?;
                     if rect.x != 0.0 || rect.y != 0.0 || at.is_some_and(|at| !rect.contains(at)) {
+                        return None;
+                    }
+                    if let Target::SwipeContext { from, to } = target_kind
+                        && (!rect.contains(from) || !rect.contains(to))
+                    {
                         return None;
                     }
                     screen = Some(rect);
@@ -317,6 +330,34 @@ mod tests {
     }
     fn point() -> Point {
         Point { x: 285.0, y: 505.0 }
+    }
+
+    #[test]
+    fn swipe_context_requires_both_points_inside_an_unobstructed_safe_app() {
+        let from = Point { x: 195.0, y: 650.0 };
+        let to = Point { x: 195.0, y: 250.0 };
+        assert!(swipe_context(&tree(""), from, to));
+        for bad in [
+            Point { x: -1.0, y: 200.0 },
+            Point { x: 393.0, y: 200.0 },
+            Point {
+                x: f64::NAN,
+                y: 200.0,
+            },
+            Point { x: 200.0, y: 852.0 },
+        ] {
+            assert!(!swipe_context(&tree(""), bad, to));
+            assert!(!swipe_context(&tree(""), from, bad));
+        }
+        for body in [
+            "<XCUIElementTypeSecureTextField visible=\"false\"/>",
+            "<XCUIElementTypeAlert/>",
+            "<XCUIElementTypeSheet/>",
+            "<XCUIElementTypeOther label=\"Enter Passcode\"/>",
+            "<broken>",
+        ] {
+            assert!(!swipe_context(&tree(body), from, to), "{body}");
+        }
     }
 
     #[test]

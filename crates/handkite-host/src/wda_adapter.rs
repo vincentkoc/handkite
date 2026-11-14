@@ -623,6 +623,7 @@ impl DeviceAdapter for WdaAdapter {
                 | Action::ClickButton { .. }
                 | Action::DoubleTap { .. }
                 | Action::LongPress { .. }
+                | Action::Swipe { .. }
                 | Action::Home
                 | Action::Text { .. }
                 | Action::TextCurrent { .. }
@@ -698,6 +699,27 @@ impl DeviceAdapter for WdaAdapter {
                 captured_at,
                 action,
             )
+        } else if let Action::Swipe {
+            from,
+            to,
+            duration_ms,
+        } = action
+        {
+            native_swipe_deadline(
+                &observation,
+                owned_input,
+                native_before,
+                native_after,
+                reported_lock,
+                action,
+                captured_at,
+            )
+            .map(|until| ActionAdmission::NativeSwipe {
+                from: *from,
+                to: *to,
+                duration_ms: *duration_ms,
+                until,
+            })
         } else if matches!(action, Action::Home) {
             native_home_deadline(
                 &observation,
@@ -749,6 +771,7 @@ impl DeviceAdapter for WdaAdapter {
                 Action::Tap { .. }
                     | Action::DoubleTap { .. }
                     | Action::LongPress { .. }
+                    | Action::Swipe { .. }
                     | Action::Text { .. }
                     | Action::TextCurrent { .. }
                     | Action::Key { .. }
@@ -789,6 +812,24 @@ impl DeviceAdapter for WdaAdapter {
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
         self.error_diagnostic = None;
+        if let Some(ActionAdmission::NativeSwipe {
+            from,
+            to,
+            duration_ms,
+            until,
+        }) = admission
+        {
+            if !matches!(action, Action::Swipe { from: actual_from, to: actual_to, duration_ms: actual_duration }
+                if *actual_from == from && *actual_to == to && *actual_duration == duration_ms)
+                || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            return self.execute(action, send_deadline);
+        }
         if let Some(ActionAdmission::NativeKey { key, until }) = admission {
             if !matches!(action, Action::KeyCurrent { key: actual } if *actual == key)
                 || self.owned_session.is_none()
@@ -1094,6 +1135,42 @@ fn native_text_admission(
     }
 }
 
+fn native_swipe_deadline(
+    observation: &RawObservation,
+    owned: bool,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    action: &Action,
+    captured_at: Instant,
+) -> Option<Instant> {
+    let Action::Swipe {
+        from,
+        to,
+        duration_ms,
+    } = action
+    else {
+        return None;
+    };
+    if !owned
+        || native_before != LockState::Unlocked
+        || native_after != LockState::Unlocked
+        || reported_lock != Some(false)
+        || observation.state.lock != LockState::Unlocked
+        || !observation.state.wda_ready
+        || observation
+            .state
+            .foreground_app
+            .as_deref()
+            .is_none_or(|app| app == "com.apple.springboard")
+        || !(1..=5000).contains(duration_ms)
+        || !crate::wda_ui_admission::swipe_context(&observation.accessibility_tree, *from, *to)
+    {
+        return None;
+    }
+    captured_at.checked_add(TEXT_INPUT_AGE)
+}
+
 fn native_home_deadline(
     observation: &RawObservation,
     owned: bool,
@@ -1229,6 +1306,61 @@ mod tests {
             Err(AdapterError)
         );
         assert_eq!(adapter.take_error_diagnostic(), None);
+    }
+
+    #[test]
+    fn native_swipe_admission_requires_a_safe_context_and_both_native_checks() {
+        let captured = Instant::now();
+        let from = Point { x: 195.0, y: 650.0 };
+        let to = Point { x: 195.0, y: 250.0 };
+        for change in 0..13 {
+            let mut observation = home_sample(false);
+            observation.accessibility_tree = r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"/></AppiumAUT>"#.into();
+            let mut owned = true;
+            let mut before = LockState::Unlocked;
+            let mut after = LockState::Unlocked;
+            let mut reported = Some(false);
+            let mut action = Action::Swipe {
+                from,
+                to,
+                duration_ms: 500,
+            };
+            match change {
+                1 => owned = false,
+                2 => before = LockState::Locked,
+                3 => after = LockState::Uncertain,
+                4 => reported = None,
+                5 => reported = Some(true),
+                6 => observation.state.lock = LockState::Locked,
+                7 => observation.state.wda_ready = false,
+                8 => observation.state.foreground_app = Some("com.apple.springboard".into()),
+                9 => observation.state.foreground_app = None,
+                10 => action = Action::Home,
+                11 => {
+                    action = Action::Swipe {
+                        from,
+                        to,
+                        duration_ms: 0,
+                    }
+                }
+                12 => observation.accessibility_tree = "<broken>".into(),
+                _ => {}
+            }
+            let result = native_swipe_deadline(
+                &observation,
+                owned,
+                before,
+                after,
+                reported,
+                &action,
+                captured,
+            );
+            assert_eq!(
+                result,
+                (change == 0).then_some(captured + TEXT_INPUT_AGE),
+                "case {change}"
+            );
+        }
     }
 
     fn home_sample(home: bool) -> RawObservation {

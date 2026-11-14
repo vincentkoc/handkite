@@ -97,6 +97,12 @@ pub enum ActionAdmission {
     NativeHome {
         until: Instant,
     },
+    NativeSwipe {
+        from: Point,
+        to: Point,
+        duration_ms: u32,
+        until: Instant,
+    },
     NativeText {
         until: Instant,
     },
@@ -156,6 +162,7 @@ pub trait DeviceAdapter {
             admission,
             Some(
                 ActionAdmission::NativeHome { .. }
+                    | ActionAdmission::NativeSwipe { .. }
                     | ActionAdmission::NativeModalTap { .. }
                     | ActionAdmission::NativeText { .. }
                     | ActionAdmission::NativeTextGesture { .. }
@@ -245,6 +252,31 @@ fn gesture_admission_status(
     admission: Option<ActionAdmission>,
     now: Instant,
 ) -> Option<GestureAdmission> {
+    if let Action::Swipe {
+        from,
+        to,
+        duration_ms,
+    } = action
+    {
+        return Some(match admission {
+            Some(ActionAdmission::NativeSwipe {
+                from: admitted_from,
+                to: admitted_to,
+                duration_ms: admitted_duration,
+                ..
+            }) if *from != admitted_from
+                || *to != admitted_to
+                || *duration_ms != admitted_duration =>
+            {
+                GestureAdmission::Mismatched
+            }
+            Some(ActionAdmission::NativeSwipe { until, .. }) if now >= until => {
+                GestureAdmission::Expired
+            }
+            Some(ActionAdmission::NativeSwipe { .. }) => GestureAdmission::Present,
+            _ => GestureAdmission::Missing,
+        });
+    }
     let (Action::DoubleTap { at } | Action::LongPress { at, .. }) = action else {
         return None;
     };
@@ -416,6 +448,27 @@ impl<A: DeviceAdapter> Controller<A> {
                 if fresh.state.lock == LockState::Unlocked
                     && fresh.state.wda_ready
                     && Instant::now() < until =>
+            {
+                Some(until)
+            }
+            (
+                Action::Swipe {
+                    from,
+                    to,
+                    duration_ms,
+                },
+                Some(ActionAdmission::NativeSwipe {
+                    from: admitted_from,
+                    to: admitted_to,
+                    duration_ms: admitted_duration,
+                    until,
+                }),
+            ) if *from == admitted_from
+                && *to == admitted_to
+                && *duration_ms == admitted_duration
+                && fresh.state.lock == LockState::Unlocked
+                && fresh.state.wda_ready
+                && Instant::now() < until =>
             {
                 Some(until)
             }
