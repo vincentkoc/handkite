@@ -691,27 +691,38 @@ impl DeviceAdapter for WdaAdapter {
         if !use_hint {
             self.cache.clear();
         }
-        let native_before = if use_hint {
+        let mut native_before = if use_hint {
             self.native_hint()
         } else {
             self.native_fresh(None)
         };
-        let (observation, captured_at, reported_lock) = self
+        let (mut observation, mut captured_at, mut reported_lock) = self
             .capture_checked_with_lock_report(SCREEN_SOURCE)
             .inspect_err(|_| {
                 self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
             })?;
-        let native_after = if use_hint
-            && reported_lock == Some(false)
-            && observation.state.lock == LockState::Unlocked
-            && crate::wda_ui_admission::safe_context(&observation.accessibility_tree)
-        {
+        let native_after = if use_hint && normal_hint_context(&observation, reported_lock) {
             // This is the same preparation hint, not a new native observation.
             // execute() still requires a fresh native result before sending input.
             native_before
         } else {
             self.cache.clear();
-            self.native_fresh(None)
+            if use_hint {
+                // Special contexts require the original fresh bracket. A hint
+                // already copied into native_before cannot serve as that proof.
+                let (before, capture, after) = fresh_native_bracket(
+                    || self.native_fresh(None),
+                    || self.capture_checked_with_lock_report(SCREEN_SOURCE),
+                )
+                .inspect_err(|_| {
+                    self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
+                })?;
+                native_before = before;
+                (observation, captured_at, reported_lock) = capture;
+                after
+            } else {
+                self.native_fresh(None)
+            }
         };
         self.validate_owned().inspect_err(|_| {
             self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
@@ -1276,6 +1287,29 @@ fn native_swipe_deadline(
     captured_at.checked_add(TEXT_INPUT_AGE)
 }
 
+fn normal_hint_context(observation: &RawObservation, reported: Option<bool>) -> bool {
+    reported == Some(false)
+        && observation.state.lock == LockState::Unlocked
+        && observation
+            .state
+            .foreground_app
+            .as_deref()
+            .is_some_and(|app| app != "com.apple.springboard")
+        && crate::wda_ui_admission::safe_context(&observation.accessibility_tree)
+}
+
+type CheckedCapture = (RawObservation, Instant, Option<bool>);
+
+fn fresh_native_bracket(
+    mut native: impl FnMut() -> LockState,
+    capture: impl FnOnce() -> Result<CheckedCapture, AdapterError>,
+) -> Result<(LockState, CheckedCapture, LockState), AdapterError> {
+    let before = native();
+    let capture = capture()?;
+    let after = native();
+    Ok((before, capture, after))
+}
+
 fn native_app_launch_deadline(
     observation: &RawObservation,
     owned: bool,
@@ -1435,6 +1469,31 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hinted_app_to_home_or_modal_requires_a_new_native_bracket() {
+        for home in [true, false] {
+            let mut raw = home_sample(home);
+            if !home {
+                raw.accessibility_tree = "<XCUIElementTypeAlert/>".into();
+            }
+            assert!(!normal_hint_context(&raw, Some(false)));
+            let calls = std::cell::RefCell::new(Vec::new());
+            let (before, _, after) = fresh_native_bracket(
+                || {
+                    calls.borrow_mut().push("native");
+                    LockState::Locked
+                },
+                || {
+                    calls.borrow_mut().push("capture");
+                    Ok((raw, Instant::now(), Some(false)))
+                },
+            )
+            .unwrap();
+            assert_eq!(*calls.borrow(), ["native", "capture", "native"]);
+            assert_eq!((before, after), (LockState::Locked, LockState::Locked));
+        }
+    }
 
     #[test]
     fn app_launch_admission_requires_unlocked_owned_safe_context() {
