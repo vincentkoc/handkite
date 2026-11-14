@@ -554,7 +554,11 @@ class Campaign:
         try:
             self.peer.initialize()
             self.renew()
-            self.step({"tool": "handkite_observe", "expect": {"lock": "unlocked"}})
+            self.step({"tool": "handkite_observe"})
+            # Home has conservative lock metadata; scenario preparation may
+            # launch its app through the controller's guarded native admission.
+            require(self.screen["metadata"]["state"].get("lock") in
+                    {"unlocked", "uncertain"}, "device_locked")
             if self.preflight is not None:
                 self.preflight()
             # Keep scenario ordering fixed across baseline and candidate runs.

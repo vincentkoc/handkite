@@ -240,6 +240,45 @@ for line in sys.stdin:
         self.assertEqual(campaign.failure_context["step_index"], 0)
         self.assertEqual(campaign.failure_context["call"]["error_code"], "ViewChanged")
 
+    def test_bootstrap_allows_guarded_home_preparation_but_no_locked_input(self):
+        class FakePeer:
+            healthy = True
+
+            def __init__(self, lock):
+                self.calls = []
+                self.lock = lock
+
+            def initialize(self):
+                pass
+
+            def tool(self, name, arguments):
+                call = {"tool": name}
+                self.calls.append(call)
+                result = screen_result()
+                payload = json.loads(result["content"][0]["text"])
+                payload["metadata"]["state"]["lock"] = self.lock
+                payload["metadata"]["state"]["foreground_app"] = "com.apple.springboard"
+                result["content"][0]["text"] = json.dumps(payload)
+                return result, call
+
+        for lock in ("unlocked", "uncertain", "locked"):
+            with self.subTest(lock=lock):
+                reached_preflight = []
+
+                def stop_before_preparation():
+                    reached_preflight.append(True)
+                    raise BenchError("fixture_stop")
+
+                peer = FakePeer(lock)
+                campaign = Campaign(peer, plan(), 20, 0, stop_before_preparation)
+                campaign.run()
+                self.assertEqual(bool(reached_preflight), lock != "locked")
+                self.assertEqual(campaign.failure,
+                                 "device_locked" if lock == "locked" else "fixture_stop")
+                self.assertFalse(any(call["tool"] in
+                                     {"handkite_tap", "handkite_launch_app", "handkite_text"}
+                                     for call in peer.calls))
+
     def test_expectation_failure_reports_predicate_names_without_values(self):
         class FakePeer:
             calls = []
