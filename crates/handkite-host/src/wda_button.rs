@@ -70,18 +70,22 @@ pub(crate) async fn resolve(
         "value": format!("(type == 'XCUIElementTypeButton' OR type == 'XCUIElementTypeMenuItem') AND label == {label}")
     }))
     .map_err(|_| AdapterError)?;
-    let matches = value(
-        wda,
-        session,
-        "POST",
-        &format!("/session/{session}/elements"),
-        &query,
-    )
-    .await?;
-    let matches = matches
-        .as_array()
-        .filter(|items| items.len() == 1)
-        .ok_or(AdapterError)?;
+    let matches = {
+        let _timing = crate::timing::Span::new("button_find");
+        let result = value(
+            wda,
+            session,
+            "POST",
+            &format!("/session/{session}/elements"),
+            &query,
+        )
+        .await;
+        crate::timing::outcome("button_find_ok", result.is_ok());
+        result?
+    };
+    let matches = matches.as_array().filter(|items| items.len() == 1);
+    crate::timing::outcome("button_unique", matches.is_some());
+    let matches = matches.ok_or(AdapterError)?;
     let element = &matches[0];
     let read_id = |key| match element.get(key) {
         None => Ok(None),
@@ -105,12 +109,42 @@ pub(crate) async fn resolve(
         format!("{base}/enabled"),
         format!("{base}/displayed"),
     ];
+    let _timing = crate::timing::Span::new("button_attributes");
     let (kind, label, rect, enabled, visible) = tokio::join!(
         value(wda, session, "GET", &paths[0], b""),
         value(wda, session, "GET", &paths[1], b""),
         value(wda, session, "GET", &paths[2], b""),
         value(wda, session, "GET", &paths[3], b""),
         value(wda, session, "GET", &paths[4], b""),
+    );
+    crate::timing::outcome(
+        "button_type_matches",
+        kind.as_ref().is_ok_and(|value| {
+            value
+                .as_str()
+                .is_some_and(crate::wda_ui_admission::clickable_kind)
+        }),
+    );
+    crate::timing::outcome(
+        "button_label_matches",
+        label.as_ref().is_ok_and(|value| *value == target.label),
+    );
+    crate::timing::outcome(
+        "button_enabled",
+        enabled.as_ref().is_ok_and(|value| *value == true),
+    );
+    crate::timing::outcome(
+        "button_visible",
+        visible.as_ref().is_ok_and(|value| *value == true),
+    );
+    crate::timing::outcome(
+        "button_rect_matches",
+        rect.as_ref().is_ok_and(|value| {
+            value["x"].as_f64() == Some(target.x)
+                && value["y"].as_f64() == Some(target.y)
+                && value["width"].as_f64() == Some(target.width)
+                && value["height"].as_f64() == Some(target.height)
+        }),
     );
     let rect = rect?;
     if !kind?
