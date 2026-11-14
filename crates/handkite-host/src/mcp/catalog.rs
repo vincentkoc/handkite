@@ -125,7 +125,7 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         ),
         (
             "handkite_click_button",
-            "Click one uniquely labelled Button by its observed label and rectangle. Uses element identity, not a coordinate fallback. Requires an expected observation revision.",
+            "Click one uniquely labelled Button or MenuItem by its observed label and rectangle. Uses element identity, not a coordinate fallback. Requires an expected observation revision.",
         ),
         (
             "handkite_double_tap",

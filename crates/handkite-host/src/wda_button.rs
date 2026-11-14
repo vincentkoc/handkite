@@ -67,7 +67,7 @@ pub(crate) async fn resolve(
     let label = serde_json::to_string(&target.label).map_err(|_| AdapterError)?;
     let query = serde_json::to_vec(&json!({
         "using": "predicate string",
-        "value": format!("type == 'XCUIElementTypeButton' AND label == {label}")
+        "value": format!("(type == 'XCUIElementTypeButton' OR type == 'XCUIElementTypeMenuItem') AND label == {label}")
     }))
     .map_err(|_| AdapterError)?;
     let matches = value(
@@ -113,7 +113,9 @@ pub(crate) async fn resolve(
         value(wda, session, "GET", &paths[4], b""),
     );
     let rect = rect?;
-    if kind? != "XCUIElementTypeButton"
+    if !kind?
+        .as_str()
+        .is_some_and(crate::wda_ui_admission::clickable_kind)
         || label? != target.label
         || enabled? != true
         || visible? != true
@@ -235,6 +237,17 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn menu_item_uses_the_same_bound_element_click() {
+        let mut fake = Fake::new();
+        fake.changes
+            .insert("/name".into(), json!("XCUIElementTypeMenuItem"));
+        let resolved = resolve(&fake, "session-1", &target()).await.unwrap();
+        assert_eq!(fake.clicks(), 0);
+        assert_eq!(resolved.click(&fake).await.unwrap().accepted, Some(true));
+        assert_eq!(fake.clicks(), 1);
+    }
+
+    #[tokio::test]
     async fn ambiguous_missing_or_untrusted_identity_never_clicks() {
         for matched in [
             json!([]),
@@ -315,7 +328,7 @@ mod tests {
         assert_eq!(
             query.as_str().unwrap(),
             format!(
-                "type == 'XCUIElementTypeButton' AND label == {}",
+                "(type == 'XCUIElementTypeButton' OR type == 'XCUIElementTypeMenuItem') AND label == {}",
                 serde_json::to_string(&target.label).unwrap()
             )
         );

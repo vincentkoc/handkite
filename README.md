@@ -323,7 +323,7 @@ with approval bound to the concrete action. The included OpenClaw recipe remains
 disabled and observation-only.
 
 `handkite_click_button` takes an observed `target` with exact `label`, `x`, `y`,
-`width` and `height`. It resolves one visible, enabled, session-bound Button,
+`width` and `height`. It resolves one visible, enabled, session-bound Button or MenuItem,
 verifies its attributes, and clicks that identity once. It can address an overlay
 button whose coordinates overlap an underlying row; ambiguous ordinary taps
 remain refused. Missing, duplicated or changed targets do not fall back to a tap.

@@ -61,6 +61,10 @@ pub(crate) fn named_button(xml: &str, target: &ButtonTarget) -> bool {
     target.valid() && parse(xml, Target::NamedButton(target)) == Some(())
 }
 
+pub(crate) fn clickable_kind(kind: &str) -> bool {
+    matches!(kind, "XCUIElementTypeButton" | "XCUIElementTypeMenuItem")
+}
+
 pub(crate) fn visible_modal_button(xml: &str, at: Point) -> bool {
     parse(xml, Target::ModalButton(at)) == Some(())
 }
@@ -230,7 +234,7 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                         }
                     }
                 }
-                if kind == "XCUIElementTypeButton"
+                if clickable_kind(&kind)
                     && let Target::NamedButton(expected) = &target_kind
                     && attrs.get("label") == Some(&expected.label)
                     && attrs.get("visible").map(String::as_str) != Some("false")
@@ -332,6 +336,29 @@ mod tests {
             BUTTON.replace("enabled=\"true\"", "enabled=\"false\""),
             format!("<XCUIElementTypeSheet>{BUTTON}</XCUIElementTypeSheet>"),
             format!("{BUTTON}<XCUIElementTypeSecureTextField/>"),
+        ] {
+            assert!(!named_button(&tree(&body), &target));
+        }
+    }
+
+    #[test]
+    fn named_menu_item_keeps_identity_and_ambiguity_checks() {
+        let target = ButtonTarget {
+            label: "Clear text".into(),
+            x: 270.0,
+            y: 490.0,
+            width: 30.0,
+            height: 30.0,
+        };
+        let menu = BUTTON.replace("XCUIElementTypeButton", "XCUIElementTypeMenuItem");
+        assert!(named_button(&tree(&menu), &target));
+        for body in [
+            format!("{menu}{BUTTON}"),
+            format!("{menu}{menu}"),
+            menu.replace("490", "491"),
+            menu.replace("enabled=\"true\"", "enabled=\"false\""),
+            menu.replace("visible=\"true\"", "visible=\"false\""),
+            menu.replace("MenuItem", "StaticText"),
         ] {
             assert!(!named_button(&tree(&body), &target));
         }
