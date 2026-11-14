@@ -348,7 +348,7 @@ async fn task_exit_preserves_failure_after_automation_wait() {
 
 #[tokio::test]
 async fn automation_initialization_failures_are_distinct_from_wait_timeouts() {
-    for mode in 0..3 {
+    for mode in 0..4 {
         let probes = AtomicUsize::new(0);
         let result = OwnedWdaRunner::start_task(
             move |mut listener| async move {
@@ -365,7 +365,7 @@ async fn automation_initialization_failures_are_distinct_from_wait_timeouts() {
                         )
                         .await
                         .unwrap(),
-                    _ => {
+                    2 => {
                         listener
                             .log_debug_message("entering wait loop for enabling automation mode")
                             .await
@@ -375,6 +375,12 @@ async fn automation_initialization_failures_are_distinct_from_wait_timeouts() {
                             .await
                             .unwrap();
                     }
+                    _ => listener
+                        .log_message(
+                            "Failed to initialize for UI testing: Error Domain=com.apple.LocalAuthentication Code=-2",
+                        )
+                        .await
+                        .unwrap(),
                 }
                 pending().await
             },
@@ -390,6 +396,27 @@ async fn automation_initialization_failures_are_distinct_from_wait_timeouts() {
             Some(RunnerError::AutomationInitializationFailed)
         );
         assert_eq!(probes.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[test]
+fn initialization_diagnostic_keeps_native_code_without_private_description() {
+    assert_eq!(
+        initialization_diagnostic(
+            "Failed to initialize for UI testing: Error Domain=com.apple.LocalAuthentication Code=-4 UserInfo={description=sensitive-fixture-token}",
+            true,
+        ),
+        "runner_initialization_failure automation_waiting=true local_authentication=true local_authentication_code=Some(-4)",
+    );
+    for message in [
+        "Error Domain=other Code=-4 sensitive-fixture-token",
+        "Error Domain=com.apple.LocalAuthentication Code=-4sensitive-fixture-token",
+        "Error Domain=com.apple.LocalAuthentication Code=2147483648 sensitive-fixture-token",
+        "sensitive-fixture-token",
+    ] {
+        let diagnostic = initialization_diagnostic(message, false);
+        assert!(!diagnostic.contains("sensitive-fixture-token"));
+        assert!(diagnostic.ends_with("local_authentication_code=None"));
     }
 }
 

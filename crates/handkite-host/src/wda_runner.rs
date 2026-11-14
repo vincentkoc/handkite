@@ -594,14 +594,45 @@ fn initialization_failure(message: &str, automation_waiting: bool) -> RunnerErro
     }
 }
 
+fn initialization_diagnostic(message: &str, automation_waiting: bool) -> String {
+    const DOMAIN: &str = "com.apple.LocalAuthentication";
+    let code = message
+        .split_once("Error Domain=com.apple.LocalAuthentication Code=")
+        .and_then(|(_, suffix)| suffix.split_whitespace().next())
+        .filter(|value| value.len() <= 11)
+        .and_then(|value| value.parse::<i32>().ok());
+    format!(
+        "runner_initialization_failure automation_waiting={automation_waiting} local_authentication={} local_authentication_code={code:?}",
+        message.contains(DOMAIN),
+    )
+}
+
 struct PlanListener {
     phase: watch::Sender<PlanState>,
 }
 
 impl XCUITestListener for PlanListener {
+    async fn test_runner_ready_with_capabilities(&mut self) -> Result<(), IdeviceError> {
+        eprintln!("handkited: runner_startup_stage=runner_ready");
+        Ok(())
+    }
+
+    async fn did_begin_initializing_for_ui_testing(&mut self) -> Result<(), IdeviceError> {
+        eprintln!("handkited: runner_startup_stage=ui_initializing");
+        Ok(())
+    }
+
+    async fn log_message(&mut self, message: &str) -> Result<(), IdeviceError> {
+        self.log_debug_message(message).await
+    }
+
     async fn log_debug_message(&mut self, message: &str) -> Result<(), IdeviceError> {
         if message.contains("Failed to initialize for UI testing") {
             let automation_waiting = self.phase.borrow().automation_waiting;
+            eprintln!(
+                "handkited: {}",
+                initialization_diagnostic(message, automation_waiting)
+            );
             self.fail(initialization_failure(message, automation_waiting));
             return Ok(());
         }
@@ -609,7 +640,7 @@ impl XCUITestListener for PlanListener {
             message.contains("entering wait loop") && message.contains("enabling automation mode");
         let done = message.contains("cleaning up enabling automation mode");
         if waiting || done {
-            self.phase.send_if_modified(|state| {
+            let changed = self.phase.send_if_modified(|state| {
                 if state.failure.is_some() || state.phase == PlanPhase::Finished {
                     return false;
                 }
@@ -618,6 +649,14 @@ impl XCUITestListener for PlanListener {
                 state.automation_waiting = next;
                 changed
             });
+            if changed {
+                let stage = if done {
+                    "automation_finished"
+                } else {
+                    "automation_waiting"
+                };
+                eprintln!("handkited: runner_startup_stage={stage}");
+            }
         }
         Ok(())
     }
@@ -650,6 +689,10 @@ impl XCUITestListener for PlanListener {
         description: &str,
     ) -> Result<(), IdeviceError> {
         let automation_waiting = self.phase.borrow().automation_waiting;
+        eprintln!(
+            "handkited: {}",
+            initialization_diagnostic(description, automation_waiting)
+        );
         self.fail(initialization_failure(description, automation_waiting));
         Ok(())
     }
