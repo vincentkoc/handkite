@@ -29,7 +29,7 @@ pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=a
 const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const HOME_LAUNCH_AGE: Duration = Duration::from_secs(2);
-const HOME_COMPLETION_BUDGET: Duration = Duration::from_secs(5);
+const HOME_COMPLETION_BUDGET: Duration = Duration::from_secs(6);
 const HOME_PROOF_TAIL: Duration = Duration::from_secs(1);
 const TEXT_INPUT_AGE: Duration = Duration::from_secs(5);
 
@@ -1478,6 +1478,20 @@ mod tests {
         );
         assert_eq!(wda.0.get(), 1);
         assert!(start.elapsed() <= Duration::from_millis(101));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn home_acquisition_allows_the_measured_snapshot_tail() {
+        // Native and active-app checks plus the full Home snapshot crossed
+        // five seconds on device. The remaining proof still has its own cap.
+        let started = tokio::time::Instant::now();
+        let result = before_input_deadline(Instant::now() + HOME_COMPLETION_BUDGET, async {
+            tokio::time::sleep(Duration::from_millis(5_050)).await;
+            Ok(())
+        })
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(started.elapsed(), Duration::from_millis(5_050));
     }
 
     #[tokio::test]
