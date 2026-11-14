@@ -434,16 +434,22 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
             from,
             to,
             duration_ms,
-        } if point_valid(*from) && point_valid(*to) && (1..=5000).contains(duration_ms) => Ok((
-            "/actions",
-            touch_action(vec![
-                json!({"type": "pointerMove", "duration": 0, "x": from.x, "y": from.y}),
-                json!({"type": "pointerDown", "button": 0}),
-                json!({"type": "pause", "duration": 50}),
-                json!({"type": "pointerMove", "duration": duration_ms, "x": to.x, "y": to.y}),
-                json!({"type": "pointerUp", "button": 0}),
-            ]),
-        )),
+        } if point_valid(*from) && point_valid(*to) && (1..=5000).contains(duration_ms) => {
+            let seconds = f64::from(*duration_ms) / 1000.0;
+            let distance = (to.x - from.x).hypot(to.y - from.y);
+            // Preserve the requested travel time and the existing 50 ms press.
+            // The native route resolves each coordinate once instead of the
+            // repeated coordinate resolution in a W3C action sequence.
+            Ok((
+                "/wda/pressAndDragWithVelocity",
+                json!({
+                    "fromX": from.x, "fromY": from.y, "toX": to.x, "toY": to.y,
+                    "pressDuration": 0.05,
+                    "velocity": if distance == 0.0 { 1.0 } else { distance / seconds },
+                    "holdDuration": if distance == 0.0 { seconds } else { 0.0 },
+                }),
+            ))
+        }
         _ => Err(AdapterError),
     }
 }
@@ -1473,20 +1479,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_swipe_never_retries_an_uncertain_input() {
+        let mut wda = Script::new(vec![Step {
+            method: "POST",
+            path: "/session/fixture-session/wda/pressAndDragWithVelocity",
+            response: Err(WdaError::AfterSent),
+        }]);
+        wda.1 = Some(json!({"fromX":20.0,"fromY":20.0,"toX":40.0,"toY":20.0,
+            "pressDuration":0.05,"velocity":40.0,"holdDuration":0.0}));
+        assert!(
+            WdaActions::execute_on(
+                &wda,
+                &Action::Swipe {
+                    from: Point { x: 20.0, y: 20.0 },
+                    to: Point { x: 40.0, y: 20.0 },
+                    duration_ms: 500,
+                },
+                "fixture-session"
+            )
+            .await
+            .is_err()
+        );
+        wda.done();
+    }
+
+    #[test]
+    fn zero_distance_swipe_preserves_hold_time() {
+        let (_, body) = payload(&Action::Swipe {
+            from: Point { x: 20.0, y: 20.0 },
+            to: Point { x: 20.0, y: 20.0 },
+            duration_ms: 500,
+        })
+        .unwrap();
+        assert_eq!(body["velocity"], 1.0);
+        assert_eq!(body["holdDuration"], 0.5);
+        assert_eq!(body["pressDuration"], 0.05);
+    }
+
+    #[tokio::test]
     async fn swipe_preserves_direction_duration_and_sends_one_gesture() {
         let mut wda = Script::new(vec![response(
             "POST",
-            "/session/fixture-session/actions",
+            "/session/fixture-session/wda/pressAndDragWithVelocity",
             200,
             json!({"value":null}),
         )]);
-        wda.1 = Some(touch_action(vec![
-            json!({"type":"pointerMove","duration":0,"x":195.5,"y":700.0}),
-            json!({"type":"pointerDown","button":0}),
-            json!({"type":"pause","duration":50}),
-            json!({"type":"pointerMove","duration":450,"x":195.5,"y":240.0}),
-            json!({"type":"pointerUp","button":0}),
-        ]));
+        wda.1 = Some(json!({"fromX":195.5,"fromY":700.0,"toX":195.5,"toY":240.0,
+            "pressDuration":0.05,"velocity":460.0/0.45,"holdDuration":0.0}));
         let receipt = WdaActions::execute_on(
             &wda,
             &Action::Swipe {
