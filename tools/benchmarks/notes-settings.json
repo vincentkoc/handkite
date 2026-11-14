@@ -1,0 +1,500 @@
+{
+  "version": 1,
+  "cases": [
+    {
+      "name": "tap",
+      "prepare": [
+        {
+          "tool": "handkite_observe",
+          "arguments": {}
+        },
+        {
+          "tool": "handkite_launch_app",
+          "arguments": {
+            "bundle_id": "com.apple.mobilenotes"
+          },
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked"
+          },
+          "when": {
+            "app_not": "com.apple.mobilenotes"
+          }
+        },
+        {
+          "tool": "handkite_click_button",
+          "selector": {
+            "type": "Button",
+            "label": "Done"
+          },
+          "when": {
+            "keyboard": true
+          },
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked",
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        }
+      ],
+      "measure": {
+        "tool": "handkite_tap",
+        "arguments": {
+          "at": {
+            "x": 55,
+            "y": 136
+          }
+        },
+        "expect": {
+          "keyboard": true,
+          "text": {
+            "type": "TextView",
+            "value": "Alpha\n"
+          }
+        }
+      },
+      "cleanup": [
+        {
+          "tool": "handkite_click_button",
+          "selector": {
+            "type": "Button",
+            "label": "Done"
+          },
+          "when": {
+            "keyboard": true
+          },
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "type",
+      "prepare": [
+        {
+          "tool": "handkite_observe",
+          "arguments": {}
+        },
+        {
+          "tool": "handkite_launch_app",
+          "arguments": {
+            "bundle_id": "com.apple.mobilenotes"
+          },
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked"
+          },
+          "when": {
+            "app_not": "com.apple.mobilenotes"
+          }
+        },
+        {
+          "tool": "handkite_click_button",
+          "selector": {
+            "type": "Button",
+            "label": "Done"
+          },
+          "when": {
+            "keyboard": true
+          },
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked",
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_tap",
+          "arguments": {
+            "at": {
+              "x": 350,
+              "y": 136
+            }
+          },
+          "expect": {
+            "keyboard": true
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        }
+      ],
+      "measure": {
+        "tool": "handkite_text",
+        "arguments": {
+          "value": "X",
+          "selection": "current"
+        },
+        "expect": {
+          "text": {
+            "type": "TextView",
+            "value": "AlphaX\n"
+          }
+        }
+      },
+      "cleanup": [
+        {
+          "tool": "handkite_key",
+          "arguments": {
+            "key": "backspace",
+            "selection": "current"
+          },
+          "expect": {
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_click_button",
+          "selector": {
+            "type": "Button",
+            "label": "Done"
+          },
+          "when": {
+            "keyboard": true
+          },
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "swipe",
+      "prepare": [
+        {
+          "tool": "handkite_observe",
+          "arguments": {}
+        },
+        {
+          "tool": "handkite_launch_app",
+          "arguments": {
+            "bundle_id": "com.apple.Preferences"
+          },
+          "expect": {
+            "app": "com.apple.Preferences",
+            "lock": "unlocked"
+          },
+          "when": {
+            "app_not": "com.apple.Preferences"
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "app": "com.apple.Preferences",
+            "lock": "unlocked",
+            "keyboard": false,
+            "text": {
+              "type": "StaticText",
+              "label": "Airplane Mode"
+            }
+          }
+        }
+      ],
+      "measure": {
+        "tool": "handkite_swipe",
+        "arguments": {
+          "from": {
+            "x": 195,
+            "y": 650
+          },
+          "to": {
+            "x": 195,
+            "y": 250
+          },
+          "duration_ms": 500
+        },
+        "expect": {
+          "app": "com.apple.Preferences",
+          "lock": "unlocked",
+          "tree_changed": true,
+          "row_moved": {
+            "selector": {
+              "type": "StaticText",
+              "label": "Battery"
+            },
+            "minimum": 100
+          }
+        }
+      },
+      "cleanup": [
+        {
+          "tool": "handkite_swipe",
+          "arguments": {
+            "from": {
+              "x": 195,
+              "y": 250
+            },
+            "to": {
+              "x": 195,
+              "y": 650
+            },
+            "duration_ms": 500
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "text": {
+              "type": "StaticText",
+              "label": "Airplane Mode"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "launch",
+      "prepare": [
+        {
+          "tool": "handkite_observe",
+          "arguments": {}
+        },
+        {
+          "tool": "handkite_launch_app",
+          "arguments": {
+            "bundle_id": "com.apple.Preferences"
+          },
+          "expect": {
+            "app": "com.apple.Preferences",
+            "lock": "unlocked"
+          },
+          "when": {
+            "app_not": "com.apple.Preferences"
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "app": "com.apple.Preferences",
+            "lock": "unlocked"
+          }
+        }
+      ],
+      "measure": {
+        "tool": "handkite_launch_app",
+        "arguments": {
+          "bundle_id": "com.apple.mobilenotes"
+        },
+        "expect": {
+          "app": "com.apple.mobilenotes",
+          "lock": "unlocked"
+        }
+      },
+      "cleanup": [
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "observe_image",
+      "prepare": [
+        {
+          "tool": "handkite_observe",
+          "arguments": {}
+        },
+        {
+          "tool": "handkite_launch_app",
+          "arguments": {
+            "bundle_id": "com.apple.mobilenotes"
+          },
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked"
+          },
+          "when": {
+            "app_not": "com.apple.mobilenotes"
+          }
+        },
+        {
+          "tool": "handkite_click_button",
+          "selector": {
+            "type": "Button",
+            "label": "Done"
+          },
+          "when": {
+            "keyboard": true
+          },
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked",
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        }
+      ],
+      "measure": {
+        "tool": "handkite_observe",
+        "arguments": {
+          "tree_format": "omit"
+        },
+        "expect": {
+          "app": "com.apple.mobilenotes",
+          "lock": "unlocked"
+        }
+      }
+    },
+    {
+      "name": "observe_tree",
+      "prepare": [
+        {
+          "tool": "handkite_observe",
+          "arguments": {}
+        },
+        {
+          "tool": "handkite_launch_app",
+          "arguments": {
+            "bundle_id": "com.apple.mobilenotes"
+          },
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked"
+          },
+          "when": {
+            "app_not": "com.apple.mobilenotes"
+          }
+        },
+        {
+          "tool": "handkite_click_button",
+          "selector": {
+            "type": "Button",
+            "label": "Done"
+          },
+          "when": {
+            "keyboard": true
+          },
+          "expect": {
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        },
+        {
+          "tool": "handkite_observe",
+          "arguments": {},
+          "expect": {
+            "app": "com.apple.mobilenotes",
+            "lock": "unlocked",
+            "keyboard": false,
+            "text": {
+              "type": "TextView",
+              "value": "Alpha\n"
+            }
+          }
+        }
+      ],
+      "measure": {
+        "tool": "handkite_observe",
+        "arguments": {},
+        "expect": {
+          "app": "com.apple.mobilenotes",
+          "lock": "unlocked",
+          "keyboard": false,
+          "text": {
+            "type": "TextView",
+            "value": "Alpha\n"
+          }
+        }
+      }
+    }
+  ]
+}

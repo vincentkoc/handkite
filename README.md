@@ -453,6 +453,57 @@ remain external inputs; this path pin does not qualify them.
 
 `handkite-doctor --config /path/to/config.json` checks the pinned USB device, WDA status, the existing WDA session, and native lock state. It reports only readiness flags and lock state as JSON; it does not create a WDA session or send device input. Exit code 0 means the locked or unlocked phone can be observed. It does not mean app actions or PIN entry are qualified.
 
+## Repeatable MCP speed benchmark
+
+`tools/benchmark_mcp.py` measures tap, type, swipe, app launch, image-only
+observation and full-tree observation through one MCP client. It uses the
+existing service; it never starts a controller, changes WDA settings or enters
+a PIN. Enable `HANDKITE_TIMINGS=1` on the normally started service through the
+qualified diagnostic route first. The runner enables the same flag on its
+MCP subprocess and checks both trace streams before sending input.
+
+The example `tools/benchmarks/notes-settings.json` needs the dedicated Notes
+fixture containing exactly `Alpha` and a trailing newline, plus Settings at
+its top-level list. Coordinates use logical points on a 393×852 viewport.
+Use `--calibrate` for one trial per case before the measured campaign; this
+report cannot qualify the regression gate.
+The phone must be unlocked and exclusively handed to this client. Do not run
+another status or observation client during a campaign: traces are correlated
+across the two serial request streams.
+
+```sh
+python3 tools/benchmark_mcp.py run \
+  --plan tools/benchmarks/notes-settings.json \
+  --output /private/path/before.json \
+  --service-trace /private/path/service-timing.jsonl \
+  --service-pid SERVICE_PID --service-build FULL_COMMIT \
+  --client-build FULL_COMMIT --count 20 -- \
+  /path/to/handkite-mcp --service \
+  --capabilities observation,navigation,interaction
+python3 tools/benchmark_mcp.py compare /private/path/before.json /private/path/after.json
+```
+
+Each case runs one warmup and at least twenty measured trials. Preparation and
+cleanup are timed separately. The report includes nearest-rank p50/p95,
+response sizes, build identities and per-stage timings, without screenshots,
+trees, typed text or device identifiers. Failed actions stop the campaign;
+input is never retried. One read-only observation can diagnose uncertain input.
+
+`span.*.covered` is the union of overlapping intervals in that stage;
+`span.*.work` is their cumulative work. Neither should be added to enclosing
+or overlapping stages. Capture stages are reported separately for pre-input
+admission and post-input verification. `input_request` measures the WDA input
+request, excluding element lookup; it is not a separate unverified-input API.
+WDA response time includes its internal idle and snapshot work, which the host
+cannot split without WDA instrumentation. Tree omission currently reduces the
+MCP payload only: the service still acquires a paired image and tree.
+
+The comparison command fails for missing samples, failed trials, invalid or
+incomplete traces, different plans, or a p50/p95 regression above 5% plus 20 ms.
+Product budgets remain separate from that relative regression gate: input
+dispatch under 1 s, image-only observe under 500 ms, full-tree observe under
+1.5 s, launch under 3 s and full act-and-verify under 2 s.
+
 ## Owned-session idle settings
 
 The owned daemon's candidate timing policy sets its new WDA session to
