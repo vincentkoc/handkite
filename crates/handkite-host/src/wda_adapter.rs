@@ -527,6 +527,7 @@ impl DeviceAdapter for WdaAdapter {
                 | Action::LongPress { .. }
                 | Action::Home
                 | Action::Text { .. }
+                | Action::TextCurrent { .. }
                 | Action::KeyCurrent { .. }
         ) && self.owned_session.is_some()
             && self.owned_runner.is_some();
@@ -581,6 +582,7 @@ impl DeviceAdapter for WdaAdapter {
             action,
             Action::KeyCurrent { .. }
                 | Action::Text { .. }
+                | Action::TextCurrent { .. }
                 | Action::DoubleTap { .. }
                 | Action::LongPress { .. }
         ) {
@@ -629,6 +631,7 @@ impl DeviceAdapter for WdaAdapter {
                     | Action::DoubleTap { .. }
                     | Action::LongPress { .. }
                     | Action::Text { .. }
+                    | Action::TextCurrent { .. }
                     | Action::Key { .. }
                     | Action::KeyCurrent { .. }
             ) && self.owned_session.is_some())
@@ -714,7 +717,7 @@ impl DeviceAdapter for WdaAdapter {
             return Err(AdapterError);
         }
         if let Some(ActionAdmission::NativeText { until }) = admission {
-            if !matches!(action, Action::Text { .. })
+            if !matches!(action, Action::Text { .. } | Action::TextCurrent { .. })
                 || self.owned_session.is_none()
                 || self.owned_runner.is_none()
                 || Instant::now() >= until
@@ -906,6 +909,9 @@ fn native_text_admission(
     let xml = &observation.accessibility_tree;
     match action {
         Action::Text { .. } if crate::wda_ui_admission::visible_text_input(xml) => {
+            Some(ActionAdmission::NativeText { until })
+        }
+        Action::TextCurrent { .. } if crate::wda_ui_admission::visible_current_text_input(xml) => {
             Some(ActionAdmission::NativeText { until })
         }
         Action::KeyCurrent { key } if crate::wda_ui_admission::visible_current_text_input(xml) => {
@@ -1360,6 +1366,12 @@ mod tests {
                     value: "fixture".into(),
                 },
                 None,
+            ),
+            (
+                Action::TextCurrent {
+                    value: "fixture".into(),
+                },
+                Some(ActionAdmission::NativeText { until }),
             ),
             (
                 Action::LongPress {

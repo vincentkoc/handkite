@@ -841,6 +841,62 @@ fn current_selection_key_is_explicit_and_bound_to_key_and_context() {
 }
 
 #[test]
+fn current_selection_text_preserves_context_and_native_admission() {
+    for case in 0..9 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let action = Action::TextCurrent {
+            value: "Beta".into(),
+        };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = b"blink".to_vec();
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeText { until });
+            inner.adapter.native_lock = LockState::Unlocked;
+            match case {
+                1 => inner.adapter.tap_admission = None,
+                2 => inner.adapter.tree_suffix = "changed-selection".into(),
+                3 => inner.adapter.native_lock = LockState::Locked,
+                4 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeText {
+                        until: Instant::now(),
+                    })
+                }
+                5 => inner.adapter.stale_capture = true,
+                6 => inner.adapter.wda_ready = false,
+                7 => inner.adapter.app = "different.app".into(),
+                8 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeKey {
+                        key: crate::protocol::KeyboardKey::Enter,
+                        until,
+                    })
+                }
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(result.is_ok(), case == 0, "case {case}");
+        assert_eq!(inner.adapter.actions, usize::from(case == 0), "case {case}");
+        if case == 0 {
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
+        }
+    }
+}
+
+#[test]
 fn named_button_admission_preserves_tree_state_and_deadline_checks() {
     for case in 0..7 {
         let (controller, key) = controller();

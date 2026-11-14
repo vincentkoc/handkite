@@ -69,12 +69,12 @@ struct KeyArguments {
     _response: presentation::Options,
     expected_revision: Revision,
     key: KeyboardKey,
-    selection: Option<KeySelection>,
+    selection: Option<EditingSelection>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum KeySelection {
+enum EditingSelection {
     Current,
 }
 
@@ -96,6 +96,7 @@ struct TextArguments {
     _response: presentation::Options,
     expected_revision: Revision,
     value: String,
+    selection: Option<EditingSelection>,
 }
 
 #[derive(Deserialize)]
@@ -183,7 +184,7 @@ pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> 
             let args: KeyArguments = serde_json::from_value(value).map_err(|_| ())?;
             let action = match args.selection {
                 None => Action::Key { key: args.key },
-                Some(KeySelection::Current) => Action::KeyCurrent { key: args.key },
+                Some(EditingSelection::Current) => Action::KeyCurrent { key: args.key },
             };
             Ok((args.expected_revision, action))
         }
@@ -209,7 +210,11 @@ pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> 
             {
                 return Err(());
             }
-            Ok((args.expected_revision, Action::Text { value: args.value }))
+            let action = match args.selection {
+                None => Action::Text { value: args.value },
+                Some(EditingSelection::Current) => Action::TextCurrent { value: args.value },
+            };
+            Ok((args.expected_revision, action))
         }
         Tool::LaunchApp => {
             let args: LaunchArguments = serde_json::from_value(value).map_err(|_| ())?;
@@ -305,6 +310,10 @@ pub(super) fn schema(tool: Tool) -> Value {
                 json!({"type":"string","minLength":1,"description":"At most 4096 UTF-8 bytes; no control characters"}),
             );
             required.push("value");
+            properties.insert("selection".into(), json!({
+                "type":"string", "enum":["current"],
+                "description":"Opt in to typing into iOS's current editing selection. Does not preserve or prove the earlier caret/range. Omit for exact-image admission in multiline editors."
+            }));
         }
         Tool::Key => {
             properties.insert(
@@ -350,6 +359,31 @@ mod tests {
         let mut bad = request;
         bad["selection"] = json!("preserve");
         assert!(parse(Tool::Key, bad).is_err());
+    }
+
+    #[test]
+    fn current_selection_text_requires_explicit_opt_in_and_keeps_validation() {
+        let request = json!({"expected_revision":7,"value":"Beta"});
+        let (_, strict) = parse(Tool::Text, request.clone()).unwrap();
+        assert!(matches!(strict, Action::Text { .. }));
+        let mut current = request;
+        current["selection"] = json!("current");
+        let (_, action) = parse(Tool::Text, current.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(action).unwrap(),
+            json!({"type":"text_current","value":"Beta"})
+        );
+        for value in [json!(""), json!("line\nline"), json!("a".repeat(4097))] {
+            current["value"] = value;
+            assert!(parse(Tool::Text, current.clone()).is_err());
+        }
+        current["value"] = json!("Beta");
+        current["selection"] = json!("preserve");
+        assert!(parse(Tool::Text, current).is_err());
+        assert_eq!(
+            schema(Tool::Text)["properties"]["selection"]["enum"],
+            json!(["current"])
+        );
     }
 
     #[test]

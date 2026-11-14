@@ -341,7 +341,7 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
         Action::LaunchApp { bundle_id } if !bundle_id.is_empty() && bundle_id.len() <= 256 => {
             Ok(("/wda/apps/launch", json!({"bundleId": bundle_id})))
         }
-        Action::Text { value } if value.len() <= 16_384 => {
+        Action::Text { value } | Action::TextCurrent { value } if value.len() <= 16_384 => {
             let chars: Vec<String> = value.chars().map(String::from).collect();
             Ok(("/wda/keys", json!({"value": chars})))
         }
@@ -518,6 +518,19 @@ mod tests {
                 json!({"value": null}),
             ),
         ]
+    }
+
+    #[test]
+    fn current_selection_text_uses_the_same_single_key_request() {
+        let value = "Beta".to_owned();
+        let strict = payload(&Action::Text {
+            value: value.clone(),
+        })
+        .unwrap();
+        let current = payload(&Action::TextCurrent { value }).unwrap();
+        assert_eq!(current, strict);
+        assert_eq!(current.0, "/wda/keys");
+        assert_eq!(current.1, json!({"value":["B","e","t","a"]}));
     }
 
     #[tokio::test]

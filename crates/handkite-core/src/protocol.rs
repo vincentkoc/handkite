@@ -196,6 +196,10 @@ pub enum Action {
     Text {
         value: String,
     },
+    /// Types into the current editing selection, without preserving its old range.
+    TextCurrent {
+        value: String,
+    },
     Key {
         key: KeyboardKey,
     },
@@ -227,7 +231,7 @@ impl Action {
             Self::DoubleTap { .. } => "double_tap",
             Self::LongPress { .. } => "long_press",
             Self::Swipe { .. } => "swipe",
-            Self::Text { .. } => "text",
+            Self::Text { .. } | Self::TextCurrent { .. } => "text",
             Self::Key { .. } | Self::KeyCurrent { .. } => "key",
             Self::Home => "home",
             Self::LaunchApp { .. } => "launch_app",

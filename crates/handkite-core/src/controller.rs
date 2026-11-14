@@ -318,10 +318,12 @@ impl<A: DeviceAdapter> Controller<A> {
             {
                 Some(until)
             }
-            (Action::Text { .. }, Some(ActionAdmission::NativeText { until }))
-                if fresh.state.lock == LockState::Unlocked
-                    && fresh.state.wda_ready
-                    && Instant::now() < until =>
+            (
+                Action::Text { .. } | Action::TextCurrent { .. },
+                Some(ActionAdmission::NativeText { until }),
+            ) if fresh.state.lock == LockState::Unlocked
+                && fresh.state.wda_ready
+                && Instant::now() < until =>
             {
                 Some(until)
             }

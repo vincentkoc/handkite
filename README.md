@@ -342,8 +342,13 @@ the editor and outside the keyboard and overlapping buttons. Missing focus
 metadata remains unknown; explicit false or malformed focus is refused. The
 full tree/state, native unlock, session ownership and five-second deadline still
 apply. Strict keys and ordinary text insertion keep their previous checks.
-In a multiline editor, use an explicit current-selection Enter between text
-calls; literal newlines remain excluded from `handkite_text`.
+`handkite_text` also accepts `selection: "current"`. It applies the same
+current-editor proof to insertion, including TextView editors, and allows only
+screenshot drift with an unchanged tree and state. Omit it to retain ordinary
+text admission. For multiline entry, use current-selection text calls with an
+explicit current-selection Enter between them; literal newlines remain excluded
+from `handkite_text`. Deploy matching daemon and MCP versions before using this
+option.
 
 Tap and swipe coordinates are WDA viewport coordinates in logical points,
 passed unchanged, including fractional values. They are not screenshot pixels.
