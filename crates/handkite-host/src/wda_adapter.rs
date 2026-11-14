@@ -757,6 +757,7 @@ impl DeviceAdapter for WdaAdapter {
         }
         if let Action::ClickButton { target } = action {
             let Some(ActionAdmission::NativeButton { until }) = admission else {
+                self.error_diagnostic = Some(AdapterDiagnostic::ButtonAdmission);
                 return Err(AdapterError);
             };
             if self.owned_session.is_none()
@@ -764,34 +765,50 @@ impl DeviceAdapter for WdaAdapter {
                 || Instant::now() >= until
                 || send_deadline > until
             {
+                self.error_diagnostic = Some(AdapterDiagnostic::ButtonAdmission);
                 return Err(AdapterError);
             }
-            self.validate_owned_with_deadline(Some(send_deadline))?;
+            self.validate_owned_with_deadline(Some(send_deadline))
+                .inspect_err(|_| {
+                    self.error_diagnostic = Some(AdapterDiagnostic::OwnedBefore);
+                })?;
             let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
-            let button =
-                self.runtime
-                    .as_ref()
-                    .expect("adapter runtime")
-                    .block_on(before_input_deadline(send_deadline, async {
-                        crate::wda_button::resolve(
-                            &wda,
-                            self.actions.prepared_session().ok_or(AdapterError)?,
-                            target,
-                        )
-                        .await
-                    }))?;
-            self.validate_owned_with_deadline(Some(send_deadline))?;
+            let button = self
+                .runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(before_input_deadline(send_deadline, async {
+                    crate::wda_button::resolve(
+                        &wda,
+                        self.actions.prepared_session().ok_or(AdapterError)?,
+                        target,
+                    )
+                    .await
+                }))
+                .inspect_err(|_| {
+                    self.error_diagnostic = Some(AdapterDiagnostic::ButtonResolve);
+                })?;
+            self.validate_owned_with_deadline(Some(send_deadline))
+                .inspect_err(|_| {
+                    self.error_diagnostic = Some(AdapterDiagnostic::OwnedBefore);
+                })?;
             if native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
                 || Instant::now() >= send_deadline
             {
+                self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
                 return Err(AdapterError);
             }
             let receipt = self
                 .runtime
                 .as_ref()
                 .expect("adapter runtime")
-                .block_on(button.click(&wda))?;
-            self.validate_owned()?;
+                .block_on(button.click(&wda))
+                .inspect_err(|_| {
+                    self.error_diagnostic = Some(AdapterDiagnostic::ButtonClick);
+                })?;
+            self.validate_owned().inspect_err(|_| {
+                self.error_diagnostic = Some(AdapterDiagnostic::OwnershipAfterAck);
+            })?;
             return Ok(receipt);
         }
         if matches!(admission, Some(ActionAdmission::NativeButton { .. })) {

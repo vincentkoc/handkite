@@ -25,6 +25,9 @@ pub enum AdapterDiagnostic {
     PreActionCapture,
     OwnedBefore,
     NativeBefore,
+    ButtonAdmission,
+    ButtonResolve,
+    ButtonClick,
     SessionStatus,
     SessionCheck,
     InputExpiredBeforeSend,
@@ -37,11 +40,14 @@ pub enum AdapterDiagnostic {
 }
 
 impl AdapterDiagnostic {
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 16] = [
         Self::IdentityCheck,
         Self::PreActionCapture,
         Self::OwnedBefore,
         Self::NativeBefore,
+        Self::ButtonAdmission,
+        Self::ButtonResolve,
+        Self::ButtonClick,
         Self::SessionStatus,
         Self::SessionCheck,
         Self::InputExpiredBeforeSend,
@@ -59,6 +65,9 @@ impl AdapterDiagnostic {
             Self::PreActionCapture => "AdapterPreActionCapture",
             Self::OwnedBefore => "AdapterOwnedBefore",
             Self::NativeBefore => "AdapterNativeBefore",
+            Self::ButtonAdmission => "AdapterButtonAdmission",
+            Self::ButtonResolve => "AdapterButtonResolve",
+            Self::ButtonClick => "AdapterButtonClick",
             Self::SessionStatus => "AdapterSessionStatus",
             Self::SessionCheck => "AdapterSessionCheck",
             Self::InputExpiredBeforeSend => "AdapterInputExpiredBeforeSend",
