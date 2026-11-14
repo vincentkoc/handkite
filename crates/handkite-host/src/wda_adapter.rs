@@ -51,6 +51,14 @@ async fn before_input_deadline<T>(
     result
 }
 
+struct CapturePayload {
+    tree: Option<String>,
+    app: String,
+    reported: Option<bool>,
+    screenshot: ScreenImage,
+    finished: Instant,
+}
+
 pub struct WdaAdapter {
     expected: HardwareId,
     usb: PinnedUsb,
@@ -346,7 +354,87 @@ impl WdaAdapter {
         }) {
             self.cache.clear();
         }
+        if source_path == SCREEN_SOURCE {
+            if let Ok((raw, captured, reported)) = &result {
+                self.cache
+                    .record_full(self.cache_key(), raw, *captured, *reported);
+            }
+        } else {
+            self.cache.clear_full();
+        }
         result
+    }
+
+    fn capture_for_action(&self, allow_reuse: bool) -> Result<CheckedCapture, AdapterError> {
+        if allow_reuse {
+            let key = self.cache_key();
+            if let Some(previous) = self.cache.take_full(key.as_ref(), Instant::now()) {
+                let started = Instant::now();
+                let mut timings = crate::timing::enabled().then(CaptureTimings::default);
+                let result = {
+                    let _probe = crate::timing::Span::new("tree_cache_probe");
+                    self.capture_frame(timings.as_mut())
+                };
+                let current = match result {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        self.cache.clear();
+                        return Err(error);
+                    }
+                };
+                let same = previous.matches(
+                    &current.screenshot,
+                    &current.app,
+                    current.reported,
+                    Instant::now(),
+                );
+                crate::timing::outcome("tree_cache_hit", same);
+                if same {
+                    if let Some(mut timings) = timings {
+                        timings.mark_reused_tree();
+                        timings.finish(started, true);
+                        crate::timing::capture(timings);
+                    }
+                    // Both tree and image retain the original capture window.
+                    return Ok((previous.raw, previous.captured_at, previous.reported));
+                }
+                self.cache.clear();
+            }
+        } else {
+            self.cache.clear_full();
+        }
+        self.capture_checked_with_lock_report(SCREEN_SOURCE)
+    }
+
+    fn capture_frame(
+        &self,
+        mut timings: Option<&mut CaptureTimings>,
+    ) -> Result<CapturePayload, AdapterError> {
+        measure(
+            timings.as_deref_mut(),
+            Stage::OwnershipBefore,
+            &Instant::now,
+            |_| 0,
+            || self.validate_owned(),
+        )?;
+        let frame =
+            self.runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(Self::capture_payload(
+                    &UsbWda::new(self.usb.clone()),
+                    None,
+                    &Instant::now,
+                    timings.as_deref_mut(),
+                ))?;
+        measure(
+            timings,
+            Stage::OwnershipAfter,
+            &Instant::now,
+            |_| 0,
+            || self.validate_owned(),
+        )?;
+        Ok(frame)
     }
 
     /// One normal capture, with no output or input and no change to ownership checks.
@@ -421,8 +509,38 @@ impl WdaAdapter {
         started_unix_ms: u64,
         clock: &impl Fn() -> Instant,
         wall: &impl Fn() -> Result<u64, AdapterError>,
-        mut timings: Option<&mut CaptureTimings>,
+        timings: Option<&mut CaptureTimings>,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+        let payload = Self::capture_payload(wda, Some(source_path), clock, timings).await?;
+        let tree = payload.tree.ok_or(AdapterError)?;
+        let lock = classify_lock(&payload.app, &tree, payload.reported);
+        Ok((
+            RawObservation {
+                connected_usb: expected.clone(),
+                wda_target: expected.clone(),
+                window: ObservationWindow {
+                    started_unix_ms,
+                    finished_unix_ms: wall()?,
+                },
+                state: DeviceState {
+                    lock,
+                    wda_ready: true,
+                    foreground_app: Some(payload.app),
+                },
+                accessibility_tree: tree,
+                screenshot: payload.screenshot,
+            },
+            payload.finished,
+            payload.reported,
+        ))
+    }
+
+    async fn capture_payload(
+        wda: &impl WdaRequest,
+        source_path: Option<&str>,
+        clock: &impl Fn() -> Instant,
+        mut timings: Option<&mut CaptureTimings>,
+    ) -> Result<CapturePayload, AdapterError> {
         let enabled = timings.is_some();
         let (
             (image, image_timing),
@@ -436,12 +554,20 @@ impl WdaAdapter {
                 clock,
                 wda.request("GET", "/screenshot", b"", Duration::from_secs(20))
             ),
-            measurement::request(
-                enabled,
-                Stage::SourceRequest,
-                clock,
-                wda.request("GET", source_path, b"", Duration::from_secs(20))
-            ),
+            async {
+                if let Some(path) = source_path {
+                    let (response, timing) = measurement::request(
+                        enabled,
+                        Stage::SourceRequest,
+                        clock,
+                        wda.request("GET", path, b"", Duration::from_secs(20)),
+                    )
+                    .await;
+                    (response.map(Some), timing)
+                } else {
+                    (Ok(None), None)
+                }
+            },
             measurement::request(
                 enabled,
                 Stage::AppRequest,
@@ -470,7 +596,10 @@ impl WdaAdapter {
             )
         };
         let image = decode(image, Stage::ScreenshotJson)?;
-        let source = decode(source, Stage::SourceJson)?;
+        let source = match source.map_err(|_| AdapterError)? {
+            Some(response) => Some(decode(Ok(response), Stage::SourceJson)?),
+            None => None,
+        };
         let app = decode(app, Stage::AppJson)?;
         let reported_lock = decode(reported_lock, Stage::LockJson)?;
         let screenshot = measure(
@@ -489,14 +618,17 @@ impl WdaAdapter {
                 Ok(screenshot)
             },
         )?;
-        let (tree, app, reported_lock, lock) = measure(
+        let (tree, app, reported_lock) = measure(
             timings,
             Stage::PayloadValidation,
             clock,
-            |(tree, _, _, _): &(String, String, Option<bool>, LockState)| tree.len(),
+            |(tree, _, _): &(Option<String>, String, Option<bool>)| {
+                tree.as_ref().map_or(0, String::len)
+            },
             || {
                 let tree = match source {
-                    serde_json::Value::String(tree) if !tree.is_empty() => tree,
+                    Some(serde_json::Value::String(tree)) if !tree.is_empty() => Some(tree),
+                    None => None,
                     _ => return Err(AdapterError),
                 };
                 let app = app["bundleId"]
@@ -505,30 +637,19 @@ impl WdaAdapter {
                     .ok_or(AdapterError)?
                     .to_owned();
                 let reported_lock = reported_lock.as_bool();
-                let lock = classify_lock(&app, &tree, reported_lock);
-                Ok((tree, app, reported_lock, lock))
+                Ok((tree, app, reported_lock))
             },
         )?;
-        let finished = clock();
-        let observation = RawObservation {
-            connected_usb: expected.clone(),
-            wda_target: expected.clone(),
-            window: ObservationWindow {
-                started_unix_ms,
-                finished_unix_ms: wall()?,
-            },
-            state: DeviceState {
-                lock,
-                wda_ready: true,
-                foreground_app: Some(app),
-            },
-            accessibility_tree: tree,
+        Ok(CapturePayload {
+            tree,
+            app,
+            reported: reported_lock,
             screenshot: ScreenImage {
                 format: ImageFormat::Png,
                 bytes: screenshot,
             },
-        };
-        Ok((observation, finished, reported_lock))
+            finished: clock(),
+        })
     }
 
     /// Diagnostic capture retaining visibility, enabled and selected attributes.
@@ -696,9 +817,8 @@ impl DeviceAdapter for WdaAdapter {
         } else {
             self.native_fresh(None)
         };
-        let (mut observation, mut captured_at, mut reported_lock) = self
-            .capture_checked_with_lock_report(SCREEN_SOURCE)
-            .inspect_err(|_| {
+        let (mut observation, mut captured_at, mut reported_lock) =
+            self.capture_for_action(use_hint).inspect_err(|_| {
                 self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
             })?;
         let native_after = if use_hint && normal_hint_context(&observation, reported_lock) {
@@ -912,6 +1032,7 @@ impl DeviceAdapter for WdaAdapter {
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
         self.error_diagnostic = None;
+        self.cache.clear_full();
         if let Some(ActionAdmission::NativeAppLaunch { until }) = admission {
             if !take_launch_admission(
                 &mut self.launch_admission,
@@ -1007,6 +1128,7 @@ impl DeviceAdapter for WdaAdapter {
                 .expect("adapter runtime")
                 .block_on(button.click(&wda))
                 .inspect_err(|_| {
+                    self.cache.clear();
                     self.error_diagnostic = Some(AdapterDiagnostic::ButtonClick);
                 })?;
             self.validate_owned().inspect_err(|_| {
@@ -1069,7 +1191,8 @@ impl DeviceAdapter for WdaAdapter {
                 .runtime
                 .as_ref()
                 .expect("adapter runtime")
-                .block_on(self.actions.activate_home_with_existing_session(&wda))?;
+                .block_on(self.actions.activate_home_with_existing_session(&wda))
+                .inspect_err(|_| self.cache.clear())?;
             return Ok(receipt);
         }
         self.execute(action, send_deadline)

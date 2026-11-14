@@ -134,6 +134,25 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaises(BenchError):
             operation_stages([{"stage": "private_content", "elapsed_us": 1}])
 
+    def test_reused_pre_tree_requires_explicit_probe_evidence_and_full_post_tree(self):
+        names = ("service_request", "service_serialization", "service_write", "controller_dispatch",
+                 "wire_image_encode", "wda_read_request", "usb_discovery", "usb_connect",
+                 "wda_send", "wda_response", "owned_session_checks", "wda_write_request", "native_lock",
+                 "action_session_checks", "tree_cache_probe")
+        rows = [{"stage": name, "started_us": 0, "elapsed_us": 1} for name in names]
+        rows.append({"stage": "tree_cache_hit", "ok": True})
+        stages = lambda names: [{"stage": name, "elapsed_us": 1, "ok": True} for name in sorted(names)]
+        rows.extend([{"capture": {"reused_tree": True,
+                                   "stages": stages(CAPTURE_NAMES - {"source_request", "source_json"})}},
+                     {"capture": {"stages": stages(CAPTURE_NAMES)}}])
+        validate_measured_stages("tap", rows, "paired")
+        for invalid in [rows[:-2] + rows[-1:], [row for row in rows if row.get("stage") != "tree_cache_hit"]]:
+            with self.assertRaises(BenchError):
+                validate_measured_stages("tap", invalid, "paired")
+        rows[-2]["capture"].pop("reused_tree")
+        with self.assertRaises(BenchError):
+            validate_measured_stages("tap", rows, "paired")
+
     def test_each_client_stage_is_required(self):
         rows = [{"stage": name} for name in ("mcp_request", "mcp_serialization", "mcp_write",
                 "mcp_service_decode", "mcp_tree_projection", "mcp_service_exchange")]

@@ -497,6 +497,9 @@ flags and failing predicate names, without predicate values. An unmeasured
 setup failure cannot disappear from the report.
 
 `span.*.covered` is the union of overlapping intervals in that stage;
+`pre_tree_reuses` counts successful pre-action snapshot reuse. Such captures
+are marked `reused_tree` and require a successful fresh frame probe; their
+missing source timing is intentional. The original snapshot age is retained.
 `span.*.work` is their cumulative work. Neither should be added to enclosing
 or overlapping stages. Capture stages are reported separately for pre-input
 admission and post-input verification. `input_request` measures the WDA input

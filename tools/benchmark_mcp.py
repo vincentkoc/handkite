@@ -41,7 +41,7 @@ SPAN_NAMES = {"button_find", "button_attributes", "wire_image_encode", "controll
               "service_request", "service_serialization", "service_write", "wda_read_request",
               "wda_write_request", "usb_discovery", "usb_connect", "wda_send", "wda_response",
               "mcp_request", "mcp_write", "mcp_serialization", "mcp_service_exchange",
-              "mcp_service_decode", "mcp_tree_projection"}
+              "mcp_service_decode", "mcp_tree_projection", "tree_cache_probe"}
 CAPTURE_NAMES = {"ownership_before", "screenshot_request", "source_request", "app_request",
                  "lock_request", "screenshot_json", "source_json", "app_json", "lock_json",
                  "image_decode", "payload_validation", "ownership_after", "capture_total"}
@@ -163,15 +163,23 @@ def validate_measured_stages(case, rows, capture_kind):
     if case in ("tap", "type", "launch"):
         required.add("native_lock")
     require(required <= names, "missing_service_stage")
-    captures = [row["capture"]["stages"] for row in rows if "capture" in row]
+    captures = [row["capture"] for row in rows if "capture" in row]
     require(len(captures) == (2 if case in CASES[:4] else 1), "missing_capture")
     require(capture_kind in ("paired", "image_only"), "unknown_capture_kind")
     for index, capture in enumerate(captures):
         expected = CAPTURE_NAMES.copy()
+        reused = capture.get("reused_tree", False)
+        require(type(reused) is bool, "invalid_cache_trace")
+        if reused:
+            require(case in CASES[:4] and index == 0 and "tree_cache_probe" in names
+                    and any(row.get("stage") == "tree_cache_hit" and row.get("ok") is True
+                            for row in rows), "invalid_cache_trace")
+            expected -= {"source_request", "source_json"}
         if capture_kind == "image_only" and index == len(captures) - 1:
             expected -= {"source_request", "source_json"}
-        require(expected == {sample.get("stage") for sample in capture}
-                and len(expected) == len(capture), "missing_capture_stage")
+        samples = capture["stages"]
+        require(expected == {sample.get("stage") for sample in samples}
+                and len(expected) == len(samples), "missing_capture_stage")
     if case in CASES[:4]:
         require("input_request" in operation_stages(rows), "missing_input_stage")
 
@@ -386,6 +394,7 @@ def summarize(samples):
                         "failures": len(rows) - len(passed),
                         "client_ms": quantiles([row["elapsed_ms"] for row in passed]) if passed else None,
                         "stages_ms": {name: quantiles(values) for name, values in stages.items()},
+                        "pre_tree_reuses": sum(row.get("pre_tree_reused") is True for row in passed),
                         "budget_ms": BUDGETS_MS[case]}
     return result
 
@@ -663,6 +672,8 @@ def attach_stages(campaign, service_rows, expected_pid):
         stages = {"mcp." + key: value for key, value in operation_stages(client_by_op[op]).items()}
         stages.update(operation_stages(service))
         sample["service_operation"] = correspondence[op]
+        captures = [row["capture"] for row in service if "capture" in row]
+        sample["pre_tree_reused"] = bool(captures and captures[0].get("reused_tree") is True)
         sample["stages_ms"] = stages
 
 

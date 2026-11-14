@@ -26,6 +26,8 @@ pub(super) enum Stage {
 #[derive(Default, Serialize)]
 pub struct CaptureTimings {
     stages: Vec<Sample>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    reused_tree: bool,
 }
 
 #[derive(Serialize)]
@@ -37,6 +39,9 @@ pub(super) struct Sample {
 }
 
 impl CaptureTimings {
+    pub(super) fn mark_reused_tree(&mut self) {
+        self.reused_tree = true;
+    }
     pub(super) fn append(&mut self, samples: impl IntoIterator<Item = Option<Sample>>) {
         self.stages.extend(samples.into_iter().flatten());
     }
@@ -282,6 +287,35 @@ mod tests {
                     assert!(stages.iter().any(|stage| stage["ok"] == false));
                 }
             }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn frame_probe_never_requests_or_fabricates_source() {
+        for case in [0, 1, 3, 5, 6, 7] {
+            let reads = Reads {
+                case,
+                calls: RefCell::new(Vec::new()),
+            };
+            let mut timings = CaptureTimings::default();
+            let result =
+                WdaAdapter::capture_payload(&reads, None, &Instant::now, Some(&mut timings)).await;
+            assert_eq!(result.is_ok(), matches!(case, 0 | 6));
+            if let Ok(frame) = result {
+                assert!(frame.tree.is_none());
+            }
+            let mut calls = reads.calls.into_inner();
+            calls.sort();
+            assert_eq!(calls, ["/screenshot", "/wda/activeAppInfo", "/wda/locked"]);
+            let report = serde_json::to_value(&timings).unwrap();
+            assert!(!report.to_string().contains("private"));
+            assert!(
+                report["stages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|stage| !stage["stage"].as_str().unwrap().starts_with("source"))
+            );
         }
     }
 

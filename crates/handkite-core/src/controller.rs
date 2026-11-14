@@ -6,6 +6,7 @@ use crate::protocol::{
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+#[derive(Clone)]
 pub struct RawObservation {
     pub connected_usb: HardwareId,
     pub wda_target: HardwareId,
