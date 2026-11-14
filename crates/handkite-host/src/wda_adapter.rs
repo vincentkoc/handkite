@@ -736,7 +736,6 @@ impl DeviceAdapter for WdaAdapter {
                     .as_ref()
                     .expect("adapter runtime")
                     .block_on(before_input_deadline(send_deadline, async {
-                        self.actions.prepare_existing(&wda).await?;
                         crate::wda_button::resolve(
                             &wda,
                             self.actions.prepared_session().ok_or(AdapterError)?,
