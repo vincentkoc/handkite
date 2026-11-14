@@ -545,6 +545,15 @@ it rejects failed, incomplete and calibration runs. Keep the capture policy
 the same for a like-for-like regression gate; comparison output names both
 policies when they differ.
 
+The first complete real-device reference is
+[`reference.json`](tools/benchmarks/reference.json): twenty
+successful trials of each case on one service generation, with image-only
+action responses. Compare a future complete report against it with the same
+plan and capture policy. [Validation results](VALIDATION.md)
+record the stage timings, separately measured semantic verification and
+remaining budget misses. Passing the relative regression gate does not mean
+every product budget is met.
+
 `span.*.covered` is the union of overlapping intervals in that stage;
 `pre_tree_reuses` counts successful pre-action snapshot reuse. Such captures
 are marked `reused_tree` and require a successful fresh frame probe; their
@@ -554,8 +563,8 @@ or overlapping stages. Capture stages are reported separately for pre-input
 admission and post-input verification. `input_request` measures the WDA input
 request, excluding element lookup; it is not a separate unverified-input API.
 WDA response time includes its internal idle and snapshot work, which the host
-cannot split without WDA instrumentation. Tree omission currently reduces the
-MCP payload only: the service still acquires a paired image and tree.
+cannot split without WDA instrumentation. `tree_format: "omit"` alone reduces
+the MCP payload only; `capture: "image_only"` explicitly skips the tree.
 
 The comparison command fails for missing samples, failed trials, invalid or
 incomplete traces, different plans, or a p50/p95 regression above 5% plus 20 ms.
