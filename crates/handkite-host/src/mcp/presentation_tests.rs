@@ -143,6 +143,33 @@ fn image_omission_keeps_fresh_metadata_and_tree_without_another_exchange() {
 }
 
 #[test]
+fn outline_is_explicitly_lossy_and_falls_back_to_the_original() {
+    let tree = r#"<AppiumAUT><XCUIElementTypeButton name="Close" label="Close"/><XCUIElementTypeButton label="Hidden" visible="false"/></AppiumAUT>"#;
+    let reply = call(
+        &request(json!({"tree_format":"outline","image":"omit"})),
+        &captured(tree, "png"),
+    );
+    let screen = payload(&reply);
+    assert_eq!(screen["tree_format"], "outline");
+    assert_eq!(screen["tree_lossy"], true);
+    assert_eq!(screen["tree_omissions"]["invisible_nodes"], 1);
+    assert!(
+        screen["accessibility_tree"]
+            .as_str()
+            .unwrap()
+            .contains("name=label=\"Close\"")
+    );
+    let invalid = "<unknown/>";
+    let fallback = call(
+        &request(json!({"tree_format":"outline"})),
+        &captured(invalid, "png"),
+    );
+    assert_eq!(payload(&fallback)["tree_format"], "full");
+    assert_eq!(payload(&fallback)["accessibility_tree"], invalid);
+    assert_eq!(fallback["result"]["content"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn strict_arguments_refuse_before_exchange_in_both_validators() {
     let device = DeviceKey::new("phone").unwrap();
     for args in [
@@ -238,7 +265,7 @@ fn catalog_exposes_only_optional_compact_on_observe() {
         .unwrap()["inputSchema"];
     assert_eq!(
         schema["properties"]["tree_format"]["enum"],
-        json!(["full", "compact"])
+        json!(["full", "compact", "outline"])
     );
     assert_eq!(schema["additionalProperties"], false);
     assert!(schema.get("required").is_none());

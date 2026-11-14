@@ -9,6 +9,7 @@ use std::io::{self, BufRead, Write};
 mod catalog;
 mod compact;
 mod interaction;
+mod outline;
 mod presentation;
 mod response;
 mod session;

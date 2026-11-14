@@ -61,7 +61,7 @@ pub(super) fn selected_observation_content(
     include_image: bool,
 ) -> Vec<Value> {
     let metadata = metadata(&observation);
-    let mut payload = if compact {
+    let payload = if compact {
         let (tree, format, reason) = match super::compact::project(&observation.accessibility_tree)
         {
             Ok(tree) => (tree, "compact", "requested"),
@@ -72,17 +72,57 @@ pub(super) fn selected_observation_content(
     } else {
         json!({"metadata":metadata, "accessibility_tree":observation.accessibility_tree})
     };
+    finish_observation_content(
+        payload,
+        observation.screenshot_format,
+        observation.screenshot_base64,
+        include_image,
+    )
+}
+
+pub(super) fn outlined_observation_content(
+    observation: WireObservation,
+    include_image: bool,
+) -> Vec<Value> {
+    let mut payload = json!({"metadata":metadata(&observation), "tree_format_version":1});
+    match super::outline::project(&observation.accessibility_tree) {
+        Ok(outline) => {
+            payload["accessibility_tree"] = json!(outline.text);
+            payload["tree_format"] = json!("outline");
+            payload["tree_lossy"] = json!(true);
+            payload["tree_omissions"] = json!({"invisible_nodes":outline.invisible_nodes,"empty_wrappers":outline.empty_wrappers});
+            payload["tree_format_reason"] = json!("requested");
+        }
+        Err(reason) => {
+            payload["accessibility_tree"] = json!(observation.accessibility_tree);
+            payload["tree_format"] = json!("full");
+            payload["tree_format_reason"] = json!(reason.reason());
+        }
+    }
+    finish_observation_content(
+        payload,
+        observation.screenshot_format,
+        observation.screenshot_base64,
+        include_image,
+    )
+}
+
+fn finish_observation_content(
+    mut payload: Value,
+    format: ImageFormat,
+    image: String,
+    include_image: bool,
+) -> Vec<Value> {
     if !include_image {
         payload["image"] = json!({"included":false,"reason":"requested"});
     }
     let mut content = vec![json!({"type":"text", "text":payload.to_string()})];
     if include_image {
-        let mime = match observation.screenshot_format {
+        let mime = match format {
             ImageFormat::Png => "image/png",
             ImageFormat::Jpeg => "image/jpeg",
         };
-        content
-            .push(json!({"type":"image", "data":observation.screenshot_base64, "mimeType":mime}));
+        content.push(json!({"type":"image", "data":image, "mimeType":mime}));
     }
     content
 }

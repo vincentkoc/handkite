@@ -268,6 +268,16 @@ These options only reduce the agent response; the host retains its full capture
 and normal action checks. Omission means the image was not returned, not that
 the screen was unchanged. Default responses still include the full tree and image.
 
+`"tree_format":"outline"` selects an explicitly lossy reading format. It removes
+XML closing tags and repeated type names, combines equal name/label strings and
+groups coordinates as `rect=[x,y,width,height]` in logical points. It collapses
+empty generic wrappers and marks omitted, explicitly invisible nodes with counts.
+Visible descendants, explicit states, field values, and hidden field/modal/
+keyboard/container context remain represented. Missing attributes remain unknown.
+The response reports `tree_lossy` and `tree_omissions`; malformed or unsupported
+input falls back to the full original tree. This outline supplies no actionable
+IDs and never replaces the full tree used for action admission.
+
 `handkite-mcp --service` derives the device key from the protected fixed host
 config and the socket from the effective account's fixed service layout. It does
 not accept a caller-selected device or socket in this mode. This is the preferred
