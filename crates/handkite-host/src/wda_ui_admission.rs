@@ -253,7 +253,9 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                     }
                     target = true;
                 }
-                if kind == "XCUIElementTypeButton"
+                if (kind == "XCUIElementTypeButton"
+                    || matches!(target_kind, Target::TextPoint(_))
+                        && kind == "XCUIElementTypeMenuItem")
                     && attrs.get("visible").map(String::as_str) != Some("false")
                     && let Some(at) = at
                 {
@@ -415,6 +417,8 @@ mod tests {
         for extra in [
             field,
             r#"<XCUIElementTypeButton label="Clear" visible="true" enabled="true" x="60" y="70" width="40" height="30"/>"#,
+            r#"<XCUIElementTypeMenuItem label="Select" visible="true" enabled="true" x="60" y="70" width="40" height="30"/>"#,
+            r#"<XCUIElementTypeMenuItem label="Select" enabled="true" x="60" y="70" width="40" height="30"/>"#,
             r#"<XCUIElementTypeAlert/>"#,
         ] {
             assert!(!visible_text_target(&tree(&format!("{body}{extra}")), at));

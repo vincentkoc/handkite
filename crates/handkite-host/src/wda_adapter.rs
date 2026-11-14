@@ -1022,11 +1022,17 @@ fn visible_tap_deadline(
             .foreground_app
             .as_deref()
             .is_none_or(|app| app == "com.apple.springboard")
-        || !crate::wda_ui_admission::visible_button(&observation.accessibility_tree, at)
     {
         return None;
     }
-    captured_at.checked_add(HOME_LAUNCH_AGE)
+    let age = if crate::wda_ui_admission::visible_button(&observation.accessibility_tree, at) {
+        HOME_LAUNCH_AGE
+    } else if crate::wda_ui_admission::visible_text_target(&observation.accessibility_tree, at) {
+        TEXT_INPUT_AGE
+    } else {
+        return None;
+    };
+    captured_at.checked_add(age)
 }
 
 fn native_text_admission(
@@ -1604,6 +1610,54 @@ mod tests {
             observation.state.lock = LockState::Uncertain;
             observation.state.wda_ready = true;
             observation.state.foreground_app = Some("com.apple.springboard".into());
+        }
+    }
+
+    #[test]
+    fn editor_tap_uses_text_deadline_with_native_unlocked_context() {
+        let id = HardwareId::new("fixture-device").unwrap();
+        let mut observation = RawObservation {
+            connected_usb: id.clone(), wda_target: id,
+            window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
+            state: DeviceState { lock: LockState::Unlocked, wda_ready: true,
+                foreground_app: Some("com.example.notes".into()) },
+            accessibility_tree: r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeTextView visible="true" enabled="true" x="0" y="0" width="393" height="544"/><XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/></XCUIElementTypeApplication></AppiumAUT>"#.into(),
+            screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+        };
+        let at = Point { x: 80.0, y: 40.0 };
+        let captured = Instant::now();
+        for case in 0..8 {
+            let mut owned = true;
+            let mut before = LockState::Unlocked;
+            let mut after = LockState::Unlocked;
+            let mut reported = Some(false);
+            let mut point = at;
+            match case {
+                1 => owned = false,
+                2 => before = LockState::Locked,
+                3 => after = LockState::Uncertain,
+                4 => reported = None,
+                5 => point.y = 550.0,
+                6 => observation.state.lock = LockState::Uncertain,
+                7 => observation.state.wda_ready = false,
+                _ => {}
+            }
+            let result = visible_tap_deadline(
+                &observation,
+                owned,
+                before,
+                after,
+                reported,
+                point,
+                captured,
+            );
+            assert_eq!(
+                result,
+                (case == 0).then_some(captured + TEXT_INPUT_AGE),
+                "case {case}"
+            );
+            observation.state.lock = LockState::Unlocked;
+            observation.state.wda_ready = true;
         }
     }
 
