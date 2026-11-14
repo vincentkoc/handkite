@@ -44,7 +44,7 @@ fn line_splice_reconstructs_exact_bytes_including_unicode_and_newlines() {
         ("head\nold\ntail", "head\nCafé 🦊\ntail"),
         ("head\ntail\n", "head\nnew\ntail\n"),
         ("head\nremoved\ntail\n", "head\ntail\n"),
-        ("a\r\nb\r\n", "a\r\n界\r\n"),
+        ("a\r\nb\r\n", "a\r\n\u{754c}\r\n"),
     ] {
         let delta = line_delta(before, after, Revision(3)).unwrap();
         assert_eq!(delta["base_revision"], 3);
