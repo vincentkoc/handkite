@@ -59,7 +59,10 @@ async fn recover_known(
     if current.same(&original) {
         return KnownIdleRecovery::AlreadyRestored;
     }
-    if !current.is_temporary() && !current.same(&Settings::responsive()) {
+    if !current.is_temporary()
+        && !current.matches_target(&Settings::responsive())
+        && !current.same(&Settings::without_waits())
+    {
         return KnownIdleRecovery::Refused;
     }
     let receipt = write(writer, &session, RESTORE_KNOWN).await;
@@ -441,6 +444,13 @@ impl Settings {
     fn responsive() -> Self {
         Self {
             idle: RawValue::from_string("0".into()).expect("constant JSON number"),
+            animation: RawValue::from_string("0.2".into()).expect("constant JSON number"),
+        }
+    }
+
+    fn without_waits() -> Self {
+        Self {
+            idle: RawValue::from_string("0".into()).expect("constant JSON number"),
             animation: RawValue::from_string("0".into()).expect("constant JSON number"),
         }
     }
@@ -469,14 +479,16 @@ impl Settings {
     fn matches_target(&self, target: &Self) -> bool {
         same_number(&self.idle, &target.idle)
             && (same_number(&self.animation, &target.animation)
-                || (target.same(&Self::temporary()) && temporary_animation(self.animation.get())))
+                || (temporary_animation(target.animation.get())
+                    && temporary_animation(self.animation.get())))
     }
 
     fn is_owned_transition(&self, original: &Self, target: &Self) -> bool {
         (same_number(&self.idle, &original.idle) || same_number(&self.idle, &target.idle))
             && (same_number(&self.animation, &original.animation)
                 || same_number(&self.animation, &target.animation)
-                || (target.same(&Self::temporary()) && temporary_animation(self.animation.get())))
+                || (temporary_animation(target.animation.get())
+                    && temporary_animation(self.animation.get())))
     }
 }
 
@@ -542,7 +554,10 @@ mod tests {
     const SETTINGS: &str = "/session/fixture-session/appium/settings";
     const ORIGINAL: &str = r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":2}"#;
     const TARGET: &str = r#"{"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.2}"#;
-    const RESPONSIVE: &str = r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":0}"#;
+    const RESPONSIVE: &str = r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":0.2}"#;
+    const RESPONSIVE_ROUNDTRIP: &str =
+        r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":0.20000000000000001}"#;
+    const WITHOUT_WAITS: &str = r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":0}"#;
 
     struct Step {
         method: &'static str,
@@ -761,8 +776,9 @@ mod tests {
     async fn responsive_lease_restores_only_its_own_transition() {
         for current in [
             RESPONSIVE,
+            RESPONSIVE_ROUNDTRIP,
             r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":2}"#,
-            r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":0}"#,
+            r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":0.2}"#,
         ] {
             let mut steps = preflight(ORIGINAL);
             steps.extend([post(RESPONSIVE), settings(RESPONSIVE)]);
@@ -890,7 +906,13 @@ mod tests {
 
     #[tokio::test]
     async fn known_recovery_posts_exact_body_once_or_leaves_exact_original_alone() {
-        for temporary in [TARGET, ROUNDTRIP, RESPONSIVE] {
+        for temporary in [
+            TARGET,
+            ROUNDTRIP,
+            RESPONSIVE,
+            RESPONSIVE_ROUNDTRIP,
+            WITHOUT_WAITS,
+        ] {
             let mut steps = recovery_preflight(temporary, temporary);
             steps.extend([post(ORIGINAL), settings(ORIGINAL)]);
             steps.extend(session());

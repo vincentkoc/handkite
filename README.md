@@ -451,8 +451,9 @@ remain external inputs; this path pin does not qualify them.
 ## Owned-session idle settings
 
 The owned daemon's candidate timing policy sets its new WDA session to
-`waitForIdleTimeout: 0` and `animationCoolOffTimeout: 0` before reporting
-readiness. This removes WDA's implicit idle waits; Handkite still captures and
+`waitForIdleTimeout: 0` and `animationCoolOffTimeout: 0.2` before reporting
+readiness. This removes the general idle wait while retaining bounded animation
+settling before source capture; Handkite still captures and
 verifies the action's effect and retains every native lock and ownership check.
 The candidate requires matched live validation before promotion. Separate
 one-shot PIN settings remain `1.0` and `0.2`. The daemon retains the exact
