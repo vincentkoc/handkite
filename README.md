@@ -336,6 +336,15 @@ cursor-only screenshot drift but does not prove or preserve a previously
 observed selection range. Enter can submit a form; Backspace can delete its
 current selection. Arrow keys and modifier shortcuts are unsupported.
 
+Current-selection keys and double-tap/long-press also support a single visible,
+enabled TextView with one visible, enabled keyboard. Gestures must land inside
+the editor and outside the keyboard and overlapping buttons. Missing focus
+metadata remains unknown; explicit false or malformed focus is refused. The
+full tree/state, native unlock, session ownership and five-second deadline still
+apply. Strict keys and ordinary text insertion keep their previous checks.
+In a multiline editor, use an explicit current-selection Enter between text
+calls; literal newlines remain excluded from `handkite_text`.
+
 Tap and swipe coordinates are WDA viewport coordinates in logical points,
 passed unchanged, including fractional values. They are not screenshot pixels.
 Handkite supplies no screenshot-to-action transform or inferred scale/rotation.

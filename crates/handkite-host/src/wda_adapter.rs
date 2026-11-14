@@ -577,39 +577,22 @@ impl DeviceAdapter for WdaAdapter {
             .then(|| captured_at.checked_add(TEXT_INPUT_AGE))
             .flatten()
             .map(|until| ActionAdmission::NativeButton { until })
-        } else if let Action::KeyCurrent { key } = action {
-            native_text_deadline(
+        } else if matches!(
+            action,
+            Action::KeyCurrent { .. }
+                | Action::Text { .. }
+                | Action::DoubleTap { .. }
+                | Action::LongPress { .. }
+        ) {
+            native_text_admission(
                 &observation,
                 owned_input,
                 native_before,
                 native_after,
                 reported_lock,
                 captured_at,
+                action,
             )
-            .map(|until| ActionAdmission::NativeKey { key: *key, until })
-        } else if matches!(action, Action::Text { .. }) {
-            native_text_deadline(
-                &observation,
-                owned_input,
-                native_before,
-                native_after,
-                reported_lock,
-                captured_at,
-            )
-            .map(|until| ActionAdmission::NativeText { until })
-        } else if let Action::DoubleTap { at } | Action::LongPress { at, .. } = action {
-            native_text_deadline(
-                &observation,
-                owned_input,
-                native_before,
-                native_after,
-                reported_lock,
-                captured_at,
-            )
-            .filter(|_| {
-                crate::wda_ui_admission::visible_text_target(&observation.accessibility_tree, *at)
-            })
-            .map(|until| ActionAdmission::NativeTextGesture { at: *at, until })
         } else if matches!(action, Action::Home) {
             native_home_deadline(
                 &observation,
@@ -896,14 +879,15 @@ fn visible_tap_deadline(
     captured_at.checked_add(HOME_LAUNCH_AGE)
 }
 
-fn native_text_deadline(
+fn native_text_admission(
     observation: &RawObservation,
     owned: bool,
     native_before: LockState,
     native_after: LockState,
     reported_lock: Option<bool>,
     captured_at: Instant,
-) -> Option<Instant> {
+    action: &Action,
+) -> Option<ActionAdmission> {
     if !owned
         || native_before != LockState::Unlocked
         || native_after != LockState::Unlocked
@@ -915,11 +899,25 @@ fn native_text_deadline(
             .foreground_app
             .as_deref()
             .is_none_or(|app| app == "com.apple.springboard")
-        || !crate::wda_ui_admission::visible_text_input(&observation.accessibility_tree)
     {
         return None;
     }
-    captured_at.checked_add(TEXT_INPUT_AGE)
+    let until = captured_at.checked_add(TEXT_INPUT_AGE)?;
+    let xml = &observation.accessibility_tree;
+    match action {
+        Action::Text { .. } if crate::wda_ui_admission::visible_text_input(xml) => {
+            Some(ActionAdmission::NativeText { until })
+        }
+        Action::KeyCurrent { key } if crate::wda_ui_admission::visible_current_text_input(xml) => {
+            Some(ActionAdmission::NativeKey { key: *key, until })
+        }
+        Action::DoubleTap { at } | Action::LongPress { at, .. }
+            if crate::wda_ui_admission::visible_text_target(xml, *at) =>
+        {
+            Some(ActionAdmission::NativeTextGesture { at: *at, until })
+        }
+        _ => None,
+    }
 }
 
 fn native_home_deadline(
@@ -1291,13 +1289,98 @@ mod tests {
                 9 => observation.state.foreground_app = None,
                 _ => {}
             }
-            let result = native_text_deadline(&observation, owned, before, after, raw, captured);
+            let action = Action::Text {
+                value: "fixture".into(),
+            };
+            let result =
+                native_text_admission(&observation, owned, before, after, raw, captured, &action);
             if change == 0 {
-                assert_eq!(result, Some(captured + Duration::from_secs(5)));
-                assert!(result.unwrap() < Instant::now());
+                let until = captured + Duration::from_secs(5);
+                assert_eq!(result, Some(ActionAdmission::NativeText { until }));
+                assert!(until < Instant::now());
             } else {
                 assert_eq!(result, None, "case {change}");
             }
+        }
+    }
+
+    #[test]
+    fn text_view_admission_is_scoped_to_current_keys_and_point_gestures() {
+        use handkite_core::protocol::KeyboardKey;
+        let id = HardwareId::new("fixture-device").unwrap();
+        let observation = RawObservation {
+            connected_usb: id.clone(), wda_target: id,
+            window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
+            state: DeviceState { lock: LockState::Unlocked, wda_ready: true,
+                foreground_app: Some("com.example.notes".into()) },
+            accessibility_tree: r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeTextView visible="true" enabled="true" x="0" y="0" width="393" height="544"/><XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/></XCUIElementTypeApplication></AppiumAUT>"#.into(),
+            screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+        };
+        let captured = Instant::now();
+        let until = captured + Duration::from_secs(5);
+        let at = Point { x: 80.0, y: 40.0 };
+        for (action, expected) in [
+            (
+                Action::KeyCurrent {
+                    key: KeyboardKey::Enter,
+                },
+                Some(ActionAdmission::NativeKey {
+                    key: KeyboardKey::Enter,
+                    until,
+                }),
+            ),
+            (
+                Action::KeyCurrent {
+                    key: KeyboardKey::Backspace,
+                },
+                Some(ActionAdmission::NativeKey {
+                    key: KeyboardKey::Backspace,
+                    until,
+                }),
+            ),
+            (
+                Action::DoubleTap { at },
+                Some(ActionAdmission::NativeTextGesture { at, until }),
+            ),
+            (
+                Action::LongPress {
+                    at,
+                    duration_ms: 800,
+                },
+                Some(ActionAdmission::NativeTextGesture { at, until }),
+            ),
+            (
+                Action::Key {
+                    key: KeyboardKey::Enter,
+                },
+                None,
+            ),
+            (
+                Action::Text {
+                    value: "fixture".into(),
+                },
+                None,
+            ),
+            (
+                Action::LongPress {
+                    at: Point { x: 80.0, y: 580.0 },
+                    duration_ms: 800,
+                },
+                None,
+            ),
+        ] {
+            assert_eq!(
+                native_text_admission(
+                    &observation,
+                    true,
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    Some(false),
+                    captured,
+                    &action
+                ),
+                expected
+            );
         }
     }
 

@@ -73,6 +73,11 @@ pub(crate) fn visible_text_input(xml: &str) -> bool {
     parse(xml, Target::TextInput) == Some(())
 }
 
+/// Uses the current iOS selection; missing focus metadata is not focus proof.
+pub(crate) fn visible_current_text_input(xml: &str) -> bool {
+    parse(xml, Target::CurrentTextInput) == Some(())
+}
+
 pub(crate) fn visible_text_target(xml: &str, at: Point) -> bool {
     parse(xml, Target::TextPoint(at)) == Some(())
 }
@@ -82,6 +87,7 @@ enum Target<'a> {
     Button(Point),
     ModalButton(Point),
     TextInput,
+    CurrentTextInput,
     TextPoint(Point),
     NamedButton(&'a ButtonTarget),
 }
@@ -92,7 +98,8 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
         _ => None,
     };
     let allow_modal = matches!(target_kind, Target::ModalButton(_));
-    let require_text = matches!(target_kind, Target::TextInput | Target::TextPoint(_));
+    let current_text = matches!(target_kind, Target::CurrentTextInput | Target::TextPoint(_));
+    let require_text = current_text || matches!(target_kind, Target::TextInput);
     if xml.is_empty()
         || xml.len() > 2 * 1024 * 1024
         || at.is_some_and(|at| !at.x.is_finite() || !at.y.is_finite())
@@ -194,25 +201,31 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                     && attrs.get("visible").map(String::as_str) != Some("false")
                     && attrs.get("enabled").map(String::as_str) != Some("false")
                 {
+                    let rect = Rect::read(&attrs)?;
                     if attrs.get("visible").map(String::as_str) != Some("true")
                         || attrs.get("enabled").map(String::as_str) != Some("true")
                         || kind != "XCUIElementTypeKeyboard"
                             && attrs.get("focused").map(String::as_str) == Some("false")
-                        || kind == "XCUIElementTypeTextView"
+                        || current_text
+                            && attrs
+                                .get("focused")
+                                .is_some_and(|value| !matches!(value.as_str(), "true" | "false"))
+                        || kind == "XCUIElementTypeTextView" && !current_text
                         || !stack
                             .iter()
                             .any(|parent| parent == "XCUIElementTypeApplication")
-                        || !screen?.encloses(Rect::read(&attrs)?)
+                        || !screen?.encloses(rect)
                     {
                         return None;
                     }
                     if kind == "XCUIElementTypeKeyboard" {
+                        if at.is_some_and(|point| rect.contains(point)) {
+                            return None;
+                        }
                         keyboards += 1;
                     } else {
                         text_inputs += 1;
-                        if matches!(target_kind, Target::TextPoint(_))
-                            && Rect::read(&attrs)?.contains(at?)
-                        {
+                        if matches!(target_kind, Target::TextPoint(_)) && rect.contains(at?) {
                             target = true;
                         }
                     }
@@ -379,6 +392,59 @@ mod tests {
         ] {
             assert!(!visible_text_target(&tree(&format!("{body}{extra}")), at));
         }
+    }
+
+    #[test]
+    fn current_selection_and_gestures_accept_one_text_view_without_asserting_focus() {
+        let editor = r#"<XCUIElementTypeTextView visible="true" enabled="true" x="0" y="0" width="393" height="544"/>"#;
+        let keyboard = r#"<XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/>"#;
+        let body = format!("{editor}{keyboard}");
+        let at = Point { x: 80.0, y: 40.0 };
+        for focus in ["", " focused=\"true\""] {
+            let xml = tree(&body.replacen("TextView ", &format!("TextView{focus} "), 1));
+            assert!(visible_current_text_input(&xml));
+            assert!(visible_text_target(&xml, at));
+            assert!(!visible_text_input(&xml));
+        }
+        for invalid in [
+            editor.to_owned(),
+            format!("{body}{editor}"),
+            format!("{body}{keyboard}"),
+            format!("{body}{}", editor.replace("TextView", "SearchField")),
+            body.replacen("enabled=\"true\"", "enabled=\"false\"", 1),
+            body.replacen("enabled=\"true\"", "", 1),
+            body.replacen("visible=\"true\"", "", 1),
+            body.replacen("TextView ", "TextView focused=\"false\" ", 1),
+            body.replacen("TextView ", "TextView focused=\"unknown\" ", 1),
+            body.replace("width=\"393\"", "width=\"999\""),
+            format!("{body}<XCUIElementTypeSecureTextField visible=\"false\"/>"),
+            format!("{body}<XCUIElementTypeAlert/>"),
+            format!("{body}<XCUIElementTypeOther label=\"Enter Passcode\"/>"),
+            format!("{body}<broken>"),
+        ] {
+            assert!(!visible_current_text_input(&tree(&invalid)), "{invalid}");
+            assert!(!visible_text_target(&tree(&invalid), at), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn text_view_gesture_refuses_keyboard_overlap_and_editor_edges() {
+        let editor = r#"<XCUIElementTypeTextView visible="true" enabled="true" x="0" y="0" width="393" height="600"/>"#;
+        let keyboard = r#"<XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/>"#;
+        let xml = tree(&format!("{editor}{keyboard}"));
+        assert!(visible_text_target(&xml, Point { x: 50.0, y: 549.0 }));
+        for point in [
+            Point { x: 50.0, y: 550.0 },
+            Point { x: 393.0, y: 50.0 },
+            Point { x: 50.0, y: 600.0 },
+        ] {
+            assert!(!visible_text_target(&xml, point));
+        }
+        let button = r#"<XCUIElementTypeButton label="Overlay" visible="true" enabled="true" x="20" y="20" width="100" height="100"/>"#;
+        assert!(!visible_text_target(
+            &tree(&format!("{editor}{keyboard}{button}")),
+            Point { x: 50.0, y: 50.0 }
+        ));
     }
 
     fn modal(kind: &str, body: &str) -> String {

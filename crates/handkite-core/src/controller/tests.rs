@@ -761,7 +761,7 @@ fn native_text_allows_only_pixel_drift_with_fresh_unchanged_context() {
 #[test]
 fn current_selection_key_is_explicit_and_bound_to_key_and_context() {
     use crate::protocol::KeyboardKey;
-    for case in 0..8 {
+    for case in 0..11 {
         let (controller, key) = controller();
         let before = controller.observe(&key).unwrap();
         let until = Instant::now() + Duration::from_secs(5);
@@ -797,6 +797,21 @@ fn current_selection_key_is_explicit_and_bound_to_key_and_context() {
                 }
                 6 => inner.adapter.stale_capture = true,
                 7 => inner.adapter.wda_ready = false,
+                8 => {
+                    action = Action::Text {
+                        value: "fixture".into(),
+                    }
+                }
+                9 => inner.adapter.app = "different.app".into(),
+                10 => {
+                    action = Action::KeyCurrent {
+                        key: KeyboardKey::Enter,
+                    };
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeKey {
+                        key: KeyboardKey::Enter,
+                        until,
+                    });
+                }
                 _ => {}
             }
         }
@@ -813,9 +828,13 @@ fn current_selection_key_is_explicit_and_bound_to_key_and_context() {
             },
         );
         let inner = controller.inner.lock().unwrap();
-        assert_eq!(result.is_ok(), case == 0, "case {case}");
-        assert_eq!(inner.adapter.actions, usize::from(case == 0), "case {case}");
-        if case == 0 {
+        assert_eq!(result.is_ok(), matches!(case, 0 | 10), "case {case}");
+        assert_eq!(
+            inner.adapter.actions,
+            usize::from(matches!(case, 0 | 10)),
+            "case {case}"
+        );
+        if matches!(case, 0 | 10) {
             assert!(inner.adapter.send_deadline.unwrap() <= until);
         }
     }
