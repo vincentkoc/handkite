@@ -41,7 +41,10 @@ pub(super) fn with_service_code(mut result: Value, code: &str) -> Value {
             | "StaleRevision"
             | "ViewChanged"
             | "LockedAction"
-    ) {
+    ) || handkite_core::controller::AdapterDiagnostic::ALL
+        .iter()
+        .any(|diagnostic| diagnostic.code() == code)
+    {
         result["structuredContent"] = json!({"code":code});
     }
     result

@@ -11,7 +11,9 @@ use crate::wda_settings::validate_session;
 use crate::wda_settings::{IdleSettingsLease, Restoration};
 use crate::wda_transport::UsbWda;
 use base64::Engine;
-use handkite_core::controller::{ActionAdmission, AdapterError, DeviceAdapter, RawObservation};
+use handkite_core::controller::{
+    ActionAdmission, AdapterDiagnostic, AdapterError, DeviceAdapter, RawObservation,
+};
 use handkite_core::protocol::{
     Action, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, Point, ScreenImage,
     TransportReceipt,
@@ -55,6 +57,7 @@ pub struct WdaAdapter {
     owned_runner: Option<OwnedWdaRunner>,
     owned_session: Option<String>,
     owned_idle: Option<IdleSettingsLease>,
+    error_diagnostic: Option<AdapterDiagnostic>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,6 +120,7 @@ impl WdaAdapter {
             expected,
             runtime: Some(runtime),
             actions: WdaActions::default(),
+            error_diagnostic: None,
             owned_runner: None,
             owned_session: None,
             owned_idle: None,
@@ -170,6 +174,7 @@ impl WdaAdapter {
             owned_runner: Some(runner),
             owned_session: None,
             owned_idle: None,
+            error_diagnostic: None,
         };
         let liveness = adapter
             .owned_runner
@@ -502,17 +507,28 @@ async fn run_until_shutdown<T, E: Copy>(
 }
 
 impl DeviceAdapter for WdaAdapter {
+    fn take_error_diagnostic(&mut self) -> Option<AdapterDiagnostic> {
+        self.error_diagnostic.take()
+    }
+
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
-        self.validate_owned()?;
+        self.error_diagnostic = None;
+        self.validate_owned().inspect_err(|_| {
+            self.error_diagnostic = Some(AdapterDiagnostic::IdentityCheck);
+        })?;
         self.runtime
             .as_ref()
             .expect("adapter runtime")
             .block_on(self.usb.provider())
-            .map_err(|_| AdapterError)?;
+            .map_err(|_| {
+                self.error_diagnostic = Some(AdapterDiagnostic::IdentityCheck);
+                AdapterError
+            })?;
         Ok((self.expected.clone(), self.expected.clone()))
     }
 
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
+        self.error_diagnostic = None;
         self.capture_checked(SCREEN_SOURCE)
             .map(|(observation, _)| observation)
     }
@@ -552,6 +568,7 @@ impl DeviceAdapter for WdaAdapter {
         &mut self,
         action: &Action,
     ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
+        self.error_diagnostic = None;
         let owned_input = matches!(
             action,
             Action::Tap { .. }
@@ -568,10 +585,15 @@ impl DeviceAdapter for WdaAdapter {
             return self.observe().map(|observation| (observation, None));
         }
         let native_before = native_lock::query(&self.expected).state;
-        let (observation, captured_at, reported_lock) =
-            self.capture_checked_with_lock_report(SCREEN_SOURCE)?;
+        let (observation, captured_at, reported_lock) = self
+            .capture_checked_with_lock_report(SCREEN_SOURCE)
+            .inspect_err(|_| {
+                self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
+            })?;
         let native_after = native_lock::query(&self.expected).state;
-        self.validate_owned()?;
+        self.validate_owned().inspect_err(|_| {
+            self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
+        })?;
         let admission = if let Action::Tap { at } = action {
             native_modal_tap_deadline(
                 &observation,
@@ -668,7 +690,11 @@ impl DeviceAdapter for WdaAdapter {
         action: &Action,
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
-        self.validate_owned_with_deadline(Some(send_deadline))?;
+        self.error_diagnostic = None;
+        self.validate_owned_with_deadline(Some(send_deadline))
+            .inspect_err(|_| {
+                self.error_diagnostic = Some(AdapterDiagnostic::OwnedBefore);
+            })?;
         if (matches!(action, Action::LaunchApp { .. })
             || matches!(
                 action,
@@ -682,6 +708,7 @@ impl DeviceAdapter for WdaAdapter {
             ) && self.owned_session.is_some())
             && native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
         {
+            self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
             return Err(AdapterError);
         }
         let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
@@ -689,8 +716,17 @@ impl DeviceAdapter for WdaAdapter {
             .runtime
             .as_ref()
             .expect("adapter runtime")
-            .block_on(self.actions.execute_with_existing_session(&wda, action))?;
-        self.validate_owned()?;
+            .block_on(
+                self.actions
+                    .execute_with_existing_session_diagnostic(&wda, action),
+            )
+            .map_err(|diagnostic| {
+                self.error_diagnostic = Some(diagnostic);
+                AdapterError
+            })?;
+        self.validate_owned().inspect_err(|_| {
+            self.error_diagnostic = Some(AdapterDiagnostic::OwnershipAfterAck);
+        })?;
         Ok(receipt)
     }
 
@@ -704,6 +740,7 @@ impl DeviceAdapter for WdaAdapter {
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
+        self.error_diagnostic = None;
         if let Some(ActionAdmission::NativeKey { key, until }) = admission {
             if !matches!(action, Action::KeyCurrent { key: actual } if *actual == key)
                 || self.owned_session.is_none()
@@ -1085,6 +1122,23 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn early_admission_failure_does_not_reuse_previous_diagnostic() {
+        let mut adapter = WdaAdapter::new(HardwareId::new("fixture-phone").unwrap()).unwrap();
+        adapter.error_diagnostic = Some(AdapterDiagnostic::OwnershipAfterAck);
+        assert_eq!(
+            adapter.execute_with_admission(
+                &Action::KeyCurrent {
+                    key: handkite_core::protocol::KeyboardKey::Backspace
+                },
+                Instant::now() + Duration::from_secs(1),
+                None,
+            ),
+            Err(AdapterError)
+        );
+        assert_eq!(adapter.take_error_diagnostic(), None);
+    }
 
     fn home_sample(home: bool) -> RawObservation {
         let id = HardwareId::new("fixture-device").unwrap();

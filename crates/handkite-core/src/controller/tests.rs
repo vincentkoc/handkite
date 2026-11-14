@@ -2,6 +2,8 @@ use super::*;
 use crate::protocol::{ImageFormat, LockState, Point, ScreenImage};
 
 struct FakeAdapter {
+    fail_identity: bool,
+    error_diagnostic: Option<AdapterDiagnostic>,
     usb: HardwareId,
     wda: HardwareId,
     app: String,
@@ -32,6 +34,8 @@ impl FakeAdapter {
     fn new() -> Self {
         let id = HardwareId::new("fixture-phone-a").unwrap();
         Self {
+            fail_identity: false,
+            error_diagnostic: None,
             usb: id.clone(),
             wda: id,
             app: "com.example.notes".into(),
@@ -61,7 +65,14 @@ impl FakeAdapter {
 }
 
 impl DeviceAdapter for FakeAdapter {
+    fn take_error_diagnostic(&mut self) -> Option<AdapterDiagnostic> {
+        self.error_diagnostic.take()
+    }
+
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
+        if self.fail_identity {
+            return Err(AdapterError);
+        }
         Ok((self.usb.clone(), self.wda.clone()))
     }
 
@@ -1654,6 +1665,103 @@ fn native_lock_proof_does_not_bypass_identity_checks() {
         assert_eq!(inner.adapter.native_queries, usize::from(after_action));
         assert!(inner.last.is_none());
     }
+}
+
+#[test]
+fn identity_diagnostic_is_consumed_before_capture_or_input() {
+    let (controller, key) = controller();
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    {
+        let mut inner = controller.inner.lock().unwrap();
+        inner.adapter.fail_identity = true;
+        inner.adapter.error_diagnostic = Some(AdapterDiagnostic::IdentityCheck);
+    }
+    assert_eq!(
+        controller
+            .act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: None,
+                    action: Action::Home,
+                }
+            )
+            .err(),
+        Some(ControllerError::AdapterAt(AdapterDiagnostic::IdentityCheck))
+    );
+    let inner = controller.inner.lock().unwrap();
+    assert_eq!(inner.adapter.actions, 0);
+    assert_eq!(inner.adapter.error_diagnostic, None);
+}
+
+#[test]
+fn adapter_diagnostic_is_consumed_at_failure_without_replay() {
+    for diagnostic in AdapterDiagnostic::ALL {
+        let (controller, key) = controller();
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.lose_ack = true;
+            inner.adapter.error_diagnostic = Some(diagnostic);
+        }
+        let action = || ActionRequest {
+            device: key.clone(),
+            expected_revision: None,
+            action: Action::Home,
+        };
+        assert_eq!(
+            controller.act("agent", lease, action()).err(),
+            Some(ControllerError::AdapterAt(diagnostic))
+        );
+        {
+            let inner = controller.inner.lock().unwrap();
+            assert_eq!(inner.adapter.actions, 1);
+            assert_eq!(inner.adapter.error_diagnostic, None);
+            assert!(inner.last.is_none());
+        }
+        assert_eq!(
+            controller.act("agent", lease, action()).err(),
+            Some(ControllerError::Adapter)
+        );
+        assert_eq!(controller.inner.lock().unwrap().adapter.actions, 2);
+    }
+}
+
+#[test]
+fn preaction_capture_diagnostic_does_not_dispatch() {
+    let (controller, key) = controller();
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    {
+        let mut inner = controller.inner.lock().unwrap();
+        inner.adapter.fail_capture = true;
+        inner.adapter.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
+    }
+    assert_eq!(
+        controller
+            .act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: None,
+                    action: Action::Home,
+                }
+            )
+            .err(),
+        Some(ControllerError::AdapterAt(
+            AdapterDiagnostic::PreActionCapture
+        ))
+    );
+    let inner = controller.inner.lock().unwrap();
+    assert_eq!(inner.adapter.actions, 0);
+    assert_eq!(inner.adapter.error_diagnostic, None);
 }
 
 #[test]

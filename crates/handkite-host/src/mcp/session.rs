@@ -233,16 +233,27 @@ mod tests {
 
     #[test]
     fn uncertain_service_errors_expose_only_fixed_diagnostic_codes() {
-        for code in ["StaleObservation", "InvalidObservationWindow", "Adapter"] {
+        for code in ["StaleObservation", "InvalidObservationWindow", "Adapter"]
+            .into_iter()
+            .chain(handkite_core::controller::AdapterDiagnostic::ALL.map(|value| value.code()))
+        {
             let reply = uncertain_service_result("tap", code);
             assert_eq!(reply["structuredContent"]["code"], code);
             assert_eq!(reply["isError"], true);
             let payload: Value =
                 serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
             assert_eq!(payload["receipt"]["accepted"], Value::Null);
+            assert_eq!(payload["after"], Value::Null);
+            assert_eq!(payload["effect"], "unconfirmed");
             assert_eq!(payload["delivery"], "unknown");
         }
-        for code in ["private screen content", "Adapter: private detail", ""] {
+        for code in [
+            "private screen content",
+            "Adapter: private detail",
+            "AdapterInputConnect: private detail",
+            "AdapterAt(InputConnect)",
+            "",
+        ] {
             let reply = uncertain_service_result("tap", code);
             assert!(reply.get("structuredContent").is_none());
             assert!(!reply.to_string().contains("private"));

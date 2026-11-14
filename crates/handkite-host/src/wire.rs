@@ -153,12 +153,19 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
             };
         }
     };
-    result.unwrap_or_else(|error| match error {
+    result.unwrap_or_else(error_reply)
+}
+
+fn error_reply(error: ControllerError) -> Reply {
+    match error {
         ControllerError::ViewChanged(changed) => Reply::ViewChanged { changed },
+        ControllerError::AdapterAt(diagnostic) => Reply::Error {
+            code: diagnostic.code().into(),
+        },
         _ => Reply::Error {
             code: format!("{error:?}"),
         },
-    })
+    }
 }
 
 #[cfg(test)]
@@ -167,6 +174,17 @@ mod status_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn adapter_diagnostics_use_flat_fixed_wire_codes() {
+        for diagnostic in handkite_core::controller::AdapterDiagnostic::ALL {
+            let reply = error_reply(ControllerError::AdapterAt(diagnostic));
+            assert_eq!(
+                serde_json::to_value(reply).unwrap(),
+                serde_json::json!({"type":"error", "code":diagnostic.code()})
+            );
+        }
+    }
 
     #[test]
     fn wire_rejects_invalid_identity_and_unexpected_fields() {

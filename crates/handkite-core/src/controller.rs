@@ -18,6 +18,60 @@ pub struct RawObservation {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AdapterError;
 
+/// Fixed categories only: adapter details can contain private device content.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdapterDiagnostic {
+    IdentityCheck,
+    PreActionCapture,
+    OwnedBefore,
+    NativeBefore,
+    SessionStatus,
+    SessionCheck,
+    InputExpiredBeforeSend,
+    InputConnect,
+    InputInvalidRequest,
+    InputAfterSend,
+    InputTimedOutAfterSend,
+    InputResponseRejected,
+    OwnershipAfterAck,
+}
+
+impl AdapterDiagnostic {
+    pub const ALL: [Self; 13] = [
+        Self::IdentityCheck,
+        Self::PreActionCapture,
+        Self::OwnedBefore,
+        Self::NativeBefore,
+        Self::SessionStatus,
+        Self::SessionCheck,
+        Self::InputExpiredBeforeSend,
+        Self::InputConnect,
+        Self::InputInvalidRequest,
+        Self::InputAfterSend,
+        Self::InputTimedOutAfterSend,
+        Self::InputResponseRejected,
+        Self::OwnershipAfterAck,
+    ];
+
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::IdentityCheck => "AdapterIdentityCheck",
+            Self::PreActionCapture => "AdapterPreActionCapture",
+            Self::OwnedBefore => "AdapterOwnedBefore",
+            Self::NativeBefore => "AdapterNativeBefore",
+            Self::SessionStatus => "AdapterSessionStatus",
+            Self::SessionCheck => "AdapterSessionCheck",
+            Self::InputExpiredBeforeSend => "AdapterInputExpiredBeforeSend",
+            Self::InputConnect => "AdapterInputConnect",
+            Self::InputInvalidRequest => "AdapterInputInvalidRequest",
+            Self::InputAfterSend => "AdapterInputAfterSend",
+            Self::InputTimedOutAfterSend => "AdapterInputTimedOutAfterSend",
+            Self::InputResponseRejected => "AdapterInputResponseRejected",
+            Self::OwnershipAfterAck => "AdapterOwnershipAfterAck",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum ActionAdmission {
     HomeLaunch {
@@ -51,6 +105,11 @@ pub enum ActionAdmission {
 }
 
 pub trait DeviceAdapter {
+    /// Consume the fixed diagnostic from the immediately preceding failure.
+    fn take_error_diagnostic(&mut self) -> Option<AdapterDiagnostic> {
+        None
+    }
+
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
     /// Private admission bound to the exact action and capture deadline.
@@ -205,6 +264,7 @@ pub enum ControllerError {
     InvalidObservationWindow,
     RevisionExhausted,
     Adapter,
+    AdapterAt(AdapterDiagnostic),
     Poisoned,
 }
 
@@ -303,7 +363,7 @@ impl<A: DeviceAdapter> Controller<A> {
         let (usb, wda) = inner
             .adapter
             .identities()
-            .map_err(|_| ControllerError::Adapter)?;
+            .map_err(|_| Self::adapter_error(&mut inner))?;
         self.binding
             .verify(&request.device, &usb, &wda)
             .map_err(|_| ControllerError::DeviceMismatch)?;
@@ -462,13 +522,16 @@ impl<A: DeviceAdapter> Controller<A> {
         ) {
             Ok(receipt) => receipt,
             // An error can follow delivery. Keep checking the postcondition without replay.
-            Err(_) if is_lock => TransportReceipt {
-                accepted: None,
-                action_kind: request.action.kind().into(),
-            },
+            Err(_) if is_lock => {
+                inner.adapter.take_error_diagnostic();
+                TransportReceipt {
+                    accepted: None,
+                    action_kind: request.action.kind().into(),
+                }
+            }
             Err(_) => {
                 inner.last = None;
-                return Err(ControllerError::Adapter);
+                return Err(Self::adapter_error(&mut inner));
             }
         };
         let native_lock = is_lock.then(|| inner.adapter.native_lock_state());
@@ -542,9 +605,17 @@ impl<A: DeviceAdapter> Controller<A> {
                 .observe()
                 .map(|observation| (observation, None)),
         }
-        .map_err(|_| ControllerError::Adapter)?;
+        .map_err(|_| Self::adapter_error(inner))?;
         self.accept_capture(inner, requested, raw)
             .map(|observation| (observation, admission))
+    }
+
+    fn adapter_error(inner: &mut Inner<A>) -> ControllerError {
+        inner
+            .adapter
+            .take_error_diagnostic()
+            .map(ControllerError::AdapterAt)
+            .unwrap_or(ControllerError::Adapter)
     }
 
     fn accept_capture(

@@ -358,6 +358,13 @@ An app launch from Home tolerates changes in screenshot or tree bytes only when 
 
 A `ViewChanged` refusal includes `structuredContent.changed` with boolean `state`, `accessibility_tree`, and `screenshot` fields. These identify the changed components without returning their contents. They do not authorize a retry or relax the comparison. Invalid diagnostic replies retain the unknown-delivery result.
 
+Adapter failures can include a fixed stage code in `structuredContent.code`,
+such as `AdapterNativeBefore`, `AdapterSessionCheck` or
+`AdapterOwnershipAfterAck`. The last means a validated action acknowledgement
+preceded a failed ownership check. These codes contain no upstream error text.
+Every adapter failure still reports unknown delivery; inspect fresh state before
+deciding on another action, including after `AdapterInputExpiredBeforeSend`.
+
 An owned runner may admit a tap despite screenshot drift when device state and the complete accessibility tree match exactly. The fresh capture must prove one labelled, visible, enabled button containing the requested point within the application bounds, with no overlapping visible button or lock, alert, sheet, or secure-field context. Native unlock must be confirmed before and after capture and again before sending. The tap deadline is at most two seconds after capture; identity, revision and lease checks remain. Borrowed runners, text, swipes, lock and PIN input retain their existing rules. A matching view does not prove the tap's effect; check its receipt and postcondition separately.
 
 Home has a separate owned-runner admission for screenshot drift with unchanged state and tree. It requires native unlock before and after capture, WDA unlocked state, and one valid application without lock, alert, sheet or secure-field context. Its two-second capture deadline and native check before sending apply only when that admission is used. Admitted Home validates the already-bound session and sends one dedicated Home-screen activation request; it never falls back to a button press. Existing exact-view Home behavior remains available without that admission. Home does not require a button target, and its effect still needs separate verification.

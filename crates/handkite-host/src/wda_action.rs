@@ -1,7 +1,7 @@
 pub(crate) use crate::pin_field::valid_id as valid_session_id;
 use crate::wda_http::HttpResponse;
 use crate::wda_transport::{UsbWda, WdaError};
-use handkite_core::controller::AdapterError;
+use handkite_core::controller::{AdapterDiagnostic, AdapterError};
 use handkite_core::protocol::{Action, KeyboardKey, Point, TransportReceipt};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -155,9 +155,27 @@ impl WdaActions {
         wda: &impl WdaRequest,
         action: &Action,
     ) -> Result<TransportReceipt, AdapterError> {
-        self.validate_existing(wda).await?;
-        let session = self.session.as_deref().ok_or(AdapterError)?;
-        Self::execute_on(wda, action, session).await
+        self.execute_with_existing_session_diagnostic(wda, action)
+            .await
+            .map_err(|_| AdapterError)
+    }
+
+    pub(crate) async fn execute_with_existing_session_diagnostic(
+        &mut self,
+        wda: &impl WdaRequest,
+        action: &Action,
+    ) -> Result<TransportReceipt, AdapterDiagnostic> {
+        self.validate_existing_diagnostic(wda)
+            .await
+            .map_err(|error| match error.endpoint {
+                "status" => AdapterDiagnostic::SessionStatus,
+                _ => AdapterDiagnostic::SessionCheck,
+            })?;
+        let session = self
+            .session
+            .as_deref()
+            .ok_or(AdapterDiagnostic::SessionCheck)?;
+        Self::execute_on_diagnostic(wda, action, session).await
     }
 
     /// Activates the Home screen once, without a button-press fallback.
@@ -288,14 +306,31 @@ impl WdaActions {
         action: &Action,
         session: &str,
     ) -> Result<TransportReceipt, AdapterError> {
-        let (endpoint, body) = payload(action)?;
+        Self::execute_on_diagnostic(wda, action, session)
+            .await
+            .map_err(|_| AdapterError)
+    }
+
+    async fn execute_on_diagnostic(
+        wda: &impl WdaRequest,
+        action: &Action,
+        session: &str,
+    ) -> Result<TransportReceipt, AdapterDiagnostic> {
+        let (endpoint, body) =
+            payload(action).map_err(|_| AdapterDiagnostic::InputInvalidRequest)?;
         let path = format!("/session/{session}{endpoint}");
-        let body = serde_json::to_vec(&body).map_err(|_| AdapterError)?;
+        let body = serde_json::to_vec(&body).map_err(|_| AdapterDiagnostic::InputInvalidRequest)?;
         let response = wda
             .request("POST", &path, &body, Duration::from_secs(30))
             .await
-            .map_err(|_| AdapterError)?;
-        response_ok(response)?;
+            .map_err(|error| match error {
+                WdaError::ExpiredBeforeSend => AdapterDiagnostic::InputExpiredBeforeSend,
+                WdaError::NotConnected | WdaError::Usb(_) => AdapterDiagnostic::InputConnect,
+                WdaError::InvalidRequest(_) => AdapterDiagnostic::InputInvalidRequest,
+                WdaError::AfterSent => AdapterDiagnostic::InputAfterSend,
+                WdaError::TimedOutAfterSent => AdapterDiagnostic::InputTimedOutAfterSend,
+            })?;
+        response_ok(response).map_err(|_| AdapterDiagnostic::InputResponseRejected)?;
         Ok(TransportReceipt {
             accepted: Some(true),
             action_kind: action.kind().into(),
@@ -531,6 +566,93 @@ mod tests {
         assert_eq!(current, strict);
         assert_eq!(current.0, "/wda/keys");
         assert_eq!(current.1, json!({"value":["B","e","t","a"]}));
+    }
+
+    #[tokio::test]
+    async fn action_diagnostics_preserve_transport_phase_without_retry() {
+        let failures = [
+            (
+                WdaError::ExpiredBeforeSend,
+                AdapterDiagnostic::InputExpiredBeforeSend,
+            ),
+            (WdaError::AfterSent, AdapterDiagnostic::InputAfterSend),
+            (
+                WdaError::TimedOutAfterSent,
+                AdapterDiagnostic::InputTimedOutAfterSend,
+            ),
+            (WdaError::NotConnected, AdapterDiagnostic::InputConnect),
+            (
+                WdaError::Usb(crate::usb::UsbError::Unavailable),
+                AdapterDiagnostic::InputConnect,
+            ),
+            (
+                WdaError::InvalidRequest(crate::wda_http::HttpError::InvalidRequest),
+                AdapterDiagnostic::InputInvalidRequest,
+            ),
+        ];
+        for (failure, expected) in failures {
+            let mut steps = valid_action();
+            steps.last_mut().unwrap().response = Err(failure);
+            let script = Script::new(steps);
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert_eq!(
+                actions
+                    .execute_with_existing_session_diagnostic(&script, &Action::Home)
+                    .await,
+                Err(expected)
+            );
+            script.done();
+        }
+        for response in [
+            HttpResponse {
+                status: 503,
+                body: b"private response".to_vec(),
+            },
+            HttpResponse {
+                status: 200,
+                body: b"private response".to_vec(),
+            },
+            HttpResponse {
+                status: 200,
+                body: br#"{"value":{"error":"private response"}}"#.to_vec(),
+            },
+        ] {
+            let mut steps = valid_action();
+            steps.last_mut().unwrap().response = Ok(response);
+            let script = Script::new(steps);
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert_eq!(
+                actions
+                    .execute_with_existing_session_diagnostic(&script, &Action::Home)
+                    .await,
+                Err(AdapterDiagnostic::InputResponseRejected)
+            );
+            script.done();
+        }
+    }
+
+    #[tokio::test]
+    async fn action_diagnostics_distinguish_session_reads_before_input() {
+        for (index, expected) in [
+            AdapterDiagnostic::SessionStatus,
+            AdapterDiagnostic::SessionCheck,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut steps = valid_action();
+            steps.pop();
+            steps[index].response = Err(WdaError::NotConnected);
+            let script = Script::new(steps);
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert_eq!(
+                actions
+                    .execute_with_existing_session_diagnostic(&script, &Action::Home)
+                    .await,
+                Err(expected)
+            );
+            script.done();
+        }
     }
 
     #[tokio::test]
