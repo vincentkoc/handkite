@@ -496,6 +496,13 @@ Preparation failures retain their case, step, request identity, fixed change
 flags and failing predicate names, without predicate values. An unmeasured
 setup failure cannot disappear from the report.
 
+To prioritize a case without repeating it later, run disjoint case subsets on
+the same unchanged service generation, then use
+`benchmark_mcp.py merge --output complete.json swipe.json remaining.json`.
+The merge requires every case to pass twenty trials, preserves each report's
+hash, and rejects overlapping cases, mixed builds or process generations,
+failed runs and calibration. It does not concatenate unrelated trace streams.
+
 `span.*.covered` is the union of overlapping intervals in that stage;
 `pre_tree_reuses` counts successful pre-action snapshot reuse. Such captures
 are marked `reused_tree` and require a successful fresh frame probe; their

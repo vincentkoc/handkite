@@ -418,6 +418,45 @@ def compare(before, after):
     return failures
 
 
+def merge_reports(parts):
+    """Combine disjoint passing cohorts from one unchanged service generation."""
+    require(len(parts) >= 2, "missing_cohorts")
+    identity_keys = ("plan_sha256", "service_build", "client_build", "service_pid")
+    identity = {key: parts[0][0][key] for key in identity_keys}
+    seen, samples, cohorts = set(), [], []
+    for report, digest in parts:
+        require(report.get("version") == 1 and report.get("trace_valid") is True
+                and report.get("failure") is None and report.get("trace_error") is None
+                and report.get("calibration") is False and not report.get("cohorts"),
+                "incomplete_cohort")
+        require(all(report.get(key) == value for key, value in identity.items()), "different_generation")
+        selected = report.get("selected_cases", [])
+        require(bool(selected) and len(selected) == len(set(selected))
+                and set(selected) <= set(CASES) and not seen.intersection(selected), "overlapping_cohorts")
+        rows = report["samples"]
+        require(all(row["case"] in selected and row["outcome"] == "pass"
+                    and "cleanup_ms" in row for row in rows), "incomplete_cohort")
+        summary = summarize(rows)
+        require(summary == report["summary"], "inconsistent_summary")
+        require(all(summary[case]["passed"] >= 20 and summary[case]["failures"] == 0
+                    for case in selected), "incomplete_cohort")
+        seen.update(selected)
+        samples.extend(dict(row, cohort=len(cohorts)) for row in rows)
+        cohorts.append({"sha256": digest, "selected_cases": selected})
+    require(seen == set(CASES), "missing_cohorts")
+    return dict(identity, version=1, calibration=False, selected_cases=list(CASES),
+                trace_valid=True, trace_kind="validated_cohorts", trace_error=None,
+                failure=None, failure_context=None, cohorts=cohorts,
+                samples=samples, summary=summarize(samples))
+
+
+def write_report(path, report):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "w") as output:
+        json.dump(report, output, allow_nan=False, separators=(",", ":"))
+        output.write("\n")
+
+
 def validate_plan(plan):
     require(isinstance(plan, dict) and plan.get("version") == 1, "invalid_plan")
     cases = plan.get("cases")
@@ -696,11 +735,20 @@ def main():
     diff = commands.add_parser("compare")
     diff.add_argument("before", type=Path)
     diff.add_argument("after", type=Path)
+    merge = commands.add_parser("merge")
+    merge.add_argument("--output", type=Path, required=True)
+    merge.add_argument("reports", nargs="+", type=Path)
     args = parser.parse_args()
     if args.mode == "compare":
         failures = compare(decode(args.before.read_bytes()), decode(args.after.read_bytes()))
         print(json.dumps({"passed": not failures, "failures": failures}))
         return int(bool(failures))
+    if args.mode == "merge":
+        parts = [path.read_bytes() for path in args.reports]
+        report = merge_reports([(decode(part), hashlib.sha256(part).hexdigest()) for part in parts])
+        write_report(args.output, report)
+        print(json.dumps({"complete": True, "cohorts": len(parts), "cases": len(CASES)}))
+        return 0
     require(20 <= args.count <= 100 and 0 <= args.warmups <= 5, "invalid_sample_count")
     if args.calibrate:
         args.count, args.warmups = 1, 0
@@ -766,10 +814,7 @@ def main():
                   "failure": campaign.failure, "samples": campaign.samples,
                   "failure_context": campaign.failure_context, "calls": peer.calls,
                   "summary": summarize(campaign.samples)}
-        descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        with os.fdopen(descriptor, "w") as output:
-            json.dump(report, output, allow_nan=False, separators=(",", ":"))
-            output.write("\n")
+        write_report(args.output, report)
         compact = {name: {key: value[key] for key in ("attempts", "passed", "failures", "client_ms")}
                    for name, value in report["summary"].items()}
         print(json.dumps({"complete": campaign.failure is None, "summary": compact}), flush=True)

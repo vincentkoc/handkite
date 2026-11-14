@@ -6,7 +6,7 @@ import sys
 import unittest
 
 from benchmark_mcp import (BenchError, Campaign, CASES, Peer, compare, elements,
-                           operation_stages, parse_screen, quantiles, summarize,
+                           operation_stages, parse_screen, quantiles, summarize, merge_reports,
                            trace_rows, validate_plan, validate_measured_stages,
                            validate_client_stages, CAPTURE_NAMES, matches)
 
@@ -32,6 +32,30 @@ def plan():
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_merge_requires_complete_disjoint_cohorts_on_one_generation(self):
+        def cohort(cases):
+            rows = [{"case": case, "outcome": "pass", "elapsed_ms": 10, "cleanup_ms": 1}
+                    for case in cases for _ in range(20)]
+            return {"version": 1, "calibration": False, "trace_valid": True, "failure": None,
+                    "trace_error": None, "plan_sha256": "same", "service_build": "same",
+                    "client_build": "same", "service_pid": 1, "selected_cases": cases,
+                    "samples": rows, "summary": summarize(rows)}
+        first, second = cohort(["swipe"]), cohort([case for case in CASES if case != "swipe"])
+        merged = merge_reports([(first, "first"), (second, "second")])
+        self.assertEqual(len(merged["samples"]), 120)
+        self.assertEqual(compare(merged, merged), [])
+        self.assertEqual(merged["cohorts"][0]["sha256"], "first")
+        for key, value in (("failure", "ViewChanged"), ("trace_valid", False),
+                           ("service_build", "different"), ("service_pid", 2), ("calibration", True)):
+            invalid = copy.deepcopy(second)
+            invalid[key] = value
+            with self.assertRaises(BenchError):
+                merge_reports([(first, "first"), (invalid, "invalid")])
+        with self.assertRaises(BenchError):
+            merge_reports([(first, "first"), (first, "duplicate")])
+        with self.assertRaises(BenchError):
+            merge_reports([(first, "first"), (cohort(["tap"]), "incomplete")])
+
     def test_partial_campaign_preserves_plan_and_case_lifecycle(self):
         class FakePeer:
             healthy = True
