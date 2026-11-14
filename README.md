@@ -342,7 +342,7 @@ replies and false or unknown acceptance stop the sequence.
 
 For remote use, an authenticated SSH key must be bound to a restricted forced command that fixes the socket, device, and capabilities, disables forwarding and PTY allocation, and ignores client-supplied commands. Do not grant that principal an unrestricted shell or direct socket access. A CLI capability flag is host policy, not authentication; SSH access that lets a caller select another command or flags does not enforce capability separation. Keep the Unix socket and WDA off network listeners. Host identity, key enrollment, forced-command restrictions, and the intended OpenClaw connection remain unqualified and require separate setup and acceptance.
 
-The owned local path has passed real-device Clock launch, Home return, Settings launch, App Store text entry, and free WeChat installation and launch. These are separate recorded trials; scrolling and text selection do not inherit that qualification. Remote restricted-SSH enrollment and OpenClaw acceptance remain unqualified. See [current evidence and limits](VALIDATION.md). Observation returns private screen content to the calling agent.
+The owned local path has passed real-device Clock launch, Home return, Settings launch and two-way scrolling, App Store text entry, and free WeChat installation and launch. These are separate recorded trials; text selection and editing-key qualification remain pending. Remote restricted-SSH enrollment and OpenClaw acceptance remain unqualified. See [validation](VALIDATION.md). Observation returns private screen content to the calling agent.
 
 An authorized client with both capabilities follows this sequence after MCP initialization:
 
