@@ -139,11 +139,22 @@ impl From<LeaseId> for String {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GestureAdmission {
+    Missing,
+    Expired,
+    Mismatched,
+    Present,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ViewChange {
     pub state: bool,
     pub accessibility_tree: bool,
     pub screenshot: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gesture_admission: Option<GestureAdmission>,
 }
 
 impl ViewChange {
@@ -152,12 +163,33 @@ impl ViewChange {
             state: before.state != after.state,
             accessibility_tree: before.accessibility_tree != after.accessibility_tree,
             screenshot: before.screenshot != after.screenshot,
+            gesture_admission: None,
         }
     }
 
     pub fn any(self) -> bool {
         self.state || self.accessibility_tree || self.screenshot
     }
+}
+
+fn gesture_admission_status(
+    action: &Action,
+    admission: Option<ActionAdmission>,
+    now: Instant,
+) -> Option<GestureAdmission> {
+    let (Action::DoubleTap { at } | Action::LongPress { at, .. }) = action else {
+        return None;
+    };
+    Some(match admission {
+        Some(ActionAdmission::NativeTextGesture { at: admitted, .. }) if *at != admitted => {
+            GestureAdmission::Mismatched
+        }
+        Some(ActionAdmission::NativeTextGesture { until, .. }) if now >= until => {
+            GestureAdmission::Expired
+        }
+        Some(ActionAdmission::NativeTextGesture { .. }) => GestureAdmission::Present,
+        _ => GestureAdmission::Missing,
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -373,8 +405,10 @@ impl<A: DeviceAdapter> Controller<A> {
                         && last.accessibility_tree == fresh.accessibility_tree)
             })
         {
-            let change =
+            let mut change =
                 ViewChange::between(inner.last.as_ref().expect("checked revision"), &fresh);
+            change.gesture_admission =
+                gesture_admission_status(&request.action, admission, Instant::now());
             inner.last = Some(fresh);
             return Err(ControllerError::ViewChanged(change));
         }

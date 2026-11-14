@@ -452,6 +452,7 @@ fn view_change_reports_only_the_components_that_changed() {
             state: mask & 1 != 0,
             accessibility_tree: mask & 2 != 0,
             screenshot: mask & 4 != 0,
+            gesture_admission: None,
         };
         {
             let mut inner = controller.inner.lock().unwrap();
@@ -505,6 +506,7 @@ fn changed_screen_or_lock_state_blocks_input_before_transport() {
             state: true,
             accessibility_tree: true,
             screenshot: true,
+            gesture_admission: None,
         }))
     );
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
@@ -958,7 +960,7 @@ fn named_button_admission_preserves_tree_state_and_deadline_checks() {
 #[test]
 fn text_gesture_admission_is_bound_to_point_action_tree_and_native_unlock() {
     let at = Point { x: 20.0, y: 30.0 };
-    for case in 0..8 {
+    for case in 0..9 {
         let (controller, key) = controller();
         let before = controller.observe(&key).unwrap();
         let until = Instant::now() + Duration::from_secs(5);
@@ -988,6 +990,7 @@ fn text_gesture_admission_is_bound_to_point_action_tree_and_native_unlock() {
                     })
                 }
                 7 => inner.adapter.stale_capture = true,
+                8 => inner.adapter.tap_admission = None,
                 _ => {}
             }
         }
@@ -1006,6 +1009,19 @@ fn text_gesture_admission_is_bound_to_point_action_tree_and_native_unlock() {
         let inner = controller.inner.lock().unwrap();
         assert_eq!(result.is_ok(), case <= 1, "case {case}");
         assert_eq!(inner.adapter.actions, usize::from(case <= 1));
+        let diagnostic = match case {
+            3 => Some(GestureAdmission::Mismatched),
+            4 => Some(GestureAdmission::Present),
+            6 => Some(GestureAdmission::Expired),
+            8 => Some(GestureAdmission::Missing),
+            _ => None,
+        };
+        if let Some(expected) = diagnostic {
+            let Err(ControllerError::ViewChanged(change)) = result else {
+                panic!("case {case} did not report a view change");
+            };
+            assert_eq!(change.gesture_admission, Some(expected));
+        }
     }
 }
 
@@ -1285,6 +1301,7 @@ fn home_launch_tolerates_visual_drift_only_with_fresh_admission() {
                         state: false,
                         accessibility_tree: tree,
                         screenshot: image,
+                        gesture_admission: None,
                     }))
                 );
                 assert_eq!(inner.adapter.actions, 0);
@@ -1336,6 +1353,7 @@ fn home_launch_rejects_changed_state_or_expired_admission() {
                 state: change < 3,
                 accessibility_tree: true,
                 screenshot: change == 0,
+                gesture_admission: None,
             }))
         );
         assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
@@ -1387,6 +1405,7 @@ fn visual_drift_still_blocks_other_actions() {
                 state: false,
                 accessibility_tree: true,
                 screenshot: true,
+                gesture_admission: None,
             }))
         );
         assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);

@@ -667,11 +667,15 @@ fn view_change_diagnostics_are_typed_and_do_not_forward_private_fields() {
     for mask in 1..8 {
         cases.push((json!({"state":mask & 1 != 0,"accessibility_tree":mask & 2 != 0,"screenshot":mask & 4 != 0}), true));
     }
+    for admission in ["missing", "expired", "mismatched", "present"] {
+        cases.push((json!({"state":false,"accessibility_tree":false,"screenshot":true,"gesture_admission":admission}), true));
+    }
     for changed in [
         json!({"state":false,"accessibility_tree":false,"screenshot":false}),
         json!({"state":"private-value","accessibility_tree":true,"screenshot":false}),
         json!({"state":true,"screenshot":false}),
         json!({"state":true,"accessibility_tree":false,"screenshot":false,"private-value":"private-screen"}),
+        json!({"state":false,"accessibility_tree":false,"screenshot":true,"gesture_admission":"private-screen"}),
     ] {
         cases.push((changed, false));
     }

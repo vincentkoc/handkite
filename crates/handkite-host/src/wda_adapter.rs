@@ -648,6 +648,18 @@ impl DeviceAdapter for WdaAdapter {
             )
             .map(|until| ActionAdmission::HomeLaunch { until })
         };
+        if matches!(action, Action::DoubleTap { .. } | Action::LongPress { .. })
+            && admission.is_none()
+        {
+            eprintln!(
+                "handkited: gesture_admission_missing native_before_unlocked={} native_after_unlocked={} reported_unlocked={} owned_session={} owned_runner={}",
+                native_before == LockState::Unlocked,
+                native_after == LockState::Unlocked,
+                reported_lock == Some(false),
+                self.owned_session.is_some(),
+                self.owned_runner.is_some(),
+            );
+        }
         Ok((observation, admission))
     }
 
