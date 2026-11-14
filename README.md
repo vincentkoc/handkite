@@ -530,6 +530,13 @@ The merge requires every case to pass twenty trials, preserves each report's
 hash, and rejects overlapping cases, mixed builds or process generations,
 failed runs and calibration. It does not concatenate unrelated trace streams.
 
+Use `benchmark_mcp.py reference complete.json --output reference.json` to retain
+only a complete run's metrics, source hashes and plan identity for later
+`compare` calls. This omits process IDs, individual calls and sample context;
+it rejects failed, incomplete and calibration runs. Keep the capture policy
+the same for a like-for-like regression gate; comparison output names both
+policies when they differ.
+
 `span.*.covered` is the union of overlapping intervals in that stage;
 `pre_tree_reuses` counts successful pre-action snapshot reuse. Such captures
 are marked `reused_tree` and require a successful fresh frame probe; their

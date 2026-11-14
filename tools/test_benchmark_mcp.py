@@ -8,7 +8,7 @@ import time
 import unittest
 
 from benchmark_mcp import (BenchError, Campaign, CASES, Peer, compare, elements,
-                           operation_stages, parse_screen, quantiles, summarize, merge_reports,
+                           operation_stages, parse_screen, quantiles, summarize, merge_reports, reference_report,
                            trace_rows, validate_plan, validate_measured_stages,
                            validate_client_stages, CAPTURE_NAMES, matches)
 
@@ -47,6 +47,33 @@ def image_result(action=False):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_reference_keeps_metrics_without_runtime_or_call_details(self):
+        samples = [{"case":case,"outcome":"pass","elapsed_ms":10} for case in CASES for _ in range(20)]
+        report = {"version":1,"calibration":False,"trace_valid":True,"failure":None,
+                  "plan_sha256":"a" * 64,"service_build":"b" * 40,"client_build":"c" * 40,
+                  "service_pid":123,"calls":[{"private":"context"}],"samples":samples,
+                  "summary":summarize(samples)}
+        result = reference_report(report, "d" * 64)
+        self.assertEqual(compare(result, report), [])
+        self.assertEqual(result["reference_source_sha256"], "d" * 64)
+        self.assertTrue({"calls","samples","service_pid"}.isdisjoint(result))
+        for key, value in (("calibration", True), ("failure", "view_unsettled"), ("trace_valid", False)):
+            invalid = dict(report, **{key:value})
+            with self.assertRaises(BenchError):
+                reference_report(invalid, "d" * 64)
+        invalid = copy.deepcopy(report)
+        invalid["summary"]["private_context"] = "private"
+        with self.assertRaisesRegex(BenchError, "inconsistent_summary"):
+            reference_report(invalid, "d" * 64)
+        for key, value in (("passed", 0), ("client_ms", {"n":0,"p50":10,"p95":10})):
+            invalid = copy.deepcopy(report)
+            invalid["summary"]["tap"][key] = value
+            with self.assertRaises(BenchError):
+                reference_report(invalid, "d" * 64)
+        report["summary"]["tap"]["attempts"] = 19
+        with self.assertRaises(BenchError):
+            reference_report(report, "d" * 64)
+
     def test_image_measurement_keeps_fixture_verification_separate(self):
         class FakePeer:
             healthy = True

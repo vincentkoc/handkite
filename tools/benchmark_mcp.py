@@ -460,6 +460,42 @@ def merge_reports(parts):
                 samples=samples, summary=summarize(samples))
 
 
+def reference_report(report, digest):
+    require(report.get("calibration") is False and compare(report, report) == [], "incomplete_reference")
+    require(isinstance(report.get("samples"), list), "missing_reference_samples")
+    summary = summarize(report["samples"])
+    require(summary == report["summary"] and set(report["summary"]) == set(CASES), "inconsistent_summary")
+    require(report.get("capture_mode", "paired") in ("paired", "image_only"), "invalid_capture_mode")
+    for pin in (report["plan_sha256"], report["service_build"], report["client_build"], digest):
+        require(isinstance(pin, str) and len(pin) in (40, 64)
+                and all(c in "0123456789abcdef" for c in pin), "invalid_build_pin")
+    allowed_stages = {"input_request"} | {
+        f"{prefix}span.{stage}.{kind}" for prefix in ("", "mcp.")
+        for stage in SPAN_NAMES for kind in ("work", "covered")
+    } | {f"{prefix}capture_{index}.{stage}" for prefix in ("", "mcp.")
+         for index in (0, 1) for stage in CAPTURE_NAMES}
+    for case in CASES:
+        row = summary[case]
+        require(type(row["attempts"]) is int and row["passed"] == row["attempts"] >= 20
+                and row["failures"] == 0 and row["client_ms"]["n"] == row["passed"], "incomplete_reference")
+        require(set(row) <= {"attempts", "passed", "failures", "client_ms", "stages_ms",
+                             "pre_tree_reuses", "budget_ms", "fixture_verification_ms"}
+                and set(row["stages_ms"]) <= allowed_stages, "unknown_reference_metric")
+        require(all(type(value) in (int, float) and math.isfinite(value) and value >= 0
+                    for key, value in row.items()
+                    if key not in {"client_ms", "stages_ms", "fixture_verification_ms"}), "invalid_reference_metric")
+        for value in [row["client_ms"], *row["stages_ms"].values(),
+                      *([row["fixture_verification_ms"]] if "fixture_verification_ms" in row else [])]:
+            require(set(value) == {"n", "p50", "p95"}
+                    and all(type(number) in (int, float) and math.isfinite(number) and number >= 0
+                            for number in value.values()), "invalid_reference_metric")
+    return {"version": 1, "trace_valid": True, "failure": None,
+            "plan_sha256": report["plan_sha256"],
+            "capture_mode": report.get("capture_mode", "paired"),
+            "service_build": report["service_build"], "client_build": report["client_build"],
+            "reference_source_sha256": digest, "summary": summary}
+
+
 def write_report(path, report):
     descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(descriptor, "w") as output:
@@ -792,6 +828,9 @@ def main():
     merge = commands.add_parser("merge")
     merge.add_argument("--output", type=Path, required=True)
     merge.add_argument("reports", nargs="+", type=Path)
+    reference = commands.add_parser("reference")
+    reference.add_argument("report", type=Path)
+    reference.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
     if args.mode == "compare":
         before, after = decode(args.before.read_bytes()), decode(args.after.read_bytes())
@@ -805,6 +844,12 @@ def main():
         report = merge_reports([(decode(part), hashlib.sha256(part).hexdigest()) for part in parts])
         write_report(args.output, report)
         print(json.dumps({"complete": True, "cohorts": len(parts), "cases": len(CASES)}))
+        return 0
+    if args.mode == "reference":
+        raw = args.report.read_bytes()
+        result = reference_report(decode(raw), hashlib.sha256(raw).hexdigest())
+        write_report(args.output, result)
+        print(json.dumps({"complete": True, "cases": len(result["summary"])}))
         return 0
     require(20 <= args.count <= 100 and 0 <= args.warmups <= 5, "invalid_sample_count")
     if args.calibrate:
