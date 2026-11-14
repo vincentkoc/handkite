@@ -6,10 +6,11 @@ import json
 import sys
 import time
 import unittest
+from types import SimpleNamespace
 
 from benchmark_mcp import (BenchError, Campaign, CASES, Peer, compare, elements,
                            operation_stages, parse_screen, quantiles, summarize, merge_reports, reference_report,
-                           trace_rows, validate_plan, validate_measured_stages,
+                           trace_rows, correlate_prefix, attach_stages, validate_plan, validate_measured_stages,
                            validate_client_stages, CAPTURE_NAMES, matches)
 
 
@@ -47,6 +48,50 @@ def image_result(action=False):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_terminal_disconnect_keeps_completed_sample_stages_without_passing_campaign(self):
+        names = ("service_request", "service_serialization", "service_write", "controller_dispatch",
+                 "wire_image_encode", "wda_read_request", "usb_discovery", "usb_connect",
+                 "wda_send", "wda_response", "owned_session_checks", "wda_write_request",
+                 "native_lock", "action_session_checks")
+        service = [{"stage": name, "started_us": 0, "elapsed_us": 1} for name in names]
+        service += [{"capture": {"stages": [{"stage": name, "elapsed_us": 1, "ok": True}
+                                               for name in sorted(CAPTURE_NAMES)]}} for _ in range(2)]
+        client = [{"operation": 1, "stage": name, "started_us": 0, "elapsed_us": 1}
+                  for name in ("mcp_request", "mcp_serialization", "mcp_write", "mcp_service_decode",
+                               "mcp_tree_projection", "mcp_service_exchange")]
+        client += [{"operation": 2, "stage": "mcp_service_exchange", "started_us": 2, "elapsed_us": 1}]
+        for sequence, row in enumerate(service):
+            row.update(handkite_timing=1, pid=9, operation=10, sequence=sequence)
+        for sequence, row in enumerate(client):
+            row.update(handkite_timing=1, pid=8, sequence=sequence)
+        sample = {"operation": 1, "outcome": "pass", "case": "tap", "capture_kind": "paired",
+                  "cleanup_ms": 1}
+        campaign = SimpleNamespace(peer=SimpleNamespace(trace_error=None, trace=client,
+                                   calls=[{"operation": 1}, {"operation": 2}]), samples=[sample])
+        with self.assertRaisesRegex(BenchError, "service_correlation_mismatch"):
+            attach_stages(campaign, service, 9)
+        self.assertTrue(sample["trace_valid"])
+        self.assertIn("input_request", sample["stages_ms"])
+        sample.pop("cleanup_ms")
+        with self.assertRaises(BenchError):
+            attach_stages(campaign, service, 9)
+        self.assertFalse(sample["trace_valid"])
+
+    def test_correlation_preserves_only_a_proven_terminal_prefix(self):
+        def client(decoded):
+            return [{"stage": "mcp_service_exchange"}] + ([{"stage": "mcp_service_decode"}] if decoded else [])
+        clients = {1: client(True), 2: client(True), 3: client(False)}
+        service = {10: [{"stage": "service_request"}], 11: [{"stage": "service_request"}]}
+        self.assertEqual(correlate_prefix(clients, service), ({1: 10, 2: 11}, False))
+        self.assertEqual(correlate_prefix({1: client(True), 2: client(True)}, service),
+                         ({1: 10, 2: 11}, True))
+        with self.assertRaises(BenchError):
+            correlate_prefix({1: client(True), 2: client(False), 3: client(True)}, service)
+        with self.assertRaises(BenchError):
+            correlate_prefix(clients, {10: [{"stage": "service_request"}],
+                                       11: [{"stage": "wda_response"}],
+                                       12: [{"stage": "service_request"}]})
+
     def test_reference_keeps_metrics_without_runtime_or_call_details(self):
         samples = [{"case":case,"outcome":"pass","elapsed_ms":10} for case in CASES for _ in range(20)]
         report = {"version":1,"calibration":False,"trace_valid":True,"failure":None,

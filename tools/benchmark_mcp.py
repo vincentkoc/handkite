@@ -779,6 +779,20 @@ def validate_client_stages(rows, observed=True):
     require(required <= {row.get("stage") for row in rows}, "incomplete_client_trace")
 
 
+def correlate_prefix(client_by_op, service_by_op):
+    client = [op for op, rows in sorted(client_by_op.items())
+              if any(row.get("stage") == "mcp_service_exchange" for row in rows)]
+    decoded = [op for op, rows in sorted(client_by_op.items())
+               if any(row.get("stage") == "mcp_service_decode" for row in rows)]
+    all_service = sorted(op for op in service_by_op if op > 0)
+    service = [op for op, rows in sorted(service_by_op.items())
+               if any(row.get("stage") == "service_request" for row in rows)]
+    require(service == all_service[:len(service)]
+            and decoded == client[:len(service)] and len(decoded) == len(service),
+            "service_correlation_mismatch")
+    return dict(zip(client, service)), len(client) == len(service) == len(all_service)
+
+
 def attach_stages(campaign, service_rows, expected_pid):
     peer = campaign.peer
     require(peer.trace_error is None, "client_trace_invalid")
@@ -790,12 +804,7 @@ def attach_stages(campaign, service_rows, expected_pid):
         client_by_op.setdefault(row["operation"], []).append(row)
     for row in sorted(service_rows, key=lambda row: row["sequence"]):
         service_by_op.setdefault(row["operation"], []).append(row)
-    client_ops = [op for op, rows in sorted(client_by_op.items())
-                  if any(row.get("stage") == "mcp_service_exchange" for row in rows)]
-    service_ops = [op for op, rows in sorted(service_by_op.items())
-                   if any(row.get("stage") == "service_request" for row in rows)]
-    require(len(client_ops) == len(service_ops), "service_correlation_mismatch")
-    correspondence = dict(zip(client_ops, service_ops))
+    correspondence, complete = correlate_prefix(client_by_op, service_by_op)
     for call in peer.calls:
         if call["operation"] in correspondence:
             call["service_operation"] = correspondence[call["operation"]]
@@ -803,7 +812,9 @@ def attach_stages(campaign, service_rows, expected_pid):
         if "operation" not in sample:
             continue
         op = sample["operation"]
-        require(op in correspondence, "missing_service_operation")
+        sample["trace_valid"] = False
+        if op not in correspondence:
+            continue
         validate_client_stages(client_by_op[op], observed=sample["outcome"] == "pass"
                                and sample.get("capture_kind") != "image_only")
         service = service_by_op[correspondence[op]]
@@ -817,6 +828,12 @@ def attach_stages(campaign, service_rows, expected_pid):
         captures = [row["capture"] for row in service if "capture" in row]
         sample["pre_tree_reused"] = bool(captures and captures[0].get("reused_tree") is True)
         sample["stages_ms"] = stages
+        sample["trace_valid"] = (sample["outcome"] == "pass" and "cleanup_ms" in sample
+                                 and (sample.get("capture_kind") != "image_only"
+                                      or "fixture_verification_ms" in sample))
+    # A terminal transport failure must not erase already validated measurements.
+    # The whole campaign still fails; only its proven prefix retains stage data.
+    require(complete, "service_correlation_mismatch")
 
 
 def main():
