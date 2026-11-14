@@ -154,7 +154,8 @@ async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
         }
         let mut decoder = wda_http::ResponseDecoder::new();
         let mut received = 0;
-        let mut chunk = [0u8; 64 * 1024];
+        // Keep concurrent transport futures small enough for the runtime stack.
+        let mut chunk = vec![0u8; 64 * 1024];
         loop {
             let count = socket
                 .read(&mut chunk)
@@ -189,6 +190,61 @@ mod tests {
     use std::rc::Rc;
     use std::task::Context;
     use tokio::io::ReadBuf;
+
+    #[test]
+    fn exchange_future_has_bounded_inline_storage() {
+        let (socket, _peer) = tokio::io::duplex(1);
+        let future = exchange(
+            std::future::ready(Ok(socket)),
+            b"request",
+            Duration::from_secs(1),
+            None,
+            None,
+            Instant::now,
+        );
+        let bytes = std::mem::size_of_val(&future);
+        assert!(
+            bytes < 16 * 1024,
+            "transport future retains {bytes} inline bytes"
+        );
+    }
+
+    #[tokio::test]
+    async fn response_spanning_receive_buffers_is_preserved() {
+        let expected: Vec<u8> = (0..(3 * 64 * 1024 + 17)).map(|n| (n % 251) as u8).collect();
+        let body = expected.clone();
+        let (socket, mut peer) = tokio::io::duplex(4096);
+        let server = tokio::spawn(async move {
+            let mut request = [0; 7];
+            peer.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"request");
+            peer.write_all(
+                format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len()).as_bytes(),
+            )
+            .await
+            .unwrap();
+            for chunk in body.chunks(7000) {
+                peer.write_all(chunk).await.unwrap();
+            }
+            peer.shutdown().await.unwrap();
+            let mut extra = Vec::new();
+            peer.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty());
+        });
+        let response = exchange(
+            std::future::ready(Ok(socket)),
+            b"request",
+            Duration::from_secs(1),
+            None,
+            None,
+            Instant::now,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, expected);
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn fragmented_responses_send_exactly_one_request() {
