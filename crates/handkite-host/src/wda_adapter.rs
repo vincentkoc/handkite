@@ -375,7 +375,11 @@ impl WdaAdapter {
             let key = self.cache_key();
             if let Some(previous) = self.cache.take_full(key.as_ref(), Instant::now()) {
                 let started = Instant::now();
-                for attempt in 0..if recheck_frame { 2 } else { 1 } {
+                let probes = if recheck_frame { 4 } else { 1 };
+                for attempt in 0..probes {
+                    if !previous.fresh(Instant::now()) {
+                        break;
+                    }
                     let mut timings = crate::timing::enabled().then(CaptureTimings::default);
                     let result = {
                         let _probe = crate::timing::Span::new("tree_cache_probe");
@@ -402,13 +406,13 @@ impl WdaAdapter {
                         return Ok((previous.raw, previous.captured_at, previous.reported));
                     }
                     if !recheck_frame
-                        || attempt != 0
+                        || attempt + 1 == probes
                         || !previous.context_matches(&current.app, current.reported, now)
                     {
                         break;
                     }
                     // A blink can return to the exact original frame. Read once
-                    // more without renewing the snapshot or retrying any input.
+                    // again without renewing the snapshot or retrying any input.
                     crate::timing::outcome("tree_cache_recheck", true);
                 }
                 self.cache.clear();

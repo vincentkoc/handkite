@@ -40,7 +40,7 @@ impl Full {
             && reported == Some(false)
     }
 
-    fn fresh(&self, now: Instant) -> bool {
+    pub(super) fn fresh(&self, now: Instant) -> bool {
         now.checked_duration_since(self.captured_at)
             .is_some_and(|age| age < Duration::from_secs(2))
     }
