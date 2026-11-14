@@ -78,6 +78,24 @@ fn acknowledged_baseline_returns_smaller_lossless_tree_delta() {
 }
 
 #[test]
+fn omitted_tree_does_not_seed_or_preserve_a_delta_baseline() {
+    let mut cache = Cache::default();
+    let source = tree("value");
+    cache.content(observation(3, &source), Options::default());
+    let omitted = payload(&cache.content(
+        observation(4, &source),
+        options(json!({"tree_format":"omit"})),
+    ));
+    assert!(omitted.get("accessibility_tree").is_none());
+    let next = payload(&cache.content(
+        observation(5, &source),
+        options(json!({"since_revision":4})),
+    ));
+    assert_eq!(next["tree_delta_reset"], "baseline_unavailable");
+    assert_eq!(next["accessibility_tree"], source);
+}
+
+#[test]
 fn missing_or_mismatched_acknowledgement_never_sends_a_delta() {
     for acknowledgement in [None, Some(2), Some(4)] {
         let mut cache = Cache::default();

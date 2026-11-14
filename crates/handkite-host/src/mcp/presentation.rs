@@ -11,6 +11,7 @@ pub(super) enum TreeFormat {
     Full,
     Compact,
     Outline,
+    Omit,
 }
 
 #[derive(Clone, Copy, Default, Deserialize, Eq, PartialEq)]
@@ -23,14 +24,39 @@ pub(super) enum ImageMode {
 }
 
 #[derive(Clone, Copy, Default, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(try_from = "UncheckedOptions")]
 pub(super) struct Options {
+    pub tree_format: TreeFormat,
+    pub image: ImageMode,
+    pub since_revision: Option<Revision>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UncheckedOptions {
     #[serde(default)]
     pub tree_format: TreeFormat,
     #[serde(default)]
     pub image: ImageMode,
     #[serde(default, deserialize_with = "present_revision")]
     pub since_revision: Option<Revision>,
+}
+
+impl TryFrom<UncheckedOptions> for Options {
+    type Error = &'static str;
+
+    fn try_from(value: UncheckedOptions) -> Result<Self, Self::Error> {
+        if value.tree_format == TreeFormat::Omit
+            && (value.image != ImageMode::Always || value.since_revision.is_some())
+        {
+            return Err("tree omission requires an image without a delta baseline");
+        }
+        Ok(Self {
+            tree_format: value.tree_format,
+            image: value.image,
+            since_revision: value.since_revision,
+        })
+    }
 }
 
 fn present_revision<'de, D: serde::Deserializer<'de>>(
@@ -41,8 +67,8 @@ fn present_revision<'de, D: serde::Deserializer<'de>>(
 
 pub(super) fn schema() -> Value {
     json!({"type":"object", "additionalProperties":false, "properties":{
-        "tree_format":{"type":"string","enum":["full","compact","outline"],
-            "description":"Response tree presentation only; internal action checks retain the full capture."},
+        "tree_format":{"type":"string","enum":["full","compact","outline","omit"],
+            "description":"Response presentation only; internal checks retain the full capture. omit returns an image only and requires image=always without since_revision."},
         "image":{"type":"string","enum":["always","omit","changed"],
             "description":"Include, explicitly omit, or omit an identical acknowledged image. Does not skip internal capture."},
         "since_revision":{"type":"integer","minimum":0,"maximum":u64::MAX,
@@ -78,6 +104,16 @@ impl Cache {
         mut observation: WireObservation,
         options: Options,
     ) -> Vec<Value> {
+        if options.tree_format == TreeFormat::Omit {
+            self.clear();
+            let payload = response::project_payload(&mut observation, options.tree_format);
+            return response::finish_observation_content(
+                payload,
+                observation.screenshot_format,
+                observation.screenshot_base64,
+                true,
+            );
+        }
         let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
         digest.update(match observation.screenshot_format {
             handkite_core::protocol::ImageFormat::Png => b"png",

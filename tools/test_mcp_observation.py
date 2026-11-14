@@ -58,6 +58,21 @@ class ObservationTests(unittest.TestCase):
             response["result"]["content"][1]["mimeType"] = "image/jpeg"
             self.assertEqual(self.decode(response)["lock"], lock)
 
+    def test_explicit_tree_omission_retains_paired_capture_and_image(self):
+        response = fixture()
+        payload = {"metadata": metadata(), "capture_kind": "paired",
+                   "tree": {"included": False, "reason": "requested"}}
+        set_payload(response, payload)
+        self.assertEqual(self.decode(response)["tree_chars"], 0)
+        self.assertEqual(self.decode(response)["image_bytes"], 3)
+        for key, value in [("capture_kind", "unknown"),
+                           ("accessibility_tree", "<screen/>"),
+                           ("tree", {"included": True, "reason": "requested"})]:
+            malformed = dict(payload, **{key: value})
+            set_payload(response, malformed)
+            with self.assertRaises(ValueError):
+                self.decode(response)
+
     def test_unknown_fields_are_preserved_and_not_exposed(self):
         response = fixture()
         payload = json.loads(response["result"]["content"][0]["text"])

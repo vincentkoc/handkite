@@ -63,6 +63,8 @@ pub(super) fn project_payload(
     let metadata = metadata(observation);
     let original = std::mem::take(&mut observation.accessibility_tree);
     match format {
+        TreeFormat::Omit => json!({"metadata":metadata,"capture_kind":"paired",
+            "tree":{"included":false,"reason":"requested"}}),
         TreeFormat::Full => json!({"metadata":metadata,"accessibility_tree":original}),
         TreeFormat::Compact => {
             let (tree, format, reason) = match super::compact::project(&original) {

@@ -15,6 +15,16 @@ MAX_COMPACT = 2 * 1024 * 1024
 
 
 def _tree_chars(payload):
+    if "tree" in payload:
+        tree = payload["tree"]
+        _require(type(tree) is dict and tree.get("included") is False
+                 and tree.get("reason") == "requested"
+                 and payload.get("capture_kind") == "paired"
+                 and not any(key in payload for key in
+                             ("accessibility_tree", "accessibility_tree_delta",
+                              "tree_format", "tree_format_reason", "tree_format_version")),
+                 "tree")
+        return 0
     tree = payload.get("accessibility_tree")
     _require(type(tree) is str and bool(tree.strip()), "tree")
     if not any(key in payload for key in

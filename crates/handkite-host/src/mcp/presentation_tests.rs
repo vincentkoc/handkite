@@ -148,6 +148,41 @@ fn image_omission_keeps_fresh_metadata_and_tree_without_another_exchange() {
 }
 
 #[test]
+fn tree_omission_returns_the_same_image_from_one_paired_capture() {
+    let capture = captured(
+        "<AppiumAUT><XCUIElementTypeButton label='private'/></AppiumAUT>",
+        "png",
+    );
+    let full = call(&request(json!({})), &capture);
+    let omitted = call(&request(json!({"tree_format":"omit"})), &capture);
+    let screen = payload(&omitted);
+    assert_eq!(screen["metadata"], payload(&full)["metadata"]);
+    assert_eq!(screen["capture_kind"], "paired");
+    assert_eq!(
+        screen["tree"],
+        json!({"included":false,"reason":"requested"})
+    );
+    assert!(screen.get("accessibility_tree").is_none());
+    assert_eq!(
+        omitted["result"]["content"][1],
+        full["result"]["content"][1]
+    );
+    assert!(!omitted.to_string().contains("private"));
+}
+
+#[test]
+fn incomplete_action_omission_is_rejected_before_dispatch() {
+    for response in [
+        json!({"tree_format":"omit","image":"omit"}),
+        json!({"tree_format":"omit","since_revision":1}),
+    ] {
+        let args = json!({"expected_revision":1,"at":{"x":1,"y":2},"response":response});
+        assert!(!interaction::valid_raw(Tool::Tap, &args.to_string()));
+        assert!(interaction::parse_response(Tool::Tap, args).is_err());
+    }
+}
+
+#[test]
 fn outline_is_explicitly_lossy_and_falls_back_to_the_original() {
     let tree = r#"<AppiumAUT><XCUIElementTypeButton name="Close" label="Close"/><XCUIElementTypeButton label="Hidden" visible="false"/></AppiumAUT>"#;
     let reply = call(
@@ -183,6 +218,9 @@ fn strict_arguments_refuse_before_exchange_in_both_validators() {
         json!({"tree_format":null}),
         json!({"tree_format":true}),
         json!({"tree_format":"unknown"}),
+        json!({"tree_format":"omit","image":"omit"}),
+        json!({"tree_format":"omit","image":"changed"}),
+        json!({"tree_format":"omit","since_revision":3}),
         json!({"tree_format":"compact","extra":1}),
         json!({"since_revision":null}),
         json!({"since_revision":-1}),
@@ -274,7 +312,7 @@ fn catalog_exposes_only_optional_compact_on_observe() {
         .unwrap()["inputSchema"];
     assert_eq!(
         schema["properties"]["tree_format"]["enum"],
-        json!(["full", "compact", "outline"])
+        json!(["full", "compact", "outline", "omit"])
     );
     assert_eq!(schema["additionalProperties"], false);
     assert!(schema.get("required").is_none());
