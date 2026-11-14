@@ -605,11 +605,12 @@ fn competing_sessions_are_busy_until_explicit_release() {
         true
     );
     assert_eq!(fixture.requests.len(), count);
+    let busy = fixture.call(&mut second, "handkite_acquire_control", json!({}));
+    assert_eq!(busy["result"]["isError"], true);
+    assert_eq!(busy["result"]["structuredContent"]["code"], "Busy");
     assert!(
-        fixture
-            .call(&mut second, "handkite_acquire_control", json!({}))
-            .to_string()
-            .contains("Busy")
+        busy.to_string()
+            .contains("Busy: another session holds control")
     );
     fixture.call(&mut first, "handkite_release_control", json!({}));
     assert_eq!(

@@ -169,22 +169,67 @@ fn uncertain_service_result(kind: &str, code: &str) -> Value {
 
 fn service_error(code: &str) -> Value {
     // Never forward service detail that could contain a token or private screen content.
-    tool_error(match code {
-        "Busy" => "Busy: another session holds control",
-        "InvalidLease" => "InvalidLease: explicit control acquisition required",
-        "StaleRevision" => "StaleRevision: obtain a fresh observation before another action",
-        "ViewChanged" => {
-            "ViewChanged: screen context changed before input; obtain a fresh observation"
-        }
-        "DeviceMismatch" => "DeviceMismatch: pinned identity verification failed",
-        "LockedAction" => "LockedAction: action requires an unlocked phone",
-        _ => "device service rejected the request",
-    })
+    super::response::with_service_code(
+        tool_error(match code {
+            "Busy" => "Busy: another session holds control",
+            "InvalidLease" => "InvalidLease: explicit control acquisition required",
+            "StaleRevision" => "StaleRevision: obtain a fresh observation before another action",
+            "ViewChanged" => {
+                "ViewChanged: screen context changed before input; obtain a fresh observation"
+            }
+            "DeviceMismatch" => "DeviceMismatch: pinned identity verification failed",
+            "LockedAction" => "LockedAction: action requires an unlocked phone",
+            _ => "device service rejected the request",
+        }),
+        code,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn service_errors_preserve_fixed_codes_and_redact_unknown_details() {
+        for (code, message) in [
+            ("Busy", "Busy: another session holds control"),
+            (
+                "InvalidLease",
+                "InvalidLease: explicit control acquisition required",
+            ),
+            (
+                "StaleRevision",
+                "StaleRevision: obtain a fresh observation before another action",
+            ),
+            (
+                "ViewChanged",
+                "ViewChanged: screen context changed before input; obtain a fresh observation",
+            ),
+            (
+                "DeviceMismatch",
+                "DeviceMismatch: pinned identity verification failed",
+            ),
+            (
+                "LockedAction",
+                "LockedAction: action requires an unlocked phone",
+            ),
+        ] {
+            let result = service_error(code);
+            assert_eq!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["code"], code);
+            assert_eq!(result["content"][0]["text"], message);
+        }
+        for code in ["private screen content", "Busy: private detail", ""] {
+            let result = service_error(code);
+            assert_eq!(result["isError"], true);
+            assert_eq!(
+                result["content"][0]["text"],
+                "device service rejected the request"
+            );
+            assert!(result.get("structuredContent").is_none());
+            assert!(!result.to_string().contains("private"));
+        }
+    }
 
     #[test]
     fn uncertain_service_errors_expose_only_fixed_diagnostic_codes() {
