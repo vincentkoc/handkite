@@ -232,6 +232,10 @@ impl OwnedWdaRunner {
         self.task.as_ref().is_none_or(JoinHandle::is_finished)
     }
 
+    pub(crate) fn generation(&self) -> Option<tokio::task::Id> {
+        self.task.as_ref().map(JoinHandle::id)
+    }
+
     pub fn liveness(&self) -> RunnerLiveness {
         RunnerLiveness(self.task.as_ref().expect("owned task").abort_handle())
     }

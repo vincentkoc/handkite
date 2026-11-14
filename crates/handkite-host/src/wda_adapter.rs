@@ -21,6 +21,7 @@ use handkite_core::protocol::{
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod cache;
 mod measurement;
 pub use measurement::CaptureTimings;
 use measurement::{Stage, measure};
@@ -59,6 +60,7 @@ pub struct WdaAdapter {
     owned_session: Option<String>,
     owned_idle: Option<IdleSettingsLease>,
     launch_admission: Option<(String, Instant)>,
+    cache: cache::Cache,
     error_diagnostic: Option<AdapterDiagnostic>,
 }
 
@@ -127,6 +129,7 @@ impl WdaAdapter {
             owned_session: None,
             owned_idle: None,
             launch_admission: None,
+            cache: cache::Cache::default(),
         })
     }
 
@@ -178,6 +181,7 @@ impl WdaAdapter {
             owned_session: None,
             owned_idle: None,
             launch_admission: None,
+            cache: cache::Cache::default(),
             error_diagnostic: None,
         };
         let liveness = adapter
@@ -236,6 +240,45 @@ impl WdaAdapter {
     }
 
     fn validate_owned_with_deadline(&self, deadline: Option<Instant>) -> Result<(), AdapterError> {
+        let result = self.validate_owned_inner(deadline);
+        if result.is_err() {
+            self.cache.clear();
+        }
+        result
+    }
+
+    fn cache_key(&self) -> Option<cache::Key> {
+        let runner = self.owned_runner.as_ref()?;
+        if runner.is_finished() {
+            return None;
+        }
+        let session = self.owned_session.as_ref()?;
+        if !self.actions.prepared_session_matches(session) {
+            return None;
+        }
+        Some(cache::Key {
+            device: self.expected.clone(),
+            session: session.clone(),
+            runner: runner.generation()?,
+        })
+    }
+
+    fn native_fresh(&self, deadline: Option<Instant>) -> LockState {
+        self.cache
+            .refresh_native(self.cache_key(), Instant::now(), || match deadline {
+                Some(until) => native_lock::query_until(&self.expected, until).state,
+                None => native_lock::query(&self.expected).state,
+            })
+    }
+
+    fn native_hint(&self) -> LockState {
+        let key = self.cache_key();
+        self.cache
+            .native(key.as_ref(), Instant::now())
+            .unwrap_or_else(|| self.native_fresh(None))
+    }
+
+    fn validate_owned_inner(&self, deadline: Option<Instant>) -> Result<(), AdapterError> {
         let _timing = crate::timing::Span::new("owned_session_checks");
         if deadline.is_some_and(|until| Instant::now() >= until) {
             return Err(AdapterError);
@@ -288,7 +331,7 @@ impl WdaAdapter {
         &self,
         source_path: &str,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
-        if crate::timing::enabled() {
+        let result = if crate::timing::enabled() {
             let started = Instant::now();
             let mut timings = CaptureTimings::default();
             let result = self.capture_checked_recorded(source_path, Some(&mut timings));
@@ -297,7 +340,13 @@ impl WdaAdapter {
             result
         } else {
             self.capture_checked_recorded(source_path, None)
+        };
+        if !result.as_ref().is_ok_and(|(raw, _, reported)| {
+            *reported == Some(false) && raw.state.lock == LockState::Unlocked
+        }) {
+            self.cache.clear();
         }
+        result
     }
 
     /// One normal capture, with no output or input and no change to ownership checks.
@@ -638,13 +687,32 @@ impl DeviceAdapter for WdaAdapter {
         if !matches!(action, Action::LaunchApp { .. }) && !owned_input {
             return self.observe().map(|observation| (observation, None));
         }
-        let native_before = native_lock::query(&self.expected).state;
+        let use_hint = owned_input && !matches!(action, Action::Home);
+        if !use_hint {
+            self.cache.clear();
+        }
+        let native_before = if use_hint {
+            self.native_hint()
+        } else {
+            self.native_fresh(None)
+        };
         let (observation, captured_at, reported_lock) = self
             .capture_checked_with_lock_report(SCREEN_SOURCE)
             .inspect_err(|_| {
                 self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
             })?;
-        let native_after = native_lock::query(&self.expected).state;
+        let native_after = if use_hint
+            && reported_lock == Some(false)
+            && observation.state.lock == LockState::Unlocked
+            && crate::wda_ui_admission::safe_context(&observation.accessibility_tree)
+        {
+            // This is the same preparation hint, not a new native observation.
+            // execute() still requires a fresh native result before sending input.
+            native_before
+        } else {
+            self.cache.clear();
+            self.native_fresh(None)
+        };
         self.validate_owned().inspect_err(|_| {
             self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
         })?;
@@ -797,7 +865,7 @@ impl DeviceAdapter for WdaAdapter {
                     | Action::Key { .. }
                     | Action::KeyCurrent { .. }
             ) && self.owned_session.is_some())
-            && native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
+            && self.native_fresh(Some(send_deadline)) != LockState::Unlocked
         {
             self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
             return Err(AdapterError);
@@ -812,6 +880,7 @@ impl DeviceAdapter for WdaAdapter {
                     .execute_with_existing_session_diagnostic(&wda, action),
             )
             .map_err(|diagnostic| {
+                self.cache.clear();
                 self.error_diagnostic = Some(diagnostic);
                 AdapterError
             })?;
@@ -915,7 +984,7 @@ impl DeviceAdapter for WdaAdapter {
                 .inspect_err(|_| {
                     self.error_diagnostic = Some(AdapterDiagnostic::OwnedBefore);
                 })?;
-            if native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
+            if self.native_fresh(Some(send_deadline)) != LockState::Unlocked
                 || Instant::now() >= send_deadline
             {
                 self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
