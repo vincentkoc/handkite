@@ -524,10 +524,10 @@ dispatch under 1 s, image-only observe under 500 ms, full-tree observe under
 ## Owned-session idle settings
 
 The owned daemon's candidate timing policy sets its new WDA session to
-`waitForIdleTimeout: 0` and `animationCoolOffTimeout: 0.2` before reporting
-readiness. This removes the general idle wait while retaining bounded animation
-settling before source capture; Handkite still captures and
-verifies the action's effect and retains every native lock and ownership check.
+`waitForIdleTimeout: 0` and `animationCoolOffTimeout: 0` before reporting
+readiness. This removes both implicit waits; Handkite still captures and
+verifies the action's effect and retains the final fresh native lock guard
+and ownership checks.
 The candidate requires matched live validation before promotion. Separate
 one-shot PIN settings remain `1.0` and `0.2`. The daemon retains the exact
 original values and restores them before closing the session. Failed setup
