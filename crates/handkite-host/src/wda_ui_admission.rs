@@ -93,6 +93,11 @@ pub(crate) fn visible_text_target(xml: &str, at: Point) -> bool {
     parse(xml, Target::TextPoint(at)) == Some(())
 }
 
+/// Focuses one public text view; does not authorize text or selection input.
+pub(crate) fn visible_text_focus_target(xml: &str, at: Point) -> bool {
+    parse(xml, Target::TextFocusPoint(at)) == Some(())
+}
+
 enum Target<'a> {
     Context,
     SwipeContext { from: Point, to: Point },
@@ -101,17 +106,26 @@ enum Target<'a> {
     TextInput,
     CurrentTextInput,
     TextPoint(Point),
+    TextFocusPoint(Point),
     NamedButton(&'a ButtonTarget),
 }
 
 fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
     let at = match target_kind {
-        Target::Button(at) | Target::ModalButton(at) | Target::TextPoint(at) => Some(at),
+        Target::Button(at)
+        | Target::ModalButton(at)
+        | Target::TextPoint(at)
+        | Target::TextFocusPoint(at) => Some(at),
         _ => None,
     };
     let allow_modal = matches!(target_kind, Target::ModalButton(_));
     let current_text = matches!(target_kind, Target::CurrentTextInput | Target::TextPoint(_));
-    let require_text = current_text || matches!(target_kind, Target::TextInput);
+    let focus_text = matches!(target_kind, Target::TextFocusPoint(_));
+    let text_point = matches!(
+        target_kind,
+        Target::TextPoint(_) | Target::TextFocusPoint(_)
+    );
+    let require_text = current_text || focus_text || matches!(target_kind, Target::TextInput);
     if xml.is_empty()
         || xml.len() > 2 * 1024 * 1024
         || at.is_some_and(|at| !at.x.is_finite() || !at.y.is_finite())
@@ -207,27 +221,38 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                     }
                     modal = Some(rect);
                 }
+                let text_kind = matches!(
+                    kind.as_str(),
+                    "XCUIElementTypeSearchField"
+                        | "XCUIElementTypeTextField"
+                        | "XCUIElementTypeTextView"
+                        | "XCUIElementTypeKeyboard"
+                );
+                if focus_text
+                    && text_kind
+                    && attrs.get("visible").map(String::as_str) != Some("false")
+                    && (kind != "XCUIElementTypeTextView"
+                        || attrs.get("visible").map(String::as_str) != Some("true")
+                        || attrs.get("enabled").map(String::as_str) != Some("true"))
+                {
+                    return None;
+                }
                 if require_text
-                    && matches!(
-                        kind.as_str(),
-                        "XCUIElementTypeSearchField"
-                            | "XCUIElementTypeTextField"
-                            | "XCUIElementTypeTextView"
-                            | "XCUIElementTypeKeyboard"
-                    )
+                    && text_kind
                     && attrs.get("visible").map(String::as_str) != Some("false")
                     && attrs.get("enabled").map(String::as_str) != Some("false")
                 {
                     let rect = Rect::read(&attrs)?;
                     if attrs.get("visible").map(String::as_str) != Some("true")
                         || attrs.get("enabled").map(String::as_str) != Some("true")
-                        || kind != "XCUIElementTypeKeyboard"
+                        || !focus_text
+                            && kind != "XCUIElementTypeKeyboard"
                             && attrs.get("focused").map(String::as_str) == Some("false")
-                        || current_text
+                        || (current_text || focus_text)
                             && attrs
                                 .get("focused")
                                 .is_some_and(|value| !matches!(value.as_str(), "true" | "false"))
-                        || kind == "XCUIElementTypeTextView" && !current_text
+                        || kind == "XCUIElementTypeTextView" && !current_text && !focus_text
                         || !stack
                             .iter()
                             .any(|parent| parent == "XCUIElementTypeApplication")
@@ -242,7 +267,7 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                         keyboards += 1;
                     } else {
                         text_inputs += 1;
-                        if matches!(target_kind, Target::TextPoint(_)) && rect.contains(at?) {
+                        if text_point && rect.contains(at?) {
                             target = true;
                         }
                     }
@@ -267,14 +292,13 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                     target = true;
                 }
                 if (kind == "XCUIElementTypeButton"
-                    || matches!(target_kind, Target::TextPoint(_))
-                        && kind == "XCUIElementTypeMenuItem")
+                    || text_point && kind == "XCUIElementTypeMenuItem")
                     && attrs.get("visible").map(String::as_str) != Some("false")
                     && let Some(at) = at
                 {
                     let rect = Rect::read(&attrs)?;
                     if rect.contains(at) {
-                        if matches!(target_kind, Target::TextPoint(_))
+                        if text_point
                             || target
                             || !stack
                                 .iter()
@@ -310,7 +334,8 @@ fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
                     && stack.is_empty()
                     && screen.is_some()
                     && (at.is_none() && !matches!(target_kind, Target::NamedButton(_)) || target)
-                    && (!require_text || text_inputs == 1 && keyboards == 1)
+                    && (!require_text
+                        || text_inputs == 1 && keyboards == usize::from(!focus_text))
                     && (!allow_modal || modal.is_some() && target_in_modal))
                     .then_some(());
             }
@@ -496,6 +521,56 @@ mod tests {
         ] {
             assert!(!visible_current_text_input(&tree(&invalid)), "{invalid}");
             assert!(!visible_text_target(&tree(&invalid), at), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn focus_tap_requires_one_public_reading_view_without_keyboard_or_overlap() {
+        let view = r#"<XCUIElementTypeTextView visible="true" enabled="true" x="0" y="0" width="393" height="852"/>"#;
+        let at = Point { x: 55.0, y: 136.0 };
+        for focused in ["", " focused=\"false\"", " focused=\"true\""] {
+            let xml = tree(&view.replace("TextView ", &format!("TextView{focused} ")));
+            assert!(visible_text_focus_target(&xml, at));
+            assert!(!visible_current_text_input(&xml));
+            assert!(!visible_text_target(&xml, at));
+        }
+        for point in [
+            Point { x: -1.0, y: 136.0 },
+            Point { x: 393.0, y: 136.0 },
+            Point { x: 55.0, y: 852.0 },
+            Point {
+                x: f64::NAN,
+                y: 136.0,
+            },
+        ] {
+            assert!(!visible_text_focus_target(&tree(view), point));
+        }
+        for extra in [
+            view,
+            r#"<XCUIElementTypeTextView enabled="true" x="0" y="0" width="393" height="852"/>"#,
+            r#"<XCUIElementTypeTextField/>"#,
+            r#"<XCUIElementTypeKeyboard visible="true" enabled="false"/>"#,
+            r#"<XCUIElementTypeKeyboard/>"#,
+            r#"<XCUIElementTypeButton label="Overlay" visible="true" enabled="true" x="0" y="0" width="100" height="200"/>"#,
+            r#"<XCUIElementTypeMenuItem label="Overlay" enabled="true" x="0" y="0" width="100" height="200"/>"#,
+            r#"<XCUIElementTypeSecureTextField visible="false"/>"#,
+            r#"<XCUIElementTypeAlert/>"#,
+            r#"<XCUIElementTypeSheet/>"#,
+            r#"<XCUIElementTypeOther label="Enter Passcode"/>"#,
+            "<broken>",
+        ] {
+            assert!(
+                !visible_text_focus_target(&tree(&format!("{view}{extra}")), at),
+                "{extra}"
+            );
+        }
+        for invalid in [
+            view.replace("enabled=\"true\"", "enabled=\"false\""),
+            view.replace("visible=\"true\"", ""),
+            view.replace("TextView ", "TextView focused=\"unknown\" "),
+            view.replace("width=\"393\"", "width=\"500\""),
+        ] {
+            assert!(!visible_text_focus_target(&tree(&invalid), at));
         }
     }
 

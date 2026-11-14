@@ -1083,7 +1083,9 @@ fn visible_tap_deadline(
     }
     let age = if crate::wda_ui_admission::visible_button(&observation.accessibility_tree, at) {
         HOME_LAUNCH_AGE
-    } else if crate::wda_ui_admission::visible_text_target(&observation.accessibility_tree, at) {
+    } else if crate::wda_ui_admission::visible_text_target(&observation.accessibility_tree, at)
+        || crate::wda_ui_admission::visible_text_focus_target(&observation.accessibility_tree, at)
+    {
         TEXT_INPUT_AGE
     } else {
         return None;
@@ -1946,6 +1948,66 @@ mod tests {
             );
             observation.state.lock = LockState::Unlocked;
             observation.state.wda_ready = true;
+        }
+    }
+
+    #[test]
+    fn reading_view_tap_keeps_native_guards_without_enabling_text_input() {
+        let id = HardwareId::new("fixture-device").unwrap();
+        let mut observation = RawObservation {
+            connected_usb: id.clone(), wda_target: id,
+            window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
+            state: DeviceState { lock: LockState::Unlocked, wda_ready: true,
+                foreground_app: Some("com.example.notes".into()) },
+            accessibility_tree: r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeTextView visible="true" enabled="true" x="0" y="0" width="393" height="852"/></XCUIElementTypeApplication></AppiumAUT>"#.into(),
+            screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+        };
+        let at = Point { x: 55.0, y: 136.0 };
+        let captured = Instant::now();
+        for case in 0..8 {
+            let mut owned = true;
+            let mut before = LockState::Unlocked;
+            let mut after = LockState::Unlocked;
+            let mut reported = Some(false);
+            match case {
+                1 => owned = false,
+                2 => before = LockState::Locked,
+                3 => after = LockState::Uncertain,
+                4 => reported = Some(true),
+                5 => reported = None,
+                6 => observation.state.foreground_app = Some("com.apple.springboard".into()),
+                7 => observation.state.lock = LockState::Uncertain,
+                _ => {}
+            }
+            assert_eq!(
+                visible_tap_deadline(&observation, owned, before, after, reported, at, captured),
+                (case == 0).then_some(captured + TEXT_INPUT_AGE)
+            );
+            for action in [
+                Action::TextCurrent { value: "x".into() },
+                Action::KeyCurrent {
+                    key: handkite_core::protocol::KeyboardKey::Backspace,
+                },
+                Action::LongPress {
+                    at,
+                    duration_ms: 500,
+                },
+            ] {
+                assert_eq!(
+                    native_text_admission(
+                        &observation,
+                        owned,
+                        before,
+                        after,
+                        reported,
+                        captured,
+                        &action
+                    ),
+                    None
+                );
+            }
+            observation.state.foreground_app = Some("com.example.notes".into());
+            observation.state.lock = LockState::Unlocked;
         }
     }
 
