@@ -366,6 +366,9 @@ option.
 Tap and swipe coordinates are WDA viewport coordinates in logical points,
 passed unchanged, including fractional values. They are not screenshot pixels.
 Handkite supplies no screenshot-to-action transform or inferred scale/rotation.
+Moving swipes use one W3C touch sequence with a 50 ms press, the requested
+movement duration and immediate release. Durations are never shortened implicitly.
+Zero-distance swipes retain their native hold behavior.
 
 An app launch from Home tolerates changes in screenshot or tree bytes only when a fresh private Home check proves native unlock before and after capture, WDA reports unlocked, and device state matches the requested observation. Revision, identity, lease, and send deadlines still apply. The explicit owned-runner admissions documented here and in [release inputs](RELEASE.md) preserve their narrower checks; other actions require an exact view match. `StaleRevision` means the requested revision is no longer current; `ViewChanged` means the fresh screen context failed the action check. Both reject input before transport.
 
