@@ -58,6 +58,7 @@ pub struct WdaAdapter {
     owned_runner: Option<OwnedWdaRunner>,
     owned_session: Option<String>,
     owned_idle: Option<IdleSettingsLease>,
+    launch_admission: Option<(String, Instant)>,
     error_diagnostic: Option<AdapterDiagnostic>,
 }
 
@@ -125,6 +126,7 @@ impl WdaAdapter {
             owned_runner: None,
             owned_session: None,
             owned_idle: None,
+            launch_admission: None,
         })
     }
 
@@ -175,6 +177,7 @@ impl WdaAdapter {
             owned_runner: Some(runner),
             owned_session: None,
             owned_idle: None,
+            launch_admission: None,
             error_diagnostic: None,
         };
         let liveness = adapter
@@ -617,9 +620,11 @@ impl DeviceAdapter for WdaAdapter {
         action: &Action,
     ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
         self.error_diagnostic = None;
+        self.launch_admission = None;
         let owned_input = matches!(
             action,
             Action::Tap { .. }
+                | Action::LaunchApp { .. }
                 | Action::ClickButton { .. }
                 | Action::DoubleTap { .. }
                 | Action::LongPress { .. }
@@ -730,15 +735,30 @@ impl DeviceAdapter for WdaAdapter {
                 captured_at,
             )
             .map(|until| ActionAdmission::NativeHome { until })
-        } else {
-            springboard_home_launch_deadline(
+        } else if let Action::LaunchApp { bundle_id } = action {
+            if let Some(until) = native_app_launch_deadline(
                 &observation,
+                owned_input,
                 native_before,
                 native_after,
                 reported_lock,
                 captured_at,
-            )
-            .map(|until| ActionAdmission::HomeLaunch { until })
+                bundle_id,
+            ) {
+                self.launch_admission = Some((bundle_id.clone(), until));
+                Some(ActionAdmission::NativeAppLaunch { until })
+            } else {
+                springboard_home_launch_deadline(
+                    &observation,
+                    native_before,
+                    native_after,
+                    reported_lock,
+                    captured_at,
+                )
+                .map(|until| ActionAdmission::HomeLaunch { until })
+            }
+        } else {
+            None
         };
         if matches!(action, Action::DoubleTap { .. } | Action::LongPress { .. })
             && admission.is_none()
@@ -812,6 +832,20 @@ impl DeviceAdapter for WdaAdapter {
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
         self.error_diagnostic = None;
+        if let Some(ActionAdmission::NativeAppLaunch { until }) = admission {
+            if !take_launch_admission(
+                &mut self.launch_admission,
+                action,
+                until,
+                send_deadline,
+                Instant::now(),
+            ) || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+            {
+                return Err(AdapterError);
+            }
+            return self.execute(action, send_deadline);
+        }
         if let Some(ActionAdmission::NativeSwipe {
             from,
             to,
@@ -1173,6 +1207,46 @@ fn native_swipe_deadline(
     captured_at.checked_add(TEXT_INPUT_AGE)
 }
 
+fn native_app_launch_deadline(
+    observation: &RawObservation,
+    owned: bool,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    captured_at: Instant,
+    bundle_id: &str,
+) -> Option<Instant> {
+    if bundle_id.is_empty() || bundle_id.len() > 256 {
+        return None;
+    }
+    // App launches use the same unlocked, nonmodal context as Home, with
+    // the shorter text-input freshness window and a one-use target binding.
+    native_home_deadline(
+        observation,
+        owned,
+        native_before,
+        native_after,
+        reported_lock,
+        captured_at,
+    )?;
+    captured_at.checked_add(TEXT_INPUT_AGE)
+}
+
+fn take_launch_admission(
+    binding: &mut Option<(String, Instant)>,
+    action: &Action,
+    until: Instant,
+    send_deadline: Instant,
+    now: Instant,
+) -> bool {
+    let target = binding.take();
+    matches!((action, target),
+        (Action::LaunchApp { bundle_id }, Some((expected, deadline)))
+            if bundle_id == &expected && until == deadline)
+        && now < until
+        && send_deadline <= until
+}
+
 fn native_home_deadline(
     observation: &RawObservation,
     owned: bool,
@@ -1292,6 +1366,90 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn app_launch_admission_requires_unlocked_owned_safe_context() {
+        let captured = Instant::now();
+        for change in 0..15 {
+            let mut observation = home_sample(false);
+            observation.accessibility_tree =
+                r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"/></AppiumAUT>"#.into();
+            let (mut owned, mut before, mut after, mut reported, mut bundle) = (
+                true,
+                LockState::Unlocked,
+                LockState::Unlocked,
+                Some(false),
+                "com.example.notes".to_string(),
+            );
+            match change {
+                1 => owned = false,
+                2 => before = LockState::Locked,
+                3 => after = LockState::Uncertain,
+                4 => reported = None,
+                5 => reported = Some(true),
+                6 => observation.state.lock = LockState::Locked,
+                7 => observation.state.wda_ready = false,
+                8 => observation.state.foreground_app = None,
+                9 => observation.state.foreground_app = Some("com.apple.springboard".into()),
+                10 => observation.accessibility_tree = "<broken>".into(),
+                11 => observation.accessibility_tree = "<XCUIElementTypeAlert/>".into(),
+                12 => bundle.clear(),
+                13 => bundle = "a".repeat(257),
+                14 => observation.accessibility_tree = "<XCUIElementTypeApplication/>".into(),
+                _ => {}
+            }
+            assert_eq!(
+                native_app_launch_deadline(
+                    &observation,
+                    owned,
+                    before,
+                    after,
+                    reported,
+                    captured,
+                    &bundle
+                ),
+                (change == 0).then_some(captured + TEXT_INPUT_AGE),
+                "case {change}"
+            );
+        }
+    }
+
+    #[test]
+    fn app_launch_binding_is_exact_and_consumed_even_on_refusal() {
+        let now = Instant::now();
+        let until = now + TEXT_INPUT_AGE;
+        for change in 0..6 {
+            let mut binding = Some(("com.example.notes".into(), until));
+            let mut action = Action::LaunchApp {
+                bundle_id: "com.example.notes".into(),
+            };
+            let (mut admission_until, mut deadline, mut at) = (until, until, now);
+            match change {
+                1 => {
+                    action = Action::LaunchApp {
+                        bundle_id: "com.example.other".into(),
+                    }
+                }
+                2 => action = Action::Home,
+                3 => admission_until += Duration::from_millis(1),
+                4 => deadline += Duration::from_millis(1),
+                5 => at = until,
+                _ => {}
+            }
+            assert_eq!(
+                take_launch_admission(&mut binding, &action, admission_until, deadline, at),
+                change == 0
+            );
+            assert!(binding.is_none());
+            assert!(!take_launch_admission(
+                &mut binding,
+                &action,
+                until,
+                until,
+                now
+            ));
+        }
+    }
 
     #[test]
     fn early_admission_failure_does_not_reuse_previous_diagnostic() {

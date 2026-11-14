@@ -97,6 +97,9 @@ pub enum ActionAdmission {
     NativeHome {
         until: Instant,
     },
+    NativeAppLaunch {
+        until: Instant,
+    },
     NativeSwipe {
         from: Point,
         to: Point,
@@ -162,6 +165,7 @@ pub trait DeviceAdapter {
             admission,
             Some(
                 ActionAdmission::NativeHome { .. }
+                    | ActionAdmission::NativeAppLaunch { .. }
                     | ActionAdmission::NativeSwipe { .. }
                     | ActionAdmission::NativeModalTap { .. }
                     | ActionAdmission::NativeText { .. }
@@ -445,6 +449,13 @@ impl<A: DeviceAdapter> Controller<A> {
                 Some(until)
             }
             (Action::Home, Some(ActionAdmission::NativeHome { until }))
+                if fresh.state.lock == LockState::Unlocked
+                    && fresh.state.wda_ready
+                    && Instant::now() < until =>
+            {
+                Some(until)
+            }
+            (Action::LaunchApp { .. }, Some(ActionAdmission::NativeAppLaunch { until }))
                 if fresh.state.lock == LockState::Unlocked
                     && fresh.state.wda_ready
                     && Instant::now() < until =>
