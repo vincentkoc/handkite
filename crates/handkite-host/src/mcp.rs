@@ -113,7 +113,10 @@ where
             Ok(request) => process(&request, device, capabilities, session, exchange),
         };
         if let Some(response) = response {
-            let bytes = encode_response(response)?;
+            let (bytes, screen_kept) = encode_response(response)?;
+            if !screen_kept {
+                session.presentation.clear();
+            }
             output.write_all(&bytes)?;
             output.write_all(b"\n")?;
             output.flush()?;
@@ -121,10 +124,10 @@ where
     }
 }
 
-fn encode_response(mut response: Value) -> io::Result<Vec<u8>> {
+fn encode_response(mut response: Value) -> io::Result<(Vec<u8>, bool)> {
     let bytes = serde_json::to_vec(&response).map_err(io::Error::other)?;
     if bytes.len() <= MAX_RESPONSE {
-        return Ok(bytes);
+        return Ok((bytes, true));
     }
     let result = &mut response["result"];
     if let Some(content) = result["content"].as_array_mut().filter(|items| {
@@ -151,7 +154,7 @@ fn encode_response(mut response: Value) -> io::Result<Vec<u8>> {
             "MCP response too large",
         ));
     }
-    Ok(bytes)
+    Ok((bytes, false))
 }
 
 fn process<F>(
@@ -226,7 +229,9 @@ where
                     presentation::Options::default()
                 };
                 match tool {
-                    Tool::Status | Tool::Observe => tool_result(tool, options, device, exchange),
+                    Tool::Status | Tool::Observe => {
+                        tool_result(tool, options, device, session, exchange)
+                    }
                     Tool::Acquire => session.acquire(exchange),
                     Tool::Release => session.release(exchange),
                     _ => unreachable!(),
@@ -235,6 +240,9 @@ where
         }
         _ => return Some(error(id, -32601, "method not found")),
     };
+    if result.get("isError") == Some(&json!(true)) {
+        session.presentation.clear();
+    }
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
 }
 
@@ -302,6 +310,7 @@ fn tool_result<F>(
     tool: Tool,
     options: presentation::Options,
     device: &DeviceKey,
+    session: &mut Session,
     exchange: &mut F,
 ) -> Value
 where
@@ -337,7 +346,7 @@ where
             "DeviceMismatch",
         );
     }
-    let content = presentation::content(observation, options);
+    let content = session.presentation.content(observation, options);
     json!({"content": content})
 }
 

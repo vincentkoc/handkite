@@ -47,73 +47,42 @@ pub(super) fn with_service_code(mut result: Value, code: &str) -> Value {
     result
 }
 
-pub(super) fn observation_content(observation: WireObservation) -> Vec<Value> {
-    selected_observation_content(observation, false, true)
-}
-
-pub(super) fn compact_observation_content(observation: WireObservation) -> Vec<Value> {
-    selected_observation_content(observation, true, true)
-}
-
-pub(super) fn selected_observation_content(
-    observation: WireObservation,
-    compact: bool,
-    include_image: bool,
-) -> Vec<Value> {
-    let metadata = metadata(&observation);
-    let payload = if compact {
-        let (tree, format, reason) = match super::compact::project(&observation.accessibility_tree)
-        {
-            Ok(tree) => (tree, "compact", "requested"),
-            Err(reason) => (observation.accessibility_tree, "full", reason.reason()),
-        };
-        json!({"metadata":metadata, "accessibility_tree":tree,
-            "tree_format":format, "tree_format_version":1, "tree_format_reason":reason})
-    } else {
-        json!({"metadata":metadata, "accessibility_tree":observation.accessibility_tree})
-    };
-    finish_observation_content(
-        payload,
-        observation.screenshot_format,
-        observation.screenshot_base64,
-        include_image,
-    )
-}
-
-pub(super) fn outlined_observation_content(
-    observation: WireObservation,
-    include_image: bool,
-) -> Vec<Value> {
-    let mut payload = json!({"metadata":metadata(&observation), "tree_format_version":1});
-    match super::outline::project(&observation.accessibility_tree) {
-        Ok(outline) => {
-            payload["accessibility_tree"] = json!(outline.text);
-            payload["tree_format"] = json!("outline");
-            payload["tree_lossy"] = json!(true);
-            payload["tree_omissions"] = json!({"invisible_nodes":outline.invisible_nodes,"empty_wrappers":outline.empty_wrappers});
-            payload["tree_format_reason"] = json!("requested");
+pub(super) fn project_payload(
+    observation: &mut WireObservation,
+    format: super::presentation::TreeFormat,
+) -> Value {
+    use super::presentation::TreeFormat;
+    let metadata = metadata(observation);
+    let original = std::mem::take(&mut observation.accessibility_tree);
+    match format {
+        TreeFormat::Full => json!({"metadata":metadata,"accessibility_tree":original}),
+        TreeFormat::Compact => {
+            let (tree, format, reason) = match super::compact::project(&original) {
+                Ok(tree) => (tree, "compact", "requested"),
+                Err(reason) => (original, "full", reason.reason()),
+            };
+            json!({"metadata":metadata,"accessibility_tree":tree,"tree_format":format,
+                "tree_format_version":1,"tree_format_reason":reason})
         }
-        Err(reason) => {
-            payload["accessibility_tree"] = json!(observation.accessibility_tree);
-            payload["tree_format"] = json!("full");
-            payload["tree_format_reason"] = json!(reason.reason());
-        }
+        TreeFormat::Outline => match super::outline::project(&original) {
+            Ok(outline) => json!({"metadata":metadata,"accessibility_tree":outline.text,
+                "tree_format":"outline","tree_format_version":1,"tree_format_reason":"requested",
+                "tree_lossy":true,"tree_omissions":{"invisible_nodes":outline.invisible_nodes,"empty_wrappers":outline.empty_wrappers}}),
+            Err(reason) => {
+                json!({"metadata":metadata,"accessibility_tree":original,"tree_format":"full",
+                "tree_format_version":1,"tree_format_reason":reason.reason()})
+            }
+        },
     }
-    finish_observation_content(
-        payload,
-        observation.screenshot_format,
-        observation.screenshot_base64,
-        include_image,
-    )
 }
 
-fn finish_observation_content(
+pub(super) fn finish_observation_content(
     mut payload: Value,
     format: ImageFormat,
     image: String,
     include_image: bool,
 ) -> Vec<Value> {
-    if !include_image {
+    if !include_image && payload.get("image").is_none() {
         payload["image"] = json!({"included":false,"reason":"requested"});
     }
     let mut content = vec![json!({"type":"text", "text":payload.to_string()})];

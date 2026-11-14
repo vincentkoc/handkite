@@ -13,6 +13,7 @@ pub(super) const CONTROL_TTL_MS: u64 = 120_000;
 pub(super) struct Session {
     lease: Option<LeaseId>,
     acquisition_unknown: bool,
+    pub(super) presentation: presentation::Cache,
 }
 
 impl Session {
@@ -129,7 +130,7 @@ impl Session {
                     result["content"]
                         .as_array_mut()
                         .expect("text result has a content array")
-                        .extend(presentation::content(observation, options));
+                        .extend(self.presentation.content(observation, options));
                 }
                 result
             }

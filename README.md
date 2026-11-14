@@ -278,6 +278,26 @@ The response reports `tree_lossy` and `tree_omissions`; malformed or unsupported
 input falls back to the full original tree. This outline supplies no actionable
 IDs and never replaces the full tree used for action admission.
 
+For repeated observations, send `"image":"changed"` and `"since_revision":42`,
+where 42 is the last observation revision your client received and retained in
+this MCP session. The first request still returns a complete view. A subsequent
+response can replace `accessibility_tree` with `accessibility_tree_delta`:
+
+```json
+{"base_revision":42,"start_line":5,"delete_lines":1,"insert":"replacement line\n"}
+```
+
+Apply this splice to the previous returned tree, splitting into lines **with
+their line endings retained**. `start_line` is zero-based. The result is the
+complete tree for the new metadata revision. Deltas are used only when their
+serialized text is smaller; unchanged images are omitted only when that same
+acknowledged baseline has a known image. State, app, device or format changes,
+device errors, limits and missing baselines cause a full-tree response with a fixed
+`tree_delta_reset` reason. One tree of at most 1 MiB is retained per connection.
+Omit `since_revision` after losing context, reconnecting, or changing formats.
+These options also work inside an action's `response` object. They do not change
+`expected_revision`, action admission, internal capture work or device latency.
+
 `handkite-mcp --service` derives the device key from the protected fixed host
 config and the socket from the effective account's fixed service layout. It does
 not accept a caller-selected device or socket in this mode. This is the preferred

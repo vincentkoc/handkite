@@ -53,11 +53,16 @@ fn default_bytes_unchanged_and_compact_reuses_exact_capture() {
             .unwrap()
             .remove("arguments");
         assert_eq!(call(&omitted, &capture), full);
-        let Reply::Observed { observation } = serde_json::from_slice(&capture).unwrap() else {
-            panic!()
-        };
+        // Build the pre-presentation contract independently of production helpers.
         let original = json!({"jsonrpc":"2.0","id":2,"result":{
-            "content":response::observation_content(observation)}});
+        "content":[
+            {"type":"text","text":json!({"accessibility_tree":tree,"metadata":{
+                "device":"phone","revision":3,
+                "window":{"started_unix_ms":1,"finished_unix_ms":2},
+                "state":{"lock":"locked","wda_ready":true,"foreground_app":null}
+            }}).to_string()},
+            {"type":"image","data":"AQID","mimeType":if format=="png" {"image/png"} else {"image/jpeg"}}
+        ]}});
         assert_eq!(
             serde_json::to_vec(&full).unwrap(),
             serde_json::to_vec(&original).unwrap()
@@ -179,6 +184,9 @@ fn strict_arguments_refuse_before_exchange_in_both_validators() {
         json!({"tree_format":true}),
         json!({"tree_format":"unknown"}),
         json!({"tree_format":"compact","extra":1}),
+        json!({"since_revision":null}),
+        json!({"since_revision":-1}),
+        json!({"since_revision":1.5}),
     ] {
         let request = request(args);
         assert!(!valid_tool_frame(&serde_json::to_vec(&request).unwrap()));
@@ -197,6 +205,7 @@ fn strict_arguments_refuse_before_exchange_in_both_validators() {
     for args in [
         r#"{"tree_format":"compact","tree_format":"compact"}"#,
         r#"{"tree_format":"other","tree_format":"compact"}"#,
+        r#"{"since_revision":3,"since_revision":3}"#,
     ] {
         let input = format!(
             r#"{{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{{"name":"handkite_observe","arguments":{args}}}}}
@@ -384,7 +393,8 @@ fn oversized_action_keeps_the_receipt_without_replaying_or_inventing_delivery() 
         {"type":"text","text":receipt.to_string()},
         {"type":"text","text":"tree"},
         {"type":"image","data":"A".repeat(MAX_RESPONSE)}]}});
-    let bytes = encode_response(response).unwrap();
+    let (bytes, kept) = encode_response(response).unwrap();
+    assert!(!kept);
     assert!(bytes.len() < MAX_RESPONSE);
     let reply: Value = serde_json::from_slice(&bytes).unwrap();
     let result = &reply["result"];
@@ -395,4 +405,171 @@ fn oversized_action_keeps_the_receipt_without_replaying_or_inventing_delivery() 
         serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
         receipt
     );
+}
+
+#[test]
+fn failed_or_oversized_responses_cannot_supply_a_delta_baseline() {
+    let device = DeviceKey::new("phone").unwrap();
+    for oversized in [false, true] {
+        let tree = synthetic_tree(100, true, false);
+        let mut first: Value = serde_json::from_slice(&captured(&tree, "png")).unwrap();
+        if oversized {
+            let plain = call(&request(json!({})), &serde_json::to_vec(&first).unwrap());
+            let padding = MAX_RESPONSE - 2 - serde_json::to_vec(&plain).unwrap().len();
+            first["observation"]["screenshot_base64"] =
+                json!(format!("AQID{}", "A".repeat(padding)));
+        }
+        let mut last: Value = serde_json::from_slice(&captured(&tree, "png")).unwrap();
+        last["observation"]["revision"] = json!(4);
+        let mut replies = std::collections::VecDeque::from([serde_json::to_vec(&first).unwrap()]);
+        let mut requests = vec![request(json!({"image":"changed"}))];
+        if !oversized {
+            replies.push_back(br#"{"type":"error","message":"Adapter"}"#.to_vec());
+            requests.push(request(json!({})));
+        }
+        replies.push_back(serde_json::to_vec(&last).unwrap());
+        requests.push(request(json!({"since_revision":3,"image":"changed"})));
+        let input: String = requests
+            .iter()
+            .map(|request| format!("{request}\n"))
+            .collect();
+        let mut output = Vec::new();
+        serve(Cursor::new(input), &mut output, &device, |_| {
+            Ok(replies.pop_front().unwrap())
+        })
+        .unwrap();
+        assert!(replies.is_empty());
+        let output: Vec<Value> = output
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let failed = &output[if oversized { 0 } else { 1 }];
+        assert_eq!(failed["result"]["isError"], true);
+        let last = output.last().unwrap();
+        assert_eq!(payload(last)["tree_delta_reset"], "baseline_unavailable");
+        assert_eq!(payload(last)["accessibility_tree"], tree);
+        assert_eq!(last["result"]["content"].as_array().unwrap().len(), 2);
+    }
+}
+
+#[test]
+fn selective_and_delta_synthetic_wire_bytes() {
+    let tree = synthetic_tree(100, true, true);
+    let mut first: Value = serde_json::from_slice(&captured(&tree, "png")).unwrap();
+    first["observation"]["screenshot_base64"] = json!("A".repeat(65536));
+    let first = serde_json::to_vec(&first).unwrap();
+    let full = call(&request(json!({})), &first);
+    let outline = call(
+        &request(json!({"tree_format":"outline","image":"omit"})),
+        &first,
+    );
+    let mut next: Value = serde_json::from_slice(&first).unwrap();
+    next["observation"]["revision"] = json!(4);
+    next["observation"]["accessibility_tree"] = json!(tree.replacen("Café", "Coffee", 2));
+    let mut session = Session::default();
+    let device = DeviceKey::new("phone").unwrap();
+    process(
+        &request(json!({"tree_format":"outline","image":"changed"})),
+        &device,
+        Capabilities::Observation,
+        &mut session,
+        &mut |_| Ok(first.clone()),
+    )
+    .unwrap();
+    let delta = process(
+        &request(json!({"tree_format":"outline","image":"changed","since_revision":3})),
+        &device,
+        Capabilities::Observation,
+        &mut session,
+        &mut |_| Ok(serde_json::to_vec(&next).unwrap()),
+    )
+    .unwrap();
+    let sizes = [&full, &outline, &delta].map(|value| serde_json::to_vec(value).unwrap().len());
+    let text_sizes = [&full, &outline, &delta].map(|value| {
+        value["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .len()
+    });
+    assert!(sizes[2] < sizes[1] && sizes[1] < sizes[0]);
+    assert!(text_sizes[2] < text_sizes[1] && text_sizes[1] < text_sizes[0]);
+    assert!(payload(&delta).get("accessibility_tree_delta").is_some());
+    eprintln!(
+        "synthetic 100-control response bytes: full={} outline_no_image={} delta_unchanged_image={}; text bytes: full={} outline={} delta={}",
+        sizes[0], sizes[1], sizes[2], text_sizes[0], text_sizes[1], text_sizes[2]
+    );
+}
+
+#[test]
+fn action_delta_uses_its_post_action_capture_and_preserves_the_receipt() {
+    let mut before: Value =
+        serde_json::from_slice(&captured(&synthetic_tree(100, true, false), "png")).unwrap();
+    before["observation"]["state"] =
+        json!({"lock":"unlocked","wda_ready":true,"foreground_app":"com.apple.mobiletimer"});
+    let mut after = before["observation"].clone();
+    after["revision"] = json!(5);
+    after["accessibility_tree"] = json!(
+        after["accessibility_tree"]
+            .as_str()
+            .unwrap()
+            .replacen("Example", "Changed", 2)
+    );
+    let receipt = json!({"accepted":true,"action_kind":"launch_app"});
+    let token = "0123456789abcdef0123456789abcdef";
+    let mut replies = [before, json!({"type":"acquired","lease":token}),
+        json!({"type":"acted","receipt":receipt,"after":after,"native_lock":null,"effect":"changed"})].into_iter();
+    let mut calls = Vec::new();
+    let mut exchange = |bytes: &[u8]| {
+        calls.push(serde_json::from_slice::<Value>(bytes).unwrap());
+        Ok(serde_json::to_vec(&replies.next().unwrap()).unwrap())
+    };
+    let mut session = Session::default();
+    let device = DeviceKey::new("phone").unwrap();
+    process(
+        &request(json!({"tree_format":"outline","image":"changed"})),
+        &device,
+        Capabilities::ObservationAndNavigation,
+        &mut session,
+        &mut exchange,
+    )
+    .unwrap();
+    let mut acquire = request(json!({}));
+    acquire["params"]["name"] = json!("handkite_acquire_control");
+    process(
+        &acquire,
+        &device,
+        Capabilities::ObservationAndNavigation,
+        &mut session,
+        &mut exchange,
+    )
+    .unwrap();
+    let mut action = request(json!({"expected_revision":3,
+        "response":{"tree_format":"outline","image":"changed","since_revision":3}}));
+    action["params"]["name"] = json!("handkite_launch_clock");
+    let result = process(
+        &action,
+        &device,
+        Capabilities::ObservationAndNavigation,
+        &mut session,
+        &mut exchange,
+    )
+    .unwrap();
+    assert_eq!(payload(&result)["receipt"], receipt);
+    assert_eq!(result["result"]["content"].as_array().unwrap().len(), 2);
+    let screen: Value =
+        serde_json::from_str(result["result"]["content"][1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(screen["metadata"], payload(&result)["after"]);
+    assert_eq!(screen["accessibility_tree_delta"]["base_revision"], 3);
+    assert_eq!(screen["image"]["reason"], "unchanged");
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| call["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["observe", "acquire", "act"]
+    );
+    assert_eq!(calls[2]["request"]["expected_revision"], 3);
+    assert!(calls[2]["request"].get("response").is_none());
+    assert!(!result.to_string().contains(token));
 }
