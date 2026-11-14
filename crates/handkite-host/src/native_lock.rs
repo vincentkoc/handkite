@@ -79,8 +79,41 @@ pub fn query(id: &HardwareId) -> NativeLock {
 
 pub(crate) fn query_until(id: &HardwareId, deadline: Instant) -> NativeLock {
     let _timing = crate::timing::Span::new("native_lock");
-    query_inner(id, deadline.min(Instant::now() + Duration::from_secs(8)))
-        .unwrap_or_else(NativeLock::uncertain)
+    match query_inner(id, deadline.min(Instant::now() + Duration::from_secs(8))) {
+        Ok(value) => {
+            crate::timing::outcome("native_lock_unlocked", value.state == LockState::Unlocked);
+            value
+        }
+        Err(failure) => {
+            crate::timing::outcome(failure.stage(), false);
+            NativeLock::uncertain()
+        }
+    }
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum QueryFailure {
+    Deadline,
+    Storage,
+    Spawn,
+    Wait,
+    Exit,
+    Read,
+    Decode,
+}
+
+impl QueryFailure {
+    fn stage(&self) -> &'static str {
+        match self {
+            Self::Deadline => "native_lock_deadline",
+            Self::Storage => "native_lock_storage",
+            Self::Spawn => "native_lock_spawn",
+            Self::Wait => "native_lock_wait",
+            Self::Exit => "native_lock_exit",
+            Self::Read => "native_lock_read",
+            Self::Decode => "native_lock_decode",
+        }
+    }
 }
 
 fn query_command(id: &HardwareId, output: &Path) -> Command {
@@ -96,35 +129,43 @@ fn query_command(id: &HardwareId, output: &Path) -> Command {
     command
 }
 
-fn query_inner(id: &HardwareId, deadline: Instant) -> Option<NativeLock> {
+fn query_inner(id: &HardwareId, deadline: Instant) -> Result<NativeLock, QueryFailure> {
     if Instant::now() >= deadline {
-        return None;
+        return Err(QueryFailure::Deadline);
     }
-    let directory = QueryDirectory::new()?;
+    let directory = QueryDirectory::new().ok_or(QueryFailure::Storage)?;
     if Instant::now() >= deadline {
-        return None;
+        return Err(QueryFailure::Deadline);
     }
-    let mut child = query_command(id, &directory.output()).spawn().ok()?;
-    if !wait_until(&mut child, deadline) {
-        return None;
-    }
+    let mut child = query_command(id, &directory.output())
+        .spawn()
+        .map_err(|_| QueryFailure::Spawn)?;
+    wait_until(&mut child, deadline)?;
     let mut bytes = Vec::new();
     fs::File::open(directory.output())
-        .ok()?
+        .map_err(|_| QueryFailure::Read)?
         .take(MAX_JSON_BYTES as u64 + 1)
         .read_to_end(&mut bytes)
-        .ok()?;
-    parse(&bytes)
+        .map_err(|_| QueryFailure::Read)?;
+    parse(&bytes).ok_or(QueryFailure::Decode)
 }
 
-fn wait_until(child: &mut Child, deadline: Instant) -> bool {
+fn wait_until(child: &mut Child, deadline: Instant) -> Result<(), QueryFailure> {
     loop {
         match child.try_wait() {
-            Ok(Some(status)) => return status.success() && Instant::now() < deadline,
+            Ok(Some(status)) => {
+                return if Instant::now() >= deadline {
+                    Err(QueryFailure::Deadline)
+                } else if status.success() {
+                    Ok(())
+                } else {
+                    Err(QueryFailure::Exit)
+                };
+            }
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return Err(QueryFailure::Wait);
             }
             Ok(None) if Instant::now() < deadline => {
                 thread::sleep(
@@ -135,7 +176,7 @@ fn wait_until(child: &mut Child, deadline: Instant) -> bool {
             Ok(None) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return false;
+                return Err(QueryFailure::Deadline);
             }
         }
     }
@@ -154,8 +195,20 @@ mod tests {
     #[test]
     fn expired_native_wait_reaps_only_its_own_child() {
         let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        assert!(!wait_until(&mut child, Instant::now()));
+        assert_eq!(
+            wait_until(&mut child, Instant::now()),
+            Err(QueryFailure::Deadline)
+        );
         assert!(child.try_wait().unwrap().is_some());
+    }
+
+    #[test]
+    fn failed_native_process_is_distinct_from_deadline_expiry() {
+        let mut child = Command::new("/usr/bin/false").spawn().unwrap();
+        assert_eq!(
+            wait_until(&mut child, Instant::now() + Duration::from_secs(2)),
+            Err(QueryFailure::Exit)
+        );
     }
 
     #[test]
