@@ -554,6 +554,10 @@ record the stage timings, separately measured semantic verification and
 remaining budget misses. Passing the relative regression gate does not mean
 every product budget is met.
 
+For a bounded follow-up, use `compare before.json after.json --cases type swipe`.
+The result names the selected cases and still requires twenty successful samples,
+valid traces and the same plan. Omitting `--cases` keeps the full six-case gate.
+
 `span.*.covered` is the union of overlapping intervals in that stage;
 `pre_tree_reuses` counts successful pre-action snapshot reuse. Such captures
 are marked `reused_tree` and require a successful fresh frame probe; their

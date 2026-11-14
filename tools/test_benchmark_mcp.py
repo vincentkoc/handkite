@@ -620,6 +620,25 @@ for line in sys.stdin:
         with self.assertRaises(BenchError):
             compare(before, after)
 
+    def test_selected_comparison_keeps_full_gate_and_sample_requirements(self):
+        samples = [{"case": case, "outcome": "pass", "elapsed_ms": 100}
+                   for case in ("type", "swipe") for _ in range(20)]
+        before = {"version": 1, "plan_sha256": "same", "trace_valid": True,
+                  "failure": None, "summary": summarize(samples)}
+        after = copy.deepcopy(before)
+        self.assertEqual(compare(before, after, ["type", "swipe"]), [])
+        self.assertEqual(len(compare(before, after)), 4)
+        after["summary"]["type"]["client_ms"]["p95"] = 130
+        self.assertEqual(compare(before, after, ["type", "swipe"]), ["type:p95_regression"])
+        after["summary"]["type"]["attempts"] = 19
+        self.assertEqual(compare(before, after, ["type"]), ["type:correctness_or_sample_count"])
+        for selected in ([], ["type", "type"], ["unknown"]):
+            with self.assertRaises(BenchError):
+                compare(before, after, selected)
+        after["trace_valid"] = False
+        with self.assertRaises(BenchError):
+            compare(before, after, ["swipe"])
+
 
 if __name__ == "__main__":
     unittest.main()

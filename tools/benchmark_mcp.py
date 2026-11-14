@@ -407,14 +407,17 @@ def summarize(samples):
     return result
 
 
-def compare(before, after):
+def compare(before, after, selected=None):
     require(before.get("version") == after.get("version") == 1
             and before.get("trace_valid") is True and after.get("trace_valid") is True
             and before.get("failure") is None and after.get("failure") is None,
             "incomplete_benchmark")
     require(before.get("plan_sha256") == after.get("plan_sha256"), "different_plans")
+    selected = CASES if selected is None else selected
+    require(bool(selected) and len(selected) == len(set(selected))
+            and set(selected) <= set(CASES), "invalid_selected_cases")
     failures = []
-    for case in CASES:
+    for case in selected:
         old, new = before["summary"][case], after["summary"][case]
         if min(old["attempts"], new["attempts"]) < 20 or old["failures"] or new["failures"]:
             failures.append(f"{case}:correctness_or_sample_count")
@@ -918,6 +921,8 @@ def main():
     diff = commands.add_parser("compare")
     diff.add_argument("before", type=Path)
     diff.add_argument("after", type=Path)
+    diff.add_argument("--cases", nargs="+", choices=CASES,
+                      help="compare only these cohorts; omitted means all six cases")
     merge = commands.add_parser("merge")
     merge.add_argument("--output", type=Path, required=True)
     merge.add_argument("reports", nargs="+", type=Path)
@@ -931,8 +936,9 @@ def main():
     args = parser.parse_args()
     if args.mode == "compare":
         before, after = decode(args.before.read_bytes()), decode(args.after.read_bytes())
-        failures = compare(before, after)
+        failures = compare(before, after, args.cases)
         print(json.dumps({"passed": not failures, "failures": failures,
+                          "selected_cases": list(CASES if args.cases is None else args.cases),
                           "capture_before": before.get("capture_mode", "paired"),
                           "capture_after": after.get("capture_mode", "paired")}))
         return int(bool(failures))
