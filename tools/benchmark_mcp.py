@@ -543,7 +543,11 @@ class Campaign:
         if self.device is None:
             self.device = self.screen["metadata"]["device"]
         require(self.screen["metadata"]["device"] == self.device, "device_changed")
-        require(matches(self.screen, step.get("expect"), previous), "effect_mismatch")
+        failed = [key for key, value in step.get("expect", {}).items()
+                  if not matches(self.screen, {key: value}, previous)]
+        if failed:
+            call["failed_expectations"] = failed
+            raise BenchError("effect_mismatch")
         return call
 
     def run(self):

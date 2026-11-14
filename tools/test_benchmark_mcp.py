@@ -240,6 +240,22 @@ for line in sys.stdin:
         self.assertEqual(campaign.failure_context["step_index"], 0)
         self.assertEqual(campaign.failure_context["call"]["error_code"], "ViewChanged")
 
+    def test_expectation_failure_reports_predicate_names_without_values(self):
+        class FakePeer:
+            calls = []
+            healthy = True
+
+            def tool(self, name, arguments):
+                call = {"tool": name}
+                self.calls.append(call)
+                return screen_result(), call
+
+        campaign = Campaign(FakePeer(), plan(), count=20, warmups=0)
+        with self.assertRaisesRegex(BenchError, "effect_mismatch"):
+            campaign.step({"tool": "handkite_observe", "expect": {
+                "lock": "unlocked", "app": "different.fixture.app"}})
+        self.assertEqual(campaign.peer.calls[-1]["failed_expectations"], ["app"])
+
     def test_gate_requires_valid_trace_matching_plan_and_twenty_successes(self):
         samples = [{"case": case, "outcome": "pass", "elapsed_ms": 100}
                    for case in CASES for _ in range(20)]
