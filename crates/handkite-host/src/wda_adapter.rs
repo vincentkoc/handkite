@@ -25,6 +25,23 @@ const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focu
 const HOME_LAUNCH_AGE: Duration = Duration::from_secs(2);
 const TEXT_INPUT_AGE: Duration = Duration::from_secs(5);
 
+async fn before_input_deadline<T>(
+    until: Instant,
+    work: impl Future<Output = Result<T, AdapterError>>,
+) -> Result<T, AdapterError> {
+    let remaining = until
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(AdapterError)?;
+    let result = tokio::time::timeout(remaining, work)
+        .await
+        .map_err(|_| AdapterError)?;
+    if Instant::now() >= until {
+        return Err(AdapterError);
+    }
+    result
+}
+
 pub struct WdaAdapter {
     expected: HardwareId,
     usb: PinnedUsb,
@@ -172,6 +189,13 @@ impl WdaAdapter {
     }
 
     fn validate_owned(&self) -> Result<(), AdapterError> {
+        self.validate_owned_with_deadline(None)
+    }
+
+    fn validate_owned_with_deadline(&self, deadline: Option<Instant>) -> Result<(), AdapterError> {
+        if deadline.is_some_and(|until| Instant::now() >= until) {
+            return Err(AdapterError);
+        }
         let Some(session) = &self.owned_session else {
             return Ok(());
         };
@@ -186,8 +210,18 @@ impl WdaAdapter {
         self.runtime
             .as_ref()
             .expect("adapter runtime")
-            .block_on(validate_session(&UsbWda::new(self.usb.clone()), session))
-            .map_err(|_| AdapterError)?;
+            .block_on(async {
+                let wda = UsbWda::new(self.usb.clone());
+                let validation = async {
+                    validate_session(&wda, session)
+                        .await
+                        .map_err(|_| AdapterError)
+                };
+                match deadline {
+                    Some(until) => before_input_deadline(until, validation).await,
+                    None => validation.await,
+                }
+            })?;
         if self
             .owned_runner
             .as_ref()
@@ -572,7 +606,7 @@ impl DeviceAdapter for WdaAdapter {
         action: &Action,
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
-        self.validate_owned()?;
+        self.validate_owned_with_deadline(Some(send_deadline))?;
         if (matches!(action, Action::LaunchApp { .. })
             || matches!(
                 action,
@@ -583,7 +617,7 @@ impl DeviceAdapter for WdaAdapter {
                     | Action::Key { .. }
                     | Action::KeyCurrent { .. }
             ) && self.owned_session.is_some())
-            && native_lock::query(&self.expected).state != LockState::Unlocked
+            && native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
         {
             return Err(AdapterError);
         }
@@ -632,23 +666,23 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            self.validate_owned()?;
+            self.validate_owned_with_deadline(Some(send_deadline))?;
             let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
-            let button = self
-                .runtime
-                .as_ref()
-                .expect("adapter runtime")
-                .block_on(async {
-                    self.actions.prepare_existing(&wda).await?;
-                    crate::wda_button::resolve(
-                        &wda,
-                        self.actions.prepared_session().ok_or(AdapterError)?,
-                        target,
-                    )
-                    .await
-                })?;
-            self.validate_owned()?;
-            if native_lock::query(&self.expected).state != LockState::Unlocked
+            let button =
+                self.runtime
+                    .as_ref()
+                    .expect("adapter runtime")
+                    .block_on(before_input_deadline(send_deadline, async {
+                        self.actions.prepare_existing(&wda).await?;
+                        crate::wda_button::resolve(
+                            &wda,
+                            self.actions.prepared_session().ok_or(AdapterError)?,
+                            target,
+                        )
+                        .await
+                    }))?;
+            self.validate_owned_with_deadline(Some(send_deadline))?;
+            if native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
                 || Instant::now() >= send_deadline
             {
                 return Err(AdapterError);
@@ -706,8 +740,9 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            self.validate_owned()?;
-            if native_lock::query(&self.expected).state != LockState::Unlocked {
+            self.validate_owned_with_deadline(Some(send_deadline))?;
+            if native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
+            {
                 return Err(AdapterError);
             }
             let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
@@ -919,6 +954,67 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn expired_input_validation_does_not_poll_work() {
+        let polled = std::cell::Cell::new(false);
+        let result = before_input_deadline(Instant::now(), async {
+            polled.set(true);
+            Ok(())
+        })
+        .await;
+        assert!(result.is_err());
+        assert!(!polled.get());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_validation_stops_at_remaining_budget() {
+        let started = tokio::time::Instant::now();
+        let result: Result<(), AdapterError> = before_input_deadline(
+            Instant::now() + Duration::from_millis(100),
+            std::future::pending(),
+        )
+        .await;
+        assert!(result.is_err());
+        assert!(started.elapsed() <= Duration::from_millis(101));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_element_lookup_stops_before_click() {
+        struct PendingLookup(std::cell::Cell<usize>);
+        impl WdaRequest for PendingLookup {
+            async fn request(
+                &self,
+                method: &str,
+                path: &str,
+                _body: &[u8],
+                _deadline: Duration,
+            ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+                assert_eq!(method, "POST");
+                assert_eq!(path, "/session/fixture/elements");
+                self.0.set(self.0.get() + 1);
+                std::future::pending().await
+            }
+        }
+        let wda = PendingLookup(std::cell::Cell::new(0));
+        let clicked = std::cell::Cell::new(false);
+        let target = handkite_core::protocol::ButtonTarget {
+            label: "Close".into(),
+            x: 1.0,
+            y: 1.0,
+            width: 30.0,
+            height: 20.0,
+        };
+        let result = before_input_deadline(Instant::now() + Duration::from_millis(100), async {
+            let button = crate::wda_button::resolve(&wda, "fixture", &target).await?;
+            clicked.set(true);
+            button.click(&wda).await
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(wda.0.get(), 1);
+        assert!(!clicked.get());
+    }
 
     #[test]
     fn response_values_preserve_null_and_reject_missing_or_failed_envelopes() {

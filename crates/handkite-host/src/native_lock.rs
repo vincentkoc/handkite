@@ -4,7 +4,7 @@ use std::ffi::CStr;
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -74,7 +74,12 @@ fn parse(bytes: &[u8]) -> Option<NativeLock> {
 }
 
 pub fn query(id: &HardwareId) -> NativeLock {
-    query_inner(id).unwrap_or_else(NativeLock::uncertain)
+    query_until(id, Instant::now() + Duration::from_secs(8))
+}
+
+pub(crate) fn query_until(id: &HardwareId, deadline: Instant) -> NativeLock {
+    query_inner(id, deadline.min(Instant::now() + Duration::from_secs(8)))
+        .unwrap_or_else(NativeLock::uncertain)
 }
 
 fn query_command(id: &HardwareId, output: &Path) -> Command {
@@ -90,26 +95,17 @@ fn query_command(id: &HardwareId, output: &Path) -> Command {
     command
 }
 
-fn query_inner(id: &HardwareId) -> Option<NativeLock> {
+fn query_inner(id: &HardwareId, deadline: Instant) -> Option<NativeLock> {
+    if Instant::now() >= deadline {
+        return None;
+    }
     let directory = QueryDirectory::new()?;
+    if Instant::now() >= deadline {
+        return None;
+    }
     let mut child = query_command(id, &directory.output()).spawn().ok()?;
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) if status.success() => break,
-            Ok(Some(_)) => return None,
-            Err(_) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(50)),
-            Ok(None) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-        }
+    if !wait_until(&mut child, deadline) {
+        return None;
     }
     let mut bytes = Vec::new();
     fs::File::open(directory.output())
@@ -120,9 +116,46 @@ fn query_inner(id: &HardwareId) -> Option<NativeLock> {
     parse(&bytes)
 }
 
+fn wait_until(child: &mut Child, deadline: Instant) -> bool {
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success() && Instant::now() < deadline,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+            Ok(None) if Instant::now() < deadline => {
+                thread::sleep(
+                    Duration::from_millis(50)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_native_query_returns_uncertain_without_device_access() {
+        let id = HardwareId::new("test-device").unwrap();
+        assert_eq!(query_until(&id, Instant::now()), NativeLock::uncertain());
+    }
+
+    #[test]
+    fn expired_native_wait_reaps_only_its_own_child() {
+        let mut child = Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        assert!(!wait_until(&mut child, Instant::now()));
+        assert!(child.try_wait().unwrap().is_some());
+    }
 
     #[test]
     fn native_query_uses_fixed_tool_and_literal_arguments() {

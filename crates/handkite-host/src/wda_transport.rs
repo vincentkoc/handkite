@@ -11,6 +11,21 @@ pub(crate) const WDA_PORT: u16 = 8100;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_WIRE: usize = wda_http::MAX_BODY + 4 * 1024 * 1024;
 
+fn response_budget(
+    method: &str,
+    budget: Duration,
+    until: Option<Instant>,
+    now: Instant,
+) -> Duration {
+    if method == "GET" {
+        until.map_or(budget, |until| {
+            budget.min(until.saturating_duration_since(now))
+        })
+    } else {
+        budget
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WdaError {
     Usb(UsbError),
@@ -66,6 +81,9 @@ impl UsbWda {
         deadline: Duration,
     ) -> Result<HttpResponse, WdaError> {
         let request = wda_http::request(method, path, body).map_err(WdaError::InvalidRequest)?;
+        // Read-only preflight must finish before the input budget expires too.
+        // Once input is sent, retain its full response window and uncertainty rules.
+        let deadline = response_budget(method, deadline, self.write_deadline, Instant::now());
         let connect = async {
             let provider = self.usb.provider().await.map_err(WdaError::Usb)?;
             let device = tokio::time::timeout(CONNECT_TIMEOUT, provider.connect(WDA_PORT))
@@ -386,6 +404,60 @@ mod tests {
         let mut sent = Vec::new();
         peer.read_to_end(&mut sent).await.unwrap();
         assert!(sent.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn preflight_read_response_stops_at_input_deadline() {
+        let started = tokio::time::Instant::now();
+        let wall = Instant::now();
+        let until = wall + Duration::from_millis(100);
+        let (socket, mut peer) = tokio::io::duplex(64);
+        let result = exchange(
+            async { Ok(socket) },
+            b"GET /status",
+            response_budget("GET", Duration::from_secs(5), Some(until), wall),
+            Some(until),
+            None,
+            || wall + started.elapsed(),
+        )
+        .await;
+        assert!(matches!(result, Err(WdaError::TimedOutAfterSent)));
+        assert_eq!(started.elapsed(), Duration::from_millis(100));
+        let mut sent = Vec::new();
+        peer.read_to_end(&mut sent).await.unwrap();
+        assert_eq!(sent, b"GET /status");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn input_response_can_arrive_after_send_deadline_without_replay() {
+        let started = tokio::time::Instant::now();
+        let wall = Instant::now();
+        let until = wall + Duration::from_millis(100);
+        let (socket, mut peer) = tokio::io::duplex(128);
+        let server = tokio::spawn(async move {
+            let mut request = [0; 4];
+            peer.read_exact(&mut request).await.unwrap();
+            assert_eq!(&request, b"POST");
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            peer.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}")
+                .await
+                .unwrap();
+            let mut extra = Vec::new();
+            peer.read_to_end(&mut extra).await.unwrap();
+            assert!(extra.is_empty());
+        });
+        let result = exchange(
+            async { Ok(socket) },
+            b"POST",
+            response_budget("POST", Duration::from_secs(5), Some(until), wall),
+            Some(until),
+            None,
+            || wall + started.elapsed(),
+        )
+        .await;
+        assert!(result.is_ok());
+        assert_eq!(started.elapsed(), Duration::from_millis(200));
+        server.await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
