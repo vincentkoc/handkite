@@ -272,6 +272,15 @@ It requires `"image":"always"` (the default) and no `since_revision`. The
 response says `capture_kind: "paired"`: this only trims output, and still
 acquires the full internal tree. It clears the response's tree-delta baseline.
 
+To skip XML explicitly, use `{"capture":"image_only","tree_format":"omit"}`
+on `handkite_observe`, or in an action's `response` object for its final capture.
+The result has `capture_kind: "image_only"`, a device, capture window and image;
+it has no inferred lock state, tree or actionable revision. Obtain a full
+observation before another revision-bound action. Input admission still uses
+a full observation, and Home and Lock retain their paired verification.
+Changed pixels can confirm an acknowledged action; unchanged pixels leave its
+effect unconfirmed. Full paired capture remains the default.
+
 `"tree_format":"outline"` selects an explicitly lossy reading format. It removes
 XML closing tags and repeated type names, combines equal name/label strings and
 groups coordinates as `rect=[x,y,width,height]` in logical points. It collapses

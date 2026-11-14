@@ -1,5 +1,5 @@
 use super::MAX_RESPONSE;
-use crate::wire::{Reply, WireObservation};
+use crate::wire::{Reply, WireImageObservation, WireObservation};
 use handkite_core::protocol::ImageFormat;
 use serde_json::{Value, json};
 use std::io;
@@ -23,6 +23,21 @@ where
 pub(super) fn metadata(observation: &WireObservation) -> Value {
     json!({"device": observation.device, "revision": observation.revision,
         "window": observation.window, "state": observation.state})
+}
+
+pub(super) fn image_metadata(observation: &WireImageObservation) -> Value {
+    json!({"device":observation.device,"window":observation.window})
+}
+
+pub(super) fn image_content(observation: WireImageObservation) -> Vec<Value> {
+    let payload = json!({"metadata":image_metadata(&observation),"capture_kind":"image_only",
+        "tree":{"included":false,"reason":"not_captured"}});
+    finish_observation_content(
+        payload,
+        observation.screenshot_format,
+        observation.screenshot_base64,
+        true,
+    )
 }
 
 pub(super) fn text_result(value: Value) -> Value {

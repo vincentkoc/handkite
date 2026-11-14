@@ -19,6 +19,8 @@ use response::exchange_reply;
 use session::Session;
 
 #[cfg(test)]
+mod image_tests;
+#[cfg(test)]
 mod navigation_tests;
 #[cfg(test)]
 mod presentation_tests;
@@ -321,10 +323,22 @@ where
 {
     let method = if tool == Tool::Status {
         "status"
+    } else if options.capture == handkite_core::protocol::CaptureMode::ImageOnly {
+        "observe_image"
     } else {
         "observe"
     };
     let observation = match exchange_reply(json!({"method": method, "device": device}), exchange) {
+        Ok(Reply::ObservedImage { observation }) if method == "observe_image" => {
+            session.presentation.clear();
+            if &observation.device != device {
+                return response::with_service_code(
+                    tool_error("device identity mismatch"),
+                    "DeviceMismatch",
+                );
+            }
+            return json!({"content":response::image_content(observation)});
+        }
         Ok(Reply::Status { status }) if tool == Tool::Status => {
             if &status.device != device {
                 return response::with_service_code(
@@ -334,7 +348,7 @@ where
             }
             return response::text_result(json!(status));
         }
-        Ok(Reply::Observed { observation }) if tool == Tool::Observe => observation,
+        Ok(Reply::Observed { observation }) if method == "observe" => observation,
         Ok(Reply::Error { code }) => {
             return response::with_service_code(
                 tool_error("device observation unavailable"),

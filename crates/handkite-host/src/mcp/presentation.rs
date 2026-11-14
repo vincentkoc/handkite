@@ -1,6 +1,6 @@
 use super::response;
 use crate::wire::WireObservation;
-use handkite_core::protocol::{DeviceKey, DeviceState, Revision};
+use handkite_core::protocol::{CaptureMode, DeviceKey, DeviceState, Revision};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -26,6 +26,7 @@ pub(super) enum ImageMode {
 #[derive(Clone, Copy, Default, Deserialize)]
 #[serde(try_from = "UncheckedOptions")]
 pub(super) struct Options {
+    pub capture: CaptureMode,
     pub tree_format: TreeFormat,
     pub image: ImageMode,
     pub since_revision: Option<Revision>,
@@ -34,6 +35,8 @@ pub(super) struct Options {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UncheckedOptions {
+    #[serde(default)]
+    pub capture: CaptureMode,
     #[serde(default)]
     pub tree_format: TreeFormat,
     #[serde(default)]
@@ -46,12 +49,16 @@ impl TryFrom<UncheckedOptions> for Options {
     type Error = &'static str;
 
     fn try_from(value: UncheckedOptions) -> Result<Self, Self::Error> {
+        if value.capture == CaptureMode::ImageOnly && value.tree_format != TreeFormat::Omit {
+            return Err("image-only capture requires tree_format=omit");
+        }
         if value.tree_format == TreeFormat::Omit
             && (value.image != ImageMode::Always || value.since_revision.is_some())
         {
             return Err("tree omission requires an image without a delta baseline");
         }
         Ok(Self {
+            capture: value.capture,
             tree_format: value.tree_format,
             image: value.image,
             since_revision: value.since_revision,
@@ -67,6 +74,8 @@ fn present_revision<'de, D: serde::Deserializer<'de>>(
 
 pub(super) fn schema() -> Value {
     json!({"type":"object", "additionalProperties":false, "properties":{
+        "capture":{"type":"string","enum":["paired","image_only"],
+            "description":"Default paired. image_only skips XML for the returned observation, requires tree_format=omit, and has no state or actionable revision. Actions retain full pre-input admission; Home and Lock retain paired verification."},
         "tree_format":{"type":"string","enum":["full","compact","outline","omit"],
             "description":"Response presentation only; internal checks retain the full capture. omit returns an image only and requires image=always without since_revision."},
         "image":{"type":"string","enum":["always","omit","changed"],

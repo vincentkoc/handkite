@@ -1,8 +1,8 @@
 use base64::Engine;
 use handkite_core::controller::{Controller, ControllerError, DeviceAdapter, LeaseId, ViewChange};
 use handkite_core::protocol::{
-    ActionRequest, DeviceKey, DeviceState, ImageFormat, LockState, Observation, ObservationWindow,
-    ObservedEffect, Revision, TransportReceipt,
+    ActionRequest, CaptureMode, DeviceKey, DeviceState, ImageFormat, ImageObservation, LockState,
+    Observation, ObservationWindow, ObservedEffect, Revision, TransportReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -14,6 +14,9 @@ pub enum Request {
         device: DeviceKey,
     },
     Observe {
+        device: DeviceKey,
+    },
+    ObserveImage {
         device: DeviceKey,
     },
     Acquire {
@@ -28,6 +31,8 @@ pub enum Request {
         owner: String,
         lease: LeaseId,
         request: ActionRequest,
+        #[serde(default)]
+        capture: CaptureMode,
     },
 }
 
@@ -40,6 +45,9 @@ pub enum Reply {
     Observed {
         observation: WireObservation,
     },
+    ObservedImage {
+        observation: WireImageObservation,
+    },
     Acquired {
         lease: LeaseId,
     },
@@ -47,6 +55,8 @@ pub enum Reply {
     Acted {
         receipt: TransportReceipt,
         after: Option<WireObservation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        after_image: Option<WireImageObservation>,
         native_lock: Option<LockState>,
         effect: ObservedEffect,
     },
@@ -86,6 +96,27 @@ pub struct WireObservation {
     pub accessibility_tree: String,
     pub screenshot_format: ImageFormat,
     pub screenshot_base64: String,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct WireImageObservation {
+    pub device: DeviceKey,
+    pub window: ObservationWindow,
+    pub screenshot_format: ImageFormat,
+    pub screenshot_base64: String,
+}
+
+impl From<ImageObservation> for WireImageObservation {
+    fn from(value: ImageObservation) -> Self {
+        let _timing = crate::timing::Span::new("wire_image_encode");
+        Self {
+            device: value.device,
+            window: value.window,
+            screenshot_format: value.screenshot.format,
+            screenshot_base64: base64::engine::general_purpose::STANDARD
+                .encode(value.screenshot.bytes),
+        }
+    }
 }
 
 impl From<Observation> for WireObservation {
@@ -129,6 +160,13 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
                     observation: observation.into(),
                 })
         }
+        Request::ObserveImage { device } => {
+            controller
+                .observe_image(&device)
+                .map(|observation| Reply::ObservedImage {
+                    observation: observation.into(),
+                })
+        }
         Request::Acquire { owner, ttl_ms } if valid_owner(&owner) => controller
             .acquire(owner, Duration::from_millis(ttl_ms))
             .map(|lease| Reply::Acquired { lease }),
@@ -139,16 +177,16 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
             owner,
             lease,
             request,
-        } if valid_owner(&owner) => {
-            controller
-                .act(&owner, lease, request)
-                .map(|result| Reply::Acted {
-                    receipt: result.receipt,
-                    after: result.after.map(Into::into),
-                    native_lock: result.native_lock,
-                    effect: result.effect,
-                })
-        }
+            capture,
+        } if valid_owner(&owner) => controller
+            .act_with_capture(&owner, lease, request, capture)
+            .map(|result| Reply::Acted {
+                receipt: result.receipt,
+                after: result.after.map(Into::into),
+                after_image: result.after_image.map(Into::into),
+                native_lock: result.native_lock,
+                effect: result.effect,
+            }),
         _ => {
             return Reply::Error {
                 code: "InvalidOwner".into(),
@@ -290,6 +328,7 @@ mod tests {
                     .into(),
                 },
                 after: None,
+                after_image: None,
                 native_lock,
                 effect,
             };

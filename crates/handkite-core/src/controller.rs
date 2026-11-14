@@ -1,7 +1,7 @@
 use crate::protocol::{
-    Action, ActionRequest, ActionResult, DeviceBinding, DeviceKey, DeviceState, HardwareId,
-    LockState, Observation, ObservationWindow, ObservedEffect, Point, Revision, ScreenImage,
-    TransportReceipt,
+    Action, ActionRequest, ActionResult, CaptureMode, DeviceBinding, DeviceKey, DeviceState,
+    HardwareId, ImageObservation, LockState, Observation, ObservationWindow, ObservedEffect, Point,
+    Revision, ScreenImage, TransportReceipt,
 };
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -13,6 +13,13 @@ pub struct RawObservation {
     pub window: ObservationWindow,
     pub state: DeviceState,
     pub accessibility_tree: String,
+    pub screenshot: ScreenImage,
+}
+
+pub struct RawImageObservation {
+    pub connected_usb: HardwareId,
+    pub wda_target: HardwareId,
+    pub window: ObservationWindow,
     pub screenshot: ScreenImage,
 }
 
@@ -131,6 +138,9 @@ pub trait DeviceAdapter {
 
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
+    fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
+        Err(AdapterError)
+    }
     /// Private admission bound to the exact action and capture deadline.
     /// Ordinary observations return no admission.
     fn observe_for_action(
@@ -393,6 +403,16 @@ impl<A: DeviceAdapter> Controller<A> {
         lease_id: LeaseId,
         request: ActionRequest,
     ) -> Result<ActionResult, ControllerError> {
+        self.act_with_capture(owner, lease_id, request, CaptureMode::Paired)
+    }
+
+    pub fn act_with_capture(
+        &self,
+        owner: &str,
+        lease_id: LeaseId,
+        request: ActionRequest,
+        capture: CaptureMode,
+    ) -> Result<ActionResult, ControllerError> {
         let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
         if !matches!(&inner.lease, Some(lease) if lease.id == lease_id && lease.owner == owner && lease.expires_at > Instant::now())
         {
@@ -614,6 +634,38 @@ impl<A: DeviceAdapter> Controller<A> {
         } else {
             ObservedEffect::Unconfirmed
         };
+        if capture == CaptureMode::ImageOnly
+            && !matches!(request.action, Action::Home | Action::Lock)
+        {
+            let before = inner.last.take().map(|observation| observation.screenshot);
+            let observed = inner
+                .adapter
+                .observe_image()
+                .map_err(|_| ControllerError::Adapter)
+                .and_then(|raw| self.accept_image(&request.device, raw));
+            let after_image = match observed {
+                Ok(image) => Some(image),
+                Err(ControllerError::DeviceMismatch) => {
+                    return Err(ControllerError::DeviceMismatch);
+                }
+                Err(_) => None,
+            };
+            let changed = after_image
+                .as_ref()
+                .zip(before.as_ref())
+                .is_some_and(|(after, before)| after.screenshot != *before);
+            return Ok(ActionResult {
+                receipt: receipt.clone(),
+                after: None,
+                after_image,
+                native_lock,
+                effect: if receipt.accepted == Some(true) && changed {
+                    ObservedEffect::Changed
+                } else {
+                    ObservedEffect::Unconfirmed
+                },
+            });
+        }
         let observed = inner
             .adapter
             .observe_after_action(&request.action, execution_admission, &receipt)
@@ -636,6 +688,7 @@ impl<A: DeviceAdapter> Controller<A> {
                 Ok(ActionResult {
                     receipt,
                     after: Some(after),
+                    after_image: None,
                     native_lock,
                     effect,
                 })
@@ -649,6 +702,7 @@ impl<A: DeviceAdapter> Controller<A> {
                 Ok(ActionResult {
                     receipt,
                     after: None,
+                    after_image: None,
                     native_lock,
                     effect: lock_effect,
                 })
@@ -664,6 +718,58 @@ impl<A: DeviceAdapter> Controller<A> {
         let (observation, _) = self.capture(inner, requested, None)?;
         inner.last = Some(observation.clone());
         Ok(observation)
+    }
+
+    pub fn observe_image(
+        &self,
+        requested: &DeviceKey,
+    ) -> Result<ImageObservation, ControllerError> {
+        let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
+        inner.last = None;
+        let raw = inner
+            .adapter
+            .observe_image()
+            .map_err(|_| Self::adapter_error(&mut inner))?;
+        self.accept_image(requested, raw)
+    }
+
+    fn accept_image(
+        &self,
+        requested: &DeviceKey,
+        raw: RawImageObservation,
+    ) -> Result<ImageObservation, ControllerError> {
+        self.binding
+            .verify(requested, &raw.connected_usb, &raw.wda_target)
+            .map_err(|_| ControllerError::DeviceMismatch)?;
+        self.validate_window(&raw.window)?;
+        if raw.screenshot.bytes.is_empty() {
+            return Err(ControllerError::Adapter);
+        }
+        Ok(ImageObservation {
+            device: requested.clone(),
+            window: raw.window,
+            screenshot: raw.screenshot,
+        })
+    }
+
+    fn validate_window(&self, window: &ObservationWindow) -> Result<(), ControllerError> {
+        let duration = window
+            .duration_ms()
+            .map_err(|_| ControllerError::InvalidObservationWindow)?;
+        if duration > self.max_window_ms {
+            return Err(ControllerError::InvalidObservationWindow);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|_| ControllerError::StaleObservation)?
+            .as_millis() as u64;
+        let age = now
+            .checked_sub(window.finished_unix_ms)
+            .ok_or(ControllerError::StaleObservation)?;
+        if age > self.max_age_ms {
+            return Err(ControllerError::StaleObservation);
+        }
+        Ok(())
     }
 
     fn capture(
@@ -701,23 +807,7 @@ impl<A: DeviceAdapter> Controller<A> {
         self.binding
             .verify(requested, &raw.connected_usb, &raw.wda_target)
             .map_err(|_| ControllerError::DeviceMismatch)?;
-        let duration = raw
-            .window
-            .duration_ms()
-            .map_err(|_| ControllerError::InvalidObservationWindow)?;
-        if duration > self.max_window_ms {
-            return Err(ControllerError::InvalidObservationWindow);
-        }
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| ControllerError::StaleObservation)?
-            .as_millis() as u64;
-        let age = now
-            .checked_sub(raw.window.finished_unix_ms)
-            .ok_or(ControllerError::StaleObservation)?;
-        if age > self.max_age_ms {
-            return Err(ControllerError::StaleObservation);
-        }
+        self.validate_window(&raw.window)?;
         let revision = inner
             .revision
             .next()

@@ -159,6 +159,22 @@ pub struct Observation {
     pub screenshot: ScreenImage,
 }
 
+/// A captured image, without an inferred device state or actionable revision.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ImageObservation {
+    pub device: DeviceKey,
+    pub window: ObservationWindow,
+    pub screenshot: ScreenImage,
+}
+
+#[derive(Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+    #[default]
+    Paired,
+    ImageOnly,
+}
+
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ScreenImage {
     pub format: ImageFormat,
@@ -258,6 +274,8 @@ pub struct TransportReceipt {
 pub struct ActionResult {
     pub receipt: TransportReceipt,
     pub after: Option<Observation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_image: Option<ImageObservation>,
     /// Present only for lock actions; Uncertain means native proof was unavailable.
     pub native_lock: Option<LockState>,
     pub effect: ObservedEffect,

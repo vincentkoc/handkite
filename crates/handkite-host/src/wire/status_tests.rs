@@ -146,6 +146,7 @@ fn status_retains_the_complete_revision_for_action_comparison() {
         let reply = dispatch(
             &controller,
             Request::Act {
+                capture: CaptureMode::Paired,
                 owner: "fixture".into(),
                 lease,
                 request: ActionRequest {

@@ -2,7 +2,7 @@ use super::response::{exchange_reply, metadata, text_result};
 use super::{presentation, tool_error};
 use crate::wire::Reply;
 use handkite_core::controller::LeaseId;
-use handkite_core::protocol::{Action, DeviceKey, ObservedEffect, Revision};
+use handkite_core::protocol::{Action, CaptureMode, DeviceKey, ObservedEffect, Revision};
 use serde_json::{Value, json};
 use std::io;
 
@@ -98,11 +98,12 @@ impl Session {
             return tool_error("explicit control acquisition required");
         };
         let kind = action.kind();
-        let response = exchange_reply(
-            json!({"method": "act", "owner": OWNER, "lease": lease,
-            "request": {"device": device, "expected_revision": revision, "action": action}}),
-            exchange,
-        );
+        let mut request = json!({"method": "act", "owner": OWNER, "lease": lease,
+            "request": {"device": device, "expected_revision": revision, "action": action}});
+        if options.capture != CaptureMode::Paired {
+            request["capture"] = json!(options.capture);
+        }
+        let response = exchange_reply(request, exchange);
         match response {
             Ok(Reply::ViewChanged { changed }) if changed.any() => {
                 let mut result = service_error("ViewChanged");
@@ -112,17 +113,30 @@ impl Session {
             Ok(Reply::Acted {
                 receipt,
                 after,
+                after_image,
                 native_lock: None,
                 effect,
             }) if receipt.action_kind == kind && effect != ObservedEffect::LockConfirmed => {
-                if after
-                    .as_ref()
-                    .is_some_and(|observation| &observation.device != device)
+                if after.is_some() && after_image.is_some()
+                    || after_image.as_ref().is_some_and(|observation| {
+                        &observation.device != device || options.capture != CaptureMode::ImageOnly
+                    })
+                    || after
+                        .as_ref()
+                        .is_some_and(|observation| &observation.device != device)
                 {
                     return uncertain_result(kind);
                 }
                 let mut result = text_result(json!({"receipt": receipt, "effect": effect,
                     "after": after.as_ref().map(metadata)}));
+                if let Some(ref image) = after_image {
+                    result["content"][0]["text"] = json!(
+                        json!({"receipt":receipt,"effect":effect,
+                        "after":null,"after_image":super::response::image_metadata(image)})
+                        .to_string()
+                    );
+                    self.presentation.clear();
+                }
                 if effect == ObservedEffect::Unconfirmed || receipt.accepted != Some(true) {
                     result["isError"] = json!(true);
                 }
@@ -131,6 +145,12 @@ impl Session {
                         .as_array_mut()
                         .expect("text result has a content array")
                         .extend(self.presentation.content(observation, options));
+                }
+                if include_observation && let Some(observation) = after_image {
+                    result["content"]
+                        .as_array_mut()
+                        .expect("text result has content")
+                        .extend(super::response::image_content(observation));
                 }
                 result
             }

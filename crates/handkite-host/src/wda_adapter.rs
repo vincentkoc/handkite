@@ -12,7 +12,8 @@ use crate::wda_settings::{IdleSettingsLease, Restoration};
 use crate::wda_transport::UsbWda;
 use base64::Engine;
 use handkite_core::controller::{
-    ActionAdmission, AdapterDiagnostic, AdapterError, DeviceAdapter, RawObservation,
+    ActionAdmission, AdapterDiagnostic, AdapterError, DeviceAdapter, RawImageObservation,
+    RawObservation,
 };
 use handkite_core::protocol::{
     Action, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, Point, ScreenImage,
@@ -715,6 +716,36 @@ impl DeviceAdapter for WdaAdapter {
         self.error_diagnostic = None;
         self.capture_checked(SCREEN_SOURCE)
             .map(|(observation, _)| observation)
+    }
+
+    fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
+        self.error_diagnostic = None;
+        self.cache.clear_full();
+        let started = Instant::now();
+        let started_unix_ms = unix_ms()?;
+        let mut timings = crate::timing::enabled().then(CaptureTimings::default);
+        let result = self.capture_frame(timings.as_mut()).and_then(|frame| {
+            if frame.reported != Some(false) {
+                self.cache.clear();
+            }
+            Ok(RawImageObservation {
+                connected_usb: self.expected.clone(),
+                wda_target: self.expected.clone(),
+                window: ObservationWindow {
+                    started_unix_ms,
+                    finished_unix_ms: unix_ms()?,
+                },
+                screenshot: frame.screenshot,
+            })
+        });
+        if result.is_err() {
+            self.cache.clear();
+        }
+        if let Some(mut timings) = timings {
+            timings.finish(started, result.is_ok());
+            crate::timing::capture(timings);
+        }
+        result
     }
 
     fn observe_after_action(

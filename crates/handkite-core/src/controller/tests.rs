@@ -21,6 +21,7 @@ struct FakeAdapter {
     tap_admission: Option<ActionAdmission>,
     leak_home_evidence: bool,
     actions: usize,
+    image_captures: usize,
     native_lock: LockState,
     native_queries: usize,
     capture_wait_until: Option<Instant>,
@@ -53,6 +54,7 @@ impl FakeAdapter {
             tap_admission: None,
             leak_home_evidence: false,
             actions: 0,
+            image_captures: 0,
             native_lock: LockState::Uncertain,
             native_queries: 0,
             capture_wait_until: None,
@@ -132,6 +134,17 @@ impl DeviceAdapter for FakeAdapter {
             self.tap_admission.take()
         };
         Ok((observation, admission))
+    }
+
+    fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
+        self.image_captures += 1;
+        let raw = self.observe()?;
+        Ok(RawImageObservation {
+            connected_usb: raw.connected_usb,
+            wda_target: raw.wda_target,
+            window: raw.window,
+            screenshot: raw.screenshot,
+        })
     }
 
     fn observe_after_action(
@@ -283,6 +296,152 @@ fn controller() -> (Controller<FakeAdapter>, DeviceKey) {
         Controller::new(binding, FakeAdapter::new(), 1000, 5000),
         key,
     )
+}
+
+#[test]
+fn image_observation_has_no_state_or_revision_and_invalidates_full_baseline() {
+    let (controller, key) = controller();
+    let full = controller.observe(&key).unwrap();
+    let image = controller.observe_image(&key).unwrap();
+    let value = serde_json::to_value(image).unwrap();
+    assert!(value.get("state").is_none());
+    assert!(value.get("revision").is_none());
+    assert!(value.get("accessibility_tree").is_none());
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    assert_eq!(
+        controller
+            .act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(full.revision),
+                    action: Action::Home,
+                }
+            )
+            .err(),
+        Some(ControllerError::StaleRevision)
+    );
+    let inner = controller.inner.lock().unwrap();
+    assert_eq!(inner.revision, full.revision);
+    assert_eq!(inner.adapter.actions, 0);
+}
+
+#[test]
+fn image_observation_refuses_wrong_device_stale_and_oversized_windows() {
+    for case in ["device", "stale", "window", "empty"] {
+        let (controller, key) = controller();
+        let mut raw = controller
+            .inner
+            .lock()
+            .unwrap()
+            .adapter
+            .observe_image()
+            .unwrap();
+        let expected = match case {
+            "device" => {
+                raw.wda_target = HardwareId::new("other-phone").unwrap();
+                ControllerError::DeviceMismatch
+            }
+            "stale" => {
+                raw.window.started_unix_ms -= 20_000;
+                raw.window.finished_unix_ms -= 20_000;
+                ControllerError::StaleObservation
+            }
+            "window" => {
+                raw.window.started_unix_ms = raw.window.finished_unix_ms - 2000;
+                ControllerError::InvalidObservationWindow
+            }
+            _ => {
+                raw.screenshot.bytes.clear();
+                ControllerError::Adapter
+            }
+        };
+        assert_eq!(controller.accept_image(&key, raw).err(), Some(expected));
+    }
+}
+
+#[test]
+fn image_post_capture_preserves_receipt_and_only_confirms_changed_pixels() {
+    for case in ["changed", "same", "failed", "mismatch"] {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.fail_after_action = case == "failed";
+            inner.adapter.mismatch_after_action = case == "mismatch";
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act_with_capture(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action: if case == "same" {
+                    Action::Tap {
+                        at: Point { x: 1., y: 1. },
+                    }
+                } else {
+                    Action::LaunchApp {
+                        bundle_id: "com.example.clock".into(),
+                    }
+                },
+            },
+            CaptureMode::ImageOnly,
+        );
+        if case == "mismatch" {
+            assert_eq!(result.err(), Some(ControllerError::DeviceMismatch));
+        } else {
+            let result = result.unwrap();
+            assert_eq!(result.receipt.accepted, Some(true));
+            assert!(result.after.is_none());
+            assert_eq!(result.after_image.is_some(), case != "failed");
+            assert_eq!(
+                result.effect,
+                if case == "changed" {
+                    ObservedEffect::Changed
+                } else {
+                    ObservedEffect::Unconfirmed
+                }
+            );
+        }
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(inner.adapter.actions, 1);
+        assert_eq!(inner.adapter.image_captures, 1);
+        assert!(inner.last.is_none());
+    }
+}
+
+#[test]
+fn image_option_keeps_home_and_lock_full_proofs() {
+    for action in [Action::Home, Action::Lock] {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        controller.inner.lock().unwrap().adapter.native_lock = LockState::Locked;
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller
+            .act_with_capture(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action,
+                },
+                CaptureMode::ImageOnly,
+            )
+            .unwrap();
+        assert!(result.after.is_some());
+        assert!(result.after_image.is_none());
+        assert_eq!(controller.inner.lock().unwrap().adapter.image_captures, 0);
+    }
 }
 
 #[test]
