@@ -1,8 +1,10 @@
+import base64
 import copy
 import contextlib
 import io
 import json
 import sys
+import time
 import unittest
 
 from benchmark_mcp import (BenchError, Campaign, CASES, Peer, compare, elements,
@@ -32,6 +34,51 @@ def plan():
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_settle_reads_are_bounded_and_require_matching_tree_image_and_state(self):
+        class FakePeer:
+            def __init__(self, dimension, changes):
+                self.dimension, self.changes, self.calls = dimension, changes, []
+            def tool(self, name, arguments):
+                self.calls.append(name)
+                self.assert_read(name)
+                result = screen_result()
+                payload = json.loads(result["content"][0]["text"])
+                value = self.changes[len(self.calls) - 1]
+                if self.dimension == "tree":
+                    payload["accessibility_tree"] = f"<App label='{value}'/>"
+                elif self.dimension == "state":
+                    payload["metadata"]["state"]["foreground_app"] = str(value)
+                else:
+                    result["content"][1]["data"] = base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes([value])).decode()
+                result["content"][0]["text"] = json.dumps(payload)
+                return result, {"tool":name}
+            @staticmethod
+            def assert_read(name):
+                if name != "handkite_observe":
+                    raise AssertionError("settling must never send input")
+        for dimension in ("tree", "image", "state"):
+            for changes in ([0, 1, 1], [0, 1, 2]):
+                peer = FakePeer(dimension, changes)
+                campaign = Campaign(peer, plan(), 20, 0)
+                campaign.lease_started = time.monotonic()
+                if changes[-1] == changes[-2]:
+                    campaign.step({"tool":"handkite_observe", "settle":3})
+                else:
+                    with self.assertRaisesRegex(BenchError, "view_unsettled"):
+                        campaign.step({"tool":"handkite_observe", "settle":3})
+                self.assertEqual(peer.calls, ["handkite_observe"] * 3)
+
+    def test_settle_cannot_hide_input_or_expand_a_measured_request(self):
+        for tool, count in (("handkite_swipe", 3), ("handkite_observe", 4), ("handkite_observe", True)):
+            fixture = plan()
+            fixture["cases"][0]["cleanup"] = [{"tool":tool, "settle":count}]
+            with self.assertRaisesRegex(BenchError, "invalid_settle"):
+                validate_plan(fixture)
+        fixture = plan()
+        fixture["cases"][-1]["measure"]["settle"] = 3
+        with self.assertRaisesRegex(BenchError, "invalid_settle"):
+            validate_plan(fixture)
+
     def test_merge_requires_complete_disjoint_cohorts_on_one_generation(self):
         def cohort(cases):
             rows = [{"case": case, "outcome": "pass", "elapsed_ms": 10, "cleanup_ms": 1}

@@ -471,9 +471,13 @@ def validate_plan(plan):
                     for key in ("prepare", "cleanup")), "invalid_step_count")
         for step in case.get("prepare", []) + [case["measure"]] + case.get("cleanup", []):
             require(isinstance(step, dict) and step.get("tool") in ALLOWED
-                    and set(step) <= {"tool", "arguments", "selector", "when", "expect"},
+                    and set(step) <= {"tool", "arguments", "selector", "when", "expect", "settle"},
                     "invalid_step")
             require(isinstance(step.get("arguments", {}), dict), "invalid_arguments")
+            if "settle" in step:
+                require(type(step["settle"]) is int and step["settle"] == 3
+                        and step["tool"] == "handkite_observe" and not step.get("arguments")
+                        and "selector" not in step and step is not case["measure"], "invalid_settle")
             for key in ("expect", "when"):
                 expectations = step.get(key, {})
                 require(isinstance(expectations, dict)
@@ -556,6 +560,17 @@ class Campaign:
     def step(self, step):
         if not matches(self.screen, step.get("when")):
             return None
+        if "settle" in step:
+            previous = None
+            for _ in range(step["settle"]):
+                call = self.step({"tool": "handkite_observe"})
+                current = (self.screen["metadata"]["device"], self.screen["metadata"]["state"],
+                           self.screen["tree"], self.screen["image_digest"])
+                if current == previous:
+                    require(matches(self.screen, step.get("expect")), "effect_mismatch")
+                    return call
+                previous = current
+            raise BenchError("view_unsettled")
         self.renew()
         tool = step["tool"]
         arguments = dict(step.get("arguments", {}))
