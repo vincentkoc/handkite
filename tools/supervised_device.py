@@ -452,7 +452,7 @@ def pin_diagnostic(result):
             wake_admission normal_confirmation reveal_dispatch reveal_postcapture
             empty_confirmation digit_input final_confirmation""".split()),
         "step": set("""session_before source_read lock_read direct_field session_after
-            parse_source native_lock viewport_read freshness empty_admission
+            input_admission session_match parse_source native_lock viewport_read freshness empty_admission
             reveal_settle_limit complete""".split()),
         "progress": {"unchanged", "unexpected"},
         "first_unconfirmed_index": set("123456")}

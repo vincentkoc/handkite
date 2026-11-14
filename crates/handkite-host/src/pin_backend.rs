@@ -2,7 +2,7 @@ use crate::native_lock;
 use crate::pin_field;
 use crate::pin_screen::{self, ParsedPasscodeView};
 use crate::usb::PinnedUsb;
-use crate::wda_action::{WdaActions, WdaRequest};
+use crate::wda_action::{SessionValidationError, WdaActions, WdaRequest};
 use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::AdapterError;
 use handkite_core::passcode::PasscodeProgress;
@@ -67,6 +67,8 @@ pub enum PinCaptureStep {
     LockRead,
     DirectField,
     SessionAfter,
+    InputAdmission,
+    SessionMatch,
     ParseSource,
     NativeLock,
     ViewportRead,
@@ -84,6 +86,8 @@ impl PinCaptureStep {
             Self::LockRead => "lock_read",
             Self::DirectField => "direct_field",
             Self::SessionAfter => "session_after",
+            Self::InputAdmission => "input_admission",
+            Self::SessionMatch => "session_match",
             Self::ParseSource => "parse_source",
             Self::NativeLock => "native_lock",
             Self::ViewportRead => "viewport_read",
@@ -144,6 +148,39 @@ pub struct PinPreparationDiagnostic {
     pub timings: PinCaptureTimings,
     pub wda_reported_lock: PinReportedLock,
     pub refusal: &'static str,
+    pub session_check: Option<PinSessionCheck>,
+}
+
+/// Fixed metadata for the latest wake admission read; never contains WDA values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PinSessionCheck {
+    pub step: PinCaptureStep,
+    pub endpoint: &'static str,
+    pub reason: &'static str,
+    pub elapsed_ms: u128,
+    pub deadline_expired_at_start: bool,
+    pub deadline_expired_at_end: bool,
+}
+
+impl PinSessionCheck {
+    fn from_result(
+        step: PinCaptureStep,
+        started: Instant,
+        finished: Instant,
+        deadline: Instant,
+        result: Result<(), SessionValidationError>,
+    ) -> Self {
+        let (endpoint, reason) =
+            result.map_or_else(|error| (error.endpoint, error.reason), |()| ("both", "ok"));
+        Self {
+            step,
+            endpoint,
+            reason,
+            elapsed_ms: finished.saturating_duration_since(started).as_millis(),
+            deadline_expired_at_start: started >= deadline,
+            deadline_expired_at_end: finished >= deadline,
+        }
+    }
 }
 
 // Await every read, including native query completion after a failed WDA read.
@@ -231,6 +268,7 @@ pub struct NativePasscodeBackend {
     input_admission: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     capture_count: usize,
     preparation_refusal: &'static str,
+    session_check: Option<PinSessionCheck>,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -289,6 +327,7 @@ impl NativePasscodeBackend {
             input_admission: None,
             capture_count: 0,
             preparation_refusal: "none",
+            session_check: None,
         })
     }
 
@@ -362,6 +401,7 @@ impl NativePasscodeBackend {
             timings: self.capture_timings,
             wda_reported_lock: self.wda_reported_lock,
             refusal: self.preparation_refusal,
+            session_check: self.session_check,
         }
     }
 
@@ -411,6 +451,7 @@ impl NativePasscodeBackend {
             timings: self.capture_timings,
             wda_reported_lock: self.wda_reported_lock,
             refusal: self.preparation_refusal,
+            session_check: self.session_check,
         }
     }
 
@@ -606,7 +647,9 @@ impl NativePasscodeBackend {
                 return Err(BackendError::Unavailable);
             }
             check(self, &reveal)?;
+            self.capture_step = PinCaptureStep::InputAdmission;
             self.admit_input()?;
+            self.capture_step = PinCaptureStep::SessionMatch;
             if !self.actions.prepared_session_matches(&reveal.session) {
                 return Err(BackendError::Unavailable);
             }
@@ -638,16 +681,14 @@ impl NativePasscodeBackend {
     }
 
     fn check_normal_reveal(&mut self, reveal: &NormalReveal) -> Result<(), BackendError> {
+        self.capture_step = PinCaptureStep::SessionMatch;
         if !self.actions.prepared_session_matches(&reveal.session) {
             return Err(BackendError::Unavailable);
         }
         let wda = UsbWda::new(self.usb.clone())
             .with_write_deadline(reveal.fresh_until)
             .with_write_admission(self.input_admission.clone());
-        self.capture_step = PinCaptureStep::SessionBefore;
-        self.runtime
-            .block_on(self.actions.prepare_existing(&wda))
-            .map_err(|_| BackendError::Unavailable)?;
+        self.check_reveal_session(&wda, PinCaptureStep::SessionBefore, reveal.fresh_until)?;
         let orientation_path = format!("/session/{}/orientation", reveal.session);
         let expected = self.expected.clone();
         if let Err(step) = self.runtime.block_on(read_normal_reveal(
@@ -659,14 +700,33 @@ impl NativePasscodeBackend {
             self.capture_step = step;
             return Err(BackendError::Unavailable);
         }
-        self.capture_step = PinCaptureStep::SessionAfter;
-        self.runtime
-            .block_on(self.actions.prepare_existing(&wda))
-            .map_err(|_| BackendError::Unavailable)?;
+        self.check_reveal_session(&wda, PinCaptureStep::SessionAfter, reveal.fresh_until)?;
+        self.capture_step = PinCaptureStep::SessionMatch;
         if !self.actions.prepared_session_matches(&reveal.session) {
             return Err(BackendError::Unavailable);
         }
         Ok(())
+    }
+
+    fn check_reveal_session(
+        &mut self,
+        wda: &UsbWda,
+        step: PinCaptureStep,
+        deadline: Instant,
+    ) -> Result<(), BackendError> {
+        self.capture_step = step;
+        let started = Instant::now();
+        let result = self
+            .runtime
+            .block_on(self.actions.validate_existing_diagnostic(wda));
+        self.session_check = Some(PinSessionCheck::from_result(
+            step,
+            started,
+            Instant::now(),
+            deadline,
+            result,
+        ));
+        result.map_err(|_| BackendError::Unavailable)
     }
 
     fn prepare_owned_keypad_after_wake_with(
@@ -2583,6 +2643,45 @@ mod tests {
             (None, "unknown"),
         ] {
             assert_eq!(PinReportedLock::from_bool(value).as_str(), expected);
+        }
+    }
+
+    #[test]
+    fn session_diagnostic_reports_deadline_edges_without_inferring_transport_cause() {
+        let start = Instant::now();
+        let deadline = start + PIN_VIEW_BUDGET;
+        for (began, ended, expired_start, expired_end) in [
+            (start, deadline - Duration::from_nanos(1), false, false),
+            (start, deadline, false, true),
+            (deadline, deadline + Duration::from_millis(1), true, true),
+        ] {
+            for result in [
+                Ok(()),
+                Err(SessionValidationError {
+                    endpoint: "session",
+                    reason: "failed_after_send",
+                }),
+            ] {
+                let report = PinSessionCheck::from_result(
+                    PinCaptureStep::SessionAfter,
+                    began,
+                    ended,
+                    deadline,
+                    result,
+                );
+                assert_eq!(report.step, PinCaptureStep::SessionAfter);
+                assert_eq!(report.deadline_expired_at_start, expired_start);
+                assert_eq!(report.deadline_expired_at_end, expired_end);
+                assert_eq!(report.elapsed_ms, ended.duration_since(began).as_millis());
+                assert_eq!(
+                    (report.endpoint, report.reason),
+                    if result.is_ok() {
+                        ("both", "ok")
+                    } else {
+                        ("session", "failed_after_send")
+                    }
+                );
+            }
         }
     }
 

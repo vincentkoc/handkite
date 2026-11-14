@@ -200,6 +200,17 @@ fn finish(
             report.refusal
         );
         let timings = report.timings;
+        if let Some(check) = report.session_check {
+            println!(
+                "preparation=observed phase=wake_session_check step={} endpoint={} reason={} elapsed_ms={} deadline_expired_at_start={} deadline_expired_at_end={}",
+                check.step.as_str(),
+                check.endpoint,
+                check.reason,
+                check.elapsed_ms,
+                check.deadline_expired_at_start,
+                check.deadline_expired_at_end
+            );
+        }
         println!(
             "preparation=observed phase=capture_timings session_before_ms={} source_ms={} lock_ms={} direct_field_ms={} session_after_ms={} parse_ms={} native_ms={} wda_reported_lock={}",
             timings.session_before_ms,
@@ -318,6 +329,7 @@ mod tests {
             timings: Default::default(),
             wda_reported_lock: Default::default(),
             refusal: "none",
+            session_check: None,
         }
     }
 

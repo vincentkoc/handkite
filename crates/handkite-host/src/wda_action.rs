@@ -34,6 +34,41 @@ pub struct WdaActions {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct SessionValidationError {
+    pub endpoint: &'static str,
+    pub reason: &'static str,
+}
+
+impl SessionValidationError {
+    fn transport(endpoint: &'static str, error: WdaError) -> Self {
+        Self {
+            endpoint,
+            reason: match error {
+                WdaError::ExpiredBeforeSend => "expired_before_send",
+                WdaError::TimedOutAfterSent => "timed_out_after_send",
+                WdaError::AfterSent => "failed_after_send",
+                WdaError::NotConnected => "not_connected",
+                WdaError::Usb(_) => "usb",
+                WdaError::InvalidRequest(_) => "invalid_request",
+            },
+        }
+    }
+
+    fn response(endpoint: &'static str, response: HttpResponse) -> Result<Value, Self> {
+        if response.status != 200 {
+            return Err(Self {
+                endpoint,
+                reason: "http_status",
+            });
+        }
+        response_ok(response).map_err(|_| Self {
+            endpoint,
+            reason: "invalid_payload",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoordinateTapError {
     Http404,
     ReceiptUnproven,
@@ -62,6 +97,15 @@ impl WdaActions {
     }
 
     async fn validate_existing(&mut self, wda: &impl WdaRequest) -> Result<(), AdapterError> {
+        self.validate_existing_diagnostic(wda)
+            .await
+            .map_err(|_| AdapterError)
+    }
+
+    pub(crate) async fn validate_existing_diagnostic(
+        &mut self,
+        wda: &impl WdaRequest,
+    ) -> Result<(), SessionValidationError> {
         let status = wda.request("GET", "/status", b"", Duration::from_secs(10));
         let (response, validation) = if let Some(id) = self.session.as_deref() {
             let path = format!("/session/{id}");
@@ -73,14 +117,24 @@ impl WdaActions {
         } else {
             (status.await, None)
         };
-        let response = response.map_err(|_| AdapterError)?;
-        let json = response_ok(response)?;
-        let id = json["sessionId"].as_str().ok_or(AdapterError)?;
+        let response =
+            response.map_err(|error| SessionValidationError::transport("status", error))?;
+        let json = SessionValidationError::response("status", response)?;
+        let id = json["sessionId"].as_str().ok_or(SessionValidationError {
+            endpoint: "status",
+            reason: "missing_session_id",
+        })?;
         if !valid_session_id(id) {
-            return Err(AdapterError);
+            return Err(SessionValidationError {
+                endpoint: "status",
+                reason: "invalid_session_id",
+            });
         }
         if self.session.as_ref().is_some_and(|current| current != id) {
-            return Err(AdapterError);
+            return Err(SessionValidationError {
+                endpoint: "status",
+                reason: "session_mismatch",
+            });
         }
         let path = format!("/session/{id}");
         let validation = match validation {
@@ -90,8 +144,8 @@ impl WdaActions {
                     .await
             }
         }
-        .map_err(|_| AdapterError)?;
-        response_ok(validation)?;
+        .map_err(|error| SessionValidationError::transport("session", error))?;
+        SessionValidationError::response("session", validation)?;
         self.session = Some(id.into());
         Ok(())
     }
@@ -464,6 +518,95 @@ mod tests {
                 json!({"value": null}),
             ),
         ]
+    }
+
+    #[tokio::test]
+    async fn session_diagnostics_identify_failed_read_without_retry_or_rebinding() {
+        let failures = [
+            (WdaError::ExpiredBeforeSend, "expired_before_send"),
+            (WdaError::AfterSent, "failed_after_send"),
+            (WdaError::TimedOutAfterSent, "timed_out_after_send"),
+            (WdaError::NotConnected, "not_connected"),
+            (WdaError::Usb(crate::usb::UsbError::Unavailable), "usb"),
+            (
+                WdaError::InvalidRequest(crate::wda_http::HttpError::InvalidRequest),
+                "invalid_request",
+            ),
+        ];
+        for endpoint in ["status", "session"] {
+            for (failure, reason) in failures {
+                let mut steps = valid_action();
+                steps.pop();
+                steps[usize::from(endpoint == "session")].response = Err(failure);
+                let script = Script::new(steps);
+                let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+                assert_eq!(
+                    actions.validate_existing_diagnostic(&script).await,
+                    Err(SessionValidationError { endpoint, reason })
+                );
+                assert!(actions.prepared_session_matches("fixture-session"));
+                script.done();
+            }
+            for (status, body, reason) in [
+                (503, b"{}".as_slice(), "http_status"),
+                (200, b"invalid-json".as_slice(), "invalid_payload"),
+                (
+                    200,
+                    br#"{"value":{"error":"fixture"}}"#.as_slice(),
+                    "invalid_payload",
+                ),
+            ] {
+                let mut steps = valid_action();
+                steps.pop();
+                steps[usize::from(endpoint == "session")].response = Ok(HttpResponse {
+                    status,
+                    body: body.to_vec(),
+                });
+                let script = Script::new(steps);
+                let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+                assert_eq!(
+                    actions.validate_existing_diagnostic(&script).await,
+                    Err(SessionValidationError { endpoint, reason })
+                );
+                assert!(actions.prepared_session_matches("fixture-session"));
+                script.done();
+            }
+        }
+        for (id, reason) in [
+            (Value::Null, "missing_session_id"),
+            (json!(""), "invalid_session_id"),
+            (json!("different-session"), "session_mismatch"),
+        ] {
+            let script = Script::new(vec![
+                status(id),
+                response("GET", "/session/fixture-session", 200, json!({"value": {}})),
+            ]);
+            let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+            assert_eq!(
+                actions.validate_existing_diagnostic(&script).await,
+                Err(SessionValidationError {
+                    endpoint: "status",
+                    reason
+                })
+            );
+            assert!(actions.prepared_session_matches("fixture-session"));
+            script.done();
+        }
+        let mut steps = valid_action();
+        steps.pop();
+        for step in &mut steps {
+            step.response = Err(WdaError::ExpiredBeforeSend);
+        }
+        let script = Script::new(steps);
+        let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
+        assert_eq!(
+            actions.validate_existing_diagnostic(&script).await,
+            Err(SessionValidationError {
+                endpoint: "status",
+                reason: "expired_before_send"
+            })
+        );
+        script.done();
     }
 
     #[tokio::test(start_paused = true)]

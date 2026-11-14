@@ -665,6 +665,14 @@ class PureTests(unittest.TestCase):
         self.assertEqual(broker.pin_diagnostic(result)["phase"], "final_confirmation")
         self.assertEqual(broker.pin_result(result), (False, False))
 
+    def test_wake_admission_checkpoints_keep_unknown_outcome(self):
+        for step in ("input_admission", "session_match"):
+            result = (1, b"", ("handkite-unlock-once: unlock_idle=unknown "
+                      "reason=backend_unavailable action=backend_unavailable restoration=verified "
+                      f"phase=wake_admission step={step}\n").encode(), False)
+            self.assertEqual(broker.pin_diagnostic(result)["step"], step)
+            self.assertEqual(broker.pin_result(result), (False, False))
+
     def test_runner_startup_reasons_are_safe_known_zero_results(self):
         prefix = b"handkite-unlock-once: unlock_idle=refused reason=runner_unavailable runner="
         self.assertTrue({"AutomationAuthorizationRequired", "AutomationInitializationFailed",
