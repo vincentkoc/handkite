@@ -578,6 +578,9 @@ class Campaign:
                 call = self.step({"tool": "handkite_observe"})
                 current = (self.screen["metadata"]["device"], self.screen["metadata"]["state"],
                            self.screen["tree"], self.screen["image_digest"])
+                if previous is not None:
+                    call["settle_changed"] = {key: left != right for key, left, right in
+                                              zip(("device", "state", "tree", "image"), previous, current)}
                 if current == previous:
                     require(matches(self.screen, step.get("expect")), "effect_mismatch")
                     return call

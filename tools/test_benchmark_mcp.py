@@ -103,7 +103,9 @@ class BenchmarkTests(unittest.TestCase):
                 else:
                     result["content"][1]["data"] = base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes([value])).decode()
                 result["content"][0]["text"] = json.dumps(payload)
-                return result, {"tool":name}
+                call = {"tool":name}
+                self.last_call = call
+                return result, call
             @staticmethod
             def assert_read(name):
                 if name != "handkite_observe":
@@ -119,6 +121,9 @@ class BenchmarkTests(unittest.TestCase):
                     with self.assertRaisesRegex(BenchError, "view_unsettled"):
                         campaign.step({"tool":"handkite_observe", "settle":3})
                 self.assertEqual(peer.calls, ["handkite_observe"] * 3)
+                self.assertEqual(peer.last_call["settle_changed"], {
+                    key: key == dimension and changes[-1] != changes[-2]
+                    for key in ("device", "state", "tree", "image")})
 
     def test_settle_cannot_hide_input_or_expand_a_measured_request(self):
         for tool, count in (("handkite_swipe", 3), ("handkite_observe", 4), ("handkite_observe", True)):
