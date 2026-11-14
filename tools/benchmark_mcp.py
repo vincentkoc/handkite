@@ -651,18 +651,33 @@ class Campaign:
             arguments["target"] = dict(rect, label=target.get("label", ""))
         previous = self.screen
         result, call = self.peer.tool(tool, arguments)
+        if tool in ACTIONS:
+            receipt = {}
+            for item in result.get("content", []):
+                if item.get("type") == "text":
+                    try:
+                        value = decode(item["text"])
+                    except BenchError:
+                        break
+                    if isinstance(value, dict):
+                        receipt = value
+                    break
+            transport = receipt.get("receipt")
+            accepted = transport.get("accepted") if isinstance(transport, dict) else None
+            effect = receipt.get("effect")
+            # Keep fixed receipt facts even when a failed capture makes isError true.
+            call["action_result"] = {
+                "accepted": accepted if type(accepted) is bool else None,
+                "effect": effect if effect in ("changed", "lock_confirmed", "unconfirmed") else None,
+                "observed": receipt.get("after_image" if image_only else "after") is not None,
+            }
         if result.get("isError") is True:
             code = result.get("structuredContent", {}).get("code")
             if code in ERROR_CODES:
                 raise BenchError(code)
             raise BenchError("action_unconfirmed" if tool in ACTIONS else "tool_error")
         if tool in ACTIONS:
-            texts = [decode(item["text"]) for item in result.get("content", [])
-                     if item.get("type") == "text"]
-            receipt = texts[0] if texts else {}
-            require(receipt.get("receipt", {}).get("accepted") is True
-                    and receipt.get("effect") == "changed"
-                    and receipt.get("after_image" if image_only else "after") is not None,
+            require(call["action_result"] == {"accepted": True, "effect": "changed", "observed": True},
                     "action_unconfirmed")
         self.screen = parse_screen(result)
         require((self.screen["capture_kind"] == "image_only") == image_only, "wrong_capture_mode")

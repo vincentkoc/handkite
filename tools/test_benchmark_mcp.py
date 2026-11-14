@@ -412,7 +412,9 @@ for line in sys.stdin:
                         "tool": name, "elapsed_ms": 1, "response_bytes": 100}
                 self.calls.append(call)
                 if name == "handkite_tap":
-                    return {"isError": True, "content": []}, call
+                    return {"isError": True, "content": [{"type": "text", "text": json.dumps({
+                        "receipt": {"accepted": True}, "effect": "unconfirmed", "after": None,
+                        "private_error": "must not be retained"})}]}, call
                 return screen_result(), call
 
         peer = FakePeer()
@@ -427,6 +429,9 @@ for line in sys.stdin:
         self.assertEqual(campaign.samples[0]["outcome"], "action_unconfirmed")
         self.assertEqual(campaign.failure_context["phase"], "measure")
         self.assertEqual(campaign.failure_context["call"]["tool"], "handkite_tap")
+        self.assertEqual(campaign.failure_context["call"]["action_result"],
+                         {"accepted": True, "effect": "unconfirmed", "observed": False})
+        self.assertNotIn("must not be retained", json.dumps(campaign.failure_context))
 
     def test_prepare_failure_keeps_its_step_and_call(self):
         class FakePeer:
