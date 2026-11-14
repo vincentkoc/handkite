@@ -261,6 +261,13 @@ malformed or oversized XML returns the original full tree with a fixed fallback
 reason. This adds no actionable element IDs. See the
 [compact tree contract](RELEASE.md#compact-observation-presentation).
 
+Set `"image":"omit"` on an observation to receive its tree and metadata without
+an image attachment. Actions accept the same presentation options in a
+`"response"` object, for example `{"tree_format":"compact","image":"omit"}`.
+These options only reduce the agent response; the host retains its full capture
+and normal action checks. Omission means the image was not returned, not that
+the screen was unchanged. Default responses still include the full tree and image.
+
 `handkite-mcp --service` derives the device key from the protected fixed host
 config and the socket from the effective account's fixed service layout. It does
 not accept a caller-selected device or socket in this mode. This is the preferred

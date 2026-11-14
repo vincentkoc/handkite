@@ -1,4 +1,5 @@
 use super::catalog::Tool;
+use super::presentation;
 use handkite_core::protocol::{Action, ButtonTarget, KeyboardKey, Point, Revision};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -6,6 +7,8 @@ use serde_json::{Value, json};
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RevisionOnly {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
 }
 
@@ -34,6 +37,8 @@ impl ScreenPoint {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TapArguments {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
     at: ScreenPoint,
 }
@@ -41,6 +46,8 @@ struct TapArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ButtonArguments {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
     target: ButtonTarget,
 }
@@ -48,6 +55,8 @@ struct ButtonArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LongPressArguments {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
     at: ScreenPoint,
     duration_ms: u32,
@@ -56,6 +65,8 @@ struct LongPressArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct KeyArguments {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
     key: KeyboardKey,
     selection: Option<KeySelection>,
@@ -70,6 +81,8 @@ enum KeySelection {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SwipeArguments {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
     from: ScreenPoint,
     to: ScreenPoint,
@@ -79,6 +92,8 @@ struct SwipeArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TextArguments {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
     value: String,
 }
@@ -86,8 +101,26 @@ struct TextArguments {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LaunchArguments {
+    #[serde(default, rename = "response")]
+    _response: presentation::Options,
     expected_revision: Revision,
     bundle_id: String,
+}
+
+pub(super) fn parse_response(
+    tool: Tool,
+    mut value: Value,
+) -> Result<(Revision, Action, presentation::Options), ()> {
+    let options = value
+        .as_object_mut()
+        .ok_or(())?
+        .remove("response")
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|_| ())?
+        .unwrap_or_default();
+    let (revision, action) = parse(tool, value)?;
+    Ok((revision, action, options))
 }
 
 pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> {
@@ -226,6 +259,7 @@ pub(super) fn schema(tool: Tool) -> Value {
         "required":["x","y"],"additionalProperties":false});
     let mut properties = serde_json::Map::new();
     properties.insert("expected_revision".into(), revision);
+    properties.insert("response".into(), presentation::schema());
     let mut required = vec!["expected_revision"];
     match tool {
         Tool::ClickButton => {

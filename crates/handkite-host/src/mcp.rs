@@ -9,6 +9,7 @@ use std::io::{self, BufRead, Write};
 mod catalog;
 mod compact;
 mod interaction;
+mod presentation;
 mod response;
 mod session;
 pub use catalog::Capabilities;
@@ -125,10 +126,15 @@ fn encode_response(mut response: Value) -> io::Result<Vec<u8>> {
         return Ok(bytes);
     }
     let result = &mut response["result"];
-    if let Some(content) = result["content"]
-        .as_array_mut()
-        .filter(|items| items.len() == 3)
-    {
+    if let Some(content) = result["content"].as_array_mut().filter(|items| {
+        items.len() >= 2
+            && items.first().is_some_and(|item| {
+                item["text"]
+                    .as_str()
+                    .and_then(|text| serde_json::from_str::<Value>(text).ok())
+                    .is_some_and(|payload| payload.get("receipt").is_some())
+            })
+    }) {
         // Action replies put the receipt first, followed by the optional tree/image.
         // Preserve known delivery even when that screen cannot fit in one frame.
         content.truncate(1);
@@ -186,7 +192,9 @@ where
                 return Some(error(id, -32602, "unknown or unauthorized tool"));
             };
             if tool.is_action() {
-                let Ok((revision, action)) = interaction::parse(tool, params.arguments) else {
+                let Ok((revision, action, options)) =
+                    interaction::parse_response(tool, params.arguments)
+                else {
                     return Some(error(id, -32602, "invalid action arguments"));
                 };
                 session.act(
@@ -194,10 +202,11 @@ where
                     revision,
                     action,
                     Tool::Observe.allowed(capabilities),
+                    options,
                     exchange,
                 )
             } else {
-                let compact = if tool == Tool::Observe {
+                let options = if tool == Tool::Observe {
                     if !params.arguments.is_object() {
                         return Some(error(id, -32602, "invalid observation arguments"));
                     }
@@ -205,7 +214,7 @@ where
                     else {
                         return Some(error(id, -32602, "invalid observation arguments"));
                     };
-                    args.tree_format
+                    args
                 } else if !params
                     .arguments
                     .as_object()
@@ -213,10 +222,10 @@ where
                 {
                     return Some(error(id, -32602, "tool arguments must be empty"));
                 } else {
-                    false
+                    presentation::Options::default()
                 };
                 match tool {
-                    Tool::Status | Tool::Observe => tool_result(tool, compact, device, exchange),
+                    Tool::Status | Tool::Observe => tool_result(tool, options, device, exchange),
                     Tool::Acquire => session.acquire(exchange),
                     Tool::Release => session.release(exchange),
                     _ => unreachable!(),
@@ -236,21 +245,7 @@ struct ToolCall {
     arguments: Value,
 }
 
-#[derive(Default, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ObserveArguments {
-    #[serde(default, deserialize_with = "compact_only")]
-    tree_format: bool,
-}
-
-fn compact_only<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<bool, D::Error> {
-    let value = String::deserialize(deserializer)?;
-    if value == "compact" {
-        Ok(true)
-    } else {
-        Err(serde::de::Error::custom("invalid tree format"))
-    }
-}
+type ObserveArguments = presentation::Options;
 
 fn present_arguments<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -302,7 +297,12 @@ fn empty_arguments() -> Value {
     json!({})
 }
 
-fn tool_result<F>(tool: Tool, compact: bool, device: &DeviceKey, exchange: &mut F) -> Value
+fn tool_result<F>(
+    tool: Tool,
+    options: presentation::Options,
+    device: &DeviceKey,
+    exchange: &mut F,
+) -> Value
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
@@ -336,11 +336,7 @@ where
             "DeviceMismatch",
         );
     }
-    let content = if compact {
-        response::compact_observation_content(observation)
-    } else {
-        response::observation_content(observation)
-    };
+    let content = presentation::content(observation, options);
     json!({"content": content})
 }
 

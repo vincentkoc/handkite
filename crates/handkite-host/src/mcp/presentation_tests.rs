@@ -113,6 +113,36 @@ fn fallback_keeps_the_same_full_tree_and_image() {
 }
 
 #[test]
+fn image_omission_keeps_fresh_metadata_and_tree_without_another_exchange() {
+    let tree = "<AppiumAUT><XCUIElementTypeButton label='Close'/></AppiumAUT>";
+    let capture = captured(tree, "png");
+    let reply = call(
+        &request(json!({"tree_format":"compact","image":"omit"})),
+        &capture,
+    );
+    assert_eq!(reply["result"]["content"].as_array().unwrap().len(), 1);
+    let screen = payload(&reply);
+    assert_eq!(screen["metadata"]["revision"], 3);
+    assert_eq!(
+        screen["accessibility_tree"],
+        "<AppiumAUT><Button label='Close'/></AppiumAUT>"
+    );
+    assert_eq!(
+        screen["image"],
+        json!({"included":false,"reason":"requested"})
+    );
+    for options in [
+        json!({"image":null}),
+        json!({"image":"auto"}),
+        json!({"image":false}),
+    ] {
+        assert!(!valid_tool_frame(
+            &serde_json::to_vec(&request(options)).unwrap()
+        ));
+    }
+}
+
+#[test]
 fn strict_arguments_refuse_before_exchange_in_both_validators() {
     let device = DeviceKey::new("phone").unwrap();
     for args in [
@@ -120,7 +150,7 @@ fn strict_arguments_refuse_before_exchange_in_both_validators() {
         json!([]),
         json!({"tree_format":null}),
         json!({"tree_format":true}),
-        json!({"tree_format":"full"}),
+        json!({"tree_format":"unknown"}),
         json!({"tree_format":"compact","extra":1}),
     ] {
         let request = request(args);
@@ -208,7 +238,7 @@ fn catalog_exposes_only_optional_compact_on_observe() {
         .unwrap()["inputSchema"];
     assert_eq!(
         schema["properties"]["tree_format"]["enum"],
-        json!(["compact"])
+        json!(["full", "compact"])
     );
     assert_eq!(schema["additionalProperties"], false);
     assert!(schema.get("required").is_none());

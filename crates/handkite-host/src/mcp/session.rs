@@ -1,5 +1,5 @@
-use super::response::{exchange_reply, metadata, observation_content, text_result};
-use super::tool_error;
+use super::response::{exchange_reply, metadata, text_result};
+use super::{presentation, tool_error};
 use crate::wire::Reply;
 use handkite_core::controller::LeaseId;
 use handkite_core::protocol::{Action, DeviceKey, ObservedEffect, Revision};
@@ -87,6 +87,7 @@ impl Session {
         revision: Revision,
         action: Action,
         include_observation: bool,
+        options: presentation::Options,
         exchange: &mut F,
     ) -> Value
     where
@@ -128,7 +129,7 @@ impl Session {
                     result["content"]
                         .as_array_mut()
                         .expect("text result has a content array")
-                        .extend(observation_content(observation));
+                        .extend(presentation::content(observation, options));
                 }
                 result
             }

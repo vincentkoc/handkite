@@ -48,32 +48,41 @@ pub(super) fn with_service_code(mut result: Value, code: &str) -> Value {
 }
 
 pub(super) fn observation_content(observation: WireObservation) -> Vec<Value> {
-    let metadata = metadata(&observation);
-    let mime = match observation.screenshot_format {
-        ImageFormat::Png => "image/png",
-        ImageFormat::Jpeg => "image/jpeg",
-    };
-    vec![
-        json!({"type": "text", "text": json!({"metadata": metadata,
-            "accessibility_tree": observation.accessibility_tree}).to_string()}),
-        json!({"type": "image", "data": observation.screenshot_base64, "mimeType": mime}),
-    ]
+    selected_observation_content(observation, false, true)
 }
 
 pub(super) fn compact_observation_content(observation: WireObservation) -> Vec<Value> {
+    selected_observation_content(observation, true, true)
+}
+
+pub(super) fn selected_observation_content(
+    observation: WireObservation,
+    compact: bool,
+    include_image: bool,
+) -> Vec<Value> {
     let metadata = metadata(&observation);
-    let (tree, format, reason) = match super::compact::project(&observation.accessibility_tree) {
-        Ok(tree) => (tree, "compact", "requested"),
-        Err(reason) => (observation.accessibility_tree, "full", reason.reason()),
+    let mut payload = if compact {
+        let (tree, format, reason) = match super::compact::project(&observation.accessibility_tree)
+        {
+            Ok(tree) => (tree, "compact", "requested"),
+            Err(reason) => (observation.accessibility_tree, "full", reason.reason()),
+        };
+        json!({"metadata":metadata, "accessibility_tree":tree,
+            "tree_format":format, "tree_format_version":1, "tree_format_reason":reason})
+    } else {
+        json!({"metadata":metadata, "accessibility_tree":observation.accessibility_tree})
     };
-    let mime = match observation.screenshot_format {
-        ImageFormat::Png => "image/png",
-        ImageFormat::Jpeg => "image/jpeg",
-    };
-    vec![
-        json!({"type":"text", "text":json!({"metadata":metadata,
-            "accessibility_tree":tree, "tree_format":format, "tree_format_version":1,
-            "tree_format_reason":reason}).to_string()}),
-        json!({"type":"image", "data":observation.screenshot_base64, "mimeType":mime}),
-    ]
+    if !include_image {
+        payload["image"] = json!({"included":false,"reason":"requested"});
+    }
+    let mut content = vec![json!({"type":"text", "text":payload.to_string()})];
+    if include_image {
+        let mime = match observation.screenshot_format {
+            ImageFormat::Png => "image/png",
+            ImageFormat::Jpeg => "image/jpeg",
+        };
+        content
+            .push(json!({"type":"image", "data":observation.screenshot_base64, "mimeType":mime}));
+    }
+    content
 }

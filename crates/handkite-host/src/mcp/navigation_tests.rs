@@ -553,6 +553,44 @@ fn socket_transcript_returns_post_action_screen_without_another_observation() {
 }
 
 #[test]
+fn action_response_options_do_not_change_device_requests_or_receipts() {
+    let mut fixture = SocketFixture::new();
+    let input = frames(&[
+        call("handkite_status", json!({})),
+        call("handkite_acquire_control", json!({})),
+        call(
+            "handkite_launch_clock",
+            json!({"expected_revision":1,
+            "response":{"tree_format":"compact","image":"omit"}}),
+        ),
+        call("handkite_release_control", json!({})),
+    ]);
+    let (result, output) = fixture.transcript(&input, Capabilities::ObservationAndNavigation);
+    result.unwrap();
+    let replies: Vec<Value> = output
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice(line).unwrap())
+        .collect();
+    assert_eq!(payload(&replies[2])["receipt"]["accepted"], true);
+    let content = replies[2]["result"]["content"].as_array().unwrap();
+    assert_eq!(content.len(), 2);
+    let screen: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(screen["metadata"], payload(&replies[2])["after"]);
+    assert_eq!(screen["image"]["reason"], "requested");
+    assert_eq!(fixture.state.lock().unwrap().actions, ["launch_app"]);
+    assert_eq!(
+        fixture
+            .requests
+            .iter()
+            .map(|r| r["method"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["status", "acquire", "act", "release"]
+    );
+    assert!(fixture.requests.iter().all(|r| r.get("response").is_none()));
+}
+
+#[test]
 fn competing_sessions_are_busy_until_explicit_release() {
     let mut fixture = SocketFixture::new();
     let mut first = Session::default();
@@ -645,10 +683,17 @@ fn view_change_diagnostics_are_typed_and_do_not_forward_private_fields() {
             .unwrap())
         });
         let mut calls = 0;
-        let result = session.act(&device(), Revision(1), Action::Home, true, &mut |_| {
-            calls += 1;
-            Ok(serde_json::to_vec(&json!({"type":"view_changed","changed":changed})).unwrap())
-        });
+        let result = session.act(
+            &device(),
+            Revision(1),
+            Action::Home,
+            true,
+            presentation::Options::default(),
+            &mut |_| {
+                calls += 1;
+                Ok(serde_json::to_vec(&json!({"type":"view_changed","changed":changed})).unwrap())
+            },
+        );
         assert_eq!(calls, 1);
         assert_eq!(result["isError"], true);
         if valid {
@@ -1015,7 +1060,14 @@ fn unexpected_service_replies_cannot_disclose_tokens() {
     let mut exchange = |_: &[u8]| Ok(serde_json::to_vec(&replies.next().unwrap()).unwrap());
     let mut outputs = vec![session.acquire(&mut exchange)];
     for _ in 0..3 {
-        outputs.push(session.act(&device(), Revision(1), Action::Home, true, &mut exchange));
+        outputs.push(session.act(
+            &device(),
+            Revision(1),
+            Action::Home,
+            true,
+            presentation::Options::default(),
+            &mut exchange,
+        ));
     }
     outputs.push(session.release(&mut exchange));
     assert!(outputs[1..4].iter().all(|reply| reply["isError"] == true));
