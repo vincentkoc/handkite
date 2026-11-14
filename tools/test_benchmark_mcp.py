@@ -9,7 +9,7 @@ import unittest
 from types import SimpleNamespace
 
 from benchmark_mcp import (BenchError, Campaign, CASES, Peer, compare, elements,
-                           operation_stages, parse_screen, quantiles, summarize, merge_reports, reference_report,
+                           operation_stages, parse_screen, quantiles, summarize, merge_reports, reference_report, extract_report,
                            trace_rows, correlate_prefix, attach_stages, validate_plan, validate_measured_stages,
                            validate_client_stages, CAPTURE_NAMES, matches)
 
@@ -48,6 +48,54 @@ def image_result(action=False):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_extract_requires_whole_completed_cases_and_keeps_parent_failure(self):
+        rows = [{"case": case, "ordinal": n, "warmup": False, "outcome": "pass",
+                 "elapsed_ms": 10, "cleanup_ms": 1, "fixture_verification_ms": 2,
+                 "trace_valid": True, "capture_kind": "image_only",
+                 "stages_ms": {"span.service_request.work": 9}}
+                for case in ("tap", "type") for n in range(1, 21)]
+        parent = {"version": 1, "calibration": False, "trace_valid": True, "trace_error": None,
+                  "failure": "effect_mismatch", "failure_context": {"case": "swipe", "phase": "prepare"},
+                  "selected_cases": list(CASES), "samples": rows, "summary": summarize(rows),
+                  "capture_mode": "image_only", "service_pid": 123,
+                  "plan_sha256": "a" * 64, "service_build": "b" * 40, "client_build": "b" * 40}
+        extracted = extract_report(parent, "d" * 64, ["tap", "type"])
+        self.assertEqual(extracted["failure"], None)
+        self.assertEqual(extracted["extraction"], {"source_sha256": "d" * 64,
+                         "parent_failure": "effect_mismatch", "parent_phase": "prepare", "parent_case": "swipe"})
+        self.assertEqual(parent["failure"], "effect_mismatch")
+        self.assertEqual(extracted["summary"]["swipe"]["attempts"], 0)
+        for key, value in (("trace_valid", False), ("trace_error", "service_correlation_mismatch")):
+            with self.assertRaises(BenchError):
+                extract_report(dict(parent, **{key: value}), "d" * 64, ["tap"])
+        invalid = copy.deepcopy(parent)
+        invalid["failure_context"]["case"] = "tap"
+        with self.assertRaises(BenchError):
+            extract_report(invalid, "d" * 64, ["tap"])
+        for key, value in (("outcome", "action_unconfirmed"), ("trace_valid", False),
+                           ("ordinal", 2), ("cleanup_ms", None), ("fixture_verification_ms", None),
+                           ("capture_kind", "paired")):
+            invalid = copy.deepcopy(parent)
+            invalid["samples"][0][key] = value
+            with self.assertRaises(BenchError):
+                extract_report(invalid, "d" * 64, ["tap"])
+        with self.assertRaises(BenchError):
+            extract_report(parent, "d" * 64, ["swipe"])
+        for warmup in (True, False):
+            invalid = copy.deepcopy(parent)
+            invalid["samples"].append(dict(rows[0], ordinal=21, warmup=warmup, outcome="tool_error"))
+            with self.assertRaises(BenchError):
+                extract_report(invalid, "d" * 64, ["tap"])
+        remaining = copy.deepcopy(extracted)
+        remaining.pop("extraction")
+        remaining["selected_cases"] = [case for case in CASES if case not in ("tap", "type")]
+        remaining["samples"] = [dict(rows[0], case=case, ordinal=n)
+                                for case in remaining["selected_cases"] for n in range(1, 21)]
+        remaining["summary"] = summarize(remaining["samples"])
+        merged = merge_reports([(extracted, "e" * 64), (remaining, "f" * 64)])
+        self.assertEqual(merged["cohorts"][0]["extraction"], extracted["extraction"])
+        self.assertEqual(compare(merged, merged), [])
+
     def test_terminal_disconnect_keeps_completed_sample_stages_without_passing_campaign(self):
         names = ("service_request", "service_serialization", "service_write", "controller_dispatch",
                  "wire_image_encode", "wda_read_request", "usb_discovery", "usb_connect",

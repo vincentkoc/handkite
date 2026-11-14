@@ -452,12 +452,73 @@ def merge_reports(parts):
                     for case in selected), "incomplete_cohort")
         seen.update(selected)
         samples.extend(dict(row, cohort=len(cohorts)) for row in rows)
-        cohorts.append({"sha256": digest, "selected_cases": selected})
+        cohort = {"sha256": digest, "selected_cases": selected}
+        if "extraction" in report:
+            validate_extraction(report["extraction"])
+            cohort["extraction"] = report["extraction"]
+        cohorts.append(cohort)
     require(seen == set(CASES), "missing_cohorts")
     return dict(identity, version=1, calibration=False, selected_cases=list(CASES), capture_mode=capture_mode,
                 trace_valid=True, trace_kind="validated_cohorts", trace_error=None,
                 failure=None, failure_context=None, cohorts=cohorts,
                 samples=samples, summary=summarize(samples))
+
+
+def validate_extraction(value):
+    failures = ERROR_CODES | {"effect_mismatch", "view_unsettled", "action_unconfirmed", "tool_error"}
+    require(isinstance(value, dict)
+            and set(value) == {"source_sha256", "parent_failure", "parent_phase", "parent_case"}
+            and isinstance(value["source_sha256"], str) and len(value["source_sha256"]) == 64
+            and all(c in "0123456789abcdef" for c in value["source_sha256"])
+            and (value["parent_failure"] is None
+                 or isinstance(value["parent_failure"], str) and value["parent_failure"] in failures)
+            and value["parent_phase"] in (None, "prepare", "measure", "fixture_verification", "cleanup")
+            and value["parent_case"] in (None, *CASES), "invalid_extraction_provenance")
+
+
+def extract_report(report, digest, selected):
+    """Retain whole completed cases, without accepting an incomplete trace."""
+    require(report.get("version") == 1 and report.get("trace_valid") is True
+            and report.get("trace_error") is None and report.get("calibration") is False
+            and not report.get("cohorts") and not report.get("extraction"), "incomplete_cohort")
+    require(bool(selected) and len(selected) == len(set(selected)) and set(selected) <= set(CASES)
+            and set(selected) <= set(report.get("selected_cases", [])), "invalid_selected_cases")
+    mode = report.get("capture_mode", "paired")
+    require(mode in ("paired", "image_only") and type(report.get("service_pid")) is int
+            and report["service_pid"] > 0, "invalid_cohort_identity")
+    for key, lengths in (("plan_sha256", (64,)), ("service_build", (40, 64)), ("client_build", (40, 64))):
+        value = report.get(key)
+        require(isinstance(value, str) and len(value) in lengths
+                and all(c in "0123456789abcdef" for c in value), "invalid_cohort_identity")
+    context = report.get("failure_context") or {}
+    require(isinstance(context, dict), "invalid_extraction_provenance")
+    provenance = {"source_sha256": digest, "parent_failure": report.get("failure"),
+                  "parent_phase": context.get("phase"), "parent_case": context.get("case")}
+    validate_extraction(provenance)
+    require(report.get("failure") is None or context.get("case") not in selected,
+            "failed_selected_case")
+    rows = [dict(row) for row in report["samples"] if row.get("case") in selected]
+    for case in selected:
+        case_rows = [row for row in rows if row["case"] == case]
+        measured = [row for row in case_rows if not row.get("warmup")]
+        ordinals = [row.get("ordinal") for row in measured]
+        require(len(measured) >= 20 and all(type(n) is int for n in ordinals)
+                and sorted(ordinals) == list(range(1, len(measured) + 1)), "incomplete_cohort")
+        for row in case_rows:
+            kind = "image_only" if mode == "image_only" and case != "observe_tree" else "paired"
+            durations = [row.get("cleanup_ms")]
+            if kind == "image_only":
+                durations.append(row.get("fixture_verification_ms"))
+            require(row.get("outcome") == "pass" and row.get("trace_valid") is True
+                    and row.get("capture_kind") == kind
+                    and bool(row.get("stages_ms"))
+                    and all(type(n) in (int, float) and math.isfinite(n) and n >= 0 for n in durations),
+                    "incomplete_cohort")
+    identity = {key: report[key] for key in ("plan_sha256", "service_build", "client_build", "service_pid")}
+    return dict(identity, version=1, calibration=False, selected_cases=[case for case in CASES if case in selected],
+                capture_mode=mode, trace_valid=True,
+                trace_kind="validated_completed_cohort", trace_error=None, failure=None,
+                failure_context=None, extraction=provenance, samples=rows, summary=summarize(rows))
 
 
 def reference_report(report, digest):
@@ -863,6 +924,10 @@ def main():
     reference = commands.add_parser("reference")
     reference.add_argument("report", type=Path)
     reference.add_argument("--output", type=Path, required=True)
+    extract = commands.add_parser("extract")
+    extract.add_argument("report", type=Path)
+    extract.add_argument("--output", type=Path, required=True)
+    extract.add_argument("--cases", nargs="+", choices=CASES, required=True)
     args = parser.parse_args()
     if args.mode == "compare":
         before, after = decode(args.before.read_bytes()), decode(args.after.read_bytes())
@@ -882,6 +947,12 @@ def main():
         result = reference_report(decode(raw), hashlib.sha256(raw).hexdigest())
         write_report(args.output, result)
         print(json.dumps({"complete": True, "cases": len(result["summary"])}))
+        return 0
+    if args.mode == "extract":
+        raw = args.report.read_bytes()
+        result = extract_report(decode(raw), hashlib.sha256(raw).hexdigest(), args.cases)
+        write_report(args.output, result)
+        print(json.dumps({"complete": True, "selected_cases": result["selected_cases"]}))
         return 0
     require(20 <= args.count <= 100 and 0 <= args.warmups <= 5, "invalid_sample_count")
     if args.calibrate:

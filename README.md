@@ -530,6 +530,14 @@ The merge requires every case to pass twenty trials, preserves each report's
 hash, and rejects overlapping cases, mixed builds or process generations,
 failed runs and calibration. It does not concatenate unrelated trace streams.
 
+If a later case stops during preparation, completed cases can be retained with
+`benchmark_mcp.py extract stopped.json --cases tap type --output completed.json`.
+Extraction requires a globally valid trace and every selected trial's full
+verification and cleanup. It preserves the parent hash and failure in the
+cohort's provenance; it does not turn the stopped parent into a passing run.
+Invalid traces and incomplete cases cannot be extracted. The cohort can then
+be merged with disjoint passing cases from the same service generation.
+
 Use `benchmark_mcp.py reference complete.json --output reference.json` to retain
 only a complete run's metrics, source hashes and plan identity for later
 `compare` calls. This omits process IDs, individual calls and sample context;
