@@ -332,10 +332,14 @@ def parse_screen(result):
                    and "metadata" in value), None)
     require(screen is not None, "missing_observation")
     metadata = screen["metadata"]
-    require(isinstance(metadata, dict) and type(metadata.get("revision")) is int and metadata["revision"] >= 0
-            and isinstance(metadata.get("device"), str), "invalid_observation")
-    state = metadata.get("state")
-    require(isinstance(state, dict) and state.get("wda_ready") is True, "not_ready")
+    image_only = screen.get("capture_kind") == "image_only"
+    require(isinstance(metadata, dict) and isinstance(metadata.get("device"), str), "invalid_observation")
+    if image_only:
+        require(set(metadata) == {"device", "window"}, "fabricated_image_metadata")
+    else:
+        require(type(metadata.get("revision")) is int and metadata["revision"] >= 0, "invalid_observation")
+        state = metadata.get("state")
+        require(isinstance(state, dict) and state.get("wda_ready") is True, "not_ready")
     window = metadata.get("window")
     require(isinstance(window, dict)
             and type(window.get("started_unix_ms")) is int
@@ -354,10 +358,11 @@ def parse_screen(result):
     if tree is None:
         marker = screen.get("tree")
         require(isinstance(marker, dict) and marker.get("included") is False
-                and marker.get("reason") == "requested"
+                and marker.get("reason") == ("not_captured" if image_only else "requested")
                 and not any(key in screen for key in ("accessibility_tree_delta", "tree_format"))
                 and screen.get("capture_kind") in ("paired", "image_only"), "missing_tree")
     else:
+        require(not image_only, "fabricated_image_tree")
         require(isinstance(tree, str) and 0 < len(tree) <= 2 * 1024 * 1024
                 and "<!DOCTYPE" not in tree and "<!ENTITY" not in tree, "invalid_tree")
     return {"metadata": metadata, "tree": tree, "capture_kind": screen.get("capture_kind", "paired"),
@@ -396,6 +401,9 @@ def summarize(samples):
                         "stages_ms": {name: quantiles(values) for name, values in stages.items()},
                         "pre_tree_reuses": sum(row.get("pre_tree_reused") is True for row in passed),
                         "budget_ms": BUDGETS_MS[case]}
+        verification = [row["fixture_verification_ms"] for row in passed if "fixture_verification_ms" in row]
+        if verification:
+            result[case]["fixture_verification_ms"] = quantiles(verification)
     return result
 
 
@@ -423,6 +431,7 @@ def merge_reports(parts):
     require(len(parts) >= 2, "missing_cohorts")
     identity_keys = ("plan_sha256", "service_build", "client_build", "service_pid")
     identity = {key: parts[0][0][key] for key in identity_keys}
+    capture_mode = parts[0][0].get("capture_mode", "paired")
     seen, samples, cohorts = set(), [], []
     for report, digest in parts:
         require(report.get("version") == 1 and report.get("trace_valid") is True
@@ -430,6 +439,7 @@ def merge_reports(parts):
                 and report.get("calibration") is False and not report.get("cohorts"),
                 "incomplete_cohort")
         require(all(report.get(key) == value for key, value in identity.items()), "different_generation")
+        require(report.get("capture_mode", "paired") == capture_mode, "different_capture_modes")
         selected = report.get("selected_cases", [])
         require(bool(selected) and len(selected) == len(set(selected))
                 and set(selected) <= set(CASES) and not seen.intersection(selected), "overlapping_cohorts")
@@ -444,7 +454,7 @@ def merge_reports(parts):
         samples.extend(dict(row, cohort=len(cohorts)) for row in rows)
         cohorts.append({"sha256": digest, "selected_cases": selected})
     require(seen == set(CASES), "missing_cohorts")
-    return dict(identity, version=1, calibration=False, selected_cases=list(CASES),
+    return dict(identity, version=1, calibration=False, selected_cases=list(CASES), capture_mode=capture_mode,
                 trace_valid=True, trace_kind="validated_cohorts", trace_error=None,
                 failure=None, failure_context=None, cohorts=cohorts,
                 samples=samples, summary=summarize(samples))
@@ -532,7 +542,7 @@ def matches(screen, expected, previous=None):
 
 
 class Campaign:
-    def __init__(self, peer, plan, count, warmups, preflight=None, selected_cases=None):
+    def __init__(self, peer, plan, count, warmups, preflight=None, selected_cases=None, capture_mode="paired"):
         self.peer, self.plan, self.count, self.warmups = peer, plan, count, warmups
         self.screen = None
         self.device = None
@@ -542,6 +552,8 @@ class Campaign:
         self.failure_context = None
         self.phase, self.case, self.step_index = "initialize", None, None
         self.preflight = preflight
+        require(capture_mode in ("paired", "image_only"), "invalid_capture_mode")
+        self.capture_mode = capture_mode
         self.selected_cases = list(CASES) if selected_cases is None else selected_cases
         require(bool(self.selected_cases) and len(set(self.selected_cases)) == len(self.selected_cases)
                 and set(self.selected_cases) <= set(CASES), "invalid_selected_cases")
@@ -557,7 +569,7 @@ class Campaign:
         require(result.get("isError") is not True, "acquire_failed")
         self.lease_started = time.monotonic()
 
-    def step(self, step):
+    def step(self, step, image_only=False):
         if not matches(self.screen, step.get("when")):
             return None
         if "settle" in step:
@@ -574,6 +586,13 @@ class Campaign:
         self.renew()
         tool = step["tool"]
         arguments = dict(step.get("arguments", {}))
+        if image_only:
+            options = {"capture": "image_only", "tree_format": "omit"}
+            if tool in ACTIONS:
+                arguments["response"] = options
+            else:
+                require(tool == "handkite_observe", "invalid_image_tool")
+                arguments.update(options)
         if tool in ACTIONS:
             require(self.screen is not None, "missing_action_baseline")
             arguments["expected_revision"] = self.screen["metadata"]["revision"]
@@ -603,13 +622,18 @@ class Campaign:
                      if item.get("type") == "text"]
             receipt = texts[0] if texts else {}
             require(receipt.get("receipt", {}).get("accepted") is True
-                    and receipt.get("effect") == "changed" and receipt.get("after") is not None,
+                    and receipt.get("effect") == "changed"
+                    and receipt.get("after_image" if image_only else "after") is not None,
                     "action_unconfirmed")
         self.screen = parse_screen(result)
+        require((self.screen["capture_kind"] == "image_only") == image_only, "wrong_capture_mode")
+        if image_only and tool in ACTIONS:
+            require(previous is not None and self.screen["image_digest"] != previous["image_digest"],
+                    "unchanged_action_image")
         if self.device is None:
             self.device = self.screen["metadata"]["device"]
         require(self.screen["metadata"]["device"] == self.device, "device_changed")
-        failed = [key for key, value in step.get("expect", {}).items()
+        failed = [key for key, value in ({} if image_only else step.get("expect", {})).items()
                   if not matches(self.screen, {key: value}, previous)]
         if failed:
             call["failed_expectations"] = failed
@@ -644,15 +668,24 @@ class Campaign:
                     start = len(self.peer.calls)
                     try:
                         self.phase, self.step_index = "measure", None
-                        call = self.step(case["measure"])
+                        previous = self.screen
+                        image_only = self.capture_mode == "image_only" and case["name"] != "observe_tree"
+                        call = self.step(case["measure"], image_only=image_only)
                         require(call is not None, "skipped_measurement")
                         sample.update({key: call[key] for key in
                                        ("id", "operation", "elapsed_ms", "response_bytes")})
                         sample["capture_kind"] = self.screen["capture_kind"]
+                        if image_only:
+                            # This read qualifies the fixture outside the image-only request.
+                            self.phase = "fixture_verification"
+                            started = time.monotonic()
+                            self.step({"tool": "handkite_observe"})
+                            sample["fixture_verification_ms"] = (time.monotonic() - started) * 1000
+                            require(matches(self.screen, case["measure"].get("expect"), previous), "effect_mismatch")
                         sample["outcome"] = "pass"
                     except BenchError as error:
                         sample["outcome"] = str(error)
-                        if len(self.peer.calls) > start:
+                        if "operation" not in sample and len(self.peer.calls) > start:
                             sample.update({key: self.peer.calls[-1][key] for key in
                                            ("id", "operation", "elapsed_ms", "response_bytes")
                                            if key in self.peer.calls[-1]})
@@ -717,7 +750,8 @@ def attach_stages(campaign, service_rows, expected_pid):
             continue
         op = sample["operation"]
         require(op in correspondence, "missing_service_operation")
-        validate_client_stages(client_by_op[op], observed=sample["outcome"] == "pass")
+        validate_client_stages(client_by_op[op], observed=sample["outcome"] == "pass"
+                               and sample.get("capture_kind") != "image_only")
         service = service_by_op[correspondence[op]]
         require({"service_request", "service_serialization", "service_write"}
                 <= {row.get("stage") for row in service}, "incomplete_service_trace")
@@ -744,6 +778,8 @@ def main():
     run.add_argument("--count", type=int, default=20)
     run.add_argument("--warmups", type=int, default=1)
     run.add_argument("--calibrate", action="store_true", help="one trial per case; cannot qualify the gate")
+    run.add_argument("--capture", choices=("paired", "image_only"), default="paired",
+                     help="image_only measures opt-in image results, then separately times full fixture verification")
     run.add_argument("--cases", nargs="+", choices=CASES,
                      help="run selected cohorts only; a partial report cannot pass the full gate")
     run.add_argument("command", nargs=argparse.REMAINDER)
@@ -755,8 +791,11 @@ def main():
     merge.add_argument("reports", nargs="+", type=Path)
     args = parser.parse_args()
     if args.mode == "compare":
-        failures = compare(decode(args.before.read_bytes()), decode(args.after.read_bytes()))
-        print(json.dumps({"passed": not failures, "failures": failures}))
+        before, after = decode(args.before.read_bytes()), decode(args.after.read_bytes())
+        failures = compare(before, after)
+        print(json.dumps({"passed": not failures, "failures": failures,
+                          "capture_before": before.get("capture_mode", "paired"),
+                          "capture_after": after.get("capture_mode", "paired")}))
         return int(bool(failures))
     if args.mode == "merge":
         parts = [path.read_bytes() for path in args.reports]
@@ -795,7 +834,7 @@ def main():
                     return
                 time.sleep(.025)
             raise BenchError("timing_not_enabled")
-        campaign = Campaign(peer, plan, args.count, args.warmups, preflight, args.cases)
+        campaign = Campaign(peer, plan, args.count, args.warmups, preflight, args.cases, args.capture)
         try:
             campaign.run()
         finally:
@@ -821,6 +860,7 @@ def main():
             trace_error = str(error)
             campaign.failure = campaign.failure or str(error)
         report = {"version": 1, "plan_sha256": hashlib.sha256(plan_bytes).hexdigest(),
+                  "capture_mode": args.capture,
                   "calibration": args.calibrate,
                   "selected_cases": campaign.selected_cases,
                   "service_build": args.service_build, "client_build": args.client_build,

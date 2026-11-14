@@ -513,6 +513,16 @@ not the measured forward gesture. The plan hash changes with this fixture
 correction; retain earlier reports and identify it when comparing their
 otherwise unchanged measured actions.
 
+On a build with explicit image-only capture, pass `--capture image_only` to
+measure that policy for actions and the image observation case. The full-tree
+case remains paired. The runner checks acknowledged actions against changed
+image bytes, then obtains a separate full observation to verify the fixture's
+semantic expectations before cleanup. Reports label the capture policy and
+record this extra `fixture_verification_ms` separately; it is not part of the
+image-only request latency and must not be hidden when comparing workflows
+that need a full actionable revision after every step. Default runs retain
+paired capture, including the presentation-only image case.
+
 To prioritize a case without repeating it later, run disjoint case subsets on
 the same unchanged service generation, then use
 `benchmark_mcp.py merge --output complete.json swipe.json remaining.json`.

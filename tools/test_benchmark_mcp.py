@@ -33,7 +33,59 @@ def plan():
     return {"version": 1, "cases": cases}
 
 
+def image_result(action=False):
+    result = screen_result()
+    payload = json.loads(result["content"][0]["text"])
+    del payload["metadata"]["state"], payload["metadata"]["revision"], payload["accessibility_tree"]
+    payload.update(capture_kind="image_only", tree={"included":False,"reason":"not_captured"})
+    result["content"][0]["text"] = json.dumps(payload)
+    if action:
+        result["content"].insert(0, {"type":"text", "text":json.dumps({
+            "receipt":{"accepted":True},"effect":"changed","after_image":payload["metadata"]})})
+        result["content"][-1]["data"] = base64.b64encode(b"\x89PNG\r\n\x1a\nchanged").decode()
+    return result
+
+
 class BenchmarkTests(unittest.TestCase):
+    def test_image_measurement_keeps_fixture_verification_separate(self):
+        class FakePeer:
+            healthy = True
+            def __init__(self):
+                self.calls = []
+            def initialize(self):
+                pass
+            def tool(self, tool, arguments):
+                call = dict(id=len(self.calls), operation=len(self.calls), elapsed_ms=1, response_bytes=1, tool=tool)
+                self.calls.append(dict(call, arguments=arguments))
+                if tool == "handkite_tap":
+                    self_outer.assertEqual(arguments["response"], {"capture":"image_only","tree_format":"omit"})
+                    return image_result(action=True), call
+                return screen_result(), call
+        self_outer = self
+        peer = FakePeer()
+        campaign = Campaign(peer, plan(), 1, 0, selected_cases=["tap"], capture_mode="image_only")
+        with contextlib.redirect_stdout(io.StringIO()):
+            campaign.run()
+        self.assertIsNone(campaign.failure)
+        sample = campaign.samples[0]
+        self.assertEqual(sample["capture_kind"], "image_only")
+        self.assertEqual(sample["elapsed_ms"], 1)
+        self.assertIn("fixture_verification_ms", sample)
+        self.assertEqual(sum(call["tool"] == "handkite_tap" for call in peer.calls), 1)
+        self.assertEqual(sum(call["tool"] == "handkite_observe" for call in peer.calls), 2)
+        self.assertEqual(sample["operation"], next(call["operation"] for call in peer.calls if call["tool"] == "handkite_tap"))
+
+    def test_image_capture_rejects_fabricated_full_metadata(self):
+        result = image_result()
+        self.assertEqual(parse_screen(result)["capture_kind"], "image_only")
+        for key, value in (("revision", 1), ("state", {"lock":"unlocked"})):
+            invalid = copy.deepcopy(result)
+            payload = json.loads(invalid["content"][0]["text"])
+            payload["metadata"][key] = value
+            invalid["content"][0]["text"] = json.dumps(payload)
+            with self.assertRaisesRegex(BenchError, "fabricated_image_metadata"):
+                parse_screen(invalid)
+
     def test_settle_reads_are_bounded_and_require_matching_tree_image_and_state(self):
         class FakePeer:
             def __init__(self, dimension, changes):
