@@ -488,6 +488,8 @@ cleanup are timed separately. The report includes nearest-rank p50/p95,
 response sizes, build identities and per-stage timings, without screenshots,
 trees, typed text or device identifiers. Failed actions stop the campaign;
 input is never retried. One read-only observation can diagnose uncertain input.
+Preparation failures retain their case, step, request identity and fixed change
+flags, so an unmeasured setup failure cannot disappear from the report.
 
 `span.*.covered` is the union of overlapping intervals in that stage;
 `span.*.work` is their cumulative work. Neither should be added to enclosing

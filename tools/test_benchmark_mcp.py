@@ -211,6 +211,34 @@ for line in sys.stdin:
         self.assertNotIn("handkite_key", names)
         self.assertEqual(names.count("handkite_observe"), 2)
         self.assertEqual(campaign.samples[0]["outcome"], "action_unconfirmed")
+        self.assertEqual(campaign.failure_context["phase"], "measure")
+        self.assertEqual(campaign.failure_context["call"]["tool"], "handkite_tap")
+
+    def test_prepare_failure_keeps_its_step_and_call(self):
+        class FakePeer:
+            calls = []
+            healthy = True
+
+            def initialize(self):
+                pass
+
+            def tool(self, name, arguments):
+                call = {"id": len(self.calls) + 1, "operation": len(self.calls) + 1,
+                        "tool": name, "elapsed_ms": 1, "response_bytes": 100}
+                self.calls.append(call)
+                if name == "handkite_tap":
+                    call["error_code"] = "ViewChanged"
+                    return {"isError": True, "structuredContent": {"code": "ViewChanged"}}, call
+                return screen_result(), call
+
+        scenario = plan()
+        scenario["cases"][0]["prepare"] = [{"tool": "handkite_tap", "arguments": {}}]
+        campaign = Campaign(FakePeer(), scenario, count=20, warmups=0)
+        campaign.run()
+        self.assertEqual(campaign.samples, [])
+        self.assertEqual(campaign.failure_context["phase"], "prepare")
+        self.assertEqual(campaign.failure_context["step_index"], 0)
+        self.assertEqual(campaign.failure_context["call"]["error_code"], "ViewChanged")
 
     def test_gate_requires_valid_trace_matching_plan_and_twenty_successes(self):
         samples = [{"case": case, "outcome": "pass", "elapsed_ms": 100}

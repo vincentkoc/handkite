@@ -276,8 +276,20 @@ class Peer:
         require(ALLOWED <= names, "missing_capability")
 
     def tool(self, name, arguments):
-        result, call = self.request("tools/call", {"name": name, "arguments": arguments})
+        try:
+            result, call = self.request("tools/call", {"name": name, "arguments": arguments})
+        finally:
+            self.calls[-1]["tool"] = name
         call["tool"] = name
+        detail = result.get("structuredContent", {})
+        if isinstance(detail, dict):
+            if detail.get("code") in ERROR_CODES:
+                call["error_code"] = detail["code"]
+            changed = detail.get("changed")
+            if isinstance(changed, dict):
+                call["changed"] = {key: changed[key] for key in
+                                   ("state", "accessibility_tree", "screenshot")
+                                   if type(changed.get(key)) is bool}
         return result, call
 
     def close(self):
@@ -475,6 +487,8 @@ class Campaign:
         self.lease_started = None
         self.samples = []
         self.failure = None
+        self.failure_context = None
+        self.phase, self.case, self.step_index = "initialize", None, None
         self.preflight = preflight
 
     def renew(self):
@@ -541,16 +555,19 @@ class Campaign:
                 self.preflight()
             # Keep scenario ordering fixed across baseline and candidate runs.
             for case in self.plan["cases"]:
+                self.case = case["name"]
                 for ordinal in range(self.warmups + self.count):
                     sample = {"case": case["name"], "ordinal": ordinal - self.warmups + 1,
                               "warmup": ordinal < self.warmups, "outcome": "not_started"}
                     prepare_start = time.monotonic()
-                    for step in case.get("prepare", []):
+                    self.phase = "prepare"
+                    for self.step_index, step in enumerate(case.get("prepare", [])):
                         self.step(step)
                     sample["prepare_ms"] = (time.monotonic() - prepare_start) * 1000
                     self.samples.append(sample)
                     start = len(self.peer.calls)
                     try:
+                        self.phase, self.step_index = "measure", None
                         call = self.step(case["measure"])
                         require(call is not None, "skipped_measurement")
                         sample.update({key: call[key] for key in
@@ -565,13 +582,17 @@ class Campaign:
                                            if key in self.peer.calls[-1]})
                         raise
                     cleanup_start = time.monotonic()
-                    for step in case.get("cleanup", []):
+                    self.phase = "cleanup"
+                    for self.step_index, step in enumerate(case.get("cleanup", [])):
                         self.step(step)
                     sample["cleanup_ms"] = (time.monotonic() - cleanup_start) * 1000
                     print(json.dumps({key: sample[key] for key in
                                       ("case", "ordinal", "warmup", "outcome", "elapsed_ms")}), flush=True)
         except BenchError as error:
             self.failure = str(error)
+            self.failure_context = {"phase": self.phase, "case": self.case,
+                                    "step_index": self.step_index,
+                                    "call": dict(self.peer.calls[-1]) if self.peer.calls else None}
             # A fresh read can diagnose a failed action; never repeat its input.
             if self.failure in {"action_unconfirmed", "effect_mismatch", "tool_error"}:
                 try:
@@ -610,6 +631,9 @@ def attach_stages(campaign, service_rows, expected_pid):
                    if any(row.get("stage") == "service_request" for row in rows)]
     require(len(client_ops) == len(service_ops), "service_correlation_mismatch")
     correspondence = dict(zip(client_ops, service_ops))
+    for call in peer.calls:
+        if call["operation"] in correspondence:
+            call["service_operation"] = correspondence[call["operation"]]
     for sample in campaign.samples:
         if "operation" not in sample:
             continue
@@ -708,6 +732,7 @@ def main():
                   "service_build": args.service_build, "client_build": args.client_build,
                   "service_pid": args.service_pid, "trace_valid": trace_valid,
                   "failure": campaign.failure, "samples": campaign.samples,
+                  "failure_context": campaign.failure_context, "calls": peer.calls,
                   "summary": summarize(campaign.samples)}
         descriptor = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "w") as output:
