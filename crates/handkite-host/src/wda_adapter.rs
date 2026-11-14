@@ -366,54 +366,38 @@ impl WdaAdapter {
         result
     }
 
-    fn capture_for_action(
-        &self,
-        allow_reuse: bool,
-        recheck_frame: bool,
-    ) -> Result<CheckedCapture, AdapterError> {
+    fn capture_for_action(&self, allow_reuse: bool) -> Result<CheckedCapture, AdapterError> {
         if allow_reuse {
             let key = self.cache_key();
             if let Some(previous) = self.cache.take_full(key.as_ref(), Instant::now()) {
                 let started = Instant::now();
-                let probes = if recheck_frame { 4 } else { 1 };
-                for attempt in 0..probes {
-                    if !previous.fresh(Instant::now()) {
-                        break;
+                let mut timings = crate::timing::enabled().then(CaptureTimings::default);
+                let result = {
+                    let _probe = crate::timing::Span::new("tree_cache_probe");
+                    self.capture_frame(timings.as_mut())
+                };
+                let current = match result {
+                    Ok(frame) => frame,
+                    Err(error) => {
+                        self.cache.clear();
+                        return Err(error);
                     }
-                    let mut timings = crate::timing::enabled().then(CaptureTimings::default);
-                    let result = {
-                        let _probe = crate::timing::Span::new("tree_cache_probe");
-                        self.capture_frame(timings.as_mut())
-                    };
-                    let current = match result {
-                        Ok(frame) => frame,
-                        Err(error) => {
-                            self.cache.clear();
-                            return Err(error);
-                        }
-                    };
-                    let now = Instant::now();
-                    let same =
-                        previous.matches(&current.screenshot, &current.app, current.reported, now);
-                    crate::timing::outcome("tree_cache_hit", same);
-                    if same {
-                        if let Some(mut timings) = timings {
-                            timings.mark_reused_tree();
-                            timings.finish(started, true);
-                            crate::timing::capture(timings);
-                        }
-                        // Both tree and image retain the original capture window.
-                        return Ok((previous.raw, previous.captured_at, previous.reported));
+                };
+                let same = previous.matches(
+                    &current.screenshot,
+                    &current.app,
+                    current.reported,
+                    Instant::now(),
+                );
+                crate::timing::outcome("tree_cache_hit", same);
+                if same {
+                    if let Some(mut timings) = timings {
+                        timings.mark_reused_tree();
+                        timings.finish(started, true);
+                        crate::timing::capture(timings);
                     }
-                    if !recheck_frame
-                        || attempt + 1 == probes
-                        || !previous.context_matches(&current.app, current.reported, now)
-                    {
-                        break;
-                    }
-                    // A blink can return to the exact original frame. Read once
-                    // again without renewing the snapshot or retrying any input.
-                    crate::timing::outcome("tree_cache_recheck", true);
+                    // Both tree and image retain the original capture window.
+                    return Ok((previous.raw, previous.captured_at, previous.reported));
                 }
                 self.cache.clear();
             }
@@ -864,18 +848,8 @@ impl DeviceAdapter for WdaAdapter {
         } else {
             self.native_fresh(None)
         };
-        let (mut observation, mut captured_at, mut reported_lock) = self
-            .capture_for_action(
-                use_hint,
-                matches!(
-                    action,
-                    Action::Tap { .. }
-                        | Action::Text { .. }
-                        | Action::TextCurrent { .. }
-                        | Action::KeyCurrent { .. }
-                ),
-            )
-            .inspect_err(|_| {
+        let (mut observation, mut captured_at, mut reported_lock) =
+            self.capture_for_action(use_hint).inspect_err(|_| {
                 self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
             })?;
         let native_after = if use_hint && normal_hint_context(&observation, reported_lock) {
