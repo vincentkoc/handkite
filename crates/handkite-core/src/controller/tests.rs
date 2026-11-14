@@ -135,6 +135,7 @@ impl DeviceAdapter for FakeAdapter {
                     | ActionAdmission::NativeModalTap { .. }
                     | ActionAdmission::NativeText { .. }
                     | ActionAdmission::NativeTextGesture { .. }
+                    | ActionAdmission::NativeButton { .. }
             )
         ) {
             self.native_queries += 1;
@@ -740,6 +741,65 @@ fn native_text_allows_only_pixel_drift_with_fresh_unchanged_context() {
         } else {
             assert!(result.is_err(), "case {change}");
             assert_eq!(inner.adapter.actions, 0, "case {change}");
+        }
+    }
+}
+
+#[test]
+fn named_button_admission_preserves_tree_state_and_deadline_checks() {
+    for case in 0..7 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(5);
+        let mut action = Action::ClickButton {
+            target: crate::protocol::ButtonTarget {
+                label: "Close".into(),
+                x: 10.0,
+                y: 10.0,
+                width: 30.0,
+                height: 30.0,
+            },
+        };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.image_suffix = b"cursor".to_vec();
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeButton { until });
+            inner.adapter.native_lock = LockState::Unlocked;
+            match case {
+                1 => inner.adapter.tree_suffix = "changed".into(),
+                2 => inner.adapter.locked = true,
+                3 => inner.adapter.native_lock = LockState::Locked,
+                4 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeButton {
+                        until: Instant::now(),
+                    })
+                }
+                5 => inner.adapter.stale_capture = true,
+                6 => {
+                    action = Action::Tap {
+                        at: Point { x: 10.0, y: 10.0 },
+                    }
+                }
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision: Some(before.revision),
+                action,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(result.is_ok(), case == 0, "case {case}");
+        assert_eq!(inner.adapter.actions, usize::from(case == 0), "case {case}");
+        if case == 0 {
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
         }
     }
 }

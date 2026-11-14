@@ -38,6 +38,7 @@ pub mod usb;
 pub mod wda_action;
 pub mod wda_adapter;
 mod wda_bundle;
+mod wda_button;
 pub mod wda_http;
 pub mod wda_runner;
 pub mod wda_session;

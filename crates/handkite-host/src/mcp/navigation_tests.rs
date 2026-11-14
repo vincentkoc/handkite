@@ -256,6 +256,7 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
     ];
     let interaction = [
         "handkite_tap",
+        "handkite_click_button",
         "handkite_double_tap",
         "handkite_long_press",
         "handkite_swipe",

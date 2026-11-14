@@ -19,6 +19,7 @@ pub(super) enum Tool {
     Home,
     Clock,
     Tap,
+    ClickButton,
     DoubleTap,
     LongPress,
     Swipe,
@@ -37,6 +38,7 @@ impl Tool {
             "handkite_home" => Some(Self::Home),
             "handkite_launch_clock" => Some(Self::Clock),
             "handkite_tap" => Some(Self::Tap),
+            "handkite_click_button" => Some(Self::ClickButton),
             "handkite_double_tap" => Some(Self::DoubleTap),
             "handkite_long_press" => Some(Self::LongPress),
             "handkite_swipe" => Some(Self::Swipe),
@@ -50,6 +52,7 @@ impl Tool {
     pub(super) fn allowed(self, capabilities: Capabilities) -> bool {
         match self {
             Self::Tap
+            | Self::ClickButton
             | Self::DoubleTap
             | Self::LongPress
             | Self::Swipe
@@ -79,6 +82,7 @@ impl Tool {
             Self::Home
                 | Self::Clock
                 | Self::Tap
+                | Self::ClickButton
                 | Self::DoubleTap
                 | Self::LongPress
                 | Self::Swipe
@@ -118,6 +122,10 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         (
             "handkite_tap",
             "Tap one screen point using an expected observation revision and return the captured screen.",
+        ),
+        (
+            "handkite_click_button",
+            "Click one uniquely labelled Button by its observed label and rectangle. Uses element identity, not a coordinate fallback. Requires an expected observation revision.",
         ),
         (
             "handkite_double_tap",

@@ -101,6 +101,33 @@ pub struct Point {
     pub y: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ButtonTarget {
+    pub label: String,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl ButtonTarget {
+    pub fn valid(&self) -> bool {
+        !self.label.trim().is_empty()
+            && self.label.len() <= 512
+            && !self.label.chars().any(char::is_control)
+            && [self.x, self.y, self.width, self.height]
+                .into_iter()
+                .all(f64::is_finite)
+            && self.x >= 0.0
+            && self.y >= 0.0
+            && self.width > 0.0
+            && self.height > 0.0
+            && self.x + self.width <= 10_000.0
+            && self.y + self.height <= 10_000.0
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeviceState {
     pub lock: LockState,
@@ -148,6 +175,9 @@ pub enum ImageFormat {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Action {
+    ClickButton {
+        target: ButtonTarget,
+    },
     Tap {
         at: Point,
     },
@@ -188,6 +218,7 @@ pub enum KeyboardKey {
 impl Action {
     pub fn kind(&self) -> &'static str {
         match self {
+            Self::ClickButton { .. } => "click_button",
             Self::Tap { .. } => "tap",
             Self::DoubleTap { .. } => "double_tap",
             Self::LongPress { .. } => "long_press",

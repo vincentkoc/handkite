@@ -1,4 +1,4 @@
-use handkite_core::protocol::Point;
+use handkite_core::protocol::{ButtonTarget, Point};
 use quick_xml::events::Event;
 use std::collections::BTreeMap;
 
@@ -57,6 +57,10 @@ pub(crate) fn visible_button(xml: &str, at: Point) -> bool {
     parse(xml, Target::Button(at)) == Some(())
 }
 
+pub(crate) fn named_button(xml: &str, target: &ButtonTarget) -> bool {
+    target.valid() && parse(xml, Target::NamedButton(target)) == Some(())
+}
+
 pub(crate) fn visible_modal_button(xml: &str, at: Point) -> bool {
     parse(xml, Target::ModalButton(at)) == Some(())
 }
@@ -73,15 +77,16 @@ pub(crate) fn visible_text_target(xml: &str, at: Point) -> bool {
     parse(xml, Target::TextPoint(at)) == Some(())
 }
 
-enum Target {
+enum Target<'a> {
     Context,
     Button(Point),
     ModalButton(Point),
     TextInput,
     TextPoint(Point),
+    NamedButton(&'a ButtonTarget),
 }
 
-fn parse(xml: &str, target_kind: Target) -> Option<()> {
+fn parse(xml: &str, target_kind: Target<'_>) -> Option<()> {
     let at = match target_kind {
         Target::Button(at) | Target::ModalButton(at) | Target::TextPoint(at) => Some(at),
         _ => None,
@@ -213,6 +218,25 @@ fn parse(xml: &str, target_kind: Target) -> Option<()> {
                     }
                 }
                 if kind == "XCUIElementTypeButton"
+                    && let Target::NamedButton(expected) = &target_kind
+                    && attrs.get("label") == Some(&expected.label)
+                    && attrs.get("visible").map(String::as_str) != Some("false")
+                {
+                    let rect = Rect::read(&attrs)?;
+                    if target
+                        || attrs.get("visible").map(String::as_str) != Some("true")
+                        || attrs.get("enabled").map(String::as_str) != Some("true")
+                        || !screen?.encloses(rect)
+                        || rect.x != expected.x
+                        || rect.y != expected.y
+                        || rect.width != expected.width
+                        || rect.height != expected.height
+                    {
+                        return None;
+                    }
+                    target = true;
+                }
+                if kind == "XCUIElementTypeButton"
                     && attrs.get("visible").map(String::as_str) != Some("false")
                     && let Some(at) = at
                 {
@@ -253,7 +277,7 @@ fn parse(xml: &str, target_kind: Target) -> Option<()> {
                 return (roots == 1
                     && stack.is_empty()
                     && screen.is_some()
-                    && (at.is_none() || target)
+                    && (at.is_none() && !matches!(target_kind, Target::NamedButton(_)) || target)
                     && (!require_text || text_inputs == 1 && keyboards == 1)
                     && (!allow_modal || modal.is_some() && target_in_modal))
                     .then_some(());
@@ -274,6 +298,30 @@ mod tests {
     }
     fn point() -> Point {
         Point { x: 285.0, y: 505.0 }
+    }
+
+    #[test]
+    fn named_button_disambiguates_overlap_without_relaxing_coordinate_taps() {
+        let target = ButtonTarget {
+            label: "Clear text".into(),
+            x: 270.0,
+            y: 490.0,
+            width: 30.0,
+            height: 30.0,
+        };
+        let under = r#"<XCUIElementTypeButton label="Underlying row" visible="true" enabled="true" x="0" y="488" width="393" height="62"/>"#;
+        let xml = tree(&format!("{under}{BUTTON}"));
+        assert!(!visible_button(&xml, point()));
+        assert!(named_button(&xml, &target));
+        for body in [
+            format!("{BUTTON}{BUTTON}"),
+            BUTTON.replace("490", "491"),
+            BUTTON.replace("enabled=\"true\"", "enabled=\"false\""),
+            format!("<XCUIElementTypeSheet>{BUTTON}</XCUIElementTypeSheet>"),
+            format!("{BUTTON}<XCUIElementTypeSecureTextField/>"),
+        ] {
+            assert!(!named_button(&tree(&body), &target));
+        }
     }
 
     #[test]

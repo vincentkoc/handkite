@@ -456,6 +456,7 @@ impl DeviceAdapter for WdaAdapter {
         let owned_input = matches!(
             action,
             Action::Tap { .. }
+                | Action::ClickButton { .. }
                 | Action::DoubleTap { .. }
                 | Action::LongPress { .. }
                 | Action::Home
@@ -493,6 +494,22 @@ impl DeviceAdapter for WdaAdapter {
                 )
                 .map(|until| ActionAdmission::VisibleTap { at: *at, until })
             })
+        } else if let Action::ClickButton { target } = action {
+            (owned_input
+                && native_before == LockState::Unlocked
+                && native_after == LockState::Unlocked
+                && reported_lock == Some(false)
+                && observation.state.lock == LockState::Unlocked
+                && observation.state.wda_ready
+                && observation
+                    .state
+                    .foreground_app
+                    .as_deref()
+                    .is_some_and(|app| app != "com.apple.springboard")
+                && crate::wda_ui_admission::named_button(&observation.accessibility_tree, target))
+            .then(|| captured_at.checked_add(TEXT_INPUT_AGE))
+            .flatten()
+            .map(|until| ActionAdmission::NativeButton { until })
         } else if matches!(action, Action::Text { .. }) {
             native_text_deadline(
                 &observation,
@@ -578,6 +595,49 @@ impl DeviceAdapter for WdaAdapter {
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
+        if let Action::ClickButton { target } = action {
+            let Some(ActionAdmission::NativeButton { until }) = admission else {
+                return Err(AdapterError);
+            };
+            if self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            self.validate_owned()?;
+            let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
+            let button = self
+                .runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(async {
+                    self.actions.prepare_existing(&wda).await?;
+                    crate::wda_button::resolve(
+                        &wda,
+                        self.actions.prepared_session().ok_or(AdapterError)?,
+                        target,
+                    )
+                    .await
+                })?;
+            self.validate_owned()?;
+            if native_lock::query(&self.expected).state != LockState::Unlocked
+                || Instant::now() >= send_deadline
+            {
+                return Err(AdapterError);
+            }
+            let receipt = self
+                .runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(button.click(&wda))?;
+            self.validate_owned()?;
+            return Ok(receipt);
+        }
+        if matches!(admission, Some(ActionAdmission::NativeButton { .. })) {
+            return Err(AdapterError);
+        }
         if let Some(ActionAdmission::NativeText { until }) = admission {
             if !matches!(action, Action::Text { .. })
                 || self.owned_session.is_none()

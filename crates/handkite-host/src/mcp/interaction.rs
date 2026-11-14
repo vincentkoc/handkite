@@ -1,5 +1,5 @@
 use super::catalog::Tool;
-use handkite_core::protocol::{Action, KeyboardKey, Point, Revision};
+use handkite_core::protocol::{Action, ButtonTarget, KeyboardKey, Point, Revision};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
@@ -36,6 +36,13 @@ impl ScreenPoint {
 struct TapArguments {
     expected_revision: Revision,
     at: ScreenPoint,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ButtonArguments {
+    expected_revision: Revision,
+    target: ButtonTarget,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +85,18 @@ struct LaunchArguments {
 
 pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> {
     match tool {
+        Tool::ClickButton => {
+            let args: ButtonArguments = serde_json::from_value(value).map_err(|_| ())?;
+            if !args.target.valid() {
+                return Err(());
+            }
+            Ok((
+                args.expected_revision,
+                Action::ClickButton {
+                    target: args.target,
+                },
+            ))
+        }
         Tool::Home | Tool::Clock => {
             let args: RevisionOnly = serde_json::from_value(value).map_err(|_| ())?;
             let action = if tool == Tool::Home {
@@ -174,6 +193,7 @@ pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> 
 
 pub(super) fn valid_raw(tool: Tool, raw: &str) -> bool {
     match tool {
+        Tool::ClickButton => serde_json::from_str::<ButtonArguments>(raw).is_ok(),
         Tool::Home | Tool::Clock => serde_json::from_str::<RevisionOnly>(raw).is_ok(),
         Tool::Tap | Tool::DoubleTap => serde_json::from_str::<TapArguments>(raw).is_ok(),
         Tool::LongPress => serde_json::from_str::<LongPressArguments>(raw).is_ok(),
@@ -197,6 +217,23 @@ pub(super) fn schema(tool: Tool) -> Value {
     properties.insert("expected_revision".into(), revision);
     let mut required = vec!["expected_revision"];
     match tool {
+        Tool::ClickButton => {
+            properties.insert(
+                "target".into(),
+                json!({
+                    "type":"object", "additionalProperties":false,
+                    "properties":{
+                        "label":{"type":"string","minLength":1,"maxLength":512},
+                        "x":{"type":"number","minimum":0},
+                        "y":{"type":"number","minimum":0},
+                        "width":{"type":"number","exclusiveMinimum":0},
+                        "height":{"type":"number","exclusiveMinimum":0}
+                    },
+                    "required":["label","x","y","width","height"]
+                }),
+            );
+            required.push("target");
+        }
         Tool::Tap | Tool::DoubleTap | Tool::LongPress => {
             properties.insert("at".into(), point);
             required.push("at");
@@ -246,6 +283,25 @@ pub(super) fn schema(tool: Tool) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn semantic_button_requires_exact_typed_arguments() {
+        let valid = json!({"expected_revision":7,"target":{"label":"Close","x":338,"y":489,"width":38,"height":38}});
+        let (_, action) = parse(Tool::ClickButton, valid.clone()).unwrap();
+        assert_eq!(action.kind(), "click_button");
+        for (key, value) in [
+            ("label", json!("")),
+            ("width", json!(0)),
+            ("x", json!(-1)),
+            ("id", json!("caller-id")),
+        ] {
+            let mut bad = valid.clone();
+            bad["target"][key] = value;
+            assert!(parse(Tool::ClickButton, bad).is_err(), "{key}");
+        }
+        let duplicate = r#"{"expected_revision":7,"target":{"label":"Close","label":"Other","x":338,"y":489,"width":38,"height":38}}"#;
+        assert!(!valid_raw(Tool::ClickButton, duplicate));
+    }
 
     #[test]
     fn tap_and_swipe_share_fractional_viewport_point_schema() {
