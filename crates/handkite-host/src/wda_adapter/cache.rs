@@ -30,8 +30,11 @@ impl Full {
         reported: Option<bool>,
         now: Instant,
     ) -> bool {
+        self.context_matches(app, reported, now) && self.raw.screenshot == *image
+    }
+
+    pub fn context_matches(&self, app: &str, reported: Option<bool>, now: Instant) -> bool {
         self.fresh(now)
-            && self.raw.screenshot == *image
             && self.raw.state.foreground_app.as_deref() == Some(app)
             && self.reported == reported
             && reported == Some(false)
@@ -198,6 +201,15 @@ mod tests {
         let mut changed = raw.screenshot.clone();
         changed.bytes.push(2);
         assert!(!previous.matches(&changed, "example.app", Some(false), now));
+        assert!(previous.context_matches("example.app", Some(false), now));
+        assert!(!previous.context_matches("changed.app", Some(false), now));
+        assert!(!previous.context_matches("example.app", None, now));
+        assert!(!previous.context_matches("example.app", Some(true), now));
+        assert!(!previous.context_matches(
+            "example.app",
+            Some(false),
+            now + Duration::from_secs(2)
+        ));
         assert!(!previous.matches(
             &raw.screenshot,
             "example.app",

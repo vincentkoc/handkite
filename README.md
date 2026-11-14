@@ -558,6 +558,11 @@ every product budget is met.
 `pre_tree_reuses` counts successful pre-action snapshot reuse. Such captures
 are marked `reused_tree` and require a successful fresh frame probe; their
 missing source timing is intentional. The original snapshot age is retained.
+Tap and text/key admission can recheck one changed frame when the app and
+unlocked state still match. Reuse still requires exact whole-frame equality
+within the original two-second window; otherwise full capture is required.
+Both probes retain ownership checks, and the aggregate probe interval records
+their cost. A probe error stops the action without sending input.
 `span.*.work` is their cumulative work. Neither should be added to enclosing
 or overlapping stages. Capture stages are reported separately for pre-input
 admission and post-input verification. `input_request` measures the WDA input
