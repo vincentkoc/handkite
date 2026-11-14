@@ -117,7 +117,7 @@ pub(crate) async fn start_owned_idle_settings(
         session,
         stopped: Cell::new(false),
     };
-    wda_settings::IdleSettingsLease::start_responsive(&guarded, session).await
+    wda_settings::IdleSettingsLease::start_without_waits(&guarded, session).await
 }
 
 pub(crate) async fn restore_owned_idle_settings(
@@ -573,13 +573,14 @@ mod tests {
             .await
             .unwrap_or_else(|_| panic!("idle setup failed"));
         assert_eq!(fake.settings.borrow()["waitForIdleTimeout"], 0);
-        assert_eq!(fake.settings.borrow()["animationCoolOffTimeout"], 0.2);
+        assert_eq!(fake.settings.borrow()["animationCoolOffTimeout"], 0);
         assert_eq!(fake.posts(), vec!["/session/owned-session/appium/settings"]);
         assert_eq!(
             restore_owned_idle_settings(&fake, lease).await,
             Restoration::Verified
         );
         assert_eq!(fake.settings.borrow()["waitForIdleTimeout"], 10);
+        assert_eq!(fake.settings.borrow()["animationCoolOffTimeout"], 2);
         assert_eq!(
             close_session(&fake, "owned-session").await,
             SessionClose::Acknowledged

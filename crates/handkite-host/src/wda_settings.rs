@@ -129,11 +129,11 @@ impl IdleSettingsLease {
         Self::start_with_target(wda, session, Settings::temporary()).await
     }
 
-    pub(crate) async fn start_responsive(
+    pub(crate) async fn start_without_waits(
         wda: &impl WdaRequest,
         session: &str,
     ) -> Result<Self, (SettingsError, Restoration)> {
-        Self::start_with_target(wda, session, Settings::responsive()).await
+        Self::start_with_target(wda, session, Settings::without_waits()).await
     }
 
     async fn start_with_target(
@@ -773,6 +773,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_wait_lease_restores_exact_preimage_and_partial_transition() {
+        for original in [
+            ORIGINAL,
+            RESPONSIVE,
+            r#"{"waitForIdleTimeout":2.50e0,"animationCoolOffTimeout":0.12500000000000000001}"#,
+        ] {
+            let old: Settings = serde_json::from_str(original).unwrap();
+            for current in [
+                WITHOUT_WAITS.to_string(),
+                format!(
+                    r#"{{"waitForIdleTimeout":0,"animationCoolOffTimeout":{}}}"#,
+                    old.animation.get()
+                ),
+                format!(
+                    r#"{{"waitForIdleTimeout":{},"animationCoolOffTimeout":0}}"#,
+                    old.idle.get()
+                ),
+            ] {
+                let mut steps = preflight(original);
+                steps.extend([post(WITHOUT_WAITS), settings(WITHOUT_WAITS)]);
+                steps.extend(session());
+                steps.extend(restoration(original, &current));
+                let fake = Fake::new(steps);
+                let lease = IdleSettingsLease::start_without_waits(&fake, SESSION)
+                    .await
+                    .unwrap();
+                assert_eq!(lease.restore(&fake).await, Restoration::Verified);
+                fake.done(2);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn zero_wait_lease_refuses_foreign_settings_and_preserves_uncertain_receipts() {
+        for failure in 0..4 {
+            let mut steps = preflight(ORIGINAL);
+            let mut set = post(WITHOUT_WAITS);
+            if failure == 1 {
+                set.response = Err(WdaError::AfterSent);
+            }
+            steps.extend([
+                set,
+                settings(if failure == 0 {
+                    ORIGINAL
+                } else {
+                    WITHOUT_WAITS
+                }),
+            ]);
+            steps.extend(session());
+            if failure == 3 {
+                steps.extend(session());
+                steps.push(settings(TARGET));
+            } else {
+                let mut restore = restoration(
+                    ORIGINAL,
+                    if failure == 0 {
+                        ORIGINAL
+                    } else {
+                        WITHOUT_WAITS
+                    },
+                );
+                if failure == 2 {
+                    restore
+                        .iter_mut()
+                        .find(|step| step.method == "POST")
+                        .unwrap()
+                        .response = Err(WdaError::AfterSent);
+                }
+                steps.extend(restore);
+            }
+            let fake = Fake::new(steps);
+            let result = IdleSettingsLease::start_without_waits(&fake, SESSION).await;
+            if failure == 0 {
+                assert!(matches!(
+                    result,
+                    Err((SettingsError::VerificationFailed, Restoration::Verified))
+                ));
+            } else if failure == 1 {
+                assert!(matches!(
+                    result,
+                    Err((SettingsError::WriteUnproven, Restoration::Verified))
+                ));
+            } else {
+                assert_eq!(
+                    result.unwrap().restore(&fake).await,
+                    Restoration::Unproven(if failure == 2 {
+                        SettingsError::WriteUnproven
+                    } else {
+                        SettingsError::ConcurrentChange
+                    })
+                );
+            }
+            fake.done(if failure == 3 { 1 } else { 2 });
+        }
+    }
+
+    #[tokio::test]
     async fn responsive_lease_restores_only_its_own_transition() {
         for current in [
             RESPONSIVE,
@@ -785,9 +882,10 @@ mod tests {
             steps.extend(session());
             steps.extend(restoration(ORIGINAL, current));
             let fake = Fake::new(steps);
-            let lease = IdleSettingsLease::start_responsive(&fake, SESSION)
-                .await
-                .unwrap_or_else(|_| panic!("responsive setup failed"));
+            let lease =
+                IdleSettingsLease::start_with_target(&fake, SESSION, Settings::responsive())
+                    .await
+                    .unwrap_or_else(|_| panic!("responsive setup failed"));
             assert_eq!(lease.restore(&fake).await, Restoration::Verified);
             fake.done(2);
         }
@@ -798,7 +896,7 @@ mod tests {
         steps.extend(session());
         steps.push(settings(TARGET));
         let fake = Fake::new(steps);
-        let lease = IdleSettingsLease::start_responsive(&fake, SESSION)
+        let lease = IdleSettingsLease::start_with_target(&fake, SESSION, Settings::responsive())
             .await
             .unwrap_or_else(|_| panic!("responsive setup failed"));
         assert_eq!(
@@ -816,7 +914,7 @@ mod tests {
         steps.extend(restoration(ORIGINAL, ORIGINAL));
         let fake = Fake::new(steps);
         assert!(matches!(
-            IdleSettingsLease::start_responsive(&fake, SESSION).await,
+            IdleSettingsLease::start_with_target(&fake, SESSION, Settings::responsive()).await,
             Err((SettingsError::VerificationFailed, Restoration::Verified))
         ));
         fake.done(2);
@@ -842,7 +940,8 @@ mod tests {
             }
             steps.extend(restore);
             let fake = Fake::new(steps);
-            let result = IdleSettingsLease::start_responsive(&fake, SESSION).await;
+            let result =
+                IdleSettingsLease::start_with_target(&fake, SESSION, Settings::responsive()).await;
             if lose_set {
                 assert!(matches!(
                     result,
