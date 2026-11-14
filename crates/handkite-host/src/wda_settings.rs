@@ -7,8 +7,6 @@ use serde_json::{Value, value::RawValue};
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-const TEMPORARY: &[u8] =
-    br#"{"settings":{"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.2}}"#;
 const DEADLINE: Duration = Duration::from_secs(10);
 const RECOVERY_BUDGET: Duration = Duration::from_secs(5);
 const KNOWN_ORIGINAL: &str = r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":2}"#;
@@ -24,7 +22,7 @@ pub enum KnownIdleRecovery {
 }
 
 /// One explicit recovery for the known 10/2 preimage. Requires exclusive ownership.
-/// Only the stranded temporary pair is writable; no retries or device input.
+/// Only a complete known temporary pair is writable; no retries or device input.
 pub async fn restore_known_idle(wda: &UsbWda) -> KnownIdleRecovery {
     let fresh_until = Instant::now() + RECOVERY_BUDGET;
     recover_known(
@@ -61,7 +59,7 @@ async fn recover_known(
     if current.same(&original) {
         return KnownIdleRecovery::AlreadyRestored;
     }
-    if !current.is_temporary() {
+    if !current.is_temporary() && !current.same(&Settings::responsive()) {
         return KnownIdleRecovery::Refused;
     }
     let receipt = write(writer, &session, RESTORE_KNOWN).await;
@@ -113,6 +111,7 @@ pub struct IdleSettingsOutcome<T, E> {
 pub(crate) struct IdleSettingsLease {
     session: String,
     original: Settings,
+    target: Settings,
 }
 
 impl IdleSettingsLease {
@@ -124,15 +123,35 @@ impl IdleSettingsLease {
         wda: &impl WdaRequest,
         session: &str,
     ) -> Result<Self, (SettingsError, Restoration)> {
+        Self::start_with_target(wda, session, Settings::temporary()).await
+    }
+
+    pub(crate) async fn start_responsive(
+        wda: &impl WdaRequest,
+        session: &str,
+    ) -> Result<Self, (SettingsError, Restoration)> {
+        Self::start_with_target(wda, session, Settings::responsive()).await
+    }
+
+    async fn start_with_target(
+        wda: &impl WdaRequest,
+        session: &str,
+        target: Settings,
+    ) -> Result<Self, (SettingsError, Restoration)> {
         let original = preimage(wda, session)
             .await
             .map_err(|reason| (reason, Restoration::NotNeeded))?;
         let lease = Self {
             session: session.to_owned(),
             original,
+            target,
         };
-        let receipt = write(wda, session, TEMPORARY).await;
-        let verified = verify_temporary(wda, session).await;
+        let body = serde_json::to_vec(&SettingsBody {
+            settings: &lease.target,
+        })
+        .map_err(|_| (SettingsError::InvalidSettings, Restoration::NotNeeded))?;
+        let receipt = write(wda, session, &body).await;
+        let verified = verify_temporary(wda, session, &lease.target).await;
         match receipt.and(verified) {
             Ok(()) => Ok(lease),
             Err(reason) => Err((reason, lease.restore(wda).await)),
@@ -140,7 +159,7 @@ impl IdleSettingsLease {
     }
 
     pub(crate) async fn restore(self, wda: &impl WdaRequest) -> Restoration {
-        match restore(wda, &self.session, &self.original).await {
+        match restore(wda, &self.session, &self.original, &self.target).await {
             Ok(()) => Restoration::Verified,
             Err(reason) => Restoration::Unproven(reason),
         }
@@ -256,10 +275,11 @@ async fn restore(
     wda: &impl WdaRequest,
     session: &str,
     original: &Settings,
+    target: &Settings,
 ) -> Result<(), SettingsError> {
     validate_session(wda, session).await?;
     let current = read(wda, session).await?;
-    if !current.is_owned_transition(original) {
+    if !current.is_owned_transition(original, target) {
         return Err(SettingsError::ConcurrentChange);
     }
     let body = serde_json::to_vec(&SettingsBody { settings: original })
@@ -285,10 +305,14 @@ async fn verify(
     }
 }
 
-async fn verify_temporary(wda: &impl WdaRequest, session: &str) -> Result<(), SettingsError> {
+async fn verify_temporary(
+    wda: &impl WdaRequest,
+    session: &str,
+    target: &Settings,
+) -> Result<(), SettingsError> {
     let current = read(wda, session).await?;
     validate_session(wda, session).await?;
-    if current.is_temporary() {
+    if current.matches_target(target) {
         Ok(())
     } else {
         Err(SettingsError::VerificationFailed)
@@ -414,6 +438,13 @@ struct SettingsBody<'a> {
 }
 
 impl Settings {
+    fn responsive() -> Self {
+        Self {
+            idle: RawValue::from_string("0".into()).expect("constant JSON number"),
+            animation: RawValue::from_string("0".into()).expect("constant JSON number"),
+        }
+    }
+
     fn temporary() -> Self {
         Self {
             idle: RawValue::from_string("1.0".into()).expect("constant JSON number"),
@@ -432,15 +463,20 @@ impl Settings {
     }
 
     fn is_temporary(&self) -> bool {
-        same_number(&self.idle, &Self::temporary().idle)
-            && temporary_animation(self.animation.get())
+        self.matches_target(&Self::temporary())
     }
 
-    fn is_owned_transition(&self, original: &Self) -> bool {
-        let temporary = Self::temporary();
-        (same_number(&self.idle, &original.idle) || same_number(&self.idle, &temporary.idle))
+    fn matches_target(&self, target: &Self) -> bool {
+        same_number(&self.idle, &target.idle)
+            && (same_number(&self.animation, &target.animation)
+                || (target.same(&Self::temporary()) && temporary_animation(self.animation.get())))
+    }
+
+    fn is_owned_transition(&self, original: &Self, target: &Self) -> bool {
+        (same_number(&self.idle, &original.idle) || same_number(&self.idle, &target.idle))
             && (same_number(&self.animation, &original.animation)
-                || temporary_animation(self.animation.get()))
+                || same_number(&self.animation, &target.animation)
+                || (target.same(&Self::temporary()) && temporary_animation(self.animation.get())))
     }
 }
 
@@ -506,6 +542,7 @@ mod tests {
     const SETTINGS: &str = "/session/fixture-session/appium/settings";
     const ORIGINAL: &str = r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":2}"#;
     const TARGET: &str = r#"{"waitForIdleTimeout":1.0,"animationCoolOffTimeout":0.2}"#;
+    const RESPONSIVE: &str = r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":0}"#;
 
     struct Step {
         method: &'static str,
@@ -721,6 +758,92 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn responsive_lease_restores_only_its_own_transition() {
+        for current in [
+            RESPONSIVE,
+            r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":2}"#,
+            r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":0}"#,
+        ] {
+            let mut steps = preflight(ORIGINAL);
+            steps.extend([post(RESPONSIVE), settings(RESPONSIVE)]);
+            steps.extend(session());
+            steps.extend(restoration(ORIGINAL, current));
+            let fake = Fake::new(steps);
+            let lease = IdleSettingsLease::start_responsive(&fake, SESSION)
+                .await
+                .unwrap_or_else(|_| panic!("responsive setup failed"));
+            assert_eq!(lease.restore(&fake).await, Restoration::Verified);
+            fake.done(2);
+        }
+
+        let mut steps = preflight(ORIGINAL);
+        steps.extend([post(RESPONSIVE), settings(RESPONSIVE)]);
+        steps.extend(session());
+        steps.extend(session());
+        steps.push(settings(TARGET));
+        let fake = Fake::new(steps);
+        let lease = IdleSettingsLease::start_responsive(&fake, SESSION)
+            .await
+            .unwrap_or_else(|_| panic!("responsive setup failed"));
+        assert_eq!(
+            lease.restore(&fake).await,
+            Restoration::Unproven(SettingsError::ConcurrentChange)
+        );
+        fake.done(1);
+    }
+
+    #[tokio::test]
+    async fn responsive_setup_refusal_restores_before_returning() {
+        let mut steps = preflight(ORIGINAL);
+        steps.extend([post(RESPONSIVE), settings(ORIGINAL)]);
+        steps.extend(session());
+        steps.extend(restoration(ORIGINAL, ORIGINAL));
+        let fake = Fake::new(steps);
+        assert!(matches!(
+            IdleSettingsLease::start_responsive(&fake, SESSION).await,
+            Err((SettingsError::VerificationFailed, Restoration::Verified))
+        ));
+        fake.done(2);
+    }
+
+    #[tokio::test]
+    async fn responsive_lost_receipts_remain_uncertain_without_retries() {
+        for lose_set in [true, false] {
+            let mut steps = preflight(ORIGINAL);
+            let mut set = post(RESPONSIVE);
+            if lose_set {
+                set.response = Err(WdaError::AfterSent);
+            }
+            steps.extend([set, settings(RESPONSIVE)]);
+            steps.extend(session());
+            let mut restore = restoration(ORIGINAL, RESPONSIVE);
+            if !lose_set {
+                restore
+                    .iter_mut()
+                    .find(|step| step.method == "POST")
+                    .unwrap()
+                    .response = Err(WdaError::AfterSent);
+            }
+            steps.extend(restore);
+            let fake = Fake::new(steps);
+            let result = IdleSettingsLease::start_responsive(&fake, SESSION).await;
+            if lose_set {
+                assert!(matches!(
+                    result,
+                    Err((SettingsError::WriteUnproven, Restoration::Verified))
+                ));
+            } else {
+                let lease = result.unwrap_or_else(|_| panic!("setup failed"));
+                assert_eq!(
+                    lease.restore(&fake).await,
+                    Restoration::Unproven(SettingsError::WriteUnproven)
+                );
+            }
+            fake.done(2);
+        }
+    }
+
+    #[tokio::test]
     async fn temporary_roundtrip_verifies_and_restores_without_relaxing_originals() {
         let mut steps = preflight(ORIGINAL);
         steps.extend([post(TARGET), settings(ROUNDTRIP)]);
@@ -767,7 +890,7 @@ mod tests {
 
     #[tokio::test]
     async fn known_recovery_posts_exact_body_once_or_leaves_exact_original_alone() {
-        for temporary in [TARGET, ROUNDTRIP] {
+        for temporary in [TARGET, ROUNDTRIP, RESPONSIVE] {
             let mut steps = recovery_preflight(temporary, temporary);
             steps.extend([post(ORIGINAL), settings(ORIGINAL)]);
             steps.extend(session());
@@ -783,6 +906,8 @@ mod tests {
     #[tokio::test]
     async fn known_recovery_refuses_foreign_changed_stale_or_invalid_values_without_post() {
         for values in [
+            r#"{"waitForIdleTimeout":0,"animationCoolOffTimeout":2}"#,
+            r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":0}"#,
             r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":2}"#,
             r#"{"waitForIdleTimeout":10,"animationCoolOffTimeout":0.2}"#,
             r#"{"waitForIdleTimeout":1,"animationCoolOffTimeout":0.20000000000000002}"#,
