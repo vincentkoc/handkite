@@ -23,6 +23,7 @@ pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=a
 const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const HOME_LAUNCH_AGE: Duration = Duration::from_secs(2);
+const HOME_COMPLETION_BUDGET: Duration = Duration::from_secs(5);
 const TEXT_INPUT_AGE: Duration = Duration::from_secs(5);
 
 async fn before_input_deadline<T>(
@@ -483,6 +484,37 @@ impl DeviceAdapter for WdaAdapter {
             .map(|(observation, _)| observation)
     }
 
+    fn observe_after_action(
+        &mut self,
+        action: &Action,
+        admission: Option<ActionAdmission>,
+        receipt: &TransportReceipt,
+    ) -> Result<RawObservation, AdapterError> {
+        if !matches!(action, Action::Home)
+            || !matches!(admission, Some(ActionAdmission::NativeHome { .. }))
+            || receipt.accepted != Some(true)
+        {
+            return self.observe();
+        }
+        let until = Instant::now() + HOME_COMPLETION_BUDGET;
+        wait_for_home(until, &Instant::now, |until| {
+            self.validate_owned_with_deadline(Some(until))?;
+            let before = native_lock::query_until(&self.expected, until).state;
+            let (raw, captured, reported) = self
+                .runtime
+                .as_ref()
+                .expect("adapter runtime")
+                .block_on(before_input_deadline(
+                    until,
+                    Self::capture(&self.usb, &self.expected, SCREEN_SOURCE, None),
+                ))?;
+            let after = native_lock::query_until(&self.expected, until).state;
+            self.validate_owned_with_deadline(Some(until))?;
+            let home = home_completion(&raw, before, after, reported, captured)?;
+            Ok((raw, home))
+        })
+    }
+
     fn observe_for_action(
         &mut self,
         action: &Action,
@@ -751,7 +783,6 @@ impl DeviceAdapter for WdaAdapter {
                 .as_ref()
                 .expect("adapter runtime")
                 .block_on(self.actions.activate_home_with_existing_session(&wda))?;
-            self.validate_owned()?;
             return Ok(receipt);
         }
         self.execute(action, send_deadline)
@@ -917,6 +948,42 @@ fn native_home_deadline(
     captured_at.checked_add(HOME_LAUNCH_AGE)
 }
 
+fn wait_for_home(
+    until: Instant,
+    now: &impl Fn() -> Instant,
+    mut capture: impl FnMut(Instant) -> Result<(RawObservation, bool), AdapterError>,
+) -> Result<RawObservation, AdapterError> {
+    loop {
+        if now() >= until {
+            return Err(AdapterError);
+        }
+        let (observation, home) = capture(until)?;
+        if now() >= until {
+            return Err(AdapterError);
+        }
+        if home {
+            return Ok(observation);
+        }
+    }
+}
+
+fn home_completion(
+    observation: &RawObservation,
+    before: LockState,
+    after: LockState,
+    reported: Option<bool>,
+    captured: Instant,
+) -> Result<bool, AdapterError> {
+    if springboard_home_launch_deadline(observation, before, after, reported, captured).is_some() {
+        return Ok(true);
+    }
+    // Only a valid, still-unlocked app capture is a transition worth observing again.
+    if native_home_deadline(observation, true, before, after, reported, captured).is_some() {
+        return Ok(false);
+    }
+    Err(AdapterError)
+}
+
 /// One-capture private admission for launching an app from unlocked Home.
 /// It never changes the public lock classification or authorizes direct input.
 pub fn springboard_home_launch_deadline(
@@ -954,6 +1021,148 @@ pub fn springboard_home_launch_deadline(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn home_sample(home: bool) -> RawObservation {
+        let id = HardwareId::new("fixture-device").unwrap();
+        RawObservation {
+            connected_usb: id.clone(),
+            wda_target: id,
+            window: ObservationWindow {
+                started_unix_ms: 0,
+                finished_unix_ms: 1,
+            },
+            state: DeviceState {
+                lock: if home {
+                    LockState::Uncertain
+                } else {
+                    LockState::Unlocked
+                },
+                wda_ready: true,
+                foreground_app: Some(
+                    if home {
+                        "com.apple.springboard"
+                    } else {
+                        "com.example.clock"
+                    }
+                    .into(),
+                ),
+            },
+            accessibility_tree: if home {
+                "<XCUIElementTypeApplication><XCUIElementTypeIcon/></XCUIElementTypeApplication>"
+            } else {
+                r#"<XCUIElementTypeApplication x="0" y="0" width="393" height="852"/>"#
+            }
+            .into(),
+            screenshot: ScreenImage {
+                format: ImageFormat::Png,
+                bytes: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn home_completion_requires_native_unlock_and_home_evidence() {
+        let now = Instant::now();
+        for home in [false, true] {
+            let mut sample = home_sample(home);
+            assert_eq!(
+                home_completion(
+                    &sample,
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    Some(false),
+                    now
+                ),
+                Ok(home)
+            );
+            for (before, after, reported) in [
+                (LockState::Locked, LockState::Unlocked, Some(false)),
+                (LockState::Unlocked, LockState::Uncertain, Some(false)),
+                (LockState::Unlocked, LockState::Unlocked, Some(true)),
+                (LockState::Unlocked, LockState::Unlocked, None),
+            ] {
+                assert!(home_completion(&sample, before, after, reported, now).is_err());
+            }
+            sample
+                .accessibility_tree
+                .push_str("<XCUIElementTypeSecureTextField/>");
+            assert!(
+                home_completion(
+                    &sample,
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    Some(false),
+                    now
+                )
+                .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn home_completion_observes_transition_without_resetting_deadline() {
+        let start = Instant::now();
+        let until = start + Duration::from_millis(5);
+        let elapsed = std::cell::Cell::new(0);
+        let mut captures = 0;
+        let result = wait_for_home(
+            until,
+            &|| start + Duration::from_millis(elapsed.get()),
+            |deadline| {
+                assert_eq!(deadline, until);
+                captures += 1;
+                elapsed.set(elapsed.get() + 1);
+                Ok((home_sample(captures == 2), captures == 2))
+            },
+        )
+        .unwrap();
+        assert_eq!(captures, 2);
+        assert_eq!(
+            result.state.foreground_app.as_deref(),
+            Some("com.apple.springboard")
+        );
+
+        elapsed.set(0);
+        captures = 0;
+        assert!(
+            wait_for_home(
+                until,
+                &|| start + Duration::from_millis(elapsed.get()),
+                |deadline| {
+                    assert_eq!(deadline, until);
+                    captures += 1;
+                    elapsed.set(elapsed.get() + 1);
+                    Ok((home_sample(false), false))
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(captures, 5);
+    }
+
+    #[test]
+    fn home_completion_stops_on_capture_failure_or_late_home() {
+        let start = Instant::now();
+        let until = start + Duration::from_millis(5);
+        let now = std::cell::Cell::new(start);
+        let mut captures = 0;
+        assert!(
+            wait_for_home(until, &|| now.get(), |_| {
+                captures += 1;
+                Err(AdapterError)
+            })
+            .is_err()
+        );
+        assert_eq!(captures, 1);
+        assert!(
+            wait_for_home(until, &|| now.get(), |_| {
+                now.set(until);
+                Ok((home_sample(true), true))
+            })
+            .is_err()
+        );
+        assert!(wait_for_home(until, &|| now.get(), |_| panic!("expired capture polled")).is_err());
+    }
 
     #[tokio::test]
     async fn expired_input_validation_does_not_poll_work() {

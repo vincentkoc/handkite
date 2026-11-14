@@ -61,6 +61,15 @@ pub trait DeviceAdapter {
     ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
         self.observe().map(|observation| (observation, None))
     }
+    /// Capture the result without resending the acknowledged action.
+    fn observe_after_action(
+        &mut self,
+        _action: &Action,
+        _admission: Option<ActionAdmission>,
+        _receipt: &TransportReceipt,
+    ) -> Result<RawObservation, AdapterError> {
+        self.observe()
+    }
     /// The adapter must send no action bytes at or after this monotonic deadline.
     fn execute(
         &mut self,
@@ -432,9 +441,11 @@ impl<A: DeviceAdapter> Controller<A> {
         } else {
             ObservedEffect::Unconfirmed
         };
-        let observed = self
-            .capture(&mut inner, &request.device, None)
-            .map(|(observation, _)| observation);
+        let observed = inner
+            .adapter
+            .observe_after_action(&request.action, execution_admission, &receipt)
+            .map_err(|_| ControllerError::Adapter)
+            .and_then(|raw| self.accept_capture(&mut inner, &request.device, raw));
         match observed {
             Ok(after) => {
                 let changed = inner
@@ -496,6 +507,16 @@ impl<A: DeviceAdapter> Controller<A> {
                 .map(|observation| (observation, None)),
         }
         .map_err(|_| ControllerError::Adapter)?;
+        self.accept_capture(inner, requested, raw)
+            .map(|observation| (observation, admission))
+    }
+
+    fn accept_capture(
+        &self,
+        inner: &mut Inner<A>,
+        requested: &DeviceKey,
+        raw: RawObservation,
+    ) -> Result<Observation, ControllerError> {
         self.binding
             .verify(requested, &raw.connected_usb, &raw.wda_target)
             .map_err(|_| ControllerError::DeviceMismatch)?;
@@ -521,17 +542,14 @@ impl<A: DeviceAdapter> Controller<A> {
             .next()
             .map_err(|_| ControllerError::RevisionExhausted)?;
         inner.revision = revision;
-        Ok((
-            Observation {
-                device: requested.clone(),
-                revision,
-                window: raw.window,
-                state: raw.state,
-                accessibility_tree: raw.accessibility_tree,
-                screenshot: raw.screenshot,
-            },
-            admission,
-        ))
+        Ok(Observation {
+            device: requested.clone(),
+            revision,
+            window: raw.window,
+            state: raw.state,
+            accessibility_tree: raw.accessibility_tree,
+            screenshot: raw.screenshot,
+        })
     }
 }
 

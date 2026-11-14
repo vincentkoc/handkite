@@ -25,6 +25,7 @@ struct FakeAdapter {
     send_deadline: Option<Instant>,
     send_started: Option<Instant>,
     execution_admission: Option<ActionAdmission>,
+    after_admission: Option<ActionAdmission>,
 }
 
 impl FakeAdapter {
@@ -54,6 +55,7 @@ impl FakeAdapter {
             send_deadline: None,
             send_started: None,
             execution_admission: None,
+            after_admission: None,
         }
     }
 }
@@ -119,6 +121,16 @@ impl DeviceAdapter for FakeAdapter {
             self.tap_admission.take()
         };
         Ok((observation, admission))
+    }
+
+    fn observe_after_action(
+        &mut self,
+        _action: &Action,
+        admission: Option<ActionAdmission>,
+        _receipt: &TransportReceipt,
+    ) -> Result<RawObservation, AdapterError> {
+        self.after_admission = admission;
+        self.observe()
     }
 
     fn execute_with_admission(
@@ -1033,6 +1045,46 @@ fn native_home_admission_tolerates_only_pixels_and_is_passed_to_execution() {
                 "case {change}"
             );
             assert_eq!(inner.adapter.actions, 0);
+        }
+    }
+}
+
+#[test]
+fn home_completion_keeps_acknowledgment_when_observation_fails() {
+    for fail in [false, true] {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let admission = ActionAdmission::NativeHome {
+            until: Instant::now() + Duration::from_secs(2),
+        };
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.tap_admission = Some(admission);
+            inner.adapter.native_lock = LockState::Unlocked;
+            inner.adapter.fail_after_action = fail;
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller
+            .act(
+                "agent",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action: Action::Home,
+                },
+            )
+            .unwrap();
+        assert_eq!(result.receipt.accepted, Some(true));
+        assert_eq!(result.after.is_none(), fail);
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(inner.adapter.actions, 1);
+        assert_eq!(inner.adapter.after_admission, Some(admission));
+        if fail {
+            assert_eq!(result.effect, ObservedEffect::Unconfirmed);
+            assert!(inner.last.is_none());
         }
     }
 }
