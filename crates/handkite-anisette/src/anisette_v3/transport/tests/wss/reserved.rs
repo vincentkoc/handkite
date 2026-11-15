@@ -339,7 +339,7 @@ async fn persistence_failure_never_polls_close_or_overwrites_residue() {
     assert!(load(&layout).is_err());
 }
 
-fn change_attempt(layout: &crate::service_layout::ServiceLayout) {
+fn change_attempt(layout: &crate::layout::StateLayout) {
     fs::set_permissions(
         layout.anisette_state_directory().join("attempt.json"),
         fs::Permissions::from_mode(0o600),
@@ -429,7 +429,7 @@ async fn custody_changed_during_discovery_blocks_wss() {
 
 struct MutatingProvider {
     inner: FixtureProvider,
-    layout: crate::service_layout::ServiceLayout,
+    layout: crate::layout::StateLayout,
     finish: bool,
 }
 

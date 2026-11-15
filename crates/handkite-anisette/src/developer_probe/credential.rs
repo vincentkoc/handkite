@@ -6,6 +6,20 @@ use zeroize::Zeroizing;
 const INVALID: &str = "developer credential input is unsafe or invalid";
 const MAX_BYTES: usize = 4354;
 
+/// Require an empty ACL on a held input file, failing closed outside macOS.
+fn check_private_input_acl(input: &File) -> Result<(), &'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        crate::fs_anchor::check_acl(input.as_raw_fd(), true)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = input;
+        Err("private input ACL verification requires macOS")
+    }
+}
+
 /// One account identity and Xcode token from a private, one-shot input file.
 /// The source is never reopened, logged, or persisted by this module.
 pub struct DeveloperCredential {
@@ -25,7 +39,7 @@ impl DeveloperCredential {
         {
             return Err(INVALID);
         }
-        crate::release_verify::check_private_input_acl(&file).map_err(|_| INVALID)?;
+        check_private_input_acl(&file).map_err(|_| INVALID)?;
         let mut bytes = Zeroizing::new(Vec::new());
         file.by_ref()
             .take(MAX_BYTES as u64 + 1)
@@ -44,7 +58,7 @@ impl DeveloperCredential {
         {
             return Err(INVALID);
         }
-        crate::release_verify::check_private_input_acl(&file).map_err(|_| INVALID)?;
+        check_private_input_acl(&file).map_err(|_| INVALID)?;
         Self::parse(&bytes)
     }
 

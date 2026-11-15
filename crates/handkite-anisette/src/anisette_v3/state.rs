@@ -1,7 +1,7 @@
 //! Fixed Mac-side reservation. Dropping a handle never removes or resets state.
 
 use super::MacosProvisionedState;
-use crate::service_layout::ServiceLayout;
+use crate::layout::StateLayout;
 
 #[cfg(target_os = "macos")]
 mod macos;
@@ -18,12 +18,12 @@ impl PendingProvisioning {
     /// Exclusively reserve the fixed account location before any network work.
     /// Every existing entry blocks reservation, including empty or invalid state.
     pub fn reserve() -> Result<Self, &'static str> {
-        let layout = ServiceLayout::current_account()
+        let layout = StateLayout::current_account()
             .map_err(|_| "Anisette service account is unavailable")?;
         Self::reserve_at(&layout)
     }
 
-    fn reserve_at(layout: &ServiceLayout) -> Result<Self, &'static str> {
+    fn reserve_at(layout: &StateLayout) -> Result<Self, &'static str> {
         #[cfg(target_os = "macos")]
         {
             Ok(Self {
@@ -75,7 +75,7 @@ impl PendingProvisioning {
 /// Restart can read valid ready state only; it cannot resume an attempt.
 pub fn load_ready() -> Result<MacosProvisionedState, &'static str> {
     let layout =
-        ServiceLayout::current_account().map_err(|_| "Anisette service account is unavailable")?;
+        StateLayout::current_account().map_err(|_| "Anisette service account is unavailable")?;
     #[cfg(target_os = "macos")]
     {
         macos::load(&layout)

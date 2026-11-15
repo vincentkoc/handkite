@@ -2,17 +2,17 @@ use super::*;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
-pub(crate) fn fixture() -> (tempfile::TempDir, ServiceLayout, PendingProvisioning) {
-    let (scratch, layout) = crate::service_layout::tests::fixture();
+pub(crate) fn fixture() -> (tempfile::TempDir, StateLayout, PendingProvisioning) {
+    let (scratch, layout) = crate::layout::tests::fixture();
     let pending = PendingProvisioning::reserve_at(&layout).unwrap();
     (scratch, layout, pending)
 }
 
-pub(crate) fn load(layout: &ServiceLayout) -> Result<MacosProvisionedState, &'static str> {
+pub(crate) fn load(layout: &StateLayout) -> Result<MacosProvisionedState, &'static str> {
     macos::load(layout)
 }
 
-pub(crate) fn is_reserved(layout: &ServiceLayout) -> bool {
+pub(crate) fn is_reserved(layout: &StateLayout) -> bool {
     PendingProvisioning::reserve_at(layout).is_err()
 }
 
@@ -59,7 +59,7 @@ fn reservation_is_private_immutable_random_and_survives_drop() {
 
 #[test]
 fn concurrent_reservation_has_exactly_one_winner() {
-    let (_scratch, layout) = crate::service_layout::tests::fixture();
+    let (_scratch, layout) = crate::layout::tests::fixture();
     let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
     let handles: Vec<_> = (0..2)
         .map(|_| {
@@ -85,7 +85,7 @@ fn concurrent_reservation_has_exactly_one_winner() {
 #[test]
 fn every_existing_entry_blocks_reservation_without_repair() {
     for kind in ["empty", "partial", "stage", "file", "symlink"] {
-        let (_scratch, layout) = crate::service_layout::tests::fixture();
+        let (_scratch, layout) = crate::layout::tests::fixture();
         let path = layout.anisette_state_directory();
         match kind {
             "file" => fs::write(&path, b"existing").unwrap(),
@@ -161,7 +161,7 @@ fn identity_mismatch_and_existing_stage_or_ready_never_overwrite() {
 #[test]
 fn reservation_rejects_unprotected_or_symlinked_ancestors() {
     for path_kind in ["root", "state"] {
-        let (_scratch, layout) = crate::service_layout::tests::fixture();
+        let (_scratch, layout) = crate::layout::tests::fixture();
         let path = if path_kind == "root" {
             layout.root()
         } else {

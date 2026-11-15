@@ -1,7 +1,7 @@
 //! Explicit read-only compatibility probe. No account login, signing, or device mutation.
 
-use handkite_host::anisette_v3::{AnisetteClient, AnisetteIdentity};
-use handkite_host::developer_probe::{DeveloperCredential, list_teams};
+use handkite_anisette::anisette_v3::{AnisetteClient, AnisetteIdentity};
+use handkite_anisette::developer_probe::{DeveloperCredential, list_teams};
 use std::fs::File;
 use std::future::Future;
 use std::io::{self, Write};

@@ -1,5 +1,5 @@
 use super::*;
-use crate::release_files::{
+use crate::fs_anchor::{
     Fingerprint, check_acl, components, directory_matches, directory_metadata, open_at,
 };
 use ring::rand::{SecureRandom, SystemRandom};
@@ -40,7 +40,7 @@ struct Anchor {
 }
 
 impl Anchor {
-    fn open(layout: &ServiceLayout) -> Result<Self, &'static str> {
+    fn open(layout: &StateLayout) -> Result<Self, &'static str> {
         let names = components(&layout.state_directory()).map_err(|_| INVALID)?;
         let uid = unsafe { libc::geteuid() };
         let root = open_at(libc::AT_FDCWD, c"/", true).map_err(|_| INVALID)?;
@@ -140,7 +140,7 @@ pub(super) struct Pending {
     identifier: Zeroizing<[u8; 16]>,
 }
 
-pub(super) fn reserve(layout: &ServiceLayout) -> Result<Pending, &'static str> {
+pub(super) fn reserve(layout: &StateLayout) -> Result<Pending, &'static str> {
     let anchor = Anchor::open(layout)?;
     let mut identifier = Zeroizing::new([0; 16]);
     SystemRandom::new()
@@ -259,7 +259,7 @@ impl Pending {
     }
 }
 
-pub(super) fn load(layout: &ServiceLayout) -> Result<MacosProvisionedState, &'static str> {
+pub(super) fn load(layout: &StateLayout) -> Result<MacosProvisionedState, &'static str> {
     let anchor = Anchor::open(layout)?;
     let file = open_at(anchor.parent().as_raw_fd(), c"anisette-v3", true).map_err(|_| INVALID)?;
     let directory = Directory {

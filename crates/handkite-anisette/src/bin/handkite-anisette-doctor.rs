@@ -1,4 +1,4 @@
-use handkite_host::anisette_v3::{AnisetteClient, AnisetteIdentity, state};
+use handkite_anisette::anisette_v3::{AnisetteClient, AnisetteIdentity, state};
 use std::future::Future;
 use std::path::Path;
 

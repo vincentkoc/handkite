@@ -1,4 +1,6 @@
-use handkite_host::anisette_v3::{AnisetteClient, AnisetteIdentity, state::PendingProvisioning};
+use handkite_anisette::anisette_v3::{
+    AnisetteClient, AnisetteIdentity, state::PendingProvisioning,
+};
 use std::future::Future;
 use std::path::Path;
 

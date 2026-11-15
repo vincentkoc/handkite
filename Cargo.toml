@@ -1,6 +1,8 @@
 [workspace]
 members = ["crates/handkite-core", "crates/handkite-host"]
 resolver = "3"
+# Optional Apple-account/Anisette tooling is its own workspace and lockfile.
+exclude = ["crates/handkite-anisette"]
 
 [workspace.package]
 edition = "2024"
