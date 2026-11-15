@@ -67,11 +67,6 @@ impl ServiceLayout {
         self.root().join("state")
     }
 
-    /// Fixed Mac-side V3 reservation and opaque provisioning state.
-    pub fn anisette_state_directory(&self) -> PathBuf {
-        self.state_directory().join("anisette-v3")
-    }
-
     /// A staging path only, outside launchd's automatically loaded directories.
     pub fn staged_launchd_descriptor(&self) -> PathBuf {
         self.root().join("launchd/com.handkite.host.plist")
@@ -210,10 +205,6 @@ pub(crate) mod tests {
                 root.join("runtime/handkited.stderr.log")
             );
             assert_eq!(layout.state_directory(), root.join("state"));
-            assert_eq!(
-                layout.anisette_state_directory(),
-                root.join("state/anisette-v3")
-            );
             assert_eq!(
                 layout.staged_launchd_descriptor(),
                 root.join("launchd/com.handkite.host.plist")

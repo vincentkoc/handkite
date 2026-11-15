@@ -102,7 +102,7 @@ fn absolute_path(value: &str) -> Option<PathBuf> {
         return None;
     }
     let path = if value.starts_with("file:") {
-        let url = reqwest::Url::parse(value).ok()?;
+        let url = url::Url::parse(value).ok()?;
         if url.scheme() != "file"
             || url.host_str().is_some()
             || url.query().is_some()
