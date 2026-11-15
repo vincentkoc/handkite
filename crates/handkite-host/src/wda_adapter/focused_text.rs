@@ -273,6 +273,22 @@ async fn app_matches(wda: &impl WdaRequest, session: &str, app: &str) -> Result<
     Ok(())
 }
 
+async fn dispatch_to_focused(
+    wda: &impl WdaRequest,
+    session: &str,
+    field: &str,
+    app: &str,
+    action: &Action,
+) -> Result<TransportReceipt, AdapterDiagnostic> {
+    let focus_timing = crate::timing::Span::new("text_final_focus");
+    let (active, app) = tokio::join!(active(wda, session), app_matches(wda, session, app));
+    if active.map_err(|_| AdapterDiagnostic::PreActionCapture)? != field || app.is_err() {
+        return Err(AdapterDiagnostic::PreActionCapture);
+    }
+    drop(focus_timing);
+    WdaActions::execute_on_diagnostic(wda, action, session).await
+}
+
 impl WdaAdapter {
     pub(super) fn prepare_focus(
         &mut self,
@@ -398,18 +414,8 @@ impl WdaAdapter {
                     .validate_existing_diagnostic(&wda)
                     .await
                     .map_err(|_| AdapterDiagnostic::SessionCheck)?;
-                let _focus = crate::timing::Span::new("text_final_focus");
-                let (active, app) = tokio::join!(
-                    active(&wda, &input.key.session),
-                    app_matches(&wda, &input.key.session, &input.app)
-                );
-                if active.map_err(|_| AdapterDiagnostic::PreActionCapture)? != input.field
-                    || app.is_err()
-                {
-                    return Err(AdapterDiagnostic::PreActionCapture);
-                }
-                drop(_focus);
-                WdaActions::execute_on_diagnostic(&wda, action, &input.key.session).await
+                dispatch_to_focused(&wda, &input.key.session, &input.field, &input.app, action)
+                    .await
             })
             .map_err(|reason| {
                 self.error_diagnostic = Some(reason);
@@ -591,6 +597,61 @@ mod tests {
             XML.replace("value=", "focused=\"false\" value="),
         ] {
             assert!(crate::wda_ui_admission::current_text_snapshot(&bad).is_none());
+        }
+    }
+
+    struct FocusFake {
+        mode: u8,
+        sends: RefCell<usize>,
+    }
+    impl WdaRequest for FocusFake {
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            _: &[u8],
+            _: Duration,
+        ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+            let result = if method == "POST" {
+                assert!(path.ends_with("/wda/keys"));
+                *self.sends.borrow_mut() += 1;
+                Value::Null
+            } else if path.ends_with("/element/active") {
+                match self.mode {
+                    1 => json!({"ELEMENT":"another-editor"}),
+                    4 => json!({}),
+                    _ => json!({"ELEMENT":"editor"}),
+                }
+            } else if path.ends_with("/wda/activeAppInfo") {
+                json!({"bundleId":if self.mode==2 { "other.app" } else { "example.editor" }})
+            } else {
+                assert!(path.ends_with("/wda/locked"));
+                json!(self.mode == 3)
+            };
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(&json!({"sessionId":"session","value":result})).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn changed_or_unknown_focus_app_or_lock_never_sends_text() {
+        for mode in 0..=4 {
+            let fake = FocusFake {
+                mode,
+                sends: RefCell::new(0),
+            };
+            let result = dispatch_to_focused(
+                &fake,
+                "session",
+                "editor",
+                "example.editor",
+                &Action::TextCurrent { value: "X".into() },
+            )
+            .await;
+            assert_eq!(result.is_ok(), mode == 0);
+            assert_eq!(*fake.sends.borrow(), usize::from(mode == 0));
         }
     }
 

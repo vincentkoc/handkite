@@ -144,8 +144,13 @@ pub trait DeviceAdapter {
     fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
         Err(AdapterError)
     }
-    /// Optional current-selection text preparation. No input may be sent here.
-    /// `None` retains the full-observation path; unsafe evidence must refuse.
+    /// Owned adapters can forbid generic text fallback after failed preparation.
+    fn requires_current_text_preparation(&self) -> bool {
+        false
+    }
+
+    /// Optional current-selection preparation. No input may be sent here.
+    /// A strict adapter's `None` permits one read-only refresh, never generic input.
     fn prepare_current_text(
         &mut self,
         _action: &Action,

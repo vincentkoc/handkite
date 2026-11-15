@@ -70,6 +70,9 @@ class BenchmarkTests(unittest.TestCase):
                 validate_measured_stages("type", [row for row in rows if row.get("stage") != stage], "image_only")
         with self.assertRaises(BenchError):
             validate_measured_stages("type", rows + [{"capture": capture}], "image_only")
+        full = {"stages": [{"stage": name, "elapsed_us": 1, "ok": True} for name in sorted(CAPTURE_NAMES)]}
+        refreshed = [{"capture":full}, {"stage":"text_prepare", "started_us":0, "elapsed_us":1}] + rows
+        validate_measured_stages("type", refreshed, "image_only")
 
     def test_response_settings_and_query_posts_are_not_counted_as_input(self):
         rows = [{"stage":"text_context_transaction", "started_us":0, "elapsed_us":100},

@@ -26,22 +26,58 @@ impl<A: DeviceAdapter> Controller<A> {
         capture: CaptureMode,
     ) -> Result<Option<ActionResult>, ControllerError> {
         if capture != CaptureMode::ImageOnly
-            || request.expected_revision.is_none()
             || !matches!(&request.action, Action::TextCurrent { .. })
         {
             return Ok(None);
         }
-        let Some(baseline) = &inner.last else {
-            return Ok(None);
-        };
-        if self.validate_window(&baseline.window).is_err() || !public_text_state(&baseline.state) {
+        let strict = inner.adapter.requires_current_text_preparation();
+        if request.expected_revision.is_none() && strict {
+            return Err(ControllerError::StaleRevision);
+        }
+        if request.expected_revision.is_none() {
             return Ok(None);
         }
+        let Some(baseline) = inner.last.clone() else {
+            return if strict {
+                Err(ControllerError::StaleObservation)
+            } else {
+                Ok(None)
+            };
+        };
+        if self.validate_window(&baseline.window).is_err() || !public_text_state(&baseline.state) {
+            return if strict {
+                Err(ControllerError::StaleObservation)
+            } else {
+                Ok(None)
+            };
+        }
         let baseline_state = baseline.state.clone();
-        let prepared = inner
+        let mut prepared = inner
             .adapter
-            .prepare_current_text(&request.action, baseline)
+            .prepare_current_text(&request.action, &baseline)
             .map_err(|_| Self::adapter_error(inner))?;
+        if prepared.is_none() && strict {
+            // A read-only refresh may resolve ambiguity. It must return through
+            // the same strict preparation, never the generic input fallback.
+            let (fresh, _) = self.capture(inner, &request.device, None)?;
+            if fresh.state != baseline.state
+                || fresh.accessibility_tree != baseline.accessibility_tree
+            {
+                let change = ViewChange::between(&baseline, &fresh);
+                inner.last = Some(fresh);
+                return Err(ControllerError::ViewChanged(change));
+            }
+            prepared = inner
+                .adapter
+                .prepare_current_text(&request.action, &fresh)
+                .map_err(|_| Self::adapter_error(inner))?;
+            if prepared.is_none() {
+                inner.last = None;
+                return Err(ControllerError::AdapterAt(
+                    AdapterDiagnostic::PreActionCapture,
+                ));
+            }
+        }
         let Some(prepared) = prepared else {
             return Ok(None);
         };
@@ -140,6 +176,7 @@ mod tests {
         captures: usize,
         verified: bool,
         fail_readback: bool,
+        preparations: usize,
     }
 
     fn raw() -> RawObservation {
@@ -168,6 +205,9 @@ mod tests {
     }
 
     impl DeviceAdapter for Adapter {
+        fn requires_current_text_preparation(&self) -> bool {
+            true
+        }
         fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
             let raw = raw();
             Ok((raw.connected_usb, raw.wda_target))
@@ -184,6 +224,10 @@ mod tests {
             _: &Action,
             _: &Observation,
         ) -> Result<Option<PreparedText>, AdapterError> {
+            self.preparations += 1;
+            if self.prepare == 5 || self.prepare == 6 && self.preparations == 1 {
+                return Ok(None);
+            }
             let mut raw = raw();
             if self.prepare == 1 {
                 raw.state.lock = LockState::Locked;
@@ -286,7 +330,7 @@ mod tests {
 
     #[test]
     fn unsafe_or_expired_preparation_never_sends() {
-        for prepare in 1..=4 {
+        for prepare in 1..=5 {
             let (controller, _, lease, request) = fixture(Adapter {
                 prepare,
                 ..Adapter::default()
@@ -298,6 +342,39 @@ mod tests {
             );
             assert_eq!(controller.inner.lock().unwrap().adapter.sends, 0);
         }
+    }
+
+    #[test]
+    fn ambiguity_refreshes_once_then_requires_strict_token() {
+        let (controller, _, lease, request) = fixture(Adapter {
+            prepare: 6,
+            verified: true,
+            ..Adapter::default()
+        });
+        let result = controller
+            .act_with_capture("owner", lease, request, CaptureMode::ImageOnly)
+            .unwrap();
+        assert!(result.effect == ObservedEffect::Changed);
+        let inner = controller.inner.lock().unwrap();
+        assert_eq!(
+            (
+                inner.adapter.captures,
+                inner.adapter.preparations,
+                inner.adapter.sends
+            ),
+            (2, 2, 1)
+        );
+    }
+
+    #[test]
+    fn strict_text_without_revision_cannot_reach_generic_input() {
+        let (controller, _, lease, mut request) = fixture(Adapter::default());
+        request.expected_revision = None;
+        assert!(matches!(
+            controller.act_with_capture("owner", lease, request, CaptureMode::ImageOnly),
+            Err(ControllerError::StaleRevision)
+        ));
+        assert_eq!(controller.inner.lock().unwrap().adapter.sends, 0);
     }
 
     #[test]

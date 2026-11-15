@@ -705,6 +705,10 @@ async fn run_until_shutdown<T, E: Copy>(
 }
 
 impl DeviceAdapter for WdaAdapter {
+    fn requires_current_text_preparation(&self) -> bool {
+        self.owned_runner.is_some() || self.owned_session.is_some()
+    }
+
     fn prepare_current_text(
         &mut self,
         action: &Action,
@@ -1102,6 +1106,13 @@ impl DeviceAdapter for WdaAdapter {
     ) -> Result<TransportReceipt, AdapterError> {
         self.error_diagnostic = None;
         self.cache.clear_full();
+        if self.owned_session.is_some()
+            && matches!(action, Action::Text { .. } | Action::TextCurrent { .. })
+            && !matches!(admission, Some(ActionAdmission::NativeText { .. }))
+        {
+            self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
+            return Err(AdapterError);
+        }
         if let Some(ActionAdmission::NativeAppLaunch { until }) = admission {
             if !take_launch_admission(
                 &mut self.launch_admission,

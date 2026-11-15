@@ -172,7 +172,11 @@ def validate_measured_stages(case, rows, capture_kind):
                 and {"text_context_transaction", "text_context_query", "text_final_focus", "text_readback"} <= names
                 and any(row.get("stage") == "text_verified" and row.get("ok") is True for row in rows),
                 "invalid_text_trace")
-    require(len(captures) == (1 if narrow else 2 if case in CASES[:4] else 1), "missing_capture")
+    refreshed = narrow and len(captures) == 2
+    if refreshed:
+        require(sum(row.get("stage") == "text_prepare" and "elapsed_us" in row for row in rows) == 2,
+                "invalid_text_refresh")
+    require(len(captures) == (2 if refreshed else 1 if narrow else 2 if case in CASES[:4] else 1), "missing_capture")
     require(capture_kind in ("paired", "image_only"), "unknown_capture_kind")
     for index, capture in enumerate(captures):
         expected = CAPTURE_NAMES.copy()
