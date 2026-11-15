@@ -271,6 +271,9 @@ class Peer:
                     and type(response.get("id")) is int
                     and response["id"] == self.identifier, "response_identity")
             call["response_bytes"] = len(raw)
+            error = response.get("error")
+            if isinstance(error, dict) and type(error.get("code")) is int:
+                call["rpc_error_code"] = error["code"]
             require("error" not in response and isinstance(response.get("result"), dict),
                     "rpc_error")
             return response["result"], call

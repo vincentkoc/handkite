@@ -5,6 +5,7 @@ import json
 import re
 import tempfile
 import unittest
+from unittest.mock import patch
 import unicodedata
 from pathlib import Path
 from xml.sax.saxutils import quoteattr
@@ -191,6 +192,55 @@ class CompareTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_only_invalid_arguments_are_classified_as_rpc_refusal(self):
+        peer = object.__new__(text_matrix.MatrixPeer)
+        for code, expected in [(-32602, text_matrix.RpcRefused),
+                               (-32603, BenchError), (None, BenchError)]:
+            peer.calls = [{"rpc_error_code": code}]
+            peer.healthy = False
+            with patch.object(text_matrix.Peer, "tool", side_effect=BenchError("rpc_error")):
+                with self.assertRaises(expected):
+                    peer.tool("handkite_text", {})
+            self.assertEqual(peer.healthy, code == -32602)
+
+    def test_default_keyboard_label_is_accepted_before_transport_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "report.json"
+            argv = ["text_matrix.py", "run", "--keyboard", "english", "--build", "installed",
+                    "--output", str(output), "--", "unused"]
+            with patch("sys.argv", argv), patch.object(text_matrix, "MatrixPeer",
+                                                       side_effect=BenchError("transport_probe")):
+                with patch("builtins.print") as printed:
+                    self.assertEqual(text_matrix.main(), 1)
+                printed.assert_called_once_with("text_matrix=transport_probe")
+
+    def test_transport_failure_observes_once_and_never_sends_next_case(self):
+        class BrokenTransport(FakeEditor):
+            def tool(self, name, arguments):
+                result = super().tool(name, arguments)
+                if name == "handkite_text":
+                    raise BenchError("transport_eof")
+                return result
+        peer = BrokenTransport()
+        rows = run(peer, only=["ascii_sentence", "simplified_chinese"])
+        self.assertEqual(rows["ascii_sentence"]["outcome"], "uncertain")
+        self.assertTrue(rows["ascii_sentence"]["editor_changed"])
+        self.assertEqual(rows["simplified_chinese"]["outcome"], "not_run")
+        self.assertEqual([call["tool"] for call in peer.calls].count("handkite_observe"), 3)
+
+    def test_keyboard_is_required_before_each_case(self):
+        class HiddenKeyboard(FakeEditor):
+            def tool(self, name, arguments):
+                result = super().tool(name, arguments)
+                if name == "handkite_key":
+                    self.keyboard = False
+                return result
+        peer = HiddenKeyboard()
+        rows = run(peer, only=["ascii_sentence", "simplified_chinese"])
+        self.assertEqual(rows["ascii_sentence"]["outcome"], "pass")
+        self.assertEqual(rows["simplified_chinese"]["detail"], "keyboard_not_visible")
+        self.assertEqual(len([text for text in peer.sent if text != "\n"]), 1)
+
     def test_faithful_editor_passes_every_case_and_sends_each_text_once(self):
         peer = FakeEditor()
         rows = run(peer)

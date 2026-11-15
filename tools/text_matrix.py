@@ -179,7 +179,8 @@ class MatrixPeer(Peer):
         try:
             return super().tool(name, arguments)
         except BenchError as error:
-            if error.args != ("rpc_error",):
+            if (error.args != ("rpc_error",)
+                    or self.calls[-1].get("rpc_error_code") != -32602):
                 raise
             # A JSON-RPC argument rejection leaves the stream usable.
             self.healthy = True
@@ -237,6 +238,10 @@ class Matrix:
             result, call = self.peer.tool(tool, arguments)
         except RpcRefused:
             return "refused", self.peer.calls[-1]
+        except BenchError:
+            # The request may have reached the device. Diagnose once below,
+            # then stop; a transport error is never an argument refusal.
+            return "uncertain", self.peer.calls[-1]
         if result.get("isError") is True:
             code = call.get("error_code")
             return ("stop_pre_input" if code in PRE_INPUT else "uncertain"), call
@@ -252,6 +257,7 @@ class Matrix:
         parts = case.get("segments") or [case["input"]]
         row["sizes"] = sizes("\n".join(parts))
         before = editor_value(self.observe())
+        require(bool(elements(self.screen, {"type": "Keyboard"})), "keyboard_not_visible")
         row["baseline_scalars"] = len(before)
         outcome = "sent"
         request_ms = []
@@ -282,7 +288,7 @@ class Matrix:
             try:
                 after = editor_value(self.observe())
                 row["editor_changed"] = after != before
-                if outcome == "refused" and after != before:
+                if outcome in ("refused", "stop_pre_input") and after != before:
                     outcome = "uncertain"
             except BenchError as error:
                 row["diagnosis"] = error.args[0]
@@ -397,7 +403,8 @@ def main():
                 print(f"{case['id']}\t{expectation(case, args.keyboard)}")
             return 0
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
-        require(len(args.keyboard_label) <= 64 and args.keyboard_label.isprintable(),
+        require(len(args.keyboard_label) <= 64
+                and (not args.keyboard_label or args.keyboard_label.isprintable()),
                 "invalid_keyboard_label")
         require(not args.output.exists(), "output_exists")
         peer = MatrixPeer(command)
