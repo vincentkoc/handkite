@@ -15,29 +15,13 @@ MODERN_UDID = "00008120-00123456789A1234"
 
 
 def project_fixture():
-    def block(identifier, settings):
-        return (
-            f"\t\t{identifier} /* Debug */ = {{\n"
-            "\t\t\tisa = XCBuildConfiguration;\n"
-            "\t\t\tbaseConfigurationReference = EEE5CABF1C80361500CBBDD9 /* IOSSettings.xcconfig */;\n"
-            "\t\t\tbuildSettings = {\n"
-            f"\t\t\t\t{settings}\n"
-            "\t\t\t\tINFOPLIST_FILE = WebDriverAgentRunner/Info.plist;\n"
-            "\t\t\t\tUSES_XCTRUNNER = YES;\n"
-            "\t\t\t};\n"
-            "\t\t};\n"
-        )
+    return b"pinned project bytes"
 
-    original = build.ORIGINAL_BUNDLE
-    return (
-        "\n" + block(build.IOS_CONFIGS[0], original)
-        + block(build.IOS_CONFIGS[1], original)
-        + "\t\tCONFIG_LIST = { buildConfigurations = (\n"
-        + f"\t\t\t\t{build.IOS_CONFIGS[0]} /* Debug */,\n"
-        + f"\t\t\t\t{build.IOS_CONFIGS[1]} /* Release */,\n"
-        + "\t\t); };\n"
-        + "\t\tOTHER /* tvOS */ = { PRODUCT_BUNDLE_IDENTIFIER = com.facebook.WebDriverAgentRunner; };\n"
-    ).encode()
+def archive_fixture(destination, data):
+    for path, content in ((build.PROJECT, data), (build.SCHEME_FILE, b"pinned scheme bytes")):
+        target = destination / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
 
 
 class BuildTests(unittest.TestCase):
@@ -56,7 +40,7 @@ class BuildTests(unittest.TestCase):
             )) as run,
         ):
             self.assertEqual(
-                build.resolved_settings(Path("/project"), "ABCDE12345", MODERN_UDID),
+                build.resolved_settings(Path("/project"), "ABCDE12345", MODERN_UDID, "com.example.Runner"),
                 {"PLATFORM_NAME": "iphoneos"},
             )
         self.assertNotIn("CPATH", run.call_args.kwargs["env"])
@@ -67,7 +51,7 @@ class BuildTests(unittest.TestCase):
         with mock.patch.object(build.subprocess, "run", return_value=mock.Mock(
             returncode=0, stdout=b"    PLATFORM_NAME = iphoneos\n",
         )) as run:
-            build.resolved_settings(Path("/project"), "ABCDE12345", MODERN_UDID, True)
+            build.resolved_settings(Path("/project"), "ABCDE12345", MODERN_UDID, "com.example.Runner", True)
         command = run.call_args.args[0]
         self.assertEqual(command[command.index("-destination") + 1], "generic/platform=iOS")
         self.assertNotIn("-allowProvisioningUpdates", command)
@@ -92,15 +76,22 @@ class BuildTests(unittest.TestCase):
         ):
             self.assertIsNone(build.UDID.fullmatch(invalid))
 
-    def test_patch_changes_only_two_pinned_ios_configs(self):
-        data = project_fixture()
-        with mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()):
-            result = build.patch_project(data, "com.example.Runner")
-        self.assertEqual(result.count(b"PRODUCT_BUNDLE_IDENTIFIER = com.example.Runner;"), 2)
-        self.assertEqual(result.count(build.ORIGINAL_BUNDLE.encode()), 1)
-        self.assertIn(b"OTHER /* tvOS */", result)
-        with self.assertRaisesRegex(ValueError, "project_source_mismatch"):
-            build.patch_project(data, "com.example.Runner")
+    def test_source_hashes_are_checked_without_patching(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = project_fixture()
+            archive_fixture(root, data)
+            with (
+                mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()),
+                mock.patch.object(build, "SCHEME_SHA256", hashlib.sha256(b"pinned scheme bytes").hexdigest()),
+            ):
+                manifest = build.source_manifest(root)
+                self.assertEqual(manifest["source_commit"], build.SOURCE_COMMIT)
+                self.assertEqual(manifest["source_subdirectory"], "packages/webdriveragent")
+                self.assertEqual((root / build.PROJECT).read_bytes(), data)
+                (root / build.SCHEME_FILE).write_bytes(b"changed")
+                with self.assertRaisesRegex(ValueError, "project_source_mismatch"):
+                    build.source_manifest(root)
 
     def test_invalid_identity_never_creates_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -113,10 +104,21 @@ class BuildTests(unittest.TestCase):
         self.check_build_destination(False)
         self.check_build_destination(True)
 
+    def test_unsigned_build_disables_signing_without_provisioning(self):
+        self.check_build_destination(False, unsigned=True)
+
+    def test_unsigned_build_rejects_provisioning_before_output(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "build"
+            with self.assertRaisesRegex(ValueError, "unsigned_provisioning_conflict"):
+                build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID,
+                            "com.example.Runner", True, False, True)
+            self.assertFalse(output.exists())
+
     def test_failed_xcode_build_keeps_private_log_and_reports_failure(self):
         self.check_build_destination(False, returncode=65)
 
-    def check_build_destination(self, generic, returncode=0):
+    def check_build_destination(self, generic, returncode=0, unsigned=False):
         data = project_fixture()
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "build"
@@ -128,9 +130,7 @@ class BuildTests(unittest.TestCase):
             ]
 
             def archive(_, destination):
-                project = destination / build.PROJECT
-                project.parent.mkdir(parents=True)
-                project.write_bytes(data)
+                archive_fixture(destination, data)
 
             def xcode(*args, **kwargs):
                 self.assertEqual(report.call_args_list, messages)
@@ -141,12 +141,14 @@ class BuildTests(unittest.TestCase):
                 mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()),
                 mock.patch.object(build, "source_is_pinned", return_value=True),
                 mock.patch.object(build, "archive_source", side_effect=archive),
-                mock.patch.object(build, "patch_lock_state", return_value={"fixture": True}),
+                mock.patch.object(build, "SCHEME_SHA256", hashlib.sha256(b"pinned scheme bytes").hexdigest()),
                 mock.patch.object(build, "resolved_settings", return_value={
                     "PRODUCT_BUNDLE_IDENTIFIER": "com.example.Runner",
+                    "PRODUCT_NAME": "HandkiteRunner",
                     "DEVELOPMENT_TEAM": "ABCDE12345",
                     "CODE_SIGN_STYLE": "Automatic",
                     "PLATFORM_NAME": "iphoneos",
+                    **({"CODE_SIGNING_ALLOWED": "NO", "CODE_SIGNING_REQUIRED": "NO"} if unsigned else {}),
                 }) as settings,
                 mock.patch.object(build.subprocess, "run", side_effect=xcode) as run,
                 mock.patch.object(build.time, "monotonic", side_effect=[10, 11, 12, 14, 20]),
@@ -155,19 +157,24 @@ class BuildTests(unittest.TestCase):
                 if returncode:
                     with self.assertRaisesRegex(ValueError, "^xcode_build_failed$"):
                         build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID,
-                                    "com.example.Runner", False, generic)
+                                    "com.example.Runner", False, generic, unsigned)
                 else:
                     build.build(Path("/source"), output, "ABCDE12345", MODERN_UDID,
-                                "com.example.Runner", False, generic)
+                                "com.example.Runner", False, generic, unsigned)
             self.assertEqual(report.call_args_list, messages)
-            self.assertEqual(settings.call_args.args[-1], generic)
+            self.assertEqual(settings.call_args.args[-2:], (generic, unsigned))
             command = run.call_args.args[0]
             self.assertEqual(command[:3], ["/usr/bin/xcodebuild", "clean", "build-for-testing"])
             self.assertEqual(command[command.index("-destination") + 1],
                              "generic/platform=iOS" if generic else f"platform=iOS,id={MODERN_UDID}")
             self.assertNotIn("-allowProvisioningUpdates", command)
             self.assertNotIn("-allowProvisioningDeviceRegistration", command)
-            self.assertNotIn("PRODUCT_BUNDLE_IDENTIFIER=com.example.Runner", command)
+            self.assertIn("HANDKITE_RUNNER_BUNDLE_ID=com.example.Runner", command)
+            self.assertFalse(any(arg.startswith("PRODUCT_BUNDLE_IDENTIFIER=") for arg in command))
+            self.assertEqual("CODE_SIGNING_ALLOWED=NO" in command, unsigned)
+            self.assertEqual("CODE_SIGNING_REQUIRED=NO" in command, unsigned)
+            self.assertEqual(command[command.index("-scheme") + 1], "HandkiteRunner")
+            self.assertEqual((output / "source" / build.PROJECT).read_bytes(), data)
             self.assertFalse(any(word in command for word in ("test-without-building", "install", "launch")))
             self.assertNotIn("CPATH", run.call_args.kwargs["env"])
             self.assertEqual((output / "build.log").stat().st_mode & 0o777, 0o600)
@@ -195,7 +202,7 @@ class BuildTests(unittest.TestCase):
                 self.assertEqual(build.main(), code)
             run.assert_called_once_with(
                 Path("/source"), Path("/output"), "ABCDE12345", MODERN_UDID,
-                "com.example.Runner", False, False,
+                "com.example.Runner", False, False, False,
             )
             report.assert_called_once_with(
                 f"wda_build={status} elapsed_seconds=17.5", flush=True,
@@ -207,15 +214,13 @@ class BuildTests(unittest.TestCase):
             output = Path(directory) / "build"
 
             def archive(_, destination):
-                project = destination / build.PROJECT
-                project.parent.mkdir(parents=True)
-                project.write_bytes(data)
+                archive_fixture(destination, data)
 
             with (
                 mock.patch.object(build, "PROJECT_SHA256", hashlib.sha256(data).hexdigest()),
                 mock.patch.object(build, "source_is_pinned", return_value=True),
                 mock.patch.object(build, "archive_source", side_effect=archive),
-                mock.patch.object(build, "patch_lock_state", return_value={"fixture": True}),
+                mock.patch.object(build, "SCHEME_SHA256", hashlib.sha256(b"pinned scheme bytes").hexdigest()),
                 mock.patch.object(build, "resolved_settings", return_value={"PLATFORM_NAME": "iphonesimulator"}),
                 mock.patch.object(build.subprocess, "run") as run,
             ):

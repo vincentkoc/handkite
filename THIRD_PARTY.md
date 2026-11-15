@@ -18,11 +18,10 @@ revision pinned in the root `Cargo.toml`; it is the only git dependency.
 ## Appium WebDriverAgent
 
 `tools/wda/build.py` builds an iOS XCTest runner from a pinned upstream
-checkout of [Appium WebDriverAgent](https://github.com/appium/WebDriverAgent)
+checkout of the [Handkite WebDriverAgent fork](https://github.com/vincentkoc/handkite-wda)
 (see [tools/wda/SOURCE.md](tools/wda/SOURCE.md)). The upstream tree is not
-vendored, but `build.py` contains short excerpts of upstream source as patch
-match strings and replacements. Those excerpts, and any built runner, are
-subject to the upstream licence:
+vendored and the builder does not embed or patch its source. The fork and any
+built runner remain subject to the upstream licence:
 
 ```text
 BSD License

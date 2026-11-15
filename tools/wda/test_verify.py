@@ -22,13 +22,13 @@ CERT = "b" * 40
 def fixture(directory: str) -> tuple[Path, Path, Path]:
     output = Path(directory) / "build"
     root = output / "DerivedData/Build/Products/Debug-iphoneos"
-    app = root / "WebDriverAgentRunner-Runner.app"
-    test = app / "PlugIns/WebDriverAgentRunner.xctest"
+    app = root / "HandkiteRunner-Runner.app"
+    test = app / "PlugIns/HandkiteRunner.xctest"
     test.mkdir(parents=True)
     (app / "Info.plist").write_bytes(plistlib.dumps({"CFBundleIdentifier": RUNNER}))
     (app / "embedded.mobileprovision").write_bytes(b"fixture")
     (test / "test-binary").write_bytes(b"fixture")
-    run = root / "WebDriverAgentRunner.xctestrun"
+    run = root / "HandkiteRunner.xctestrun"
     run.write_bytes(b"fixture")
     return output, app, run
 
@@ -69,7 +69,7 @@ class VerifyTests(unittest.TestCase):
     def test_exact_runner_and_xctestrun_are_required(self):
         with tempfile.TemporaryDirectory() as directory:
             output, app, run = fixture(directory)
-            self.assertEqual(verify.products(output), (app, app / "PlugIns/WebDriverAgentRunner.xctest", run))
+            self.assertEqual(verify.products(output), (app, app / "PlugIns/HandkiteRunner.xctest", run))
             run.with_name("extra.xctestrun").write_bytes(b"other")
             with self.assertRaisesRegex(ValueError, "products_ambiguous"):
                 verify.products(output)
@@ -150,7 +150,7 @@ class VerifyTests(unittest.TestCase):
     def test_complete_fixture_checks_each_nested_signature_and_returns_hashes(self):
         with tempfile.TemporaryDirectory() as directory:
             output, app, run = fixture(directory)
-            test = app / "PlugIns/WebDriverAgentRunner.xctest"
+            test = app / "PlugIns/HandkiteRunner.xctest"
             with (
                 mock.patch.object(verify, "signature", side_effect=lambda path, _: RUNNER if path == app else "test.id") as signer,
                 mock.patch.object(verify, "leaf_sha1", return_value=CERT),

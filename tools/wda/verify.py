@@ -47,13 +47,13 @@ def products(output: Path) -> tuple[Path, Path, Path]:
         raise ValueError("products_unavailable")
     apps = [
         path for path in root.rglob("*.app")
-        if path.is_dir() and (path / "PlugIns/WebDriverAgentRunner.xctest").is_dir()
+        if path.is_dir() and (path / "PlugIns/HandkiteRunner.xctest").is_dir()
     ]
     runs = [path for path in root.rglob("*.xctestrun") if path.is_file()]
     if len(apps) != 1 or len(runs) != 1:
         raise ValueError("products_ambiguous")
     app, run = apps[0], runs[0]
-    test = app / "PlugIns/WebDriverAgentRunner.xctest"
+    test = app / "PlugIns/HandkiteRunner.xctest"
     for path in (app, test, run, app / "Info.plist", app / "embedded.mobileprovision"):
         if not no_symlinks(path, root):
             raise ValueError("products_unsafe")

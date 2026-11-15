@@ -1,21 +1,32 @@
 # WebDriverAgent source pin
 
-Handkite builds its iOS XCTest runner from [Appium WebDriverAgent v16.15.3](https://github.com/appium/WebDriverAgent/tree/v16.15.3), commit `02cb92f0e93c8b021443bcbb8eeb80932c113220`.
+Handkite builds its iOS XCTest runner from the private
+[Handkite WDA fork](https://github.com/vincentkoc/handkite-wda/tree/1262085ed9a13ef4e0d0e222cf0a918ecfe4b565/packages/webdriveragent),
+commit `1262085ed9a13ef4e0d0e222cf0a918ecfe4b565`, on
+`handkite/appium-webdriveragent-17.0.6`. Its upstream base is Appium
+`appium-webdriveragent@17.0.6` in the
+[appium-ios monorepo](https://github.com/appium/appium-ios/tree/main/packages/webdriveragent).
 
-The pinned project is `WebDriverAgent.xcodeproj`; the scheme is `WebDriverAgentRunner`. The pinned `project.pbxproj` has SHA-256 `9a9cbda0e2ac34dac53ddb8253ce7b08ef58b25db44720f3281a47fc760aecff`. These values identify source input; they do not prove a successful local build or signature.
+The builder archives only `packages/webdriveragent`. The project remains
+`WebDriverAgent.xcodeproj`; the scheme and product are `HandkiteRunner`.
+The pinned project SHA-256 is
+`bbc76ffc83962e55e6a0f941e86e71ee978d501b0e29c388579788a48056c3f3`;
+the shared scheme SHA-256 is
+`73d246bbc783189cc0400a3f93a6f4174a86396d522f92c7c525598292f9daba`.
+These identify source inputs, not build or signature qualification.
 
-The upstream project is [BSD-3-Clause licensed](https://github.com/appium/WebDriverAgent/blob/v16.15.3/LICENSE). Preserve its notices when distributing a built runner. The upstream tree is not vendored, but `build.py` embeds short excerpts of the pinned WebDriverAgent sources (`XCUIDevice+FBHelpers.m`, its header, and `FBCustomCommands.m`) as patch match strings and replacements. Those excerpts remain under the upstream licence:
+The fork contains the initial lock-state correction and runner product rename.
+The builder makes no source changes: it supplies the owner's bundle ID through
+`HANDKITE_RUNNER_BUNDLE_ID` and writes `source-provenance.json`.
+See the fork's `packages/webdriveragent/HANDKITE.md` for patch ownership.
+Target names and upstream classes remain unchanged.
 
-```text
-BSD License
+WebDriverAgent is BSD-3-Clause licensed. Preserve the fork's `LICENSE` and
+upstream notices with the built runner; the full terms are reproduced in
+[THIRD_PARTY.md](../../THIRD_PARTY.md). The upstream source is not vendored in
+this repository.
 
-For WebDriverAgent software
-
-Copyright (c) 2015-present, Facebook, Inc. All rights reserved.
-```
-
-The complete licence terms are in the upstream [LICENSE](https://github.com/appium/WebDriverAgent/blob/v16.15.3/LICENSE) and are reproduced in [THIRD_PARTY.md](../../THIRD_PARTY.md).
-
-The iOS XCTest runner is separate from Handkite's macOS host executables and their release-signing policy.
-
-The archive-only `initial-lock-state-v1` patch corrects cold-start initialization in `XCUIDevice+FBHelpers.m` and exposes unknown state through `FBCustomCommands.m`. It also adds the nullable getter declaration and `FBHandkiteLockState.h`. The source pin remains unchanged; strict preimage hashes and output hashes are recorded by the builder in `source-patches.json`. Upstream notices remain intact in the archived copy.
+The iOS XCTest runner is separate from Handkite's macOS host executables and
+their release-signing policy. A source re-pin does not install or qualify a
+new runner. Retain the previously qualified runner and configuration for the
+reviewed upgrade and matched device cohorts.
