@@ -236,12 +236,21 @@ fn field_from_context(
         if field.is_some() || rect(baseline) != Some(bounds) {
             return Err(AdapterError);
         }
-        for key in ["type", "name", "label", "value", "placeholderValue"] {
+        for key in ["type", "name", "label", "placeholderValue"] {
             if attrs.get(key) != baseline.get(key) {
                 return Err(AdapterError);
             }
         }
-        field = Some((identity, attrs.get("value").cloned().ok_or(AdapterError)?));
+        let before = match item.get("attribute/value") {
+            // WDA represents an empty editor as null; its full XML may omit value.
+            // Normalize only this otherwise admitted public editor, never a missing key.
+            Some(Value::Null) if baseline.get("value").is_none_or(String::is_empty) => {
+                String::new()
+            }
+            Some(Value::String(value)) if baseline.get("value") == Some(value) => value.clone(),
+            _ => return Err(AdapterError),
+        };
+        field = Some((identity, before));
     }
     if keyboards != 1 {
         return Err(AdapterError);
@@ -457,10 +466,7 @@ impl WdaAdapter {
                         app_matches(&wda, &input.key.session, &input.app)
                     );
                     Ok::<_, AdapterError>(
-                        app.is_ok()
-                            && after?
-                                .as_str()
-                                .is_some_and(|after| inserted(&input.before, &input.text, after)),
+                        app.is_ok() && inserted_value(&input.before, &input.text, &after?),
                     )
                 })
                 .unwrap_or(false)
@@ -491,6 +497,12 @@ impl WdaAdapter {
             input_verified: verified,
         })
     }
+}
+
+fn inserted_value(before: &str, text: &str, after: &Value) -> bool {
+    after
+        .as_str()
+        .is_some_and(|after| inserted(before, text, after))
 }
 
 /// One insertion/replacement at the current selection; no old caret is inferred.
@@ -564,6 +576,75 @@ mod tests {
     }
 
     #[test]
+    fn null_value_keeps_context_and_attribute_refusals() {
+        let xml = XML.replace("Alpha&#10;", "");
+        let (screen, baseline) = crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
+        let empty = || {
+            let mut data = items();
+            data[0]["attribute/value"] = Value::Null;
+            data
+        };
+        for kind in ["SecureTextField", "Alert", "Sheet", "Other"] {
+            let mut data = empty();
+            data[0]["type"] = json!(format!("XCUIElementType{kind}"));
+            assert!(
+                field_from_context(&data, &screen, &baseline).is_err(),
+                "{kind}"
+            );
+        }
+        for kind in ["SecureTextField", "Alert", "Sheet"] {
+            let mut data = empty();
+            let mut hidden = element(kind, "hidden");
+            hidden["displayed"] = json!(false);
+            hidden["attribute/value"] = Value::Null;
+            data.as_array_mut().unwrap().push(hidden);
+            assert!(
+                field_from_context(&data, &screen, &baseline).is_err(),
+                "{kind}"
+            );
+        }
+        for marker in MARKERS {
+            let mut data = empty();
+            data[1]["attribute/name"] = json!(marker);
+            assert!(
+                field_from_context(&data, &screen, &baseline).is_err(),
+                "{marker}"
+            );
+        }
+        for (key, bad) in [
+            ("enabled", Value::Null),
+            ("enabled", json!(false)),
+            ("displayed", Value::Null),
+            ("displayed", json!(false)),
+            ("attribute/focused", Value::Null),
+            ("attribute/focused", json!("unknown")),
+            ("attribute/value", json!(true)),
+            ("attribute/value", json!(0)),
+            ("attribute/value", json!({})),
+            ("attribute/value", json!([])),
+        ] {
+            let mut data = empty();
+            data[0][key] = bad;
+            assert!(
+                field_from_context(&data, &screen, &baseline).is_err(),
+                "{key}"
+            );
+        }
+        for key in ["attribute/value", "attribute/focused"] {
+            let mut data = empty();
+            data[0].as_object_mut().unwrap().remove(key);
+            assert!(
+                field_from_context(&data, &screen, &baseline).is_err(),
+                "{key}"
+            );
+        }
+        assert!(
+            classify(&empty()).is_err(),
+            "nonempty baseline must disagree"
+        );
+    }
+
+    #[test]
     fn rich_context_requires_one_matching_public_editor_and_keyboard() {
         assert_eq!(
             classify(&items()).unwrap(),
@@ -620,6 +701,10 @@ mod tests {
             XML.replace("Alpha&#10;", "Enter Passcode"),
             XML.replace("TextView", "SecureTextField"),
             XML.replace("value=", "focused=\"false\" value="),
+            XML.replace("Alpha&#10;", "")
+                .replace("value=", "focused=\"false\" value="),
+            XML.replace("Alpha&#10;", "")
+                .replace("value=", "focused=\"unknown\" value="),
         ] {
             assert!(crate::wda_ui_admission::current_text_snapshot(&bad).is_none());
         }
@@ -662,6 +747,12 @@ mod tests {
 
     #[tokio::test]
     async fn changed_or_unknown_focus_app_or_lock_never_sends_text() {
+        let xml = XML.replace("Alpha&#10;", "");
+        let (screen, baseline) = crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
+        let mut data = items();
+        data[0]["attribute/value"] = Value::Null;
+        let (field, before) = field_from_context(&data, &screen, &baseline).unwrap();
+        assert!(before.is_empty());
         for mode in 0..=4 {
             let fake = FocusFake {
                 mode,
@@ -670,7 +761,7 @@ mod tests {
             let result = dispatch_to_focused(
                 &fake,
                 "session",
-                "editor",
+                &field,
                 "example.editor",
                 &Action::TextCurrent { value: "X".into() },
             )
@@ -784,6 +875,57 @@ mod tests {
             ("\u{732b}\u{72ac}", "X", "\u{732b}X\u{72d7}"),
         ] {
             assert!(!inserted(before, text, after));
+        }
+    }
+
+    struct ValueFake(Value);
+
+    impl WdaRequest for ValueFake {
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            _: &[u8],
+            _: Duration,
+        ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+            assert_eq!(method, "GET");
+            assert_eq!(path, "/session/session/element/editor/attribute/value");
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(&self.0).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_editor_readback_requires_exact_typed_string() {
+        let mut replies = vec![(json!({"sessionId":"session"}), false)];
+        for after in [
+            json!("typed"),
+            json!(""),
+            json!("wrong"),
+            json!("typed-extra"),
+            json!("typedtyped"),
+            Value::Null,
+            json!(0),
+            json!({}),
+        ] {
+            let accepted = after == "typed";
+            replies.push((json!({"sessionId":"session","value":after}), accepted));
+        }
+        for (reply, accepted) in replies {
+            let after = value(
+                &ValueFake(reply),
+                "session",
+                "GET",
+                "/session/session/element/editor/attribute/value",
+                b"",
+            )
+            .await;
+            assert_eq!(
+                after.is_ok_and(|after| inserted_value("", "typed", &after)),
+                accepted
+            );
         }
     }
 }
