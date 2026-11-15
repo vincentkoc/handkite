@@ -769,5 +769,121 @@ for line in sys.stdin:
             compare(before, after, ["swipe"])
 
 
+class SettingsFixtureTests(unittest.TestCase):
+    def test_fresh_launch_is_only_available_for_settings_preparation(self):
+        valid = {"tool": "handkite_launch_app",
+                 "arguments": {"bundle_id": "com.apple.Preferences"}, "fresh_launch": True}
+        for changes in ({"fresh_launch": False}, {"fresh_launch": 1},
+                        {"arguments": {"bundle_id": "example.other"}},
+                        {"tool": "handkite_text"}, {"when": {}}, {"selector": {}},
+                        {"settle": 3}):
+            with self.subTest(changes=changes), self.assertRaises(BenchError):
+                invalid = plan()
+                invalid["cases"][2]["prepare"] = [dict(valid, **changes)]
+                validate_plan(invalid)
+        for phase in ("measure", "cleanup"):
+            with self.subTest(phase=phase), self.assertRaises(BenchError):
+                invalid = plan()
+                invalid["cases"][3][phase] = dict(valid) if phase == "measure" else [dict(valid)]
+                validate_plan(invalid)
+
+    def test_missing_settings_hook_refuses_before_any_call(self):
+        peer = SimpleNamespace(calls=[])
+        campaign = Campaign(peer, plan(), 1, 0)
+        campaign.phase = "prepare"
+        with self.assertRaisesRegex(BenchError, "settings_reset_unavailable"):
+            campaign.step({"tool": "handkite_launch_app",
+                           "arguments": {"bundle_id": "com.apple.Preferences"},
+                           "fresh_launch": True})
+        self.assertEqual(peer.calls, [])
+
+    def run_fixture(self, root_after_reset=True, confirmed=True):
+        events = []
+
+        class FakePeer:
+            healthy = True
+
+            def __init__(self):
+                self.calls = []
+                self.terminated = False
+                self.app = "com.apple.Preferences"
+
+            def initialize(self):
+                pass
+
+            def tool(self, tool, arguments):
+                events.append(tool)
+                call = dict(id=len(self.calls), operation=len(self.calls),
+                            elapsed_ms=1, response_bytes=1, tool=tool)
+                self.calls.append(call)
+                if tool == "handkite_launch_app":
+                    self.app = "com.apple.Preferences"
+                root = self.terminated and root_after_reset
+                tree = ('<Application><StaticText label="Airplane Mode"/></Application>'
+                        if root else '<Application><StaticText label="Keyboards"/></Application>')
+                result = screen_result(tree)
+                payload = json.loads(result["content"][0]["text"])
+                payload["metadata"]["state"]["foreground_app"] = self.app
+                payload["metadata"]["revision"] = len(self.calls)
+                result["content"][0]["text"] = json.dumps(payload)
+                if tool in ("handkite_launch_app", "handkite_swipe"):
+                    result["content"].insert(0, {"type": "text", "text": json.dumps({
+                        "receipt": {"accepted": True}, "effect": "changed",
+                        "after": payload["metadata"]})})
+                return result, call
+
+        peer = FakePeer()
+
+        def reset():
+            events.append("terminate_settings")
+            if isinstance(confirmed, Exception):
+                raise confirmed
+            peer.terminated = True
+            peer.app = "com.apple.springboard"
+            return confirmed
+
+        scenario = plan()
+        scenario["cases"][2]["prepare"] = [
+            {"tool": "handkite_launch_app", "arguments": {"bundle_id": "com.apple.Preferences"},
+             "fresh_launch": True},
+            {"tool": "handkite_observe", "expect": {
+                "app": "com.apple.Preferences", "lock": "unlocked",
+                "text": {"type": "StaticText", "label": "Airplane Mode"}}},
+        ]
+        campaign = Campaign(peer, validate_plan(scenario), 1, 0,
+                            selected_cases=["swipe"], settings_reset=reset)
+        with contextlib.redirect_stdout(io.StringIO()):
+            campaign.run()
+        return campaign, events
+
+    def test_stale_settings_subpage_is_reset_before_launch(self):
+        campaign, events = self.run_fixture()
+        self.assertIsNone(campaign.failure)
+        start = events.index("terminate_settings")
+        self.assertEqual(events[start:start + 3],
+                         ["terminate_settings", "handkite_observe", "handkite_launch_app"])
+        self.assertEqual(events.count("terminate_settings"), 1)
+        self.assertEqual(events.count("handkite_swipe"), 1)
+
+    def test_settings_subpage_after_reset_still_stops_before_swipe(self):
+        campaign, events = self.run_fixture(root_after_reset=False)
+        self.assertEqual(campaign.failure, "effect_mismatch")
+        self.assertEqual(campaign.failure_context["phase"], "prepare")
+        self.assertNotIn("handkite_swipe", events)
+        self.assertEqual(events.count("terminate_settings"), 1)
+
+    def test_unconfirmed_settings_reset_stops_before_launch(self):
+        campaign, events = self.run_fixture(confirmed=False)
+        self.assertEqual(campaign.failure, "settings_reset_unconfirmed")
+        self.assertNotIn("handkite_launch_app", events)
+        self.assertNotIn("handkite_swipe", events)
+
+    def test_settings_reset_exception_stops_without_exposing_context(self):
+        campaign, events = self.run_fixture(confirmed=RuntimeError("private context"))
+        self.assertEqual(campaign.failure, "settings_reset_failed")
+        self.assertNotIn("handkite_launch_app", events)
+        self.assertNotIn("handkite_swipe", events)
+
+
 if __name__ == "__main__":
     unittest.main()

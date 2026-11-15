@@ -632,9 +632,16 @@ def validate_plan(plan):
                     for key in ("prepare", "cleanup")), "invalid_step_count")
         for step in case.get("prepare", []) + [case["measure"]] + case.get("cleanup", []):
             require(isinstance(step, dict) and step.get("tool") in ALLOWED
-                    and set(step) <= {"tool", "arguments", "selector", "when", "expect", "settle"},
+                    and set(step) <= {"tool", "arguments", "selector", "when", "expect", "settle", "fresh_launch"},
                     "invalid_step")
             require(isinstance(step.get("arguments", {}), dict), "invalid_arguments")
+            if "fresh_launch" in step:
+                require(step["fresh_launch"] is True
+                        and any(step is candidate for candidate in case.get("prepare", []))
+                        and step.get("tool") == "handkite_launch_app"
+                        and step.get("arguments") == {"bundle_id": "com.apple.Preferences"}
+                        and "when" not in step and "selector" not in step,
+                        "invalid_fresh_launch")
             if "settle" in step:
                 require(type(step["settle"]) is int and 3 <= step["settle"] <= 5
                         and step["tool"] == "handkite_observe" and not step.get("arguments")
@@ -693,7 +700,8 @@ def matches(screen, expected, previous=None):
 
 
 class Campaign:
-    def __init__(self, peer, plan, count, warmups, preflight=None, selected_cases=None, capture_mode="paired"):
+    def __init__(self, peer, plan, count, warmups, preflight=None, selected_cases=None, capture_mode="paired",
+                 settings_reset=None):
         self.peer, self.plan, self.count, self.warmups = peer, plan, count, warmups
         self.screen = None
         self.device = None
@@ -704,6 +712,7 @@ class Campaign:
         self.failure_context = None
         self.phase, self.case, self.step_index = "initialize", None, None
         self.preflight = preflight
+        self.settings_reset = settings_reset
         require(capture_mode in ("paired", "image_only"), "invalid_capture_mode")
         self.capture_mode = capture_mode
         self.selected_cases = list(CASES) if selected_cases is None else selected_cases
@@ -724,6 +733,22 @@ class Campaign:
     def step(self, step, image_only=False):
         if not matches(self.screen, step.get("when")):
             return None
+        if step.get("fresh_launch"):
+            require(step["fresh_launch"] is True and self.phase == "prepare"
+                    and step.get("tool") == "handkite_launch_app"
+                    and step.get("arguments") == {"bundle_id": "com.apple.Preferences"}
+                    and callable(self.settings_reset), "settings_reset_unavailable")
+            self.renew()
+            require(matches(self.screen, {"lock": "unlocked"}), "device_locked")
+            self.screen = None
+            try:
+                confirmed = self.settings_reset()
+            except BenchError:
+                raise
+            except Exception:
+                raise BenchError("settings_reset_failed") from None
+            require(confirmed is True, "settings_reset_unconfirmed")
+            self.step({"tool": "handkite_observe"})
         if "settle" in step:
             previous = None
             for _ in range(step["settle"]):

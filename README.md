@@ -482,8 +482,15 @@ qualified diagnostic route first. The runner enables the same flag on its
 MCP subprocess and checks both trace streams before sending input.
 
 The example `tools/benchmarks/notes-settings.json` needs the dedicated Notes
-fixture containing exactly `Alpha` and a trailing newline, plus Settings at
-its top-level list. Coordinates use logical points on a 393×852 viewport.
+fixture containing exactly `Alpha` and a trailing newline. Its Settings
+preparation uses `fresh_launch: true`: an independently qualified driver must
+provide `Campaign(settings_reset=...)` to terminate only Settings through the
+existing owned WDA session, without retry. The callback returns `True` only
+after a valid termination response, including an already-stopped app. A missing
+or unconfirmed callback stops before launch. The runner discards the old view,
+observes again, then uses the normal guarded launch and strict root-list check.
+It never navigates Back or taps a Settings row to repair the fixture. Coordinates
+use logical points on a 393×852 viewport.
 Use `--calibrate` for one trial per case before the measured campaign; this
 report cannot qualify the regression gate.
 The phone must be unlocked and exclusively handed to this client. Do not run
@@ -491,7 +498,7 @@ another status or observation client during a campaign: traces are correlated
 across the two serial request streams.
 
 ```sh
-python3 tools/benchmark_mcp.py run \
+python3 /path/to/qualified-benchmark-driver.py run \
   --plan tools/benchmarks/notes-settings.json \
   --output /private/path/before.json \
   --service-trace /private/path/service-timing.jsonl \

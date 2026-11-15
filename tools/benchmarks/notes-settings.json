@@ -341,9 +341,7 @@
             "app": "com.apple.Preferences",
             "lock": "unlocked"
           },
-          "when": {
-            "app_not": "com.apple.Preferences"
-          }
+          "fresh_launch": true
         },
         {
           "tool": "handkite_observe",
@@ -449,9 +447,7 @@
             "app": "com.apple.Preferences",
             "lock": "unlocked"
           },
-          "when": {
-            "app_not": "com.apple.Preferences"
-          }
+          "fresh_launch": true
         },
         {
           "tool": "handkite_observe",
