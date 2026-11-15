@@ -15,7 +15,7 @@ The pinned `linux/amd64` image passed one local `--backend macos --check` run
 under amd64 emulation with no network or state mount. That command verifies the
 bundled macOS asset and exits before server initialization; it does not qualify
 native execution, provisioning, headers, or signing. The exact digests and
-receipt are in `VALIDATION.md`. Repeat the asset check on an admitted native
+receipt are in the repository [`VALIDATION.md`](../../../VALIDATION.md). Repeat the asset check on an admitted native
 x86_64 host before the first stateful start, using the same digest and no data
 mount; do not treat normal startup as a read-only health check.
 
@@ -27,7 +27,7 @@ one explicit check with Python 3, a Docker CLI supporting platform-qualified
 image inspection (Docker 29 or later), and Docker's containerd image store:
 
 ```sh
-python3 -B deploy/anisette/check_image.py \
+python3 -B crates/handkite-anisette/deploy/check_image.py \
   --context ADMITTED_LOCAL_CONTEXT \
   --expected-daemon-id ADMITTED_DAEMON_ID
 ```
@@ -50,7 +50,7 @@ amd64 image on an arm64 host does not satisfy this check.
 The helper fixes the index and amd64 child digests above, the `anisette-server`
 entrypoint, UID/GID `10001:10001`, and `--backend macos --check`. Docker 29's
 platform-qualified image `.Id` must equal the child manifest digest. The registry
-config digest in `VALIDATION.md` remains provenance evidence; it is not substituted
+config digest in the repository [`VALIDATION.md`](../../../VALIDATION.md) remains provenance evidence; it is not substituted
 for that local image identity. The created container must report the pinned child
 in `ImageManifestDescriptor.digest`; its top-level `.Image` can be a config ID.
 The helper requires Docker's `driver-type=io.containerd.snapshotter.v1` signal;
@@ -82,7 +82,7 @@ the task container for explicit recovery.
 Run the helper's offline regression tests without Docker:
 
 ```sh
-python3 -B deploy/anisette/test_check_image.py -fv
+python3 -B crates/handkite-anisette/deploy/test_check_image.py -fv
 ```
 
 All subprocess calls in that suite are intercepted by a fake Docker daemon. These
@@ -110,7 +110,7 @@ The three canonical client operations do not need query parameters.
 With Python 3, OpenSSL, and a verified Caddy binary available, run from the repository root:
 
 ```sh
-CADDY_BIN=/path/to/caddy python3 -B deploy/anisette/test_proxy.py -fv
+CADDY_BIN=/path/to/caddy python3 -B crates/handkite-anisette/deploy/test_proxy.py -fv
 ```
 
 The test fails if Caddy is unavailable. It loads the checked-in routing and client-auth
@@ -120,7 +120,7 @@ generates temporary test identities. A synthetic upstream accepts every method s
 an upstream refusal cannot hide a proxy leak. Tests verify allowed requests, blocked
 requests with zero upstream receipts, client authentication, and WebSocket frames
 in both directions. The fixture stops its own processes and removes its files;
-it does not load the Anisette image or contact Apple. See `VALIDATION.md` for the
+it does not load the Anisette image or contact Apple. See the repository [`VALIDATION.md`](../../../VALIDATION.md) for the
 tested Caddy version and binary provenance.
 
 ## Host admission
