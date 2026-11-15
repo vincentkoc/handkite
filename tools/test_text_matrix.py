@@ -356,10 +356,33 @@ class RunnerTests(unittest.TestCase):
         # English passed this case live, so a rewrite there is now unexpected.
         self.assertIs(rows["ascii_rewrite_bait"]["as_expected"], False)
         self.assertEqual(rows["simplified_chinese"]["outcome"], "pass")
+        self.assertNotIn("separator", rows["ascii_rewrite_bait"])
         composed = FakeEditor(rewrite=lambda text: unicodedata.normalize("NFC", text))
         rows = run(composed, only=["japanese_dakuten_decomposed"])
         self.assertEqual(rows["japanese_dakuten_decomposed"]["outcome"], "nfc_equal")
         self.assertEqual(sum(text != "\n" for text in composed.sent), 1)
+
+    def test_single_case_never_sends_a_trailing_enter(self):
+        for rewrite, expected in [(lambda text: text, "pass"),
+                                  (lambda text: text[:-1], "mismatch")]:
+            with self.subTest(expected=expected):
+                peer = FakeEditor(rewrite=rewrite)
+                rows = run(peer, only=["simplified_chinese"])
+                self.assertEqual(rows["simplified_chinese"]["outcome"], expected)
+                self.assertNotIn("separator", rows["simplified_chinese"])
+                self.assertEqual(len(peer.sent), 1)
+                self.assertNotIn("\n", peer.sent)
+                self.assertFalse(peer.controlled)
+
+    def test_mismatch_stops_the_note_before_separator_or_next_case(self):
+        cases = text_matrix.select_cases(text_matrix.load_spec(), "english", "branch",
+                                         ["ascii_sentence", "simplified_chinese"])
+        peer = FakeEditor(rewrite=lambda text: text[:-1])
+        rows = text_matrix.Matrix(peer, cases, "english").run()
+        self.assertEqual([row["outcome"] for row in rows], ["mismatch", "not_run"])
+        self.assertNotIn("separator", rows[0])
+        self.assertEqual(len(peer.sent), 1)
+        self.assertFalse(peer.controlled)
 
     def test_pre_input_stop_continues_and_uncertain_input_stops_the_run(self):
         spec = {case["id"]: case for case in text_matrix.load_spec()["cases"]}

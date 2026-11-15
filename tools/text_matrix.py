@@ -445,7 +445,7 @@ class Matrix:
         try:
             require(editor_value(self.observe()) == "", "scratch_note_not_empty")
             require(bool(elements(self.screen, {"type": "Keyboard"})), "keyboard_not_visible")
-            for case in self.cases:
+            for index, case in enumerate(self.cases):
                 if stopped:
                     self.rows.append({"id": case["id"], "class": case["class"],
                                       "outcome": "not_run", "reason": stopped})
@@ -462,7 +462,9 @@ class Matrix:
                     stopped = "after_partial_case"
                 elif row["outcome"] == "tree_capped":
                     stopped = "note_full"
-                elif row["outcome"] in ("pass", "nfc_equal", "mismatch"):
+                elif row["outcome"] == "mismatch":
+                    stopped = "after_mismatch"
+                elif row["outcome"] in ("pass", "nfc_equal") and index + 1 < len(self.cases):
                     try:
                         row["separator"] = self.separate()
                         if row["separator"]["outcome"] not in ("sent", "not_needed"):

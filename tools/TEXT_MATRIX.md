@@ -51,7 +51,9 @@ For each case, once:
    reported as `nfc_equal`, never as `pass`; no field is assumed to normalise.
    Rule `unchanged` (refusal cases): the tool must reject the arguments and the
    value must be identical before and after.
-5. An Enter key puts the next case on a new line. Nothing is deleted.
+5. An Enter key separates passing cases within a note. There is no trailing
+   Enter after the final case. A mismatch stops the note before any separator
+   or further text is sent. Nothing is deleted.
 
 Every input after the first in a note, including the Enter between cases and
 each step of `multiline_enter_key`, starts from its **own fresh observation**,
@@ -119,6 +121,12 @@ Keyboards: `english`, `pinyin`, `zhuyin`, `japanese_romaji`, `japanese_kana`,
 build without this branch and `--build branch` for one that contains it.
 `--note` may be omitted when the selection fits one note. With `--cases`, notes
 are numbered over the selected cases.
+
+For Pinyin and other input methods, run one case per new empty note with
+`--cases CASE_ID`. This avoids an Enter separator accepting a candidate. Inspect
+the read-back and composition state before preparing another note. Do not pick
+a candidate or resume a mismatched case. Direct full-value comparisons for long
+cases use the input itself, without a trailing newline.
 
 `--build installed` leaves out `refuse_line_separator` and
 `refuse_function_key`: a build without the shared validation rule would send
