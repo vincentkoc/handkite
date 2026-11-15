@@ -22,7 +22,7 @@ pub async fn list_teams(
     anisette: &AnisetteClient,
     credential: DeveloperCredential,
 ) -> Result<(), &'static str> {
-    let state = state::load_ready()?;
+    let state = state::load_ready(anisette.origin())?;
     let info = anisette.client_info().await?;
     let headers = anisette.get_headers(&state).await?;
     let request_headers = request::headers(&credential, &state, &info, &headers)?;

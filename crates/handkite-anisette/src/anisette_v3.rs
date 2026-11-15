@@ -3,9 +3,11 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 pub mod apple;
+mod origin;
 pub mod state;
 mod tls;
 mod transport;
+pub use origin::AnisetteOrigin;
 pub use tls::AnisetteIdentity;
 pub use transport::{
     AnisetteClient, ClientInfo, EndProvisioningData, ProvisioningDataError,

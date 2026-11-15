@@ -1,8 +1,8 @@
-use handkite_anisette::anisette_v3::{AnisetteClient, AnisetteIdentity, state};
+use handkite_anisette::anisette_v3::{AnisetteClient, AnisetteIdentity, AnisetteOrigin, state};
 use std::future::Future;
 use std::path::Path;
 
-const USAGE: &str = "usage: handkite-anisette-doctor --cert FILE --key FILE [--headers]";
+const USAGE: &str = "usage: handkite-anisette-doctor --origin https://HOST[:PORT] --cert FILE --key FILE [--headers]";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Mode {
@@ -10,18 +10,32 @@ enum Mode {
     Headers,
 }
 
-fn options(args: &[String]) -> Result<(&Path, &Path, Mode), &'static str> {
-    match args {
-        [cert_flag, cert, key_flag, key] if cert_flag == "--cert" && key_flag == "--key" => {
-            Ok((Path::new(cert), Path::new(key), Mode::ClientInfo))
-        }
-        [cert_flag, cert, key_flag, key, headers]
-            if cert_flag == "--cert" && key_flag == "--key" && headers == "--headers" =>
+type Options<'a> = (AnisetteOrigin, &'a Path, &'a Path, Mode);
+
+/// The origin has no default: a missing or invalid value fails before any I/O.
+fn options(args: &[String]) -> Result<Options<'_>, &'static str> {
+    let (origin, cert, key, mode) = match args {
+        [origin_flag, origin, cert_flag, cert, key_flag, key]
+            if origin_flag == "--origin" && cert_flag == "--cert" && key_flag == "--key" =>
         {
-            Ok((Path::new(cert), Path::new(key), Mode::Headers))
+            (origin, cert, key, Mode::ClientInfo)
         }
-        _ => Err(USAGE),
-    }
+        [origin_flag, origin, cert_flag, cert, key_flag, key, headers]
+            if origin_flag == "--origin"
+                && cert_flag == "--cert"
+                && key_flag == "--key"
+                && headers == "--headers" =>
+        {
+            (origin, cert, key, Mode::Headers)
+        }
+        _ => return Err(USAGE),
+    };
+    Ok((
+        AnisetteOrigin::parse(origin)?,
+        Path::new(cert),
+        Path::new(key),
+        mode,
+    ))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -34,20 +48,24 @@ async fn main() {
 
 async fn run() -> Result<(), &'static str> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let (cert, key, mode) = options(&args)?;
+    let (origin, cert, key, mode) = options(&args)?;
     let identity = AnisetteIdentity::load(cert, key)?;
-    let client = AnisetteClient::new(identity)?;
-    let status = check(mode, state::load_ready, |ready| async {
-        match ready {
-            Some(ready) => {
-                client.get_headers(&ready).await?;
+    let client = AnisetteClient::new(identity, origin)?;
+    let status = check(
+        mode,
+        || state::load_ready(client.origin()),
+        |ready| async {
+            match ready {
+                Some(ready) => {
+                    client.get_headers(&ready).await?;
+                }
+                None => {
+                    client.client_info().await?;
+                }
             }
-            None => {
-                client.client_info().await?;
-            }
-        }
-        Ok(())
-    })
+            Ok(())
+        },
+    )
     .await?;
     println!("{status}");
     Ok(())
@@ -84,18 +102,62 @@ mod tests {
 
     #[test]
     fn mode_requires_exact_flags() {
-        let base = ["--cert", "/private/client.pem", "--key", "/private/key.pem"];
-        assert_eq!(options(&args(&base)).unwrap().2, Mode::ClientInfo);
-        let mut with_headers = base.to_vec();
-        with_headers.push("--headers");
-        assert_eq!(options(&args(&with_headers)).unwrap().2, Mode::Headers);
+        let base = [
+            "--origin",
+            "https://anisette.example.invalid",
+            "--cert",
+            "/private/client.pem",
+            "--key",
+            "/private/key.pem",
+        ];
+        let base = args(&base);
+        let parsed = options(&base).unwrap();
+        assert_eq!(parsed.0.to_string(), "https://anisette.example.invalid");
+        assert_eq!(parsed.3, Mode::ClientInfo);
+        let mut with_headers = base.clone();
+        with_headers.push("--headers".into());
+        assert_eq!(options(&with_headers).unwrap().3, Mode::Headers);
         for invalid in [
             vec![],
             vec!["--headers", "--cert", "cert", "--key", "key"],
-            vec!["--cert", "cert", "--key", "key", "--headers", "--headers"],
-            vec!["--cert", "cert", "--key", "key", "--provision"],
+            vec!["--cert", "cert", "--key", "key"],
+            vec!["--cert", "cert", "--key", "key", "--headers"],
+            vec![
+                "--origin",
+                "https://anisette.example.invalid",
+                "--cert",
+                "cert",
+            ],
+            vec![
+                "--origin",
+                "https://anisette.example.invalid",
+                "--cert",
+                "cert",
+                "--key",
+                "key",
+                "--headers",
+                "--headers",
+            ],
+            vec![
+                "--origin",
+                "https://anisette.example.invalid",
+                "--cert",
+                "cert",
+                "--key",
+                "key",
+                "--provision",
+            ],
         ] {
-            assert!(options(&args(&invalid)).is_err());
+            assert_eq!(options(&args(&invalid)).err(), Some(USAGE));
+        }
+    }
+
+    #[test]
+    fn invalid_origin_fails_closed_before_identity_load() {
+        for origin in ["", "http://anisette.example.invalid", "https://127.0.0.1"] {
+            let invalid = ["--origin", origin, "--cert", "cert", "--key", "key"];
+            let error = options(&args(&invalid)).err().unwrap();
+            assert!(error.starts_with("Anisette origin must be https://"));
         }
     }
 

@@ -2,18 +2,24 @@ use super::*;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
+pub(crate) const FIXTURE_ORIGIN: &str = "https://anisette.example.invalid";
+
+pub(crate) fn origin() -> AnisetteOrigin {
+    AnisetteOrigin::parse(FIXTURE_ORIGIN).unwrap()
+}
+
 pub(crate) fn fixture() -> (tempfile::TempDir, StateLayout, PendingProvisioning) {
     let (scratch, layout) = crate::layout::tests::fixture();
-    let pending = PendingProvisioning::reserve_at(&layout).unwrap();
+    let pending = PendingProvisioning::reserve_at(&layout, &origin()).unwrap();
     (scratch, layout, pending)
 }
 
 pub(crate) fn load(layout: &StateLayout) -> Result<MacosProvisionedState, &'static str> {
-    macos::load(layout)
+    macos::load(layout, &origin())
 }
 
 pub(crate) fn is_reserved(layout: &StateLayout) -> bool {
-    PendingProvisioning::reserve_at(layout).is_err()
+    PendingProvisioning::reserve_at(layout, &origin()).is_err()
 }
 
 fn state(identifier: [u8; 16]) -> MacosProvisionedState {
@@ -34,7 +40,8 @@ fn reservation_is_private_immutable_random_and_survives_drop() {
     let path = layout.anisette_state_directory();
     let attempt = fs::read(path.join("attempt.json")).unwrap();
     let record: serde_json::Value = serde_json::from_slice(&attempt).unwrap();
-    assert_eq!(record["origin"], "https://anisette.example.invalid");
+    assert_eq!(record["origin"], FIXTURE_ORIGIN);
+    assert_eq!(pending.origin(), &origin());
     assert_eq!(record["backend"], "macos-adid");
     assert_eq!(record["version"], 1);
     assert_eq!(
@@ -67,7 +74,7 @@ fn concurrent_reservation_has_exactly_one_winner() {
             let barrier = barrier.clone();
             std::thread::spawn(move || {
                 barrier.wait();
-                PendingProvisioning::reserve_at(&layout).is_ok()
+                PendingProvisioning::reserve_at(&layout, &origin()).is_ok()
             })
         })
         .collect();
@@ -168,12 +175,12 @@ fn reservation_rejects_unprotected_or_symlinked_ancestors() {
             layout.state_directory()
         };
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(PendingProvisioning::reserve_at(&layout).is_err());
+        assert!(PendingProvisioning::reserve_at(&layout, &origin()).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         let moved = path.with_extension("held");
         fs::rename(&path, &moved).unwrap();
         symlink(&moved, &path).unwrap();
-        assert!(PendingProvisioning::reserve_at(&layout).is_err());
+        assert!(PendingProvisioning::reserve_at(&layout, &origin()).is_err());
         assert!(!layout.anisette_state_directory().exists());
     }
 }
@@ -271,6 +278,29 @@ fn ready_load_rejects_attempt_identity_origin_backend_version_and_schema() {
         assert!(load(&layout).is_err(), "{field}");
         assert!(is_reserved(&layout));
     }
+}
+
+#[test]
+fn configured_origin_is_recorded_and_binds_ready_state() {
+    let other = AnisetteOrigin::parse("https://other.example.invalid:8443").unwrap();
+    let (_scratch, layout) = crate::layout::tests::fixture();
+    let pending = PendingProvisioning::reserve_at(&layout, &other).unwrap();
+    let value = state(*pending.identifier());
+    pending.persist(&value).unwrap();
+    let attempt: serde_json::Value = serde_json::from_slice(
+        &fs::read(layout.anisette_state_directory().join("attempt.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(attempt["origin"], "https://other.example.invalid:8443");
+    assert_eq!(
+        macos::load(&layout, &other).unwrap().as_bytes(),
+        value.as_bytes()
+    );
+    // Ready state for one sidecar is never served to a client of another.
+    assert!(load(&layout).is_err());
+    // Any origin is blocked once the fixed location is reserved.
+    assert!(is_reserved(&layout));
+    assert!(PendingProvisioning::reserve_at(&layout, &other).is_err());
 }
 
 #[test]

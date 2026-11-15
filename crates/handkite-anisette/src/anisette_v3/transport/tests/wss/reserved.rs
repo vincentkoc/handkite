@@ -32,10 +32,11 @@ impl TlsFixture {
         let address = listener.local_addr().unwrap();
         let client = AnisetteClient {
             http: http_builder(&self.client)
-                .resolve("anisette.example.invalid", address)
+                .resolve(FIXTURE_HOST, address)
                 .build()
                 .unwrap(),
             tls: self.client.config,
+            origin: fixture_origin(),
             test_port: Some(address.port()),
         };
         let server = tokio::spawn(async move {
@@ -118,7 +119,7 @@ async fn reserved_flow_fetches_one_info_and_binds_apple_wss_attempt_and_ready() 
     let (_scratch, layout, pending) = fixture();
     let identifier = *pending.identifier();
     let server_layout = layout.clone();
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .client_info_then_wss(
             || {},
             true,
@@ -173,7 +174,7 @@ async fn reserved_flow_fetches_one_info_and_binds_apple_wss_attempt_and_ready() 
 #[tokio::test]
 async fn client_info_failure_consumes_reservation_before_discovery() {
     let (_scratch, layout, pending) = fixture();
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .http(info_response(b"malformed"))
         .await;
     let result = client
@@ -188,9 +189,28 @@ async fn client_info_failure_consumes_reservation_before_discovery() {
 }
 
 #[tokio::test]
+async fn reservation_for_another_origin_is_refused_before_any_request() {
+    let (_scratch, layout, pending) = fixture();
+    let (mut client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
+        .http(info_response(INFO))
+        .await;
+    client.origin = AnisetteOrigin::parse("https://other.example.invalid").unwrap();
+    let result = client
+        .provision_apple_with_discovery(pending, |_| async {
+            panic!("discovery cannot run for a mismatched origin")
+        })
+        .await;
+    assert_eq!(result.err(), Some("Anisette reservation origin mismatch"));
+    assert!(is_reserved(&layout));
+    assert!(load(&layout).is_err());
+    server.abort();
+    assert!(server.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
 async fn empty_policy_after_info_consumes_reservation_without_wss() {
     let (_scratch, layout, pending) = fixture();
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .http(info_response(INFO))
         .await;
     assert!(matches!(
@@ -210,17 +230,18 @@ async fn empty_policy_after_info_consumes_reservation_without_wss() {
 #[tokio::test]
 async fn unpolled_production_future_drop_preserves_reservation_without_requests() {
     let (_scratch, layout, pending) = fixture();
-    let fixture = TlsFixture::new("anisette.example.invalid", true, true);
+    let fixture = TlsFixture::new(FIXTURE_HOST, true, true);
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
     let client = AnisetteClient {
         http: http_builder(&fixture.client)
-            .resolve("anisette.example.invalid", address)
+            .resolve(FIXTURE_HOST, address)
             .build()
             .unwrap(),
         tls: fixture.client.config,
+        origin: fixture_origin(),
         test_port: Some(address.port()),
     };
     drop(client.provision_apple(pending));
@@ -237,7 +258,7 @@ async fn unpolled_production_future_drop_preserves_reservation_without_requests(
 async fn reserved_provider_failure_and_cancellation_do_not_replay() {
     for cancel in [false, true] {
         let (_scratch, layout, pending) = fixture();
-        let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
             .wss(|mut socket| async move {
                 challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
                 socket
@@ -275,7 +296,7 @@ async fn reserved_provider_failure_and_cancellation_do_not_replay() {
 async fn wrong_success_identifier_preserves_pending_without_ready() {
     let (_scratch, layout, pending) = fixture();
     let identifier = *pending.identifier();
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(move |mut socket| async move {
             finish_for(&mut socket, identifier).await;
             let mut wrong = identifier;
@@ -351,17 +372,18 @@ fn change_attempt(layout: &crate::layout::StateLayout) {
 async fn changed_custody_rejects_before_client_info_connection() {
     let (_scratch, layout, pending) = fixture();
     change_attempt(&layout);
-    let tls = TlsFixture::new("anisette.example.invalid", true, true);
+    let tls = TlsFixture::new(FIXTURE_HOST, true, true);
     let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
     let client = AnisetteClient {
         http: http_builder(&tls.client)
-            .resolve("anisette.example.invalid", address)
+            .resolve(FIXTURE_HOST, address)
             .build()
             .unwrap(),
         tls: tls.client.config,
+        origin: fixture_origin(),
         test_port: Some(address.port()),
     };
     assert!(
@@ -384,7 +406,7 @@ async fn changed_custody_rejects_before_client_info_connection() {
 async fn custody_changed_during_client_info_blocks_apple_discovery() {
     let (_scratch, layout, pending) = fixture();
     let mutate = layout.clone();
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .client_info_then_wss(
             move || change_attempt(&mutate),
             false,
@@ -406,7 +428,7 @@ async fn custody_changed_during_client_info_blocks_apple_discovery() {
 #[tokio::test]
 async fn custody_changed_during_discovery_blocks_wss() {
     let (_scratch, layout, pending) = fixture();
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .http(info_response(INFO))
         .await;
     let mut apple_server = None;
@@ -455,7 +477,7 @@ impl ProvisioningDataProvider for MutatingProvider {
 async fn custody_changed_during_provider_await_blocks_reply() {
     for finish in [false, true] {
         let (_scratch, layout, pending) = fixture();
-        let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
             .wss(move |mut socket| async move {
                 challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
                 if finish {
@@ -502,7 +524,7 @@ async fn custody_changed_during_provider_await_blocks_reply() {
 async fn custody_changed_before_challenge_blocks_identifier_reply() {
     let (_scratch, layout, pending) = fixture();
     let mutate = layout.clone();
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(move |mut socket| async move {
             change_attempt(&mutate);
             socket

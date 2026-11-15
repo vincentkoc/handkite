@@ -1,6 +1,6 @@
 //! Explicit read-only compatibility probe. No account login, signing, or device mutation.
 
-use handkite_anisette::anisette_v3::{AnisetteClient, AnisetteIdentity};
+use handkite_anisette::anisette_v3::{AnisetteClient, AnisetteIdentity, AnisetteOrigin};
 use handkite_anisette::developer_probe::{DeveloperCredential, list_teams};
 use std::fs::File;
 use std::future::Future;
@@ -30,11 +30,16 @@ impl ResultKind {
     }
 }
 
-fn options(args: &[String]) -> Option<(&Path, &Path)> {
-    let [cert_flag, cert, key_flag, key] = args else {
+/// `--origin` has no default; a missing or invalid origin is invalid arguments.
+fn options(args: &[String]) -> Option<(AnisetteOrigin, &Path, &Path)> {
+    let [origin_flag, origin, cert_flag, cert, key_flag, key] = args else {
         return None;
     };
-    (cert_flag == "--cert" && key_flag == "--key").then_some((Path::new(cert), Path::new(key)))
+    if origin_flag != "--origin" || cert_flag != "--cert" || key_flag != "--key" {
+        return None;
+    }
+    let origin = AnisetteOrigin::parse(origin).ok()?;
+    Some((origin, Path::new(cert), Path::new(key)))
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -45,9 +50,9 @@ async fn main() -> ExitCode {
             run(
                 &args,
                 File::from(fd),
-                |cert, key| {
+                |origin, cert, key| {
                     let identity = AnisetteIdentity::load(cert, key).map_err(|_| ())?;
-                    AnisetteClient::new(identity).map_err(|_| ())
+                    AnisetteClient::new(identity, origin).map_err(|_| ())
                 },
                 DeveloperCredential::read_once,
                 |client, credential| async move {
@@ -73,15 +78,15 @@ async fn run<T, U, I, C, F, Fut>(
     request: F,
 ) -> ResultKind
 where
-    I: FnOnce(&Path, &Path) -> Result<T, ()>,
+    I: FnOnce(AnisetteOrigin, &Path, &Path) -> Result<T, ()>,
     C: FnOnce(File) -> Result<U, &'static str>,
     F: FnOnce(T, U) -> Fut,
     Fut: Future<Output = Result<(), ()>>,
 {
-    let Some((cert, key)) = options(args) else {
+    let Some((origin, cert, key)) = options(args) else {
         return ResultKind::InvalidArguments;
     };
-    let Ok(client) = identity(cert, key) else {
+    let Ok(client) = identity(origin, cert, key) else {
         return ResultKind::IdentityUnavailable;
     };
     let Ok(credential) = credential(input) else {
@@ -97,13 +102,38 @@ where
 mod tests {
     use super::*;
 
+    const ARGS: [&str; 6] = [
+        "--origin",
+        "https://anisette.example.invalid",
+        "--cert",
+        "/private/cert",
+        "--key",
+        "/private/key",
+    ];
+
     #[test]
     fn accepts_only_exact_arguments() {
-        let args = ["--cert", "/private/cert", "--key", "/private/key"].map(str::to_owned);
+        let args = ARGS.map(str::to_owned);
         assert!(options(&args).is_some());
         for values in [
             vec![],
+            vec!["--cert", "cert", "--key", "key"],
             vec!["--key", "key", "--cert", "cert"],
+            vec![
+                "--origin",
+                "https://anisette.example.invalid",
+                "--cert",
+                "c",
+            ],
+            vec![
+                "--origin",
+                "http://anisette.example.invalid",
+                "--cert",
+                "c",
+                "--key",
+                "k",
+            ],
+            vec!["--origin", "", "--cert", "c", "--key", "k"],
             vec!["--cert", "cert", "--key", "key", "--retry"],
             vec!["--cert", "cert", "--key", "key", "--token", "secret"],
         ] {
@@ -121,12 +151,12 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_identity_and_credential_never_send_request() {
-        let args = ["--cert", "/private/cert", "--key", "/private/key"].map(str::to_owned);
+        let args = ARGS.map(str::to_owned);
         let file = File::open("/dev/null").unwrap();
         let result = run(
             &args,
             file,
-            |_, _| Err::<u8, _>(()),
+            |_, _, _| Err::<u8, _>(()),
             |_| -> Result<u8, &'static str> { panic!("credential read") },
             |_, _| async { panic!("network") },
         )
@@ -136,7 +166,7 @@ mod tests {
         let result = run(
             &args,
             file,
-            |_, _| Ok(1_u8),
+            |_, _, _| Ok(1_u8),
             |_| Err::<u8, _>("invalid"),
             |_, _| async { panic!("network") },
         )
@@ -147,12 +177,12 @@ mod tests {
     #[tokio::test]
     async fn accepted_input_sends_exactly_one_request() {
         use std::cell::Cell;
-        let args = ["--cert", "/private/cert", "--key", "/private/key"].map(str::to_owned);
+        let args = ARGS.map(str::to_owned);
         let calls = Cell::new(0);
         let result = run(
             &args,
             File::open("/dev/null").unwrap(),
-            |_, _| Ok(1_u8),
+            |_, _, _| Ok(1_u8),
             |_| Ok::<_, &'static str>(2_u8),
             |client, credential| {
                 assert_eq!((client, credential), (1, 2));

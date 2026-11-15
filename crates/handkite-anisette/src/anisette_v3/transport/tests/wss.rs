@@ -14,10 +14,11 @@ impl TlsFixture {
         let address = listener.local_addr().unwrap();
         let client = AnisetteClient {
             http: http_builder(&self.client)
-                .resolve("anisette.example.invalid", address)
+                .resolve(FIXTURE_HOST, address)
                 .build()
                 .unwrap(),
             tls: self.client.config,
+            origin: fixture_origin(),
             test_port: Some(address.port()),
         };
         let server = tokio::spawn(async move {
@@ -130,7 +131,7 @@ async fn through_finish(socket: &mut ServerSocket) {
 
 #[tokio::test]
 async fn wss_provisions_once_with_shared_mtls_and_routing_info() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(|mut socket| async move {
             through_finish(&mut socket).await;
             socket.send(Message::Text(serde_json::json!({
@@ -149,7 +150,7 @@ async fn wss_provisions_once_with_shared_mtls_and_routing_info() {
 #[tokio::test]
 async fn wss_composes_with_approved_apple_https_callbacks() {
     let (mut provider, apple_server) = crate::anisette_v3::apple::fixture_provider().await;
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(|mut socket| async move {
             through_finish(&mut socket).await;
             socket.send(Message::Text(serde_json::json!({
@@ -171,7 +172,7 @@ async fn wss_composes_with_approved_apple_https_callbacks() {
 
 #[tokio::test]
 async fn wss_delayed_challenge_gets_a_fresh_reply_deadline() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(|mut socket| async move {
             challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
             tokio::time::sleep(Duration::from_secs(2)).await;
@@ -206,7 +207,7 @@ async fn wss_delayed_challenge_gets_a_fresh_reply_deadline() {
 
 #[tokio::test]
 async fn wss_fresh_reply_budget_cannot_extend_the_conversation_deadline() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(|mut socket| async move {
             challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
             tokio::time::sleep(Duration::from_millis(150)).await;
@@ -241,9 +242,9 @@ async fn wss_fresh_reply_budget_cannot_extend_the_conversation_deadline() {
 #[tokio::test]
 async fn wss_rejects_untrusted_wrong_name_and_missing_client_identity() {
     for (name, trusted, authenticated) in [
-        ("anisette.example.invalid", false, true),
+        (FIXTURE_HOST, false, true),
         ("wrong.fixture.invalid", true, true),
-        ("anisette.example.invalid", true, false),
+        (FIXTURE_HOST, true, false),
     ] {
         let (client, server) = TlsFixture::new(name, trusted, authenticated)
             .wss(|_| async { panic!("TLS must reject before upgrade") })
@@ -260,7 +261,7 @@ async fn wss_rejects_untrusted_wrong_name_and_missing_client_identity() {
 
 #[tokio::test]
 async fn wss_rejects_redirect_without_reconnecting() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true).http(
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true).http(
         b"HTTP/1.1 302 Found\r\nLocation: https://fallback.invalid/\r\nContent-Length: 0\r\n\r\n".to_vec()
     ).await;
     let mut provider = FixtureProvider::default();
@@ -271,7 +272,7 @@ async fn wss_rejects_redirect_without_reconnecting() {
 
 #[tokio::test]
 async fn wss_rejects_wrong_state_identity_after_finish() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(|mut socket| async move {
             through_finish(&mut socket).await;
             socket.send(Message::Text(serde_json::json!({
@@ -295,7 +296,7 @@ async fn wss_rejects_binary_out_of_order_malformed_closed_and_oversized_messages
         Message::Text("x".repeat(MAX_SERVER_MESSAGE_BYTES + 1).into()),
         Message::Close(None),
     ] {
-        let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
             .wss(|mut socket| async move {
                 let _ = socket.send(message).await;
                 let _ = socket.next().await;
@@ -315,7 +316,7 @@ async fn wss_rejects_binary_out_of_order_malformed_closed_and_oversized_messages
 
 #[tokio::test]
 async fn wss_bounds_control_frames_without_advancing_conversation() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(|mut socket| async move {
             for _ in 0..=MAX_CONTROL_FRAMES {
                 let _ = socket.send(Message::Pong(Vec::new().into())).await;
@@ -334,7 +335,7 @@ async fn wss_bounds_control_frames_without_advancing_conversation() {
 
 #[tokio::test]
 async fn wss_control_frames_do_not_reset_read_deadline() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .wss(|mut socket| async move {
             for _ in 0..MAX_CONTROL_FRAMES {
                 tokio::time::sleep(Duration::from_millis(220)).await;
@@ -356,7 +357,7 @@ async fn wss_control_frames_do_not_reset_read_deadline() {
 #[tokio::test]
 async fn wss_stops_on_provider_failure_or_deadline_without_replay() {
     for stall in [false, true] {
-        let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
             .wss(|mut socket| async move {
                 challenge(&mut socket, serde_json::json!({"result":"GiveIdentifier"})).await;
                 socket

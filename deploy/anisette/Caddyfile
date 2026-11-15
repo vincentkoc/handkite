@@ -1,3 +1,6 @@
+# anisette.example.invalid is a reserved placeholder that can never obtain a
+# certificate. Replace it with the admitted sidecar hostname before installing;
+# the Mac client must be given the same origin with --origin.
 anisette.example.invalid {
 	tls {
 		client_auth {

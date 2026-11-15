@@ -13,7 +13,6 @@ use zeroize::Zeroizing;
 
 const INVALID: &str = "Anisette state is unsafe, incomplete or changed";
 const RESERVED: &str = "Anisette provisioning is already reserved";
-const ORIGIN: &str = "https://anisette.example.invalid";
 const BACKEND: &str = "macos-adid";
 const VERSION: u32 = 1;
 const ATTEMPT_LIMIT: usize = 1024;
@@ -138,9 +137,13 @@ pub(super) struct Pending {
     directory: Directory,
     attempt: ProtectedFile,
     identifier: Zeroizing<[u8; 16]>,
+    origin: AnisetteOrigin,
 }
 
-pub(super) fn reserve(layout: &StateLayout) -> Result<Pending, &'static str> {
+pub(super) fn reserve(
+    layout: &StateLayout,
+    origin: &AnisetteOrigin,
+) -> Result<Pending, &'static str> {
     let anchor = Anchor::open(layout)?;
     let mut identifier = Zeroizing::new([0; 16]);
     SystemRandom::new()
@@ -148,7 +151,7 @@ pub(super) fn reserve(layout: &StateLayout) -> Result<Pending, &'static str> {
         .map_err(|_| "Anisette identifier generation failed")?;
     let bytes = Zeroizing::new(
         serde_json::to_vec(&Attempt {
-            origin: ORIGIN.into(),
+            origin: origin.to_string(),
             backend: BACKEND.into(),
             version: VERSION,
             identifier: *identifier,
@@ -183,6 +186,7 @@ pub(super) fn reserve(layout: &StateLayout) -> Result<Pending, &'static str> {
         directory,
         attempt,
         identifier,
+        origin: origin.clone(),
     };
     value.revalidate(&[b"attempt.json"])?;
     Ok(value)
@@ -191,6 +195,10 @@ pub(super) fn reserve(layout: &StateLayout) -> Result<Pending, &'static str> {
 impl Pending {
     pub(super) fn identifier(&self) -> &[u8; 16] {
         &self.identifier
+    }
+
+    pub(super) fn origin(&self) -> &AnisetteOrigin {
+        &self.origin
     }
 
     fn revalidate(&self, names: &[&[u8]]) -> Result<(), &'static str> {
@@ -259,7 +267,10 @@ impl Pending {
     }
 }
 
-pub(super) fn load(layout: &StateLayout) -> Result<MacosProvisionedState, &'static str> {
+pub(super) fn load(
+    layout: &StateLayout,
+    origin: &AnisetteOrigin,
+) -> Result<MacosProvisionedState, &'static str> {
     let anchor = Anchor::open(layout)?;
     let file = open_at(anchor.parent().as_raw_fd(), c"anisette-v3", true).map_err(|_| INVALID)?;
     let directory = Directory {
@@ -270,7 +281,8 @@ pub(super) fn load(layout: &StateLayout) -> Result<MacosProvisionedState, &'stat
     inventory(&directory.file, &[b"attempt.json", b"ready.json"])?;
     let attempt = ProtectedFile::open(&directory.file, c"attempt.json", anchor.uid, ATTEMPT_LIMIT)?;
     let parsed: Attempt = serde_json::from_slice(&attempt.bytes).map_err(|_| INVALID)?;
-    if parsed.origin != ORIGIN || parsed.backend != BACKEND || parsed.version != VERSION {
+    if parsed.origin != origin.to_string() || parsed.backend != BACKEND || parsed.version != VERSION
+    {
         return Err(INVALID);
     }
     let ready = ProtectedFile::open(
@@ -286,6 +298,7 @@ pub(super) fn load(layout: &StateLayout) -> Result<MacosProvisionedState, &'stat
         directory,
         attempt,
         identifier: Zeroizing::new(parsed.identifier),
+        origin: origin.clone(),
     };
     retained.revalidate(&[b"attempt.json", b"ready.json"])?;
     ready.revalidate(&retained.directory.file, c"ready.json", retained.anchor.uid)?;

@@ -9,6 +9,13 @@ use tokio_rustls::TlsAcceptor;
 
 mod wss;
 
+/// Reserved placeholder; fixtures route it to loopback, never to DNS.
+const FIXTURE_HOST: &str = "anisette.example.invalid";
+
+fn fixture_origin() -> AnisetteOrigin {
+    AnisetteOrigin::parse(&format!("https://{FIXTURE_HOST}")).unwrap()
+}
+
 struct TlsFixture {
     server: Arc<ServerConfig>,
     client: AnisetteIdentity,
@@ -95,18 +102,16 @@ impl TlsFixture {
             .unwrap()
             .replace(
                 "https://fallback.invalid/",
-                &format!(
-                    "https://anisette.example.invalid:{}/redirected",
-                    address.port()
-                ),
+                &format!("https://{FIXTURE_HOST}:{}/redirected", address.port()),
             )
             .into_bytes();
         let client = AnisetteClient {
             http: http_builder(&self.client)
-                .resolve("anisette.example.invalid", address)
+                .resolve(FIXTURE_HOST, address)
                 .build()
                 .unwrap(),
             tls: self.client.config,
+            origin: fixture_origin(),
             test_port: Some(address.port()),
         };
         let server = tokio::spawn(async move {
@@ -178,7 +183,7 @@ fn state(identifier: [u8; 16]) -> MacosProvisionedState {
 
 #[tokio::test]
 async fn https_client_info_requires_mutual_tls_and_fixed_path() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .http(response(
             "200 OK",
             br#"{"client_info":"fixture client","user_agent":"fixture/1"}"#,
@@ -193,7 +198,7 @@ async fn https_client_info_requires_mutual_tls_and_fixed_path() {
 
 #[tokio::test]
 async fn https_headers_send_only_bound_state_and_return_validated_headers() {
-    let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+    let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
         .http(response("200 OK", br#"{"result":"Headers","X-Apple-I-MD":"otp","X-Apple-I-MD-M":"machine","X-Apple-I-MD-RINFO":"17106176"}"#))
         .await;
     let state = state([7; 16]);
@@ -218,9 +223,9 @@ async fn https_headers_send_only_bound_state_and_return_validated_headers() {
 #[tokio::test]
 async fn https_rejects_untrusted_wrong_name_and_missing_client_identity() {
     for (name, trusted, authenticated) in [
-        ("anisette.example.invalid", false, true),
+        (FIXTURE_HOST, false, true),
         ("wrong.fixture.invalid", true, true),
-        ("anisette.example.invalid", true, false),
+        (FIXTURE_HOST, true, false),
     ] {
         let (client, server) = TlsFixture::new(name, trusted, authenticated)
             .http(response("200 OK", b"{}"))
@@ -251,7 +256,7 @@ async fn https_rejects_redirects_errors_and_bounded_chunked_bodies() {
             br#"{"result":"GetHeadersError","message":"private server detail"}"#,
         ),
     ] {
-        let (client, server) = TlsFixture::new("anisette.example.invalid", true, true)
+        let (client, server) = TlsFixture::new(FIXTURE_HOST, true, true)
             .http(response)
             .await;
         let error = client.get_headers(&state([7; 16])).await.err().unwrap();

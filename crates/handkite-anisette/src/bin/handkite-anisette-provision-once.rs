@@ -1,15 +1,23 @@
 use handkite_anisette::anisette_v3::{
-    AnisetteClient, AnisetteIdentity, state::PendingProvisioning,
+    AnisetteClient, AnisetteIdentity, AnisetteOrigin, state::PendingProvisioning,
 };
 use std::future::Future;
 use std::path::Path;
 
-const USAGE: &str = "usage: handkite-anisette-provision-once --cert FILE --key FILE";
+const USAGE: &str =
+    "usage: handkite-anisette-provision-once --origin https://HOST[:PORT] --cert FILE --key FILE";
 
-fn options(args: &[String]) -> Result<(&Path, &Path), &'static str> {
+/// The origin has no default: a missing or invalid value fails before any I/O.
+fn options(args: &[String]) -> Result<(AnisetteOrigin, &Path, &Path), &'static str> {
     match args {
-        [cert_flag, cert, key_flag, key] if cert_flag == "--cert" && key_flag == "--key" => {
-            Ok((Path::new(cert), Path::new(key)))
+        [origin_flag, origin, cert_flag, cert, key_flag, key]
+            if origin_flag == "--origin" && cert_flag == "--cert" && key_flag == "--key" =>
+        {
+            Ok((
+                AnisetteOrigin::parse(origin)?,
+                Path::new(cert),
+                Path::new(key),
+            ))
         }
         _ => Err(USAGE),
     }
@@ -20,11 +28,11 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = execute(
         &args,
-        |cert, key| {
+        |origin, cert, key| {
             let identity = AnisetteIdentity::load(cert, key).map_err(|_| ())?;
-            AnisetteClient::new(identity).map_err(|_| ())
+            AnisetteClient::new(identity, origin).map_err(|_| ())
         },
-        || PendingProvisioning::reserve().map_err(|_| ()),
+        |client: &AnisetteClient| PendingProvisioning::reserve(client.origin()).map_err(|_| ()),
         |client, pending| async move {
             client
                 .provision_apple(pending)
@@ -45,17 +53,17 @@ async fn main() {
 
 async fn execute<I, P, F, Fut>(
     args: &[String],
-    load_identity: impl FnOnce(&Path, &Path) -> Result<I, ()>,
-    reserve: impl FnOnce() -> Result<P, ()>,
+    load_identity: impl FnOnce(AnisetteOrigin, &Path, &Path) -> Result<I, ()>,
+    reserve: impl FnOnce(&I) -> Result<P, ()>,
     provision: F,
 ) -> Result<&'static str, &'static str>
 where
     F: FnOnce(I, P) -> Fut,
     Fut: Future<Output = Result<(), ()>>,
 {
-    let (cert, key) = options(args)?;
-    let identity = load_identity(cert, key).map_err(|_| "identity_unavailable")?;
-    let pending = reserve().map_err(|_| "reservation_unavailable")?;
+    let (origin, cert, key) = options(args)?;
+    let identity = load_identity(origin, cert, key).map_err(|_| "identity_unavailable")?;
+    let pending = reserve(&identity).map_err(|_| "reservation_unavailable")?;
     provision(identity, pending)
         .await
         .map_err(|_| "provisioning_failed")?;
@@ -71,17 +79,39 @@ mod tests {
         items.iter().map(|item| (*item).to_owned()).collect()
     }
 
+    const ORIGIN: [&str; 2] = ["--origin", "https://anisette.example.invalid"];
+
+    fn full(rest: &[&'static str]) -> Vec<String> {
+        args(&[&ORIGIN[..], rest].concat())
+    }
+
     #[test]
-    fn requires_exact_identity_arguments() {
-        assert!(options(&args(&["--cert", "/private/cert", "--key", "/private/key"])).is_ok());
+    fn requires_exact_origin_and_identity_arguments() {
+        let valid = full(&["--cert", "/private/cert", "--key", "/private/key"]);
+        let parsed = options(&valid).unwrap();
+        assert_eq!(parsed.0.to_string(), "https://anisette.example.invalid");
         for invalid in [
             vec![],
+            vec!["--cert", "cert", "--key", "key"],
+            vec!["--key", "key", "--cert", "cert"],
+            vec!["--cert", "cert", "--key", "key", "--origin", ORIGIN[1]],
+        ] {
+            assert_eq!(options(&args(&invalid)).err(), Some(USAGE));
+        }
+        for invalid in [
             vec!["--key", "key", "--cert", "cert"],
             vec!["--cert", "cert", "--key", "key", "--retry"],
             vec!["--cert", "cert", "--key", "key", "--state", "elsewhere"],
         ] {
-            assert!(options(&args(&invalid)).is_err());
+            assert_eq!(options(&full(&invalid)).err(), Some(USAGE));
         }
+        let invalid_origin = ["--origin", "https://localhost", "--cert", "c", "--key", "k"];
+        assert!(
+            options(&args(&invalid_origin))
+                .err()
+                .unwrap()
+                .starts_with("Anisette origin must be https://")
+        );
     }
 
     #[tokio::test]
@@ -89,9 +119,9 @@ mod tests {
         let reserve_count = Cell::new(0);
         let provision_count = Cell::new(0);
         let result = execute(
-            &args(&["--cert", "cert", "--key", "key"]),
-            |_, _| Err::<u8, _>(()),
-            || {
+            &full(&["--cert", "cert", "--key", "key"]),
+            |_, _, _| Err::<u8, _>(()),
+            |_| {
                 reserve_count.set(reserve_count.get() + 1);
                 Ok(1_u8)
             },
@@ -110,9 +140,9 @@ mod tests {
     async fn reservation_failure_does_not_contact_server() {
         let provision_count = Cell::new(0);
         let result = execute(
-            &args(&["--cert", "cert", "--key", "key"]),
-            |_, _| Ok(1_u8),
-            || Err::<u8, _>(()),
+            &full(&["--cert", "cert", "--key", "key"]),
+            |_, _, _| Ok(1_u8),
+            |_| Err::<u8, _>(()),
             |_, _| {
                 provision_count.set(provision_count.get() + 1);
                 async { Ok(()) }
@@ -127,12 +157,14 @@ mod tests {
     async fn one_reservation_is_consumed_by_one_provisioning_call() {
         let stage = Cell::new(0);
         let result = execute(
-            &args(&["--cert", "cert", "--key", "key"]),
-            |_, _| {
+            &full(&["--cert", "cert", "--key", "key"]),
+            |origin, _, _| {
+                assert_eq!(origin.to_string(), ORIGIN[1]);
                 assert_eq!(stage.replace(1), 0);
                 Ok(1_u8)
             },
-            || {
+            |identity| {
+                assert_eq!(*identity, 1);
                 assert_eq!(stage.replace(2), 1);
                 Ok(2_u8)
             },
@@ -151,9 +183,9 @@ mod tests {
     async fn provisioning_failure_has_no_second_call() {
         let calls = Cell::new(0);
         let result = execute(
-            &args(&["--cert", "cert", "--key", "key"]),
-            |_, _| Ok(1_u8),
-            || Ok(2_u8),
+            &full(&["--cert", "cert", "--key", "key"]),
+            |_, _, _| Ok(1_u8),
+            |_| Ok(2_u8),
             |_, _| {
                 calls.set(calls.get() + 1);
                 async { Err(()) }

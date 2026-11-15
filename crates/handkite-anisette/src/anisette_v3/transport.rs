@@ -1,5 +1,5 @@
 use super::{
-    AnisetteIdentity, AppleSigningHeaders, FinishProvisioning, MAX_CPIM_BYTES,
+    AnisetteIdentity, AnisetteOrigin, AppleSigningHeaders, FinishProvisioning, MAX_CPIM_BYTES,
     MAX_HEADERS_RESPONSE_BYTES, MAX_SERVER_MESSAGE_BYTES, MacosProvisionedState,
     ProvisioningConversation, ProvisioningEvent, RoutingInfo, validate_base64,
 };
@@ -16,9 +16,9 @@ use tokio_tungstenite::tungstenite::{Message, protocol::WebSocketConfig};
 use tokio_tungstenite::{Connector, MaybeTlsStream, WebSocketStream};
 use zeroize::Zeroizing;
 
-const CLIENT_INFO_URL: &str = "https://anisette.example.invalid/v3/client_info";
-const HEADERS_URL: &str = "https://anisette.example.invalid/v3/get_headers";
-const PROVISIONING_URL: &str = "wss://anisette.example.invalid/v3/provisioning_session";
+const CLIENT_INFO_PATH: &str = "/v3/client_info";
+const HEADERS_PATH: &str = "/v3/get_headers";
+const PROVISIONING_PATH: &str = "/v3/provisioning_session";
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
 const STAGE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -145,29 +145,36 @@ impl ClientInfo {
     }
 }
 
-/// Fixed-origin V3 transport. It has no endpoint, proxy or retry configuration.
+/// Single-origin V3 transport. The operator supplies the only origin; there is
+/// no default host, per-endpoint override, proxy, or retry configuration.
 pub struct AnisetteClient {
     http: reqwest::Client,
     tls: Arc<ClientConfig>,
+    origin: AnisetteOrigin,
     #[cfg(test)]
     test_port: Option<u16>,
 }
 
 impl AnisetteClient {
-    pub fn new(identity: AnisetteIdentity) -> Result<Self, &'static str> {
+    pub fn new(identity: AnisetteIdentity, origin: AnisetteOrigin) -> Result<Self, &'static str> {
         Ok(Self {
             http: http_builder(&identity)
                 .build()
                 .map_err(|_| "Anisette HTTPS configuration failed")?,
             tls: identity.config,
+            origin,
             #[cfg(test)]
             test_port: None,
         })
     }
 
+    pub fn origin(&self) -> &AnisetteOrigin {
+        &self.origin
+    }
+
     pub async fn client_info(&self) -> Result<ClientInfo, &'static str> {
         let body = self
-            .response(self.http.get(self.url(CLIENT_INFO_URL)))
+            .response(self.http.get(self.url("https", CLIENT_INFO_PATH)))
             .await?;
         ClientInfo::parse(&body)
     }
@@ -191,7 +198,7 @@ impl AnisetteClient {
         .map_err(|_| "Anisette header request is invalid")?;
         let request = self
             .http
-            .post(self.url(HEADERS_URL))
+            .post(self.url("https", HEADERS_PATH))
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .body(body);
         let body = self.response(request).await?;
@@ -220,6 +227,10 @@ impl AnisetteClient {
         D: FnOnce(super::apple::AppleProvisioningContext) -> F,
         F: Future<Output = Result<super::apple::AppleProvisioningProvider, &'static str>>,
     {
+        // The reservation records the origin it was made for; never cross it.
+        if pending.origin() != &self.origin {
+            return Err("Anisette reservation origin mismatch");
+        }
         pending.revalidate()?;
         let info = self.client_info().await?;
         pending.revalidate()?;
@@ -354,10 +365,10 @@ impl AnisetteClient {
             let tcp = if let Some(port) = self.test_port {
                 TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).await
             } else {
-                TcpStream::connect(("anisette.example.invalid", 443)).await
+                TcpStream::connect((self.origin.host(), self.origin.port())).await
             };
             #[cfg(not(test))]
-            let tcp = TcpStream::connect(("anisette.example.invalid", 443)).await;
+            let tcp = TcpStream::connect((self.origin.host(), self.origin.port())).await;
             let tcp = tcp.map_err(|_| "Anisette WSS connection failed")?;
             let config = WebSocketConfig::default()
                 .read_buffer_size(16 * 1024)
@@ -366,7 +377,7 @@ impl AnisetteClient {
                 .max_message_size(Some(MAX_SERVER_MESSAGE_BYTES))
                 .max_frame_size(Some(MAX_SERVER_MESSAGE_BYTES));
             let (socket, _) = tokio_tungstenite::client_async_tls_with_config(
-                self.url(PROVISIONING_URL),
+                self.url("wss", PROVISIONING_PATH),
                 tcp,
                 Some(config),
                 Some(Connector::Rustls(self.tls.clone())),
@@ -379,14 +390,12 @@ impl AnisetteClient {
         .map_err(|_| "Anisette WSS connection timed out")?
     }
 
-    fn url(&self, endpoint: &'static str) -> String {
+    fn url(&self, scheme: &'static str, path: &'static str) -> String {
         #[cfg(test)]
         if let Some(port) = self.test_port {
-            let mut url = reqwest::Url::parse(endpoint).expect("constant URL");
-            url.set_port(Some(port)).unwrap();
-            return url.into();
+            return format!("{scheme}://{}:{port}{path}", self.origin.host());
         }
-        endpoint.into()
+        format!("{scheme}://{}{path}", self.origin.authority())
     }
 
     async fn response(
