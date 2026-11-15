@@ -30,6 +30,89 @@ fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(30)
 }
 
+#[tokio::test(start_paused = true)]
+async fn explicit_pairing_requests_stop_before_readiness_or_timeout() {
+    for mode in 0..3 {
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let probes = AtomicUsize::new(0);
+        let started = Instant::now();
+        let result = OwnedWdaRunner::start_task(
+            |mut listener| {
+                let dropped = dropped.clone();
+                async move {
+                    let _guard = OnDrop(dropped);
+                    match mode {
+                        0 => listener
+                            .log_debug_message(
+                                "PairingDialogResponsePending sensitive-fixture-token",
+                            )
+                            .await
+                            .unwrap(),
+                        1 => listener
+                            .initialization_for_ui_testing_did_fail(
+                                "device is not paired sensitive-fixture-token",
+                            )
+                            .await
+                            .unwrap(),
+                        _ => {
+                            let _ = listener.did_fail_to_bootstrap("InvalidHostID").await;
+                        }
+                    }
+                    pending().await
+                }
+            },
+            || {
+                probes.fetch_add(1, Ordering::SeqCst);
+                async { ready() }
+            },
+            deadline(),
+        )
+        .await;
+        assert_eq!(result.err(), Some(RunnerError::PairingRequired));
+        assert_eq!(Instant::now(), started);
+        assert_eq!(probes.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[test]
+fn pairing_transport_errors_keep_other_failures_distinct() {
+    for error in [
+        IdeviceError::InvalidHostID,
+        IdeviceError::UnknownErrorType("PairingDialogResponsePending".into()),
+        IdeviceError::UnknownErrorType("UserDeniedPairing".into()),
+        IdeviceError::UnexpectedResponse("missing PairRecordData in pair record response".into()),
+    ] {
+        assert_eq!(
+            transport_failure(&error, RunnerError::LookupFailed),
+            RunnerError::PairingRequired,
+        );
+    }
+    for error in [
+        IdeviceError::DeviceLocked,
+        IdeviceError::DeveloperModeNotEnabled,
+        IdeviceError::UnknownErrorType("unknown sensitive-fixture-token".into()),
+    ] {
+        assert_eq!(
+            transport_failure(&error, RunnerError::LookupFailed),
+            RunnerError::LookupFailed,
+        );
+    }
+    for message in [
+        "Timed out while enabling automation mode",
+        "Error Domain=com.apple.LocalAuthentication Code=-4",
+    ] {
+        assert_eq!(
+            initialization_failure(message, true),
+            RunnerError::AutomationInitializationFailed,
+        );
+    }
+    assert!(!pairing_required("Trust This Computer dialog dismissed"));
+    assert!(!pairing_required(
+        "Trust This Computer accepted successfully"
+    ));
+}
+
 #[tokio::test]
 async fn only_explicit_usbmux_refusal_admits_vacant_endpoint() {
     let deadline = deadline();

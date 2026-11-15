@@ -25,6 +25,8 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const VACANCY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+pub const PAIRING_REQUIRED_MESSAGE: &str =
+    "pairing_required: owner must accept trust/passcode on device";
 
 mod native_process;
 
@@ -83,6 +85,7 @@ pub enum RunnerError {
     InvalidTimeout,
     LookupFailed,
     LookupTimedOut,
+    PairingRequired,
     EndpointBusy,
     EndpointUnproven,
     EndpointCleanupUnproven,
@@ -164,11 +167,11 @@ impl OwnedWdaRunner {
                     .map_err(|_| RunnerError::LookupFailed)?;
                 let mut proxy = InstallationProxyClient::connect(&*provider)
                     .await
-                    .map_err(|_| RunnerError::LookupFailed)?;
+                    .map_err(|error| transport_failure(&error, RunnerError::LookupFailed))?;
                 let config =
                     TestConfig::from_installation_proxy(&mut proxy, runner_bundle_id, None)
                         .await
-                        .map_err(|_| RunnerError::LookupFailed)?;
+                        .map_err(|error| transport_failure(&error, RunnerError::LookupFailed))?;
                 require_port_vacant(provider.connect(WDA_PORT), deadline).await?;
                 Ok((provider, config))
             },
@@ -200,7 +203,7 @@ impl OwnedWdaRunner {
                 XCUITestService::new(provider)
                     .run(config, &mut listener, None)
                     .await
-                    .map_err(|_| RunnerError::RunnerFailed)
+                    .map_err(|error| transport_failure(&error, RunnerError::RunnerFailed))
             },
             || async {
                 // The outer absolute deadline also covers USB discovery/connect.
@@ -587,8 +590,39 @@ fn startup_timeout_error(state: PlanState) -> RunnerError {
     }
 }
 
+fn pairing_required(message: &str) -> bool {
+    // Match explicit protocol states, never a generic automation wait or timeout.
+    [
+        "PairingDialogResponsePending",
+        "UserDeniedPairing",
+        "InvalidHostID",
+        "device is not paired",
+        "Device is not paired",
+    ]
+    .iter()
+    .any(|state| message.contains(state))
+}
+
+fn transport_failure(error: &IdeviceError, fallback: RunnerError) -> RunnerError {
+    match error {
+        IdeviceError::InvalidHostID => RunnerError::PairingRequired,
+        IdeviceError::UnknownErrorType(state) if pairing_required(state) => {
+            RunnerError::PairingRequired
+        }
+        IdeviceError::UnexpectedResponse(message)
+            if message == "missing PairRecordData in pair record response"
+                || pairing_required(message) =>
+        {
+            RunnerError::PairingRequired
+        }
+        _ => fallback,
+    }
+}
+
 fn initialization_failure(message: &str, automation_waiting: bool) -> RunnerError {
-    if automation_waiting
+    if pairing_required(message) {
+        RunnerError::PairingRequired
+    } else if automation_waiting
         || message.contains("enabling automation mode")
         || message.contains("com.apple.LocalAuthentication")
     {
@@ -631,6 +665,10 @@ impl XCUITestListener for PlanListener {
     }
 
     async fn log_debug_message(&mut self, message: &str) -> Result<(), IdeviceError> {
+        if pairing_required(message) {
+            self.fail(RunnerError::PairingRequired);
+            return Ok(());
+        }
         if message.contains("Failed to initialize for UI testing") {
             let automation_waiting = self.phase.borrow().automation_waiting;
             eprintln!(
@@ -701,8 +739,12 @@ impl XCUITestListener for PlanListener {
         Ok(())
     }
 
-    async fn did_fail_to_bootstrap(&mut self, _description: &str) -> Result<(), IdeviceError> {
-        self.fail(RunnerError::BootstrapFailed);
+    async fn did_fail_to_bootstrap(&mut self, description: &str) -> Result<(), IdeviceError> {
+        self.fail(if pairing_required(description) {
+            RunnerError::PairingRequired
+        } else {
+            RunnerError::BootstrapFailed
+        });
         Err(IdeviceError::UnexpectedResponse(
             "test runner bootstrap failed".into(),
         ))

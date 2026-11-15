@@ -150,7 +150,7 @@ fn serve(layout: ServiceLayout, mode: DaemonMode) -> Result<(), String> {
                             move || owner.validate_current().is_ok()
                         },
                     )
-                    .map_err(|error| format!("cannot start owned WDA: {}", error.category()))?;
+                    .map_err(|error| format!("cannot start owned WDA: {}", error.message()))?;
                     serve_adapter(binding, adapter, listener)
                 },
             )

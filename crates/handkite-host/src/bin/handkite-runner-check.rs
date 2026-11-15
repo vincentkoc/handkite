@@ -24,6 +24,9 @@ fn main() {
         Ok(()) => println!("runner_check=startup_ready joined=true endpoint_vacant=true"),
         Err(reason) => {
             println!("runner_check=refused reason={reason}");
+            if reason == "pairing_required" {
+                eprintln!("{}", handkite_host::wda_runner::PAIRING_REQUIRED_MESSAGE);
+            }
             std::process::exit(1);
         }
     }
@@ -115,6 +118,7 @@ fn runner_reason(error: RunnerError) -> &'static str {
         RunnerError::InvalidTimeout => "invalid_timeout",
         RunnerError::LookupFailed => "lookup_failed",
         RunnerError::LookupTimedOut => "lookup_timed_out",
+        RunnerError::PairingRequired => "pairing_required",
         RunnerError::EndpointBusy => "endpoint_busy",
         RunnerError::EndpointUnproven => "endpoint_unproven",
         RunnerError::EndpointCleanupUnproven => "endpoint_cleanup_unproven",
@@ -141,6 +145,7 @@ mod tests {
     #[test]
     fn startup_errors_have_fixed_private_safe_reasons() {
         for error in [
+            RunnerError::PairingRequired,
             RunnerError::EndpointBusy,
             RunnerError::EndpointCleanupUnproven,
             RunnerError::OwnershipLost,
