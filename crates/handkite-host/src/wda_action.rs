@@ -312,7 +312,7 @@ impl WdaActions {
             .map_err(|_| AdapterError)
     }
 
-    pub(crate) async fn execute_on_diagnostic(
+    async fn execute_on_diagnostic(
         wda: &impl WdaRequest,
         action: &Action,
         session: &str,
