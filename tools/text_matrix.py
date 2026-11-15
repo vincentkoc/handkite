@@ -245,6 +245,12 @@ class Matrix:
         if result.get("isError") is True:
             code = call.get("error_code")
             return ("stop_pre_input" if code in PRE_INPUT else "uncertain"), call
+        action = next((json.loads(part["text"]) for part in result.get("content", [])
+                       if part.get("type") == "text" and '"receipt"' in part.get("text", "")), {})
+        call["accepted"] = action.get("receipt", {}).get("accepted")
+        call["effect"] = action.get("effect")
+        if call["accepted"] is not True:
+            return "uncertain", call
         try:
             self.accept(parse_screen(result))
         except BenchError:
@@ -271,6 +277,9 @@ class Matrix:
             request_ms.append(round(elapsed, 3) if isinstance(elapsed, float) else None)
             if "error_code" in call:
                 row["error_code"] = call["error_code"]
+            if "accepted" in call:
+                row["accepted"] = call["accepted"]
+                row["effect"] = call.get("effect")
             if outcome != "sent":
                 break
         row["request_ms"] = request_ms
@@ -311,7 +320,7 @@ class Matrix:
             return {"outcome": "stop_pre_input", "diagnosis": "keyboard_not_visible"}
         outcome, call = self.act("handkite_key", {"key": "enter"})
         result = {"outcome": outcome, "elapsed_ms": call.get("elapsed_ms")}
-        for key in ("error_code", "rpc_error_code", "changed"):
+        for key in ("error_code", "rpc_error_code", "changed", "accepted", "effect"):
             if key in call:
                 result[key] = call[key]
         if outcome == "sent":

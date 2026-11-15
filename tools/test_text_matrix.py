@@ -92,7 +92,10 @@ class FakeEditor:
             call["elapsed_ms"] = 100.0 + 5.0 * len(text.encode("utf-16-le")) / 2
             self.value += self.rewrite(text)
         self.revision += 1
-        return self.screen(), call
+        result = self.screen()
+        result["content"].insert(0, {"type": "text", "text": json.dumps({
+            "receipt": {"accepted": True}, "effect": "changed"})})
+        return result, call
 
 
 def text_matrix_refusal(text):
@@ -192,6 +195,21 @@ class CompareTests(unittest.TestCase):
 
 
 class RunnerTests(unittest.TestCase):
+    def test_unknown_receipt_stops_even_with_a_readable_observation(self):
+        class UnknownReceipt(FakeEditor):
+            def tool(self, name, arguments):
+                result, call = super().tool(name, arguments)
+                if name == "handkite_text":
+                    result["content"][0]["text"] = json.dumps({
+                        "receipt": {"accepted": None}, "effect": "unconfirmed"})
+                return result, call
+        peer = UnknownReceipt()
+        rows = run(peer, only=["ascii_sentence", "simplified_chinese"])
+        self.assertEqual(rows["ascii_sentence"]["outcome"], "uncertain")
+        self.assertIsNone(rows["ascii_sentence"]["accepted"])
+        self.assertEqual(rows["simplified_chinese"]["outcome"], "not_run")
+        self.assertNotIn("\n", peer.sent)
+
     def test_only_invalid_arguments_are_classified_as_rpc_refusal(self):
         peer = object.__new__(text_matrix.MatrixPeer)
         for code, expected in [(-32602, text_matrix.RpcRefused),
