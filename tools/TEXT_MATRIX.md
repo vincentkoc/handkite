@@ -151,14 +151,15 @@ The runner does not enable or read service timing.
 note. At 60 per second it should exceed the 30 second request deadline and end
 `uncertain`; at a higher rate it should end `tree_capped`.
 
-### Typing frequency (branch build only)
+### Typing frequency
 
-A build containing this branch reads `HANDKITE_TYPING_FREQUENCY` once at
-service start: a plain decimal from 60 through 600, sent as `frequency` with
-each text request. Unset or invalid keeps the runner default of 60. Add
+The default is 240 characters per second. `HANDKITE_TYPING_FREQUENCY` is read
+once at service start: a plain decimal from 60 through 600, sent as `frequency`
+with each text request. Unset or invalid uses 240. Add
 `--typing-frequency N` to label the report; it does not set the rate.
 
-No rate is the default yet. Before one is promoted:
+The owner approved 240 after the English checks below passed. Qualification
+under each installed input method remains separate:
 
 1. `time_ascii_500` and `time_mixed_units_500` pass by exact tree comparison,
    each in its own note, at the default and at the candidate rate.

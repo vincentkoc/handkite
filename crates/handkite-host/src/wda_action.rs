@@ -372,34 +372,33 @@ fn touch_action(steps: Vec<Value>) -> Value {
     json!({"actions": [{"type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"}, "actions": steps}]})
 }
 
-/// WDA joins the array before one XCTest text synthesis. Send the value whole
-/// so no layer can ever split a grapheme cluster. Without `frequency` the
-/// runner types at its own default, 60 per second in the pinned WDA.
-fn text_payload(value: &str, frequency: Option<u32>) -> Value {
-    match frequency {
-        Some(frequency) => json!({"value": [value], "frequency": frequency}),
-        None => json!({"value": [value]}),
-    }
+/// Send one whole string so no layer splits a grapheme cluster.
+fn text_payload(value: &str, frequency: u32) -> Value {
+    json!({"value": [value], "frequency": frequency})
 }
 
-/// Opt-in typing rate from `HANDKITE_TYPING_FREQUENCY`, read once per process.
-/// Unset or invalid keeps the runner default. Qualify a rate with exact
-/// read-back before using it: too high a rate can drop or reorder characters.
-fn typing_frequency() -> Option<u32> {
-    static FREQUENCY: OnceLock<Option<u32>> = OnceLock::new();
+const DEFAULT_TYPING_FREQUENCY: u32 = 240;
+
+/// Read the override once per process; otherwise use the qualified default.
+fn typing_frequency() -> u32 {
+    static FREQUENCY: OnceLock<u32> = OnceLock::new();
     *FREQUENCY.get_or_init(|| {
         parse_typing_frequency(std::env::var("HANDKITE_TYPING_FREQUENCY").ok().as_deref())
     })
 }
 
-/// Plain decimal from 60 through 600 per second; anything else is ignored
-/// rather than clamped, so a typo never selects an unintended rate.
-fn parse_typing_frequency(raw: Option<&str>) -> Option<u32> {
-    let raw = raw?;
+/// Accept plain decimal 60 through 600; invalid overrides use the default.
+fn parse_typing_frequency(raw: Option<&str>) -> u32 {
+    let Some(raw) = raw else {
+        return DEFAULT_TYPING_FREQUENCY;
+    };
     if raw.is_empty() || raw.len() > 3 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
+        return DEFAULT_TYPING_FREQUENCY;
     }
-    raw.parse().ok().filter(|rate| (60..=600).contains(rate))
+    raw.parse()
+        .ok()
+        .filter(|rate| (60..=600).contains(rate))
+        .unwrap_or(DEFAULT_TYPING_FREQUENCY)
 }
 
 fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
@@ -608,7 +607,7 @@ mod tests {
         let current = payload(&Action::TextCurrent { value }).unwrap();
         assert_eq!(current, strict);
         assert_eq!(current.0, "/wda/keys");
-        assert_eq!(current.1, json!({"value":["Beta"]}));
+        assert_eq!(current.1, json!({"value":["Beta"],"frequency":240}));
     }
 
     /// What WDA types: the request body as sent, decoded, then joined the way
@@ -620,7 +619,8 @@ mod tests {
         let received: Value = serde_json::from_slice(&sent).unwrap();
         let parts = received["value"].as_array().unwrap();
         assert_eq!(parts.len(), 1, "text must not be split before WDA");
-        assert_eq!(received.as_object().unwrap().len(), 1);
+        assert_eq!(received.as_object().unwrap().len(), 2);
+        assert_eq!(received["frequency"], 240);
         parts.iter().map(|part| part.as_str().unwrap()).collect()
     }
 
@@ -701,26 +701,31 @@ mod tests {
     }
 
     #[test]
-    fn typing_frequency_is_opt_in_bounded_and_leaves_the_text_whole() {
-        assert_eq!(text_payload("Beta", None), json!({"value":["Beta"]}));
+    fn typing_frequency_defaults_to_240_and_keeps_bounded_overrides() {
         assert_eq!(
-            text_payload("\u{1f44b}\u{1f3fd}", Some(240)),
+            text_payload("Beta", parse_typing_frequency(None)),
+            json!({"value":["Beta"],"frequency":240})
+        );
+        assert_eq!(
+            text_payload("\u{1f44b}\u{1f3fd}", parse_typing_frequency(Some("240"))),
             json!({"value":["\u{1f44b}\u{1f3fd}"],"frequency":240})
         );
         for (raw, expected) in [
-            (None, None),
-            (Some("60"), Some(60)),
-            (Some("240"), Some(240)),
-            (Some("600"), Some(600)),
-            (Some(""), None),
-            (Some("0"), None),
-            (Some("59"), None),
-            (Some("601"), None),
-            (Some("+120"), None),
-            (Some(" 120"), None),
-            (Some("120.0"), None),
-            (Some("1e2"), None),
-            (Some("0120"), None),
+            (None, 240),
+            (Some("60"), 60),
+            (Some("120"), 120),
+            (Some("240"), 240),
+            (Some("480"), 480),
+            (Some("600"), 600),
+            (Some(""), 240),
+            (Some("0"), 240),
+            (Some("59"), 240),
+            (Some("601"), 240),
+            (Some("+120"), 240),
+            (Some(" 120"), 240),
+            (Some("120.0"), 240),
+            (Some("1e2"), 240),
+            (Some("0120"), 240),
         ] {
             assert_eq!(parse_typing_frequency(raw), expected, "{raw:?}");
         }

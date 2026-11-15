@@ -331,9 +331,9 @@ finite coordinates from 0 through 10,000; swipes and long presses last 1 through
 any script, without normalization. It excludes control characters and line
 breaks, U+2028 and U+2029, and U+F700 through U+F8FF, which XCTest reads as
 hardware keys; use `handkite_key` for Enter and Tab.
-The optional `HANDKITE_TYPING_FREQUENCY` service variable, a plain decimal from
-60 through 600 read once at start, sets the runner's typing rate per second for
-text; unset or invalid keeps the runner default of 60. The
+Text uses 240 characters per second by default. The optional
+`HANDKITE_TYPING_FREQUENCY` service variable, a plain decimal from 60 through
+600 read once at start, overrides that rate; unset or invalid uses 240. The
 [text matrix](tools/TEXT_MATRIX.md) qualifies scripts, keyboards and rates.
 App identifiers are bounded ASCII bundle identifiers. Arguments reject unknown
 or duplicate fields, including nested target fields. Each call dispatches once,
