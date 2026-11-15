@@ -303,6 +303,12 @@ class Matrix:
         before = editor_value(self.screen)
         if not before:
             return {"outcome": "not_needed"}
+        # Typing can leave keyboard animation in the action's capture. Refresh
+        # before this distinct input, while requiring the proved text to remain.
+        if editor_value(self.observe()) != before:
+            return {"outcome": "stop_pre_input", "diagnosis": "separator_editor_changed"}
+        if not elements(self.screen, {"type": "Keyboard"}):
+            return {"outcome": "stop_pre_input", "diagnosis": "keyboard_not_visible"}
         outcome, call = self.act("handkite_key", {"key": "enter"})
         result = {"outcome": outcome, "elapsed_ms": call.get("elapsed_ms")}
         for key in ("error_code", "rpc_error_code", "changed"):

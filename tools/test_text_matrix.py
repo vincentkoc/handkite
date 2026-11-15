@@ -262,6 +262,19 @@ class RunnerTests(unittest.TestCase):
         report = text_matrix.report(list(rows.values()), "english", "", "installed", "current", None)
         self.assertEqual(report["separator_stops"], {"separator_stop_pre_input": 1})
 
+    def test_separator_refresh_refuses_changed_editor_before_input(self):
+        class ChangedEditor(FakeEditor):
+            def tool(self, name, arguments):
+                if name == "handkite_observe" and self.sent:
+                    self.value += "x"
+                return super().tool(name, arguments)
+        peer = ChangedEditor()
+        rows = run(peer, only=["ascii_sentence", "simplified_chinese"])
+        self.assertEqual(rows["ascii_sentence"]["separator"],
+                         {"outcome": "stop_pre_input", "diagnosis": "separator_editor_changed"})
+        self.assertFalse(any(call["tool"] == "handkite_key" for call in peer.calls))
+        self.assertEqual(rows["simplified_chinese"]["outcome"], "not_run")
+
     def test_faithful_editor_passes_every_case_and_sends_each_text_once(self):
         peer = FakeEditor()
         rows = run(peer)
