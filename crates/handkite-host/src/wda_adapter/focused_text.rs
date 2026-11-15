@@ -539,6 +539,31 @@ mod tests {
     }
 
     #[test]
+    fn explicit_null_value_matches_a_guarded_empty_public_editor() {
+        for kind in ["TextView", "TextField", "SearchField"] {
+            for value_attribute in ["value=\"\"", ""] {
+                let xml = XML
+                    .replace("TextView", kind)
+                    .replace("value=\"Alpha&#10;\"", value_attribute)
+                    .replace(
+                        &format!("XCUIElementType{kind} "),
+                        &format!("XCUIElementType{kind} focused=\"true\" "),
+                    );
+                let (screen, baseline) =
+                    crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
+                let mut data = items();
+                data[0]["type"] = json!(format!("XCUIElementType{kind}"));
+                data[0]["attribute/value"] = Value::Null;
+                assert_eq!(
+                    field_from_context(&data, &screen, &baseline).unwrap(),
+                    ("editor".into(), String::new()),
+                    "{kind} {value_attribute}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn rich_context_requires_one_matching_public_editor_and_keyboard() {
         assert_eq!(
             classify(&items()).unwrap(),
