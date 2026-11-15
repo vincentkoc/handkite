@@ -4,6 +4,7 @@ use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::{AdapterDiagnostic, AdapterError};
 use handkite_core::protocol::{Action, KeyboardKey, Point, TransportReceipt, injectable_text};
 use serde_json::{Value, json};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 pub(crate) trait WdaRequest {
@@ -371,6 +372,36 @@ fn touch_action(steps: Vec<Value>) -> Value {
     json!({"actions": [{"type": "pointer", "id": "finger1", "parameters": {"pointerType": "touch"}, "actions": steps}]})
 }
 
+/// WDA joins the array before one XCTest text synthesis. Send the value whole
+/// so no layer can ever split a grapheme cluster. Without `frequency` the
+/// runner types at its own default, 60 per second in the pinned WDA.
+fn text_payload(value: &str, frequency: Option<u32>) -> Value {
+    match frequency {
+        Some(frequency) => json!({"value": [value], "frequency": frequency}),
+        None => json!({"value": [value]}),
+    }
+}
+
+/// Opt-in typing rate from `HANDKITE_TYPING_FREQUENCY`, read once per process.
+/// Unset or invalid keeps the runner default. Qualify a rate with exact
+/// read-back before using it: too high a rate can drop or reorder characters.
+fn typing_frequency() -> Option<u32> {
+    static FREQUENCY: OnceLock<Option<u32>> = OnceLock::new();
+    *FREQUENCY.get_or_init(|| {
+        parse_typing_frequency(std::env::var("HANDKITE_TYPING_FREQUENCY").ok().as_deref())
+    })
+}
+
+/// Plain decimal from 60 through 600 per second; anything else is ignored
+/// rather than clamped, so a typo never selects an unintended rate.
+fn parse_typing_frequency(raw: Option<&str>) -> Option<u32> {
+    let raw = raw?;
+    if raw.is_empty() || raw.len() > 3 || !raw.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    raw.parse().ok().filter(|rate| (60..=600).contains(rate))
+}
+
 fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
     match action {
         Action::Home => Ok(("/wda/pressButton", json!({"name": "home"}))),
@@ -378,9 +409,7 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
             Ok(("/wda/apps/launch", json!({"bundleId": bundle_id})))
         }
         Action::Text { value } | Action::TextCurrent { value } if injectable_text(value) => {
-            // WDA joins the array before one XCTest text synthesis. Send the
-            // value whole so no layer can ever split a grapheme cluster.
-            Ok(("/wda/keys", json!({"value": [value]})))
+            Ok(("/wda/keys", text_payload(value, typing_frequency())))
         }
         Action::Lock => Ok(("/wda/lock", json!({}))),
         Action::Tap { at } if point_valid(*at) => Ok((
@@ -668,6 +697,32 @@ mod tests {
             ] {
                 assert!(payload(&action).is_err());
             }
+        }
+    }
+
+    #[test]
+    fn typing_frequency_is_opt_in_bounded_and_leaves_the_text_whole() {
+        assert_eq!(text_payload("Beta", None), json!({"value":["Beta"]}));
+        assert_eq!(
+            text_payload("\u{1f44b}\u{1f3fd}", Some(240)),
+            json!({"value":["\u{1f44b}\u{1f3fd}"],"frequency":240})
+        );
+        for (raw, expected) in [
+            (None, None),
+            (Some("60"), Some(60)),
+            (Some("240"), Some(240)),
+            (Some("600"), Some(600)),
+            (Some(""), None),
+            (Some("0"), None),
+            (Some("59"), None),
+            (Some("601"), None),
+            (Some("+120"), None),
+            (Some(" 120"), None),
+            (Some("120.0"), None),
+            (Some("1e2"), None),
+            (Some("0120"), None),
+        ] {
+            assert_eq!(parse_typing_frequency(raw), expected, "{raw:?}");
         }
     }
 
