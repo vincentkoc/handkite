@@ -417,7 +417,7 @@ async fn reobservation_never_rebases_the_route_and_failure_is_permanent() {
     assert!(events.borrow().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn cancellation_including_an_unpolled_future_permanently_poisons_handle() {
     for polled in [false, true] {
         let (_scratch, layout) = fixture();
