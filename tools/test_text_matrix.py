@@ -241,6 +241,27 @@ class RunnerTests(unittest.TestCase):
         self.assertEqual(rows["simplified_chinese"]["detail"], "keyboard_not_visible")
         self.assertEqual(len([text for text in peer.sent if text != "\n"]), 1)
 
+    def test_separator_failure_preserves_stage_and_stops_without_replay(self):
+        class FailedSeparator(FakeEditor):
+            def tool(self, name, arguments):
+                if name == "handkite_key":
+                    call = {"tool": name, "elapsed_ms": 5000.0,
+                            "error_code": "AdapterNativeBefore"}
+                    self.calls.append(call)
+                    return {"isError": True}, call
+                return super().tool(name, arguments)
+        peer = FailedSeparator()
+        rows = run(peer, only=["ascii_sentence", "simplified_chinese"])
+        self.assertEqual(rows["ascii_sentence"]["outcome"], "pass")
+        separator = rows["ascii_sentence"]["separator"]
+        self.assertEqual(separator["outcome"], "stop_pre_input")
+        self.assertEqual(separator["error_code"], "AdapterNativeBefore")
+        self.assertFalse(separator["editor_changed"])
+        self.assertEqual(rows["simplified_chinese"]["outcome"], "not_run")
+        self.assertEqual(sum(c["tool"] == "handkite_key" for c in peer.calls), 1)
+        report = text_matrix.report(list(rows.values()), "english", "", "installed", "current", None)
+        self.assertEqual(report["separator_stops"], {"separator_stop_pre_input": 1})
+
     def test_faithful_editor_passes_every_case_and_sends_each_text_once(self):
         peer = FakeEditor()
         rows = run(peer)

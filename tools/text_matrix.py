@@ -300,10 +300,25 @@ class Matrix:
 
     def separate(self):
         """Start the next case on a new line instead of deleting anything."""
-        if not editor_value(self.screen):
-            return True
-        outcome, _ = self.act("handkite_key", {"key": "enter"})
-        return outcome == "sent"
+        before = editor_value(self.screen)
+        if not before:
+            return {"outcome": "not_needed"}
+        outcome, call = self.act("handkite_key", {"key": "enter"})
+        result = {"outcome": outcome, "elapsed_ms": call.get("elapsed_ms")}
+        for key in ("error_code", "rpc_error_code", "changed"):
+            if key in call:
+                result[key] = call[key]
+        if outcome == "sent":
+            after = editor_value(self.screen)
+            if after != before + "\n":
+                result["outcome"] = "mismatch"
+                result["detail"] = difference(before + "\n", after)
+        else:
+            try:
+                result["editor_changed"] = editor_value(self.observe()) != before
+            except BenchError as error:
+                result["diagnosis"] = error.args[0]
+        return result
 
     def run(self):
         self.peer.initialize()
@@ -326,9 +341,11 @@ class Matrix:
                     stopped = "after_uncertain_input"
                 elif row["outcome"] in ("pass", "nfc_equal", "mismatch"):
                     try:
-                        if not self.separate():
+                        row["separator"] = self.separate()
+                        if row["separator"]["outcome"] not in ("sent", "not_needed"):
                             stopped = "separator_failed"
-                    except BenchError:
+                    except BenchError as error:
+                        row["separator"] = {"outcome": "uncertain", "diagnosis": error.args[0]}
                         stopped = "separator_failed"
         finally:
             try:
@@ -368,10 +385,16 @@ def typing_rate(rows):
 
 def report(rows, keyboard, label, build, selection, frequency):
     counts = {}
+    stops = {}
     for row in rows:
         counts[row["outcome"]] = counts.get(row["outcome"], 0) + 1
+        separator = row.get("separator", {})
+        if separator.get("outcome") not in (None, "sent", "not_needed"):
+            reason = "separator_" + separator["outcome"]
+            stops[reason] = stops.get(reason, 0) + 1
     return {"version": 1, "keyboard": keyboard, "keyboard_label": label, "build": build,
             "selection": selection, "typing_frequency": frequency, "outcomes": counts,
+            "separator_stops": stops,
             "unexpected": [row["id"] for row in rows if row.get("as_expected") is False],
             "typing_rate": typing_rate(rows), "cases": rows}
 
@@ -418,7 +441,8 @@ def main():
         with os.fdopen(fd, "w", encoding="ascii") as stream:
             json.dump(result, stream, indent=1, allow_nan=False)
             stream.write("\n")
-        print(json.dumps({"outcomes": result["outcomes"], "unexpected": result["unexpected"],
+        print(json.dumps({"outcomes": result["outcomes"], "separator_stops": result["separator_stops"],
+                          "unexpected": result["unexpected"],
                           "typing_rate": result["typing_rate"]}))
         return 0
     except BenchError as error:
