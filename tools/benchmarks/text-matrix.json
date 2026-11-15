@@ -1,0 +1,989 @@
+{
+ "version": 1,
+ "note": "Synthetic text only. Generated from crates/handkite-host/src/text_matrix.rs; tools/test_text_matrix.py keeps them in sync.",
+ "keyboards": {
+  "english": "English (US)",
+  "pinyin": "Chinese, Simplified - Pinyin",
+  "zhuyin": "Chinese, Traditional - Zhuyin (if installed)",
+  "japanese_romaji": "Japanese - Romaji",
+  "japanese_kana": "Japanese - Kana",
+  "emoji": "Emoji",
+  "other": "any other installed keyboard; name it with --keyboard-label"
+ },
+ "comparison": {
+  "exact": "typed suffix equals expected_readback scalar for scalar; canonically equivalent text is reported as nfc_equal, not pass",
+  "unchanged": "the tool refuses the call and the editor value is identical before and after"
+ },
+ "cases": [
+  {
+   "id": "ascii_sentence",
+   "class": "ascii",
+   "input": "Plain ascii words 123",
+   "expected_readback": "Plain ascii words 123",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass",
+    "pinyin": "fail",
+    "zhuyin": "fail",
+    "japanese_romaji": "fail",
+    "japanese_kana": "unknown",
+    "emoji": "unknown",
+    "other": "unknown"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "simplified_chinese",
+   "class": "simplified_chinese",
+   "input": "\u4f60\u597d\uff0c\u4e16\u754c\u3002\u7b80\u4f53\u4e2d\u6587\u8f93\u5165\u6d4b\u8bd5",
+   "expected_readback": "\u4f60\u597d\uff0c\u4e16\u754c\u3002\u7b80\u4f53\u4e2d\u6587\u8f93\u5165\u6d4b\u8bd5",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "traditional_chinese",
+   "class": "traditional_chinese",
+   "input": "\u7e41\u9ad4\u4e2d\u6587\u8f38\u5165\u6e2c\u8a66\uff0c\u81fa\u7063\u8207\u9999\u6e2f",
+   "expected_readback": "\u7e41\u9ad4\u4e2d\u6587\u8f38\u5165\u6e2c\u8a66\uff0c\u81fa\u7063\u8207\u9999\u6e2f",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "supplementary_plane_han",
+   "class": "supplementary_plane_han",
+   "input": "\ud842\udfb7\u91ce\u5bb6\u3068\ud867\ude3d",
+   "expected_readback": "\ud842\udfb7\u91ce\u5bb6\u3068\ud867\ude3d",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "japanese_kanji_hiragana_katakana",
+   "class": "japanese_kanji_hiragana_katakana",
+   "input": "\u65e5\u672c\u8a9e\u306e\u6f22\u5b57\u3068\u3072\u3089\u304c\u306a\u3068\u30ab\u30bf\u30ab\u30ca",
+   "expected_readback": "\u65e5\u672c\u8a9e\u306e\u6f22\u5b57\u3068\u3072\u3089\u304c\u306a\u3068\u30ab\u30bf\u30ab\u30ca",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "japanese_dakuten_composed",
+   "class": "japanese_dakuten_composed",
+   "input": "\u304c\u304e\u3050\u3052\u3054 \u30d1\u30d4\u30d7\u30da\u30dd",
+   "expected_readback": "\u304c\u304e\u3050\u3052\u3054 \u30d1\u30d4\u30d7\u30da\u30dd",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "japanese_dakuten_decomposed",
+   "class": "japanese_dakuten_decomposed",
+   "input": "\u304b\u3099\u304d\u3099 \u30cf\u309a\u30d2\u309a",
+   "expected_readback": "\u304b\u3099\u304d\u3099 \u30cf\u309a\u30d2\u309a",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "unknown"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "japanese_halfwidth_katakana",
+   "class": "japanese_halfwidth_katakana",
+   "input": "\uff76\uff9e\uff77\uff9e\uff78\uff9e \uff8a\uff9f",
+   "expected_readback": "\uff76\uff9e\uff77\uff9e\uff78\uff9e \uff8a\uff9f",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "unknown"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "fullwidth_punctuation",
+   "class": "fullwidth_punctuation",
+   "input": "\uff08\u5168\u89d2\uff09\uff01\uff1f\u300c\u300d\u3001\u3002",
+   "expected_readback": "\uff08\u5168\u89d2\uff09\uff01\uff1f\u300c\u300d\u3001\u3002",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "korean_syllables",
+   "class": "korean_syllables",
+   "input": "\ud55c\uad6d\uc5b4 \uc785\ub825 \ud14c\uc2a4\ud2b8",
+   "expected_readback": "\ud55c\uad6d\uc5b4 \uc785\ub825 \ud14c\uc2a4\ud2b8",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "korean_conjoining_jamo",
+   "class": "korean_conjoining_jamo",
+   "input": "\u1112\u1161\u11ab\u1100\u1173\u11af",
+   "expected_readback": "\u1112\u1161\u11ab\u1100\u1173\u11af",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "unknown"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "arabic",
+   "class": "arabic",
+   "input": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645",
+   "expected_readback": "\u0645\u0631\u062d\u0628\u0627 \u0628\u0627\u0644\u0639\u0627\u0644\u0645",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "persian_zwnj",
+   "class": "persian_zwnj",
+   "input": "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+   "expected_readback": "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "hebrew",
+   "class": "hebrew",
+   "input": "\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd",
+   "expected_readback": "\u05e9\u05dc\u05d5\u05dd \u05e2\u05d5\u05dc\u05dd",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "bidi_mixed",
+   "class": "bidi_mixed",
+   "input": "abc \u0645\u0631\u062d\u0628\u0627 123 \u05e9\u05dc\u05d5\u05dd xyz",
+   "expected_readback": "abc \u0645\u0631\u062d\u0628\u0627 123 \u05e9\u05dc\u05d5\u05dd xyz",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass",
+    "pinyin": "fail",
+    "zhuyin": "fail",
+    "japanese_romaji": "fail",
+    "japanese_kana": "unknown",
+    "emoji": "unknown",
+    "other": "unknown"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "thai",
+   "class": "thai",
+   "input": "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35\u0e04\u0e23\u0e31\u0e1a \u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22 \u0e19\u0e49\u0e33",
+   "expected_readback": "\u0e2a\u0e27\u0e31\u0e2a\u0e14\u0e35\u0e04\u0e23\u0e31\u0e1a \u0e20\u0e32\u0e29\u0e32\u0e44\u0e17\u0e22 \u0e19\u0e49\u0e33",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "devanagari_conjuncts",
+   "class": "devanagari_conjuncts",
+   "input": "\u0915\u094d\u0937\u0924\u094d\u0930\u093f\u092f \u0939\u093f\u0928\u094d\u0926\u0940",
+   "expected_readback": "\u0915\u094d\u0937\u0924\u094d\u0930\u093f\u092f \u0939\u093f\u0928\u094d\u0926\u0940",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "accented_latin_composed",
+   "class": "accented_latin_composed",
+   "input": "Caf\u00e9 na\u00efve Z\u00fcrich \u00c5ngstr\u00f6m se\u00f1or \u0110\u00e0 N\u1eb5ng",
+   "expected_readback": "Caf\u00e9 na\u00efve Z\u00fcrich \u00c5ngstr\u00f6m se\u00f1or \u0110\u00e0 N\u1eb5ng",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass",
+    "pinyin": "fail",
+    "zhuyin": "fail",
+    "japanese_romaji": "fail",
+    "japanese_kana": "unknown",
+    "emoji": "unknown",
+    "other": "unknown"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "accented_latin_decomposed",
+   "class": "accented_latin_decomposed",
+   "input": "Cafe\u0301 nai\u0308ve A\u030angstro\u0308m",
+   "expected_readback": "Cafe\u0301 nai\u0308ve A\u030angstro\u0308m",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "unknown",
+    "pinyin": "fail",
+    "zhuyin": "fail",
+    "japanese_romaji": "fail",
+    "japanese_kana": "unknown",
+    "emoji": "unknown",
+    "other": "unknown"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "single_emoji",
+   "class": "single_emoji",
+   "input": "\ud83d\ude00",
+   "expected_readback": "\ud83d\ude00",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "emoji_variation_selector",
+   "class": "emoji_variation_selector",
+   "input": "\u2764\ufe0f \u2600\ufe0f",
+   "expected_readback": "\u2764\ufe0f \u2600\ufe0f",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "emoji_keycap",
+   "class": "emoji_keycap",
+   "input": "1\ufe0f\u20e3#\ufe0f\u20e3",
+   "expected_readback": "1\ufe0f\u20e3#\ufe0f\u20e3",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "emoji_zwj_family",
+   "class": "emoji_zwj_family",
+   "input": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66",
+   "expected_readback": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "emoji_skin_tone",
+   "class": "emoji_skin_tone",
+   "input": "\ud83d\udc4b\ud83c\udffd\ud83d\udc4d\ud83c\udfff",
+   "expected_readback": "\ud83d\udc4b\ud83c\udffd\ud83d\udc4d\ud83c\udfff",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "emoji_zwj_skin_tone",
+   "class": "emoji_zwj_skin_tone",
+   "input": "\ud83e\uddd1\ud83c\udfff\u200d\ud83d\udcbb",
+   "expected_readback": "\ud83e\uddd1\ud83c\udfff\u200d\ud83d\udcbb",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "emoji_flags",
+   "class": "emoji_flags",
+   "input": "\ud83c\uddef\ud83c\uddf5\ud83c\uddf9\ud83c\uddfc\ud83c\uddfa\ud83c\uddf8",
+   "expected_readback": "\ud83c\uddef\ud83c\uddf5\ud83c\uddf9\ud83c\uddfc\ud83c\uddfa\ud83c\uddf8",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "emoji_subdivision_flag",
+   "class": "emoji_subdivision_flag",
+   "input": "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc73\udb40\udc63\udb40\udc74\udb40\udc7f",
+   "expected_readback": "\ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc73\udb40\udc63\udb40\udc74\udb40\udc7f",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "mixed_english_cjk_emoji",
+   "class": "mixed_english_cjk_emoji",
+   "input": "Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK",
+   "expected_readback": "Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass",
+    "pinyin": "fail",
+    "zhuyin": "fail",
+    "japanese_romaji": "fail",
+    "japanese_kana": "unknown",
+    "emoji": "unknown",
+    "other": "unknown"
+   },
+   "rerun_on_branch": true
+  },
+  {
+   "id": "ascii_rewrite_bait",
+   "class": "ascii_rewrite_bait",
+   "input": "\"quote\" 'single' -- ... a  b i teh (c) 1/2",
+   "expected_readback": "\"quote\" 'single' -- ... a  b i teh (c) 1/2",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "fail",
+    "pinyin": "fail",
+    "zhuyin": "fail",
+    "japanese_romaji": "fail",
+    "english": "fail",
+    "japanese_kana": "fail",
+    "emoji": "fail",
+    "other": "fail"
+   },
+   "rerun_on_branch": false
+  },
+  {
+   "id": "multiline_enter_key",
+   "class": "multiline",
+   "input": null,
+   "expected_readback": "first \u4f60\u597d\nsecond \ud83d\udc4b\ud83c\udffd\nthird",
+   "comparison": "exact",
+   "keyboards": [
+    "english",
+    "pinyin",
+    "zhuyin",
+    "japanese_romaji",
+    "japanese_kana",
+    "emoji",
+    "other"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": false,
+   "segments": [
+    "first \u4f60\u597d",
+    "second \ud83d\udc4b\ud83c\udffd",
+    "third"
+   ]
+  },
+  {
+   "id": "time_ascii_1",
+   "class": "timing",
+   "input": "a",
+   "expected_readback": "a",
+   "comparison": "exact",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true,
+   "timing": true
+  },
+  {
+   "id": "time_ascii_20",
+   "class": "timing",
+   "input": "abc123abc123abc123ab",
+   "expected_readback": "abc123abc123abc123ab",
+   "comparison": "exact",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true,
+   "timing": true
+  },
+  {
+   "id": "time_ascii_100",
+   "class": "timing",
+   "input": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1",
+   "expected_readback": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc1",
+   "comparison": "exact",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true,
+   "timing": true
+  },
+  {
+   "id": "time_ascii_500",
+   "class": "timing",
+   "input": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123ab",
+   "expected_readback": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123ab",
+   "comparison": "exact",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true,
+   "timing": true
+  },
+  {
+   "id": "time_mixed_500",
+   "class": "timing",
+   "input": "Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK ",
+   "expected_readback": "Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK ",
+   "comparison": "exact",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "pass"
+   },
+   "rerun_on_branch": true,
+   "timing": true
+  },
+  {
+   "id": "refuse_newline",
+   "class": "refused",
+   "input": "line one\nline two",
+   "expected_readback": "",
+   "comparison": "unchanged",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "refused"
+   },
+   "rerun_on_branch": true,
+   "reason": "line break: use the key tool"
+  },
+  {
+   "id": "refuse_tab",
+   "class": "refused",
+   "input": "tab\tstop",
+   "expected_readback": "",
+   "comparison": "unchanged",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "refused"
+   },
+   "rerun_on_branch": true,
+   "reason": "control character"
+  },
+  {
+   "id": "refuse_over_limit",
+   "class": "refused",
+   "input": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "expected_readback": "",
+   "comparison": "unchanged",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "refused"
+   },
+   "rerun_on_branch": true,
+   "reason": "over 4096 UTF-8 bytes"
+  },
+  {
+   "id": "refuse_line_separator",
+   "class": "refused",
+   "input": "line\u2028separator",
+   "expected_readback": "",
+   "comparison": "unchanged",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "branch"
+   ],
+   "expect": {
+    "default": "refused"
+   },
+   "rerun_on_branch": true,
+   "reason": "U+2028 acts as a line break; the installed build would type it"
+  },
+  {
+   "id": "refuse_function_key",
+   "class": "refused",
+   "input": "up\uf700arrow",
+   "expected_readback": "",
+   "comparison": "unchanged",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "branch"
+   ],
+   "expect": {
+    "default": "refused"
+   },
+   "rerun_on_branch": true,
+   "reason": "U+F700 is read by XCTest as the up arrow key; the installed build would send it"
+  },
+  {
+   "id": "deadline_ascii_2000",
+   "class": "deadline",
+   "input": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123ab",
+   "expected_readback": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123ab",
+   "comparison": "exact",
+   "keyboards": [
+    "english"
+   ],
+   "builds": [
+    "installed",
+    "branch"
+   ],
+   "expect": {
+    "default": "uncertain"
+   },
+   "rerun_on_branch": true,
+   "timing": true,
+   "optional": "--include-deadline-case"
+  }
+ ]
+}
