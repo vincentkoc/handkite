@@ -9,6 +9,7 @@ text, tree, screenshot or device identifier.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -27,6 +28,12 @@ BUILDS = ("installed", "branch")
 EXPECTATIONS = {"pass", "fail", "refused", "uncertain", "unknown"}
 COMPARISONS = {"exact", "unchanged"}
 MAX_INPUT_BYTES = 8_192
+# WDA builds the page source from XCTest's fast snapshot, which cuts every
+# `value` at 512 UTF-16 units. A tree value at that length proves a prefix only.
+TREE_VALUE_CAP = 512
+# One note holds cases only while its whole value stays visible in the tree.
+NOTE_BUDGET = 500
+IMAGE_ONLY = {"capture": "image_only", "tree_format": "omit"}
 # The request never reached the device: safe to continue with the next case.
 PRE_INPUT = {"Busy", "DeviceMismatch", "StaleObservation", "InvalidObservationWindow",
              "InvalidLease", "StaleRevision", "ViewChanged", "LockedAction",
@@ -151,8 +158,33 @@ def difference(expected, typed):
             "actual_scalar": scalar(typed), "actual_scalars": len(typed)}
 
 
+def units(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def batches(cases):
+    """Split cases into notes so each note's value stays under the tree cap.
+
+    A case that alone reaches the budget gets its own note; its tree value
+    can prove only a prefix and it is reported as `tree_capped`.
+    """
+    groups = []
+    used = None
+    for case in cases:
+        if case["comparison"] == "unchanged":
+            cost = 0
+        else:
+            cost = units(case["expected_readback"]) + 1
+        if used is None or (cost and used + cost > NOTE_BUDGET):
+            groups.append([])
+            used = 0
+        groups[-1].append(case)
+        used += cost
+    return groups
+
+
 def sizes(text):
-    return {"scalars": len(text), "utf16_units": len(text.encode("utf-16-le")) // 2,
+    return {"scalars": len(text), "utf16_units": units(text),
             "utf8_bytes": len(text.encode())}
 
 
@@ -188,8 +220,11 @@ class MatrixPeer(Peer):
 
 
 class Matrix:
-    def __init__(self, peer, cases, keyboard, selection="current", clock=time.monotonic):
+    def __init__(self, peer, cases, keyboard, selection="current", clock=time.monotonic,
+                 timing_capture="image_only"):
         require(selection in ("current", "strict"), "invalid_selection")
+        require(timing_capture in ("image_only", "paired"), "invalid_timing_capture")
+        self.timing_capture = timing_capture
         self.peer = peer
         self.cases = cases
         self.keyboard = keyboard
@@ -228,10 +263,25 @@ class Matrix:
         require(device == self.device, "device_changed")
         self.screen = screen
 
-    def act(self, tool, arguments):
+    def fresh(self, proved):
+        """Observe before an input; the editor must still hold the proved value.
+
+        An action's own capture can precede the end of keyboard animation, and
+        the service then refuses the next input with `ViewChanged`. Each input
+        therefore starts from its own observation. Returns a diagnosis or None.
+        """
+        if editor_value(self.observe()) != proved:
+            return "editor_changed"
+        if not elements(self.screen, {"type": "Keyboard"}):
+            return "keyboard_not_visible"
+        return None
+
+    def act(self, tool, arguments, image_only=False):
         """One dispatch. Returns (outcome, call); never sends the request twice."""
         self.renew()
         arguments = dict(arguments, expected_revision=self.screen["metadata"]["revision"])
+        if image_only:
+            arguments["response"] = dict(IMAGE_ONLY)
         if self.selection == "current":
             arguments["selection"] = "current"
         try:
@@ -263,7 +313,13 @@ class Matrix:
         if call["accepted"] is not True:
             return "uncertain", call
         try:
-            self.accept(parse_screen(result))
+            screen = parse_screen(result)
+            require((screen["capture_kind"] == "image_only") == image_only, "wrong_capture_mode")
+            if image_only:
+                # No tree came back: the next step must observe before it acts.
+                self.screen = None
+            else:
+                self.accept(screen)
         except BenchError:
             return "uncertain", call
         return "sent", call
@@ -276,33 +332,67 @@ class Matrix:
         before = editor_value(self.observe())
         require(bool(elements(self.screen, {"type": "Keyboard"})), "keyboard_not_visible")
         row["baseline_scalars"] = len(before)
+        image_only = bool(case.get("timing")) and self.timing_capture == "image_only"
+        row["capture"] = "image_only" if image_only else "paired"
         outcome = "sent"
         request_ms = []
+        proved = before
+        sent = 0
         for index, part in enumerate(parts):
-            if index:
-                outcome, call = self.act("handkite_key", {"key": "enter"})
+            steps = [("handkite_key", {"key": "enter"}, "\n")] if index else []
+            steps.append(("handkite_text", {"value": part}, part))
+            for tool, arguments, effect in steps:
+                if sent:
+                    # Later inputs of one case start from their own observation.
+                    diagnosis = self.fresh(proved)
+                    if diagnosis:
+                        outcome = "stop_pre_input"
+                        row["diagnosis"] = diagnosis
+                        break
+                is_text = tool == "handkite_text"
+                outcome, call = self.act(tool, arguments, image_only and is_text)
+                if is_text:
+                    elapsed = call.get("elapsed_ms")
+                    request_ms.append(round(elapsed, 3) if isinstance(elapsed, float) else None)
+                if "error_code" in call:
+                    row["error_code"] = call["error_code"]
+                if "accepted" in call:
+                    row["accepted"] = call["accepted"]
+                    row["effect"] = call.get("effect")
                 if outcome != "sent":
                     break
-            outcome, call = self.act("handkite_text", {"value": part})
-            elapsed = call.get("elapsed_ms")
-            request_ms.append(round(elapsed, 3) if isinstance(elapsed, float) else None)
-            if "error_code" in call:
-                row["error_code"] = call["error_code"]
-            if "accepted" in call:
-                row["accepted"] = call["accepted"]
-                row["effect"] = call.get("effect")
+                sent += 1
+                proved += effect
             if outcome != "sent":
                 break
         row["request_ms"] = request_ms
+        row["inputs_sent"] = sent
         if outcome == "sent":
-            typed = typed_suffix(before, editor_value(self.screen))
+            if self.screen is None:
+                started = self.clock()
+                self.observe()
+                row["verify_ms"] = round((self.clock() - started) * 1000, 3)
+            after = editor_value(self.screen)
+            typed = typed_suffix(before, after)
+            expected = case["expected_readback"]
             if typed is None:
                 outcome = "mismatch"
                 row["detail"] = "baseline_changed"
+            elif units(after) >= TREE_VALUE_CAP and units(before + expected) >= TREE_VALUE_CAP:
+                # The tree cannot show the whole value. Its prefix must still match.
+                outcome = "tree_capped" if expected.startswith(typed) else "mismatch"
+                row["detail"] = dict(difference(expected, typed), direct_read_required=True,
+                                     expected_utf16_units=units(before + expected),
+                                     expected_sha256=hashlib.sha256(
+                                         (before + expected).encode()).hexdigest())
             else:
-                outcome = compare(case["expected_readback"], typed)
+                outcome = compare(expected, typed)
                 if outcome != "pass":
-                    row["detail"] = difference(case["expected_readback"], typed)
+                    row["detail"] = difference(expected, typed)
+        elif sent and outcome == "stop_pre_input":
+            # Earlier inputs of this case were delivered; the case is incomplete
+            # and is never resumed or sent again.
+            outcome = "partial"
         else:
             # One read-only observation to learn whether anything was typed.
             try:
@@ -323,6 +413,9 @@ class Matrix:
         before = editor_value(self.screen)
         if not before:
             return {"outcome": "not_needed"}
+        if units(before) + 1 >= TREE_VALUE_CAP:
+            # A newline past the tree cap could not be verified. Use a new note.
+            return {"outcome": "stop_pre_input", "diagnosis": "note_full"}
         # Typing can leave keyboard animation in the action's capture. Refresh
         # before this distinct input, while requiring the proved text to remain.
         if editor_value(self.observe()) != before:
@@ -365,6 +458,10 @@ class Matrix:
                 self.rows.append(row)
                 if row["outcome"] == "uncertain":
                     stopped = "after_uncertain_input"
+                elif row["outcome"] == "partial":
+                    stopped = "after_partial_case"
+                elif row["outcome"] == "tree_capped":
+                    stopped = "note_full"
                 elif row["outcome"] in ("pass", "nfc_equal", "mismatch"):
                     try:
                         row["separator"] = self.separate()
@@ -436,6 +533,10 @@ def main():
         sub.add_argument("--build", choices=BUILDS, required=True)
         sub.add_argument("--cases", nargs="+")
         sub.add_argument("--include-deadline-case", action="store_true")
+        sub.add_argument("--note", type=int,
+                         help="1-based note number from `list`; each note is one run")
+    run.add_argument("--timing-capture", choices=("image_only", "paired"), default="image_only",
+                     help="response capture for timing cases; read-back is a separate observation")
     run.add_argument("--keyboard-label", default="")
     run.add_argument("--selection", choices=("current", "strict"), default="current")
     run.add_argument("--typing-frequency", type=int,
@@ -447,10 +548,16 @@ def main():
         spec = load_spec(args.spec)
         optional = ("--include-deadline-case",) if args.include_deadline_case else ()
         cases = select_cases(spec, args.keyboard, args.build, args.cases, optional)
+        notes = batches(cases)
+        require(args.note is None or 1 <= args.note <= len(notes), "unknown_note")
         if args.mode == "list":
-            for case in cases:
-                print(f"{case['id']}\t{expectation(case, args.keyboard)}")
+            for number, group in enumerate(notes, 1):
+                if args.note in (None, number):
+                    for case in group:
+                        print(f"{number}\t{case['id']}\t{expectation(case, args.keyboard)}")
             return 0
+        require(args.note is not None or len(notes) == 1, "note_required")
+        cases = notes[(args.note or 1) - 1]
         command = args.command[1:] if args.command[:1] == ["--"] else args.command
         require(len(args.keyboard_label) <= 64
                 and (not args.keyboard_label or args.keyboard_label.isprintable()),
@@ -458,11 +565,14 @@ def main():
         require(not args.output.exists(), "output_exists")
         peer = MatrixPeer(command)
         try:
-            rows = Matrix(peer, cases, args.keyboard, args.selection).run()
+            rows = Matrix(peer, cases, args.keyboard, args.selection,
+                          timing_capture=args.timing_capture).run()
         finally:
             peer.close()
         result = report(rows, args.keyboard, args.keyboard_label, args.build, args.selection,
                         args.typing_frequency)
+        result["note"] = args.note or 1
+        result["timing_capture"] = args.timing_capture
         fd = os.open(args.output, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w", encoding="ascii") as stream:
             json.dump(result, stream, indent=1, allow_nan=False)

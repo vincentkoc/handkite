@@ -32,7 +32,9 @@ class FakeEditor:
     """An in-process MCP peer with one text view, optionally rewriting input."""
 
     def __init__(self, rewrite=lambda text: text, errors=None, app=text_matrix.NOTES,
-                 lock="unlocked", initial="", keyboard=True, refuse=None):
+                 lock="unlocked", initial="", keyboard=True, refuse=None, animate=True):
+        self.animate = animate
+        self.settling = False
         self.value = initial
         self.rewrite = rewrite
         self.errors = errors or {}
@@ -50,7 +52,10 @@ class FakeEditor:
 
     def screen(self):
         keyboard = "<XCUIElementTypeKeyboard/>" if self.keyboard else ""
-        value = f" value={quoteattr(self.value)}" if self.value else ""
+        # The page source cuts every value at 512 UTF-16 units.
+        shown = self.value.encode("utf-16-le")[:2 * text_matrix.TREE_VALUE_CAP].decode(
+            "utf-16-le", errors="ignore")
+        value = f" value={quoteattr(shown)}" if shown else ""
         value = value.replace("\n", "&#10;")
         tree = (f"<XCUIElementTypeApplication><XCUIElementTypeTextView{value}/>"
                 f"{keyboard}</XCUIElementTypeApplication>")
@@ -71,8 +76,16 @@ class FakeEditor:
             self.controlled = False
             return {}, call
         if name == "handkite_observe":
+            if self.settling:
+                # Keyboard animation finished after the action's own capture.
+                self.settling = False
+                self.revision += 1
             return self.screen(), call
-        assert self.controlled and arguments["expected_revision"] == self.revision
+        assert self.controlled
+        image_only = arguments.pop("response", None) == text_matrix.IMAGE_ONLY
+        if self.settling or arguments["expected_revision"] != self.revision:
+            call["error_code"] = "ViewChanged"
+            return {"isError": True, "structuredContent": {"code": "ViewChanged"}}, call
         if name == "handkite_key":
             assert arguments == {"key": "enter", "expected_revision": self.revision,
                                  "selection": "current"}
@@ -92,7 +105,15 @@ class FakeEditor:
             call["elapsed_ms"] = 100.0 + 5.0 * len(text.encode("utf-16-le")) / 2
             self.value += self.rewrite(text)
         self.revision += 1
+        self.settling = self.animate
         result = self.screen()
+        if image_only:
+            call["image_only"] = True
+            window = {"started_unix_ms": 1, "finished_unix_ms": 2}
+            result["content"][0]["text"] = json.dumps({
+                "metadata": {"device": "fixture", "window": window},
+                "capture_kind": "image_only",
+                "tree": {"included": False, "reason": "not_captured"}})
         result["content"].insert(0, {"type": "text", "text": json.dumps({
             "receipt": {"accepted": True}, "effect": "changed"})})
         return result, call
@@ -106,7 +127,13 @@ def text_matrix_refusal(text):
 def run(peer, keyboard="english", build="branch", only=None, optional=()):
     spec = text_matrix.load_spec()
     cases = text_matrix.select_cases(spec, keyboard, build, only, optional)
-    rows = text_matrix.Matrix(peer, cases, keyboard).run()
+    rows = []
+    for number, note in enumerate(text_matrix.batches(cases)):
+        if number:
+            # Each later batch is one operator run in a new empty note.
+            peer.value = ""
+            peer.settling = False
+        rows += text_matrix.Matrix(peer, note, keyboard).run()
     return {row["id"]: row for row in rows}
 
 
@@ -122,10 +149,11 @@ class SpecTests(unittest.TestCase):
         for required in ("simplified_chinese", "traditional_chinese", "korean_syllables",
                          "arabic", "hebrew", "thai", "emoji_zwj_family", "emoji_flags",
                          "multiline_enter_key", "time_ascii_20", "time_ascii_500",
-                         "time_mixed_500"):
+                         "time_mixed_units_500"):
             self.assertIn(required, by_id)
         self.assertEqual(len(by_id["time_ascii_500"]["input"]), 500)
-        self.assertGreaterEqual(len(by_id["time_mixed_500"]["input"]), 500)
+        mixed = text_matrix.units(by_id["time_mixed_units_500"]["input"])
+        self.assertTrue(480 <= mixed < text_matrix.NOTE_BUDGET, mixed)
 
     def test_key_like_refusals_never_run_on_the_installed_build(self):
         spec = text_matrix.load_spec()
@@ -225,7 +253,7 @@ class RunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             output = Path(directory) / "report.json"
             argv = ["text_matrix.py", "run", "--keyboard", "english", "--build", "installed",
-                    "--output", str(output), "--", "unused"]
+                    "--note", "1", "--output", str(output), "--", "unused"]
             with patch("sys.argv", argv), patch.object(text_matrix, "MatrixPeer",
                                                        side_effect=BenchError("transport_probe")):
                 with patch("builtins.print") as printed:
@@ -317,7 +345,8 @@ class RunnerTests(unittest.TestCase):
         rows = run(peer, only=["ascii_sentence", "ascii_rewrite_bait", "simplified_chinese"])
         self.assertEqual(rows["ascii_sentence"]["outcome"], "pass")
         self.assertEqual(rows["ascii_rewrite_bait"]["outcome"], "mismatch")
-        self.assertIs(rows["ascii_rewrite_bait"]["as_expected"], True)
+        # English passed this case live, so a rewrite there is now unexpected.
+        self.assertIs(rows["ascii_rewrite_bait"]["as_expected"], False)
         self.assertEqual(rows["simplified_chinese"]["outcome"], "pass")
         composed = FakeEditor(rewrite=lambda text: unicodedata.normalize("NFC", text))
         rows = run(composed, only=["japanese_dakuten_decomposed"])
@@ -358,6 +387,84 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(raised.exception.args, (code,))
             self.assertEqual(peer.sent, [])
             self.assertFalse(peer.controlled)
+
+
+class CapAndSequenceTests(unittest.TestCase):
+    def spec(self):
+        return {case["id"]: case for case in text_matrix.load_spec()["cases"]}
+
+    def test_notes_keep_every_value_under_the_tree_cap(self):
+        spec = text_matrix.load_spec()
+        for keyboard in spec["keyboards"]:
+            cases = text_matrix.select_cases(spec, keyboard, "branch")
+            notes = text_matrix.batches(cases)
+            self.assertEqual([case["id"] for note in notes for case in note],
+                             [case["id"] for case in cases])
+            for note in notes:
+                typed = [case for case in note if case["comparison"] == "exact"]
+                total = sum(text_matrix.units(case["expected_readback"]) + 1 for case in typed)
+                self.assertTrue(total <= text_matrix.NOTE_BUDGET or len(typed) == 1, keyboard)
+        english = text_matrix.batches(text_matrix.select_cases(spec, "english", "branch"))
+        alone = [note for note in english if note[0]["id"] == "time_ascii_500"]
+        self.assertEqual([case["comparison"] for case in alone[0][1:]], [])
+        with_deadline = text_matrix.batches(text_matrix.select_cases(
+            spec, "english", "branch", None, ("--include-deadline-case",)))
+        self.assertEqual([case["id"] for case in with_deadline[-1]], ["deadline_ascii_2000"])
+
+    def test_multiline_observes_before_each_input_and_passes_with_view_changes(self):
+        peer = FakeEditor()
+        rows = run(peer, only=["ascii_sentence", "multiline_enter_key", "thai"])
+        self.assertEqual([row["outcome"] for row in rows.values()], ["pass"] * 3)
+        self.assertEqual(rows["multiline_enter_key"]["inputs_sent"], 5)
+        self.assertFalse([call for call in peer.calls if call.get("error_code")])
+
+    def test_stop_inside_a_multiline_case_is_partial_and_never_resumed(self):
+        second = self.spec()["multiline_enter_key"]["segments"][1]
+        peer = FakeEditor(errors={second: "ViewChanged"})
+        rows = run(peer, only=["multiline_enter_key", "time_ascii_1"])
+        row = rows["multiline_enter_key"]
+        self.assertEqual((row["outcome"], row["inputs_sent"], row["as_expected"]),
+                         ("partial", 2, False))
+        self.assertEqual(rows["time_ascii_1"]["outcome"], "not_run")
+        self.assertEqual(peer.sent.count(second), 1)
+        self.assertEqual(peer.sent.count(self.spec()["multiline_enter_key"]["segments"][0]), 1)
+
+    def test_long_cases_verify_fully_in_their_own_note(self):
+        peer = FakeEditor()
+        rows = run(peer, only=["time_ascii_20", "time_ascii_500", "time_mixed_units_500"])
+        self.assertEqual([row["outcome"] for row in rows.values()], ["pass"] * 3)
+        dropped = FakeEditor(rewrite=lambda text: text[:-3] if len(text) > 100 else text)
+        rows = run(dropped, only=["time_ascii_500"])
+        self.assertEqual(rows["time_ascii_500"]["outcome"], "mismatch")
+        self.assertEqual(rows["time_ascii_500"]["detail"]["actual_scalars"], 497)
+
+    def test_value_past_the_tree_cap_proves_a_prefix_only(self):
+        peer = FakeEditor()
+        rows = run(peer, only=["deadline_ascii_2000"], optional=("--include-deadline-case",))
+        row = rows["deadline_ascii_2000"]
+        self.assertEqual(row["outcome"], "tree_capped")
+        self.assertEqual(row["detail"]["actual_scalars"], text_matrix.TREE_VALUE_CAP)
+        self.assertEqual(row["detail"]["expected_utf16_units"], 2000)
+        self.assertIs(row["detail"]["direct_read_required"], True)
+        self.assertNotIn("separator", row)
+        wrong = FakeEditor(rewrite=lambda text: "X" + text[1:])
+        rows = run(wrong, only=["deadline_ascii_2000"], optional=("--include-deadline-case",))
+        self.assertEqual(rows["deadline_ascii_2000"]["outcome"], "mismatch")
+
+    def test_timing_cases_use_image_only_capture_and_a_separate_read_back(self):
+        peer = FakeEditor()
+        rows = run(peer, only=["ascii_sentence", "time_ascii_20"])
+        self.assertEqual(rows["time_ascii_20"]["capture"], "image_only")
+        self.assertIn("verify_ms", rows["time_ascii_20"])
+        self.assertEqual(rows["ascii_sentence"]["capture"], "paired")
+        self.assertNotIn("verify_ms", rows["ascii_sentence"])
+        self.assertEqual(sum(bool(call.get("image_only")) for call in peer.calls), 1)
+        spec = text_matrix.load_spec()
+        cases = text_matrix.select_cases(spec, "english", "branch", ["time_ascii_20"])
+        paired = FakeEditor()
+        rows = text_matrix.Matrix(paired, cases, "english", timing_capture="paired").run()
+        self.assertEqual((rows[0]["outcome"], rows[0]["capture"]), ("pass", "paired"))
+        self.assertFalse(any(call.get("image_only") for call in paired.calls))
 
 
 if __name__ == "__main__":
