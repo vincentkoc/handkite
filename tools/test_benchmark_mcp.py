@@ -817,6 +817,7 @@ class SettingsFixtureTests(unittest.TestCase):
                             elapsed_ms=1, response_bytes=1, tool=tool)
                 self.calls.append(call)
                 if tool == "handkite_launch_app":
+                    self_outer.assertEqual(arguments["expected_revision"], len(self.calls) - 1)
                     self.app = "com.apple.Preferences"
                 root = self.terminated and root_after_reset
                 tree = ('<Application><StaticText label="Airplane Mode"/></Application>'
@@ -832,10 +833,13 @@ class SettingsFixtureTests(unittest.TestCase):
                         "after": payload["metadata"]})})
                 return result, call
 
+        self_outer = self
         peer = FakePeer()
 
         def reset():
             events.append("terminate_settings")
+            self.assertIsNone(campaign.screen)
+            self.assertIsNotNone(campaign.lease_started)
             if isinstance(confirmed, Exception):
                 raise confirmed
             peer.terminated = True
