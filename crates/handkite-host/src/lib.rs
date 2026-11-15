@@ -33,6 +33,8 @@ pub mod selection_intent;
 pub mod service_layout;
 pub mod service_lock;
 pub mod ssh_bridge;
+#[cfg(test)]
+mod text_matrix;
 mod timing;
 pub mod unlock_state;
 pub mod usb;

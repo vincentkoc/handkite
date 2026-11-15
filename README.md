@@ -327,7 +327,10 @@ The separate `observation,navigation,interaction` profile adds `handkite_tap`,
 at host startup and does not change the existing profiles. Every action requires
 a current unsigned observation revision and explicit control. Points must be
 finite coordinates from 0 through 10,000; swipes and long presses last 1 through
-5,000 ms. Text is limited to 4,096 UTF-8 bytes and excludes control characters.
+5,000 ms. Text is limited to 4,096 UTF-8 bytes and is sent whole and verbatim in
+any script, without normalization. It excludes control characters and line
+breaks, U+2028 and U+2029, and U+F700 through U+F8FF, which XCTest reads as
+hardware keys; use `handkite_key` for Enter and Tab.
 App identifiers are bounded ASCII bundle identifiers. Arguments reject unknown
 or duplicate fields, including nested target fields. Each call dispatches once,
 with unknown delivery reported without replay. These tools can perform real

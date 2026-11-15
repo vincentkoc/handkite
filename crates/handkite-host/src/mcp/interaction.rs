@@ -204,10 +204,7 @@ pub(super) fn parse(tool: Tool, value: Value) -> Result<(Revision, Action), ()> 
         }
         Tool::Text => {
             let args: TextArguments = serde_json::from_value(value).map_err(|_| ())?;
-            if args.value.is_empty()
-                || args.value.len() > 4_096
-                || args.value.chars().any(char::is_control)
-            {
+            if !handkite_core::protocol::injectable_text(&args.value) {
                 return Err(());
             }
             let action = match args.selection {
@@ -307,7 +304,7 @@ pub(super) fn schema(tool: Tool) -> Value {
         Tool::Text => {
             properties.insert(
                 "value".into(),
-                json!({"type":"string","minLength":1,"description":"At most 4096 UTF-8 bytes; no control characters"}),
+                json!({"type":"string","minLength":1,"description":"Final text, inserted verbatim in any script; at most 4096 UTF-8 bytes; no control characters or line breaks (use the key tool for enter and tab)"}),
             );
             required.push("value");
             properties.insert("selection".into(), json!({
@@ -383,6 +380,55 @@ mod tests {
         assert_eq!(
             schema(Tool::Text)["properties"]["selection"]["enum"],
             json!(["current"])
+        );
+    }
+
+    #[test]
+    fn text_tool_accepts_every_script_verbatim_and_refuses_key_like_input() {
+        let long = crate::text_matrix::long_mixed_text();
+        let cases = crate::text_matrix::TEXT_MATRIX
+            .iter()
+            .map(|(class, text)| (*class, *text))
+            .chain([("long_mixed", long.as_str())]);
+        for (class, text) in cases {
+            for selection in [None, Some("current")] {
+                let mut request = json!({"expected_revision":7,"value":text});
+                if let Some(selection) = selection {
+                    request["selection"] = json!(selection);
+                }
+                // Clients may send every UTF-16 unit escaped, surrogate pairs included.
+                let escaped: String = text
+                    .encode_utf16()
+                    .map(|unit| format!("\\u{unit:04x}"))
+                    .collect();
+                let wire = format!(r#"{{"expected_revision":7,"value":"{escaped}"}}"#);
+                assert!(wire.is_ascii());
+                let from_wire: Value = serde_json::from_str(&wire).unwrap();
+                assert_eq!(from_wire["value"], request["value"], "{class}");
+                let (_, action) = parse(Tool::Text, request).unwrap();
+                let (Action::Text { value } | Action::TextCurrent { value }) = action else {
+                    panic!("{class}");
+                };
+                assert_eq!(value.as_bytes(), text.as_bytes(), "{class}");
+            }
+        }
+        for refused in [
+            "line\r\nline",
+            "tab\tstop",
+            "line\u{2028}separator",
+            "paragraph\u{2029}separator",
+            "up\u{f700}arrow",
+            "forward\u{f728}delete",
+        ] {
+            let request = json!({"expected_revision":7,"value":refused});
+            assert!(parse(Tool::Text, request).is_err());
+        }
+        assert!(
+            parse(
+                Tool::Text,
+                json!({"expected_revision":7,"value":"\u{4e2d}".repeat(1_366)})
+            )
+            .is_err()
         );
     }
 

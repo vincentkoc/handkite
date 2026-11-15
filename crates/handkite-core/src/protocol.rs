@@ -239,6 +239,30 @@ pub enum KeyboardKey {
     Escape,
 }
 
+/// Largest text accepted for one direct injection, in UTF-8 bytes.
+pub const TEXT_MAX_BYTES: usize = 4_096;
+
+/// Whether `value` may be injected as literal text in one request.
+///
+/// The value is sent whole and never normalized, truncated, or split, so every
+/// grapheme cluster (ZWJ emoji, skin tones, flags, variation selectors,
+/// combining marks) reaches the device as the caller wrote it. Refused:
+/// - empty or oversized values; the limit is bytes, checked before any send;
+/// - control characters, including newline and tab: XCTest turns them into
+///   key presses that can submit a form. Use the key action for those;
+/// - U+2028 and U+2029, which editors treat as line breaks;
+/// - U+F700..=U+F8FF, the AppKit function-key range. XCTest text synthesis
+///   reads these as arrows, forward delete, and other hardware keys, so they
+///   would move the caret or delete content instead of inserting text.
+pub fn injectable_text(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= TEXT_MAX_BYTES
+        && !value.chars().any(|scalar| {
+            scalar.is_control()
+                || matches!(scalar, '\u{2028}' | '\u{2029}' | '\u{f700}'..='\u{f8ff}')
+        })
+}
+
 impl Action {
     pub fn kind(&self) -> &'static str {
         match self {
@@ -363,6 +387,46 @@ mod tests {
         );
         for invalid in ["\"\"", "\"other phone\"", "\"../phone\""] {
             assert!(serde_json::from_str::<DeviceKey>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn injectable_text_keeps_clusters_and_refuses_keys_and_line_breaks() {
+        for accepted in [
+            "plain ASCII",
+            "\u{4f60}\u{597d}",
+            "\u{304b}\u{3099}",
+            "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}\u{200d}\u{1f466}",
+            "\u{1f44b}\u{1f3fd}",
+            "\u{1f1ef}\u{1f1f5}",
+            "\u{2764}\u{fe0f}",
+            "\u{645}\u{6cc}\u{200c}\u{62e}",
+            "\u{e000}\u{f6ff}\u{f900}",
+        ] {
+            assert!(injectable_text(accepted));
+        }
+        let limit = "a".repeat(TEXT_MAX_BYTES);
+        assert!(injectable_text(&limit));
+        // The limit is bytes: the last scalar must fit whole or the text is refused.
+        let wide = "\u{1f600}".repeat(TEXT_MAX_BYTES / 4);
+        assert!(injectable_text(&wide));
+        for refused in [
+            String::new(),
+            limit + "a",
+            wide + "a",
+            "\n".into(),
+            "\r".into(),
+            "\t".into(),
+            "\0".into(),
+            "\u{7f}".into(),
+            "\u{85}".into(),
+            "\u{2028}".into(),
+            "\u{2029}".into(),
+            "\u{f700}".into(),
+            "\u{f728}".into(),
+            "\u{f8ff}".into(),
+        ] {
+            assert!(!injectable_text(&refused));
         }
     }
 }

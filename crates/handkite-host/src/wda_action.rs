@@ -2,7 +2,7 @@ pub(crate) use crate::pin_field::valid_id as valid_session_id;
 use crate::wda_http::HttpResponse;
 use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::{AdapterDiagnostic, AdapterError};
-use handkite_core::protocol::{Action, KeyboardKey, Point, TransportReceipt};
+use handkite_core::protocol::{Action, KeyboardKey, Point, TransportReceipt, injectable_text};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -377,9 +377,10 @@ fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
         Action::LaunchApp { bundle_id } if !bundle_id.is_empty() && bundle_id.len() <= 256 => {
             Ok(("/wda/apps/launch", json!({"bundleId": bundle_id})))
         }
-        Action::Text { value } | Action::TextCurrent { value } if value.len() <= 16_384 => {
-            let chars: Vec<String> = value.chars().map(String::from).collect();
-            Ok(("/wda/keys", json!({"value": chars})))
+        Action::Text { value } | Action::TextCurrent { value } if injectable_text(value) => {
+            // WDA joins the array before one XCTest text synthesis. Send the
+            // value whole so no layer can ever split a grapheme cluster.
+            Ok(("/wda/keys", json!({"value": [value]})))
         }
         Action::Lock => Ok(("/wda/lock", json!({}))),
         Action::Tap { at } if point_valid(*at) => Ok((
@@ -578,7 +579,114 @@ mod tests {
         let current = payload(&Action::TextCurrent { value }).unwrap();
         assert_eq!(current, strict);
         assert_eq!(current.0, "/wda/keys");
-        assert_eq!(current.1, json!({"value":["B","e","t","a"]}));
+        assert_eq!(current.1, json!({"value":["Beta"]}));
+    }
+
+    /// What WDA types: the request body as sent, decoded, then joined the way
+    /// `handleKeys` joins it (`componentsJoinedByString:@""`).
+    fn text_as_wda_joins_it(action: &Action) -> String {
+        let (endpoint, body) = payload(action).unwrap();
+        assert_eq!(endpoint, "/wda/keys");
+        let sent = serde_json::to_vec(&body).unwrap();
+        let received: Value = serde_json::from_slice(&sent).unwrap();
+        let parts = received["value"].as_array().unwrap();
+        assert_eq!(parts.len(), 1, "text must not be split before WDA");
+        assert_eq!(received.as_object().unwrap().len(), 1);
+        parts.iter().map(|part| part.as_str().unwrap()).collect()
+    }
+
+    #[test]
+    fn text_matrix_reaches_wda_byte_for_byte_in_every_script() {
+        let long = crate::text_matrix::long_mixed_text();
+        let cases = crate::text_matrix::TEXT_MATRIX
+            .iter()
+            .map(|(class, text)| (*class, *text))
+            .chain([("long_mixed", long.as_str())]);
+        for (class, text) in cases {
+            for action in [
+                Action::Text { value: text.into() },
+                Action::TextCurrent { value: text.into() },
+            ] {
+                let typed = text_as_wda_joins_it(&action);
+                assert_eq!(typed.as_bytes(), text.as_bytes(), "{class}");
+                // NSString holds UTF-16; the round trip must not change a scalar.
+                let utf16: Vec<u16> = typed.encode_utf16().collect();
+                assert_eq!(String::from_utf16(&utf16).unwrap(), text, "{class}");
+            }
+        }
+    }
+
+    #[test]
+    fn text_payload_never_normalizes_composed_or_decomposed_forms() {
+        for (composed, decomposed) in [
+            ("\u{304c}", "\u{304b}\u{3099}"),
+            ("\u{e9}", "e\u{301}"),
+            ("\u{d55c}", "\u{1112}\u{1161}\u{11ab}"),
+        ] {
+            assert_ne!(composed, decomposed);
+            for text in [composed, decomposed] {
+                let typed = text_as_wda_joins_it(&Action::Text { value: text.into() });
+                assert_eq!(typed.as_bytes(), text.as_bytes());
+            }
+        }
+    }
+
+    #[test]
+    fn text_payload_refuses_hazards_instead_of_truncating_or_rewriting() {
+        let at_limit = "\u{4e2d}".repeat(1_365);
+        assert_eq!(at_limit.len(), 4_095);
+        assert_eq!(
+            text_as_wda_joins_it(&Action::Text {
+                value: at_limit.clone()
+            }),
+            at_limit
+        );
+        let over_limit = "\u{4e2d}".repeat(1_366);
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        let emoji_over_limit = family.repeat(4_096 / family.len() + 1);
+        for refused in [
+            "",
+            over_limit.as_str(),
+            emoji_over_limit.as_str(),
+            "line one\nline two",
+            "carriage\rreturn",
+            "tab\tstop",
+            "delete\u{8}",
+            "escape\u{1b}",
+            "line\u{2028}separator",
+            "paragraph\u{2029}separator",
+            "up\u{f700}arrow",
+            "forward\u{f728}delete",
+        ] {
+            for action in [
+                Action::Text {
+                    value: refused.into(),
+                },
+                Action::TextCurrent {
+                    value: refused.into(),
+                },
+            ] {
+                assert!(payload(&action).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn multiline_text_is_sent_as_single_line_parts() {
+        // Line breaks go through the key action; each line is injectable alone.
+        let multiline = "first \u{4f60}\u{597d}\nsecond \u{1f44b}\u{1f3fd}\nthird";
+        assert!(
+            payload(&Action::Text {
+                value: multiline.into()
+            })
+            .is_err()
+        );
+        for line in multiline.split('\n') {
+            assert_eq!(
+                text_as_wda_joins_it(&Action::Text { value: line.into() }),
+                line
+            );
+        }
     }
 
     #[tokio::test]
