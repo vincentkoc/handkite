@@ -36,7 +36,8 @@ ERROR_CODES = {"Busy", "DeviceMismatch", "StaleObservation", "InvalidObservation
                "AdapterInputTimedOutAfterSend", "AdapterInputResponseRejected",
                "AdapterOwnershipAfterAck"}
 SPAN_NAMES = {"button_find", "button_attributes", "wire_image_encode", "controller_dispatch",
-              "action_session_checks", "native_lock", "owned_session_checks",
+              "action_session_checks", "native_lock", "native_lock_spawn", "native_lock_process",
+              "native_lock_read_decode", "owned_session_checks",
               "home_confirmation", "home_confirmation_attempt", "home_active_app_wait",
               "service_request", "service_serialization", "service_write", "wda_read_request",
               "wda_write_request", "usb_discovery", "usb_connect", "wda_send", "wda_response",

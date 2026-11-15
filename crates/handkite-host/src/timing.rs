@@ -26,6 +26,13 @@ pub(crate) fn enabled() -> bool {
 #[derive(serde::Serialize)]
 #[serde(untagged)]
 enum Record {
+    NativeLockBudget {
+        handkite_timing: u8,
+        pid: u32,
+        operation: u64,
+        stage: &'static str,
+        remaining_us: u128,
+    },
     Outcome {
         handkite_timing: u8,
         pid: u32,
@@ -140,6 +147,18 @@ pub(crate) fn outcome(stage: &'static str, ok: bool) {
     }
 }
 
+pub(crate) fn native_lock_budget(remaining: std::time::Duration) {
+    if enabled() {
+        emit(Record::NativeLockBudget {
+            handkite_timing: 1,
+            pid: std::process::id(),
+            operation: OPERATION.load(Ordering::Relaxed),
+            stage: "native_lock_budget",
+            remaining_us: remaining.as_micros(),
+        });
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,6 +180,21 @@ mod tests {
         assert_eq!(row["started_us"], 12);
         assert_eq!(row["elapsed_us"], 345);
         assert_eq!(row["handkite_timing"], 1);
+    }
+
+    #[test]
+    fn native_budget_record_has_no_device_or_process_arguments() {
+        let row = serde_json::to_value(Record::NativeLockBudget {
+            handkite_timing: 1,
+            pid: 9,
+            operation: 7,
+            stage: "native_lock_budget",
+            remaining_us: 123,
+        })
+        .unwrap();
+        assert_eq!(row.as_object().unwrap().len(), 5);
+        assert_eq!(row["remaining_us"], 123);
+        assert_eq!(row["stage"], "native_lock_budget");
     }
 
     #[test]

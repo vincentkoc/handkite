@@ -79,7 +79,9 @@ pub fn query(id: &HardwareId) -> NativeLock {
 
 pub(crate) fn query_until(id: &HardwareId, deadline: Instant) -> NativeLock {
     let _timing = crate::timing::Span::new("native_lock");
-    match query_inner(id, deadline.min(Instant::now() + Duration::from_secs(8))) {
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(8));
+    crate::timing::native_lock_budget(deadline.saturating_duration_since(Instant::now()));
+    match query_inner(id, deadline) {
         Ok(value) => {
             crate::timing::outcome("native_lock_unlocked", value.state == LockState::Unlocked);
             value
@@ -137,10 +139,17 @@ fn query_inner(id: &HardwareId, deadline: Instant) -> Result<NativeLock, QueryFa
     if Instant::now() >= deadline {
         return Err(QueryFailure::Deadline);
     }
-    let mut child = query_command(id, &directory.output())
-        .spawn()
-        .map_err(|_| QueryFailure::Spawn)?;
-    wait_until(&mut child, deadline)?;
+    let mut child = {
+        let _timing = crate::timing::Span::new("native_lock_spawn");
+        query_command(id, &directory.output())
+            .spawn()
+            .map_err(|_| QueryFailure::Spawn)?
+    };
+    {
+        let _timing = crate::timing::Span::new("native_lock_process");
+        wait_until(&mut child, deadline)?;
+    }
+    let _timing = crate::timing::Span::new("native_lock_read_decode");
     let mut bytes = Vec::new();
     fs::File::open(directory.output())
         .map_err(|_| QueryFailure::Read)?
