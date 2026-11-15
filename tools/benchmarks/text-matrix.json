@@ -838,7 +838,9 @@
    "expected_readback": "abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123abc123ab",
    "comparison": "exact",
    "keyboards": [
-    "english"
+    "english",
+    "pinyin",
+    "japanese_kana"
    ],
    "builds": [
     "installed",
@@ -857,7 +859,9 @@
    "expected_readback": "Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK Hello \u4f60\u597d \u3053\u3093\u306b\u3061\u306f \uc548\ub155 \ud83d\udc4b\ud83c\udffd OK",
    "comparison": "exact",
    "keyboards": [
-    "english"
+    "english",
+    "pinyin",
+    "japanese_kana"
    ],
    "builds": [
     "installed",

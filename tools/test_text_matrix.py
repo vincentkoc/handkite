@@ -174,6 +174,14 @@ class SpecTests(unittest.TestCase):
         with self.assertRaises(BenchError):
             text_matrix.select_cases(spec, "klingon", "branch")
 
+    def test_long_cases_can_run_under_pinyin_and_kana_in_separate_notes(self):
+        spec = text_matrix.load_spec()
+        ids = ["time_ascii_500", "time_mixed_units_500"]
+        for keyboard in ("pinyin", "japanese_kana"):
+            cases = text_matrix.select_cases(spec, keyboard, "branch", ids)
+            self.assertEqual([case["id"] for case in cases], ids)
+            self.assertEqual(len(text_matrix.batches(cases)), 2)
+
     def test_loader_rejects_malformed_specs(self):
         good = json.loads(text_matrix.SPEC.read_text(encoding="ascii"))
         def broken(change):
