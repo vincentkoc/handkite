@@ -2,7 +2,7 @@
 
 Handkite is a local-first control service for an explicitly selected iPhone. The Mac that owns the USB connection runs the device controller; an authenticated agent bridge will expose observation and guarded actions.
 
-The design specification is maintained outside this repository.
+The design specification is kept outside this repository.
 
 Source and documentation use English. Run `python3 tools/check_source_text.py` to
 check both staged and working tracked text for Han characters without displaying
@@ -944,3 +944,7 @@ first digit or qualify live PIN entry; default behavior remains unchanged.
 ## Optional Apple-account tooling
 
 Apple-account/Anisette tooling is optional and unsupported. It lives in the separate [`crates/handkite-anisette`](crates/handkite-anisette/README.md) crate, which is excluded from the root workspace and is not built by default.
+
+## License
+
+Handkite is licensed under the [MIT License](LICENSE). Third-party components and notices are listed in [THIRD_PARTY.md](THIRD_PARTY.md); Rust dependency licences are checked by `cargo deny check licenses` against [deny.toml](deny.toml).

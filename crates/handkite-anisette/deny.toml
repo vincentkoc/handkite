@@ -1,0 +1,27 @@
+# Licence and source policy for the optional handkite-anisette workspace.
+# Run `cargo deny check licenses` from this directory.
+
+[graph]
+targets = ["aarch64-apple-darwin"]
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CDLA-Permissive-2.0",
+    "Unlicense",
+    "0BSD",
+]
+confidence-threshold = 0.93
+unused-allowed-license = "allow"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

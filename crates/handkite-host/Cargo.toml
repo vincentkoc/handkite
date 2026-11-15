@@ -3,6 +3,8 @@ name = "handkite-host"
 version = "0.1.0"
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
 
 [dependencies]
 base64 = "=0.22.1"

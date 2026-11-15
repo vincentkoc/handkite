@@ -7,6 +7,8 @@ exclude = ["crates/handkite-anisette"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.88"
+license = "MIT"
+publish = false
 
 [patch.crates-io]
 idevice = { git = "https://github.com/jkcoxson/idevice", rev = "89702099f4d7552f704f93b4526756abda319ceb" }
