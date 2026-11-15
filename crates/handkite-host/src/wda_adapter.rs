@@ -23,6 +23,7 @@ use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cache;
+mod focused_text;
 mod measurement;
 pub use measurement::CaptureTimings;
 use measurement::{Stage, measure};
@@ -71,6 +72,9 @@ pub struct WdaAdapter {
     launch_admission: Option<(String, Instant)>,
     cache: cache::Cache,
     error_diagnostic: Option<AdapterDiagnostic>,
+    focused_text: Option<focused_text::Input>,
+    text_token: u64,
+    text_response_poisoned: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -139,6 +143,9 @@ impl WdaAdapter {
             owned_idle: None,
             launch_admission: None,
             cache: cache::Cache::default(),
+            focused_text: None,
+            text_token: 0,
+            text_response_poisoned: false,
         })
     }
 
@@ -192,6 +199,9 @@ impl WdaAdapter {
             launch_admission: None,
             cache: cache::Cache::default(),
             error_diagnostic: None,
+            focused_text: None,
+            text_token: 0,
+            text_response_poisoned: false,
         };
         let liveness = adapter
             .owned_runner
@@ -289,6 +299,9 @@ impl WdaAdapter {
 
     fn validate_owned_inner(&self, deadline: Option<Instant>) -> Result<(), AdapterError> {
         let _timing = crate::timing::Span::new("owned_session_checks");
+        if self.text_response_poisoned {
+            return Err(AdapterError);
+        }
         if deadline.is_some_and(|until| Instant::now() >= until) {
             return Err(AdapterError);
         }
@@ -692,6 +705,31 @@ async fn run_until_shutdown<T, E: Copy>(
 }
 
 impl DeviceAdapter for WdaAdapter {
+    fn prepare_current_text(
+        &mut self,
+        action: &Action,
+        baseline: &handkite_core::protocol::Observation,
+    ) -> Result<Option<handkite_core::controller::PreparedText>, AdapterError> {
+        self.prepare_focus(action, baseline)
+            .inspect_err(|_| self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture))
+    }
+
+    fn execute_prepared_text(
+        &mut self,
+        action: &Action,
+        token: u64,
+        deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.execute_focus(action, token, deadline)
+    }
+
+    fn observe_after_prepared_text(
+        &mut self,
+        token: u64,
+    ) -> Result<handkite_core::controller::TextReadback, AdapterError> {
+        self.read_focus(token)
+    }
+
     fn take_error_diagnostic(&mut self) -> Option<AdapterDiagnostic> {
         self.error_diagnostic.take()
     }

@@ -14,7 +14,7 @@ pub struct PreparedText {
 pub struct TextReadback {
     pub image: RawImageObservation,
     /// The same public field changed by the requested insertion/replacement.
-    /// Focus, app, session and ownership must still match. No caret is inferred.
+    /// App, session and ownership must still match. No caret is inferred.
     pub input_verified: bool,
 }
 
