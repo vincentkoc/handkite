@@ -245,10 +245,21 @@ class Matrix:
         if result.get("isError") is True:
             code = call.get("error_code")
             return ("stop_pre_input" if code in PRE_INPUT else "uncertain"), call
-        action = next((json.loads(part["text"]) for part in result.get("content", [])
-                       if part.get("type") == "text" and '"receipt"' in part.get("text", "")), {})
-        call["accepted"] = action.get("receipt", {}).get("accepted")
-        call["effect"] = action.get("effect")
+        action = {}
+        for part in result.get("content", []):
+            if part.get("type") != "text":
+                continue
+            try:
+                candidate = json.loads(part.get("text", ""))
+            except (ValueError, TypeError):
+                continue
+            if isinstance(candidate, dict) and isinstance(candidate.get("receipt"), dict):
+                action = candidate
+                break
+        accepted = action.get("receipt", {}).get("accepted")
+        call["accepted"] = accepted if type(accepted) is bool else None
+        effect = action.get("effect")
+        call["effect"] = effect if effect in ("changed", "unchanged", "unconfirmed") else None
         if call["accepted"] is not True:
             return "uncertain", call
         try:
