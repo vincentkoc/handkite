@@ -2,7 +2,7 @@ use handkite_core::protocol::{ButtonTarget, Point};
 use quick_xml::events::Event;
 use std::collections::BTreeMap;
 
-type Attributes = BTreeMap<String, String>;
+pub(crate) type Attributes = BTreeMap<String, String>;
 
 #[derive(Clone, Copy)]
 struct Rect {
@@ -87,6 +87,53 @@ pub(crate) fn visible_text_input(xml: &str) -> bool {
 /// Uses the current iOS selection; missing focus metadata is not focus proof.
 pub(crate) fn visible_current_text_input(xml: &str) -> bool {
     parse(xml, Target::CurrentTextInput) == Some(())
+}
+
+/// Extract only after the complete baseline passed the existing text guards.
+pub(crate) fn current_text_snapshot(xml: &str) -> Option<(Attributes, Attributes)> {
+    if !visible_current_text_input(xml) {
+        return None;
+    }
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut screen = None;
+    let mut field = None;
+    loop {
+        match reader.read_event().ok()? {
+            Event::Start(node) | Event::Empty(node) => {
+                let kind = std::str::from_utf8(node.name().as_ref()).ok()?.to_owned();
+                if kind != "XCUIElementTypeApplication"
+                    && !matches!(
+                        kind.as_str(),
+                        "XCUIElementTypeTextField"
+                            | "XCUIElementTypeTextView"
+                            | "XCUIElementTypeSearchField"
+                    )
+                {
+                    continue;
+                }
+                let mut attrs = Attributes::new();
+                for attr in node.attributes() {
+                    let attr = attr.ok()?;
+                    attrs.insert(
+                        std::str::from_utf8(attr.key.as_ref()).ok()?.into(),
+                        attr.decode_and_unescape_value(reader.decoder())
+                            .ok()?
+                            .into_owned(),
+                    );
+                }
+                attrs.insert("type".into(), kind.clone());
+                if kind == "XCUIElementTypeApplication" {
+                    screen = Some(attrs);
+                } else if attrs.get("visible").map(String::as_str) == Some("true")
+                    && attrs.get("enabled").map(String::as_str) == Some("true")
+                {
+                    field = Some(attrs);
+                }
+            }
+            Event::Eof => return Some((screen?, field?)),
+            _ => {}
+        }
+    }
 }
 
 pub(crate) fn visible_text_target(xml: &str, at: Point) -> bool {

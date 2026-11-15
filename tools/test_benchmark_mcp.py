@@ -48,6 +48,41 @@ def image_result(action=False):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_focused_text_trace_requires_narrow_proof_and_one_real_capture(self):
+        names = ("service_request", "service_serialization", "service_write", "controller_dispatch",
+                 "wire_image_encode", "wda_read_request", "usb_discovery", "usb_connect",
+                 "wda_send", "wda_response", "owned_session_checks", "wda_write_request",
+                 "native_lock", "action_session_checks", "text_prepare", "text_context_transaction",
+                 "text_context_query", "text_final_focus", "text_readback")
+        rows = [{"stage": name, "started_us": 0, "elapsed_us": 1} for name in names]
+        rows += [{"stage": "text_prepared", "ok": True}, {"stage": "text_verified", "ok": True}]
+        capture = {"stages": [{"stage": name, "elapsed_us": 1, "ok": True}
+                              for name in sorted(CAPTURE_NAMES - {"source_request", "source_json"})]}
+        rows.append({"capture": capture})
+        # Give the real input its own interval outside the settings/query bracket.
+        next(row for row in rows if row.get("stage") == "wda_write_request")["started_us"] = 10
+        validate_measured_stages("type", rows, "image_only")
+        for case, mode in [("tap", "image_only"), ("type", "paired")]:
+            with self.assertRaises(BenchError):
+                validate_measured_stages(case, rows, mode)
+        for stage in ("text_verified", "text_final_focus", "text_context_query"):
+            with self.assertRaises(BenchError):
+                validate_measured_stages("type", [row for row in rows if row.get("stage") != stage], "image_only")
+        with self.assertRaises(BenchError):
+            validate_measured_stages("type", rows + [{"capture": capture}], "image_only")
+        full = {"stages": [{"stage": name, "elapsed_us": 1, "ok": True} for name in sorted(CAPTURE_NAMES)]}
+        refreshed = [{"capture":full}, {"stage":"text_prepare", "started_us":0, "elapsed_us":1}] + rows
+        validate_measured_stages("type", refreshed, "image_only")
+
+    def test_response_settings_and_query_posts_are_not_counted_as_input(self):
+        rows = [{"stage":"text_context_transaction", "started_us":0, "elapsed_us":100},
+                {"stage":"text_context_query", "started_us":20, "elapsed_us":30},
+                {"stage":"wda_write_request", "started_us":1, "elapsed_us":9},
+                {"stage":"wda_write_request", "started_us":20, "elapsed_us":30},
+                {"stage":"wda_write_request", "started_us":80, "elapsed_us":10},
+                {"stage":"wda_write_request", "started_us":110, "elapsed_us":40}]
+        self.assertEqual(operation_stages(rows)["input_request"], .04)
+
     def test_extract_requires_whole_completed_cases_and_keeps_parent_failure(self):
         rows = [{"case": case, "ordinal": n, "warmup": False, "outcome": "pass",
                  "elapsed_ms": 10, "cleanup_ms": 1, "fixture_verification_ms": 2,

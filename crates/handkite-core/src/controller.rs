@@ -6,6 +6,9 @@ use crate::protocol::{
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod focused_text;
+pub use focused_text::{PreparedText, TextReadback};
+
 #[derive(Clone)]
 pub struct RawObservation {
     pub connected_usb: HardwareId,
@@ -139,6 +142,33 @@ pub trait DeviceAdapter {
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
     fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
+        Err(AdapterError)
+    }
+    /// Owned adapters can forbid generic text fallback after failed preparation.
+    fn requires_current_text_preparation(&self) -> bool {
+        false
+    }
+
+    /// Optional current-selection preparation. No input may be sent here.
+    /// A strict adapter's `None` permits one read-only refresh, never generic input.
+    fn prepare_current_text(
+        &mut self,
+        _action: &Action,
+        _baseline: &Observation,
+    ) -> Result<Option<PreparedText>, AdapterError> {
+        Ok(None)
+    }
+    /// Consume one prepared token, recheck focus and native unlock, then send once.
+    fn execute_prepared_text(
+        &mut self,
+        _action: &Action,
+        _token: u64,
+        _send_deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        Err(AdapterError)
+    }
+    /// Read the same field after input. Failure must never resend the action.
+    fn observe_after_prepared_text(&mut self, _token: u64) -> Result<TextReadback, AdapterError> {
         Err(AdapterError)
     }
     /// Private admission bound to the exact action and capture deadline.
@@ -433,6 +463,10 @@ impl<A: DeviceAdapter> Controller<A> {
         self.binding
             .verify(&request.device, &usb, &wda)
             .map_err(|_| ControllerError::DeviceMismatch)?;
+
+        if let Some(result) = self.try_focused_text(&mut inner, &request, capture)? {
+            return Ok(result);
+        }
 
         let (fresh, admission) =
             self.capture(&mut inner, &request.device, Some(&request.action))?;

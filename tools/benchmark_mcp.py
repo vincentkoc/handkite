@@ -42,7 +42,9 @@ SPAN_NAMES = {"button_find", "button_attributes", "wire_image_encode", "controll
               "service_request", "service_serialization", "service_write", "wda_read_request",
               "wda_write_request", "usb_discovery", "usb_connect", "wda_send", "wda_response",
               "mcp_request", "mcp_write", "mcp_serialization", "mcp_service_exchange",
-              "mcp_service_decode", "mcp_tree_projection", "tree_cache_probe"}
+              "mcp_service_decode", "mcp_tree_projection", "tree_cache_probe",
+              "text_prepare", "text_context_transaction", "text_context_query",
+              "text_final_focus", "text_readback"}
 CAPTURE_NAMES = {"ownership_before", "screenshot_request", "source_request", "app_request",
                  "lock_request", "screenshot_json", "source_json", "app_json", "lock_json",
                  "image_decode", "payload_validation", "ownership_after", "capture_total"}
@@ -131,7 +133,7 @@ def operation_stages(rows):
             intervals.setdefault(stage, []).append(interval)
             name = f"span.{stage}.work"
             result[name] = result.get(name, 0) + value / 1000
-            if stage == "button_find":
+            if stage in ("button_find", "text_context_transaction"):
                 finds.append(interval)
             elif stage == "wda_write_request":
                 writes.append((interval, value / 1000))
@@ -165,7 +167,17 @@ def validate_measured_stages(case, rows, capture_kind):
         required.add("native_lock")
     require(required <= names, "missing_service_stage")
     captures = [row["capture"] for row in rows if "capture" in row]
-    require(len(captures) == (2 if case in CASES[:4] else 1), "missing_capture")
+    narrow = "text_prepare" in names and any(row.get("stage") == "text_prepared" and row.get("ok") is True for row in rows)
+    if narrow:
+        require(case == "type" and capture_kind == "image_only"
+                and {"text_context_transaction", "text_context_query", "text_final_focus", "text_readback"} <= names
+                and any(row.get("stage") == "text_verified" and row.get("ok") is True for row in rows),
+                "invalid_text_trace")
+    refreshed = narrow and len(captures) == 2
+    if refreshed:
+        require(sum(row.get("stage") == "text_prepare" and "elapsed_us" in row for row in rows) == 2,
+                "invalid_text_refresh")
+    require(len(captures) == (2 if refreshed else 1 if narrow else 2 if case in CASES[:4] else 1), "missing_capture")
     require(capture_kind in ("paired", "image_only"), "unknown_capture_kind")
     for index, capture in enumerate(captures):
         expected = CAPTURE_NAMES.copy()
