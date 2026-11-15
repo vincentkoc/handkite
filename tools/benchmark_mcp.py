@@ -386,17 +386,32 @@ def elements(screen, selector):
     return matches
 
 
+def completed_trial(row):
+    cleanup = row.get("cleanup_ms")
+    return (row.get("outcome") == "pass" and row.get("trace_valid") is True
+            and row.get("failure_kind") is None
+            and type(cleanup) in (int, float) and math.isfinite(cleanup) and cleanup >= 0
+            and (row.get("capture_kind") != "image_only"
+                 or type(row.get("fixture_verification_ms")) in (int, float)
+                 and math.isfinite(row["fixture_verification_ms"])
+                 and row["fixture_verification_ms"] >= 0))
+
+
 def summarize(samples):
     result = {}
     for case in CASES:
         rows = [row for row in samples if row["case"] == case and not row.get("warmup")]
-        passed = [row for row in rows if row["outcome"] == "pass"]
+        passed = [row for row in rows if completed_trial(row)]
+        infrastructure = sum(row.get("failure_kind") == "infrastructure_stop" for row in rows)
         stages = {}
         for row in passed:
             for stage, value in row.get("stages_ms", {}).items():
                 stages.setdefault(stage, []).append(value)
         result[case] = {"attempts": len(rows), "passed": len(passed),
-                        "failures": len(rows) - len(passed),
+                        "completed": len(passed),
+                        "infrastructure_stops": infrastructure,
+                        "input_failures": sum(row.get("failure_kind") == "input_or_unknown_failure" for row in rows),
+                        "failures": len(rows) - len(passed) - infrastructure,
                         "client_ms": quantiles([row["elapsed_ms"] for row in passed]) if passed else None,
                         "stages_ms": {name: quantiles(values) for name, values in stages.items()},
                         "pre_tree_reuses": sum(row.get("pre_tree_reused") is True for row in passed),
@@ -405,6 +420,25 @@ def summarize(samples):
         if verification:
             result[case]["fixture_verification_ms"] = quantiles(verification)
     return result
+
+
+def qualified_summary(row, legacy=False):
+    completed = row.get("passed", 0) if legacy else row.get("completed", 0)
+    return (completed >= 20 and row.get("passed") == completed
+            and row.get("attempts", 0) >= completed and row.get("failures") == 0
+            and row.get("infrastructure_stops", 0) == 0 and row.get("input_failures", 0) == 0
+            and (row.get("client_ms") or {}).get("n") == completed)
+
+
+def qualified_case(report, case):
+    legacy = "samples" not in report and bool(report.get("reference_source_sha256"))
+    if not qualified_summary(report["summary"][case], legacy=legacy):
+        return False
+    if "samples" not in report:
+        return True
+    rows = [row for row in report["samples"] if row.get("case") == case]
+    return (all(completed_trial(row) for row in rows)
+            and sum(not row.get("warmup") for row in rows) == report["summary"][case]["completed"])
 
 
 def compare(before, after, selected=None):
@@ -419,7 +453,7 @@ def compare(before, after, selected=None):
     failures = []
     for case in selected:
         old, new = before["summary"][case], after["summary"][case]
-        if min(old["attempts"], new["attempts"]) < 20 or old["failures"] or new["failures"]:
+        if not all(qualified_case(report, case) for report in (before, after)):
             failures.append(f"{case}:correctness_or_sample_count")
             continue
         for percentile in ("p50", "p95"):
@@ -447,11 +481,10 @@ def merge_reports(parts):
         require(bool(selected) and len(selected) == len(set(selected))
                 and set(selected) <= set(CASES) and not seen.intersection(selected), "overlapping_cohorts")
         rows = report["samples"]
-        require(all(row["case"] in selected and row["outcome"] == "pass"
-                    and "cleanup_ms" in row for row in rows), "incomplete_cohort")
+        require(all(row["case"] in selected and completed_trial(row) for row in rows), "incomplete_cohort")
         summary = summarize(rows)
         require(summary == report["summary"], "inconsistent_summary")
-        require(all(summary[case]["passed"] >= 20 and summary[case]["failures"] == 0
+        require(all(qualified_summary(summary[case])
                     for case in selected), "incomplete_cohort")
         seen.update(selected)
         samples.extend(dict(row, cohort=len(cohorts)) for row in rows)
@@ -463,7 +496,7 @@ def merge_reports(parts):
     require(seen == set(CASES), "missing_cohorts")
     return dict(identity, version=1, calibration=False, selected_cases=list(CASES), capture_mode=capture_mode,
                 trace_valid=True, trace_kind="validated_cohorts", trace_error=None,
-                failure=None, failure_context=None, cohorts=cohorts,
+                failure=None, failure_context=None, qualified=True, cohorts=cohorts,
                 samples=samples, summary=summarize(samples))
 
 
@@ -512,7 +545,7 @@ def extract_report(report, digest, selected):
             durations = [row.get("cleanup_ms")]
             if kind == "image_only":
                 durations.append(row.get("fixture_verification_ms"))
-            require(row.get("outcome") == "pass" and row.get("trace_valid") is True
+            require(completed_trial(row)
                     and row.get("capture_kind") == kind
                     and bool(row.get("stages_ms"))
                     and all(type(n) in (int, float) and math.isfinite(n) and n >= 0 for n in durations),
@@ -521,7 +554,7 @@ def extract_report(report, digest, selected):
     return dict(identity, version=1, calibration=False, selected_cases=[case for case in CASES if case in selected],
                 capture_mode=mode, trace_valid=True,
                 trace_kind="validated_completed_cohort", trace_error=None, failure=None,
-                failure_context=None, extraction=provenance, samples=rows, summary=summarize(rows))
+                failure_context=None, qualified=True, extraction=provenance, samples=rows, summary=summarize(rows))
 
 
 def reference_report(report, digest):
@@ -540,9 +573,11 @@ def reference_report(report, digest):
          for index in (0, 1) for stage in CAPTURE_NAMES}
     for case in CASES:
         row = summary[case]
-        require(type(row["attempts"]) is int and row["passed"] == row["attempts"] >= 20
+        require(qualified_summary(row)
+                and type(row["attempts"]) is int and row["passed"] == row["attempts"] >= 20
                 and row["failures"] == 0 and row["client_ms"]["n"] == row["passed"], "incomplete_reference")
-        require(set(row) <= {"attempts", "passed", "failures", "client_ms", "stages_ms",
+        require(set(row) <= {"attempts", "passed", "completed", "infrastructure_stops", "input_failures",
+                             "failures", "client_ms", "stages_ms",
                              "pre_tree_reuses", "budget_ms", "fixture_verification_ms"}
                 and set(row["stages_ms"]) <= allowed_stages, "unknown_reference_metric")
         require(all(type(value) in (int, float) and math.isfinite(value) and value >= 0
@@ -649,6 +684,7 @@ class Campaign:
         self.lease_started = None
         self.samples = []
         self.failure = None
+        self.failure_kind = None
         self.failure_context = None
         self.phase, self.case, self.step_index = "initialize", None, None
         self.preflight = preflight
@@ -738,6 +774,7 @@ class Campaign:
         if result.get("isError") is True:
             code = result.get("structuredContent", {}).get("code")
             if code in ERROR_CODES:
+                call["error_code"] = code
                 raise BenchError(code)
             raise BenchError("action_unconfirmed" if tool in ACTIONS else "tool_error")
         if tool in ACTIONS:
@@ -759,6 +796,8 @@ class Campaign:
         return call
 
     def run(self):
+        sample = None
+        trial_call_start = 0
         try:
             self.peer.initialize()
             self.renew()
@@ -777,12 +816,13 @@ class Campaign:
                 for ordinal in range(self.warmups + self.count):
                     sample = {"case": case["name"], "ordinal": ordinal - self.warmups + 1,
                               "warmup": ordinal < self.warmups, "outcome": "not_started"}
+                    self.samples.append(sample)
+                    trial_call_start = len(self.peer.calls)
                     prepare_start = time.monotonic()
                     self.phase = "prepare"
                     for self.step_index, step in enumerate(case.get("prepare", [])):
                         self.step(step)
                     sample["prepare_ms"] = (time.monotonic() - prepare_start) * 1000
-                    self.samples.append(sample)
                     start = len(self.peer.calls)
                     try:
                         self.phase, self.step_index = "measure", None
@@ -800,7 +840,7 @@ class Campaign:
                             self.step({"tool": "handkite_observe"})
                             sample["fixture_verification_ms"] = (time.monotonic() - started) * 1000
                             require(matches(self.screen, case["measure"].get("expect"), previous), "effect_mismatch")
-                        sample["outcome"] = "pass"
+                        sample["measurement_passed"] = True
                     except BenchError as error:
                         sample["outcome"] = str(error)
                         if "operation" not in sample and len(self.peer.calls) > start:
@@ -813,10 +853,19 @@ class Campaign:
                     for self.step_index, step in enumerate(case.get("cleanup", [])):
                         self.step(step)
                     sample["cleanup_ms"] = (time.monotonic() - cleanup_start) * 1000
+                    sample["outcome"] = "pass"
                     print(json.dumps({key: sample[key] for key in
                                       ("case", "ordinal", "warmup", "outcome", "elapsed_ms")}), flush=True)
         except BenchError as error:
             self.failure = str(error)
+            call = self.peer.calls[-1] if len(self.peer.calls) > trial_call_start else None
+            # Only this fixed adapter refusal guarantees that dispatch never began.
+            infrastructure = (self.failure == "AdapterNativeBefore" and call is not None
+                              and call.get("tool") in ACTIONS
+                              and call.get("error_code") == self.failure)
+            self.failure_kind = "infrastructure_stop" if infrastructure else "input_or_unknown_failure"
+            if sample is not None:
+                sample.update(outcome=self.failure, failure_kind=self.failure_kind, failed_phase=self.phase)
             self.failure_context = {"phase": self.phase, "case": self.case,
                                     "step_index": self.step_index,
                                     "call": dict(self.peer.calls[-1]) if self.peer.calls else None}
@@ -832,6 +881,7 @@ class Campaign:
                     self.peer.tool("handkite_release_control", {})
                 except BenchError:
                     self.failure = self.failure or "release_failed"
+                    self.failure_kind = self.failure_kind or "input_or_unknown_failure"
                 self.lease_started = None
 
 
@@ -1024,12 +1074,17 @@ def main():
                   "service_pid": args.service_pid, "trace_valid": trace_valid,
                   "trace_error": trace_error,
                   "failure": campaign.failure, "samples": campaign.samples,
+                  "failure_kind": campaign.failure_kind,
                   "failure_context": campaign.failure_context, "calls": peer.calls,
                   "summary": summarize(campaign.samples)}
+        report["qualified"] = (not args.calibrate and campaign.failure is None and trace_valid
+                               and all(qualified_case(report, case) for case in campaign.selected_cases))
         write_report(args.output, report)
-        compact = {name: {key: value[key] for key in ("attempts", "passed", "failures", "client_ms")}
+        compact = {name: {key: value[key] for key in ("attempts", "passed", "completed",
+                                                   "infrastructure_stops", "input_failures", "failures", "client_ms")}
                    for name, value in report["summary"].items()}
-        print(json.dumps({"complete": campaign.failure is None, "summary": compact}), flush=True)
+        print(json.dumps({"complete": campaign.failure is None, "qualified": report["qualified"],
+                          "summary": compact}), flush=True)
         return int(campaign.failure is not None)
 
 

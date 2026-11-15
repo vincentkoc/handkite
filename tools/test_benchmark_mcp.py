@@ -74,7 +74,7 @@ class BenchmarkTests(unittest.TestCase):
             extract_report(invalid, "d" * 64, ["tap"])
         for key, value in (("outcome", "action_unconfirmed"), ("trace_valid", False),
                            ("ordinal", 2), ("cleanup_ms", None), ("fixture_verification_ms", None),
-                           ("capture_kind", "paired")):
+                           ("capture_kind", "paired"), ("failure_kind", "infrastructure_stop")):
             invalid = copy.deepcopy(parent)
             invalid["samples"][0][key] = value
             with self.assertRaises(BenchError):
@@ -141,7 +141,8 @@ class BenchmarkTests(unittest.TestCase):
                                        12: [{"stage": "service_request"}]})
 
     def test_reference_keeps_metrics_without_runtime_or_call_details(self):
-        samples = [{"case":case,"outcome":"pass","elapsed_ms":10} for case in CASES for _ in range(20)]
+        samples = [{"case":case,"outcome":"pass","elapsed_ms":10,"cleanup_ms":1,"trace_valid":True}
+                   for case in CASES for _ in range(20)]
         report = {"version":1,"calibration":False,"trace_valid":True,"failure":None,
                   "plan_sha256":"a" * 64,"service_build":"b" * 40,"client_build":"c" * 40,
                   "service_pid":123,"calls":[{"private":"context"}],"samples":samples,
@@ -158,7 +159,8 @@ class BenchmarkTests(unittest.TestCase):
         invalid["summary"]["private_context"] = "private"
         with self.assertRaisesRegex(BenchError, "inconsistent_summary"):
             reference_report(invalid, "d" * 64)
-        for key, value in (("passed", 0), ("client_ms", {"n":0,"p50":10,"p95":10})):
+        for key, value in (("passed", 0), ("completed", 19), ("infrastructure_stops", 1),
+                           ("input_failures", 1), ("client_ms", {"n":0,"p50":10,"p95":10})):
             invalid = copy.deepcopy(report)
             invalid["summary"]["tap"][key] = value
             with self.assertRaises(BenchError):
@@ -258,7 +260,8 @@ class BenchmarkTests(unittest.TestCase):
 
     def test_merge_requires_complete_disjoint_cohorts_on_one_generation(self):
         def cohort(cases):
-            rows = [{"case": case, "outcome": "pass", "elapsed_ms": 10, "cleanup_ms": 1}
+            rows = [{"case": case, "outcome": "pass", "elapsed_ms": 10, "cleanup_ms": 1,
+                     "trace_valid": True}
                     for case in cases for _ in range(20)]
             return {"version": 1, "calibration": False, "trace_valid": True, "failure": None,
                     "trace_error": None, "plan_sha256": "same", "service_build": "same",
@@ -273,6 +276,13 @@ class BenchmarkTests(unittest.TestCase):
                            ("service_build", "different"), ("service_pid", 2), ("calibration", True)):
             invalid = copy.deepcopy(second)
             invalid[key] = value
+            with self.assertRaises(BenchError):
+                merge_reports([(first, "first"), (invalid, "invalid")])
+        for changes in ({"trace_valid": False}, {"cleanup_ms": None},
+                        {"outcome": "AdapterNativeBefore", "failure_kind": "infrastructure_stop"}):
+            invalid = copy.deepcopy(second)
+            invalid["samples"][0].update(changes)
+            invalid["summary"] = summarize(invalid["samples"])
             with self.assertRaises(BenchError):
                 merge_reports([(first, "first"), (invalid, "invalid")])
         with self.assertRaises(BenchError):
@@ -317,12 +327,91 @@ class BenchmarkTests(unittest.TestCase):
                 quantiles(values)
 
     def test_failures_are_counted_and_not_folded_into_success_quantiles(self):
-        samples = [{"case": "tap", "outcome": "pass", "elapsed_ms": 10},
+        samples = [{"case": "tap", "outcome": "pass", "elapsed_ms": 10, "cleanup_ms": 1, "trace_valid": True},
                    {"case": "tap", "outcome": "action_unconfirmed", "elapsed_ms": 1},
                    {"case": "tap", "outcome": "pass", "elapsed_ms": 999, "warmup": True}]
         result = summarize(samples)["tap"]
         self.assertEqual((result["attempts"], result["passed"], result["failures"]), (2, 1, 1))
         self.assertEqual(result["client_ms"]["p50"], 10)
+
+    def test_only_complete_trace_valid_trials_enter_statistics(self):
+        complete = {"case": "type", "outcome": "pass", "elapsed_ms": 10,
+                    "cleanup_ms": 1, "trace_valid": True}
+        samples = [complete, dict(complete, cleanup_ms=None), dict(complete, trace_valid=False),
+                   dict(complete, outcome="AdapterNativeBefore", failure_kind="infrastructure_stop",
+                        elapsed_ms=999),
+                   dict(complete, outcome="action_unconfirmed", failure_kind="input_or_unknown_failure")]
+        result = summarize(samples)["type"]
+        self.assertEqual((result["attempts"], result["completed"], result["passed"]), (5, 1, 1))
+        self.assertEqual((result["failures"], result["infrastructure_stops"], result["input_failures"]), (3, 1, 1))
+        self.assertEqual(result["client_ms"], {"n": 1, "p50": 10, "p95": 10})
+
+    def test_cleanup_native_refusal_is_an_excluded_incomplete_trial_without_retry(self):
+        class FakePeer:
+            healthy = True
+            def __init__(self):
+                self.calls = []
+            def initialize(self):
+                pass
+            def tool(self, name, arguments):
+                call = {"id": len(self.calls), "operation": len(self.calls), "tool": name,
+                        "elapsed_ms": 1, "response_bytes": 1}
+                self.calls.append(call)
+                if name == "handkite_key":
+                    return {"isError": True, "structuredContent": {"code": "AdapterNativeBefore"}}, call
+                result = screen_result()
+                if name == "handkite_text":
+                    result["content"].insert(0, {"type": "text", "text": json.dumps({
+                        "receipt": {"accepted": True}, "effect": "changed", "after": {}})})
+                return result, call
+
+        fixture = plan()
+        fixture["cases"][1]["cleanup"] = [{"tool": "handkite_key", "arguments": {"key": "enter"}}]
+        peer = FakePeer()
+        campaign = Campaign(peer, fixture, 20, 0, selected_cases=["type"])
+        campaign.run()
+        trial = campaign.samples[0]
+        self.assertTrue(trial["measurement_passed"])
+        self.assertEqual(trial["outcome"], "AdapterNativeBefore")
+        self.assertEqual(trial["failed_phase"], "cleanup")
+        self.assertEqual(trial["failure_kind"], "infrastructure_stop")
+        self.assertNotIn("cleanup_ms", trial)
+        self.assertEqual(campaign.failure_context["call"]["error_code"], "AdapterNativeBefore")
+        summary = summarize(campaign.samples)["type"]
+        self.assertEqual((summary["completed"], summary["infrastructure_stops"], summary["input_failures"]), (0, 1, 0))
+        self.assertIsNone(summary["client_ms"])
+        self.assertEqual([call["tool"] for call in peer.calls].count("handkite_text"), 1)
+        self.assertEqual([call["tool"] for call in peer.calls].count("handkite_key"), 1)
+
+    def test_qualification_rejects_stops_and_incomplete_traces_but_accepts_legacy_reference(self):
+        rows = [{"case": "type", "outcome": "pass", "elapsed_ms": 10,
+                 "cleanup_ms": 1, "trace_valid": True} for _ in range(20)]
+        report = {"version": 1, "plan_sha256": "same", "trace_valid": True, "failure": None,
+                  "samples": rows, "summary": summarize(rows)}
+        self.assertEqual(compare(report, report, ["type"]), [])
+        for changes in ({"trace_valid": False}, {"cleanup_ms": None},
+                        {"outcome": "AdapterNativeBefore", "failure_kind": "infrastructure_stop"},
+                        {"outcome": "action_unconfirmed", "failure_kind": "input_or_unknown_failure"}):
+            invalid = copy.deepcopy(report)
+            invalid["samples"].append(dict(rows[0], **changes))
+            invalid["summary"] = summarize(invalid["samples"])
+            self.assertEqual(compare(report, invalid, ["type"]), ["type:correctness_or_sample_count"])
+        invalid = copy.deepcopy(report)
+        invalid["samples"][0]["trace_valid"] = False
+        self.assertEqual(compare(report, invalid, ["type"]), ["type:correctness_or_sample_count"])
+        invalid = copy.deepcopy(report)
+        invalid["samples"].append(dict(rows[0], warmup=True, outcome="AdapterNativeBefore",
+                                       failure_kind="infrastructure_stop"))
+        invalid["summary"] = summarize(invalid["samples"])
+        self.assertEqual(compare(report, invalid, ["type"]), ["type:correctness_or_sample_count"])
+        reference = {key: copy.deepcopy(value) for key, value in report.items() if key != "samples"}
+        reference["reference_source_sha256"] = "d" * 64
+        for summary in reference["summary"].values():
+            for key in ("completed", "infrastructure_stops", "input_failures"):
+                summary.pop(key)
+        self.assertEqual(compare(reference, report, ["type"]), [])
+        reference.pop("reference_source_sha256")
+        self.assertEqual(compare(reference, report, ["type"]), ["type:correctness_or_sample_count"])
 
     def test_trace_gaps_or_mixed_processes_are_not_accepted(self):
         rows = [{"handkite_timing": 1, "pid": 7, "sequence": n, "operation": 1}
@@ -525,6 +614,9 @@ for line in sys.stdin:
         self.assertEqual(campaign.failure_context["call"]["action_result"],
                          {"accepted": True, "effect": "unconfirmed", "observed": False})
         self.assertNotIn("must not be retained", json.dumps(campaign.failure_context))
+        self.assertEqual(campaign.samples[0]["failure_kind"], "input_or_unknown_failure")
+        summary = summarize(campaign.samples)["tap"]
+        self.assertEqual((summary["input_failures"], summary["infrastructure_stops"]), (1, 0))
 
     def test_prepare_failure_keeps_its_step_and_call(self):
         class FakePeer:
@@ -547,7 +639,9 @@ for line in sys.stdin:
         scenario["cases"][0]["prepare"] = [{"tool": "handkite_tap", "arguments": {}}]
         campaign = Campaign(FakePeer(), scenario, count=20, warmups=0)
         campaign.run()
-        self.assertEqual(campaign.samples, [])
+        self.assertEqual(len(campaign.samples), 1)
+        self.assertEqual(campaign.samples[0]["outcome"], "ViewChanged")
+        self.assertEqual(campaign.samples[0]["failed_phase"], "prepare")
         self.assertEqual(campaign.failure_context["phase"], "prepare")
         self.assertEqual(campaign.failure_context["step_index"], 0)
         self.assertEqual(campaign.failure_context["call"]["error_code"], "ViewChanged")
@@ -608,7 +702,7 @@ for line in sys.stdin:
         self.assertEqual(campaign.peer.calls[-1]["failed_expectations"], ["app"])
 
     def test_gate_requires_valid_trace_matching_plan_and_twenty_successes(self):
-        samples = [{"case": case, "outcome": "pass", "elapsed_ms": 100}
+        samples = [{"case": case, "outcome": "pass", "elapsed_ms": 100, "cleanup_ms": 1, "trace_valid": True}
                    for case in CASES for _ in range(20)]
         before = {"version": 1, "plan_sha256": "same", "trace_valid": True,
                   "failure": None, "summary": summarize(samples)}
@@ -621,7 +715,7 @@ for line in sys.stdin:
             compare(before, after)
 
     def test_selected_comparison_keeps_full_gate_and_sample_requirements(self):
-        samples = [{"case": case, "outcome": "pass", "elapsed_ms": 100}
+        samples = [{"case": case, "outcome": "pass", "elapsed_ms": 100, "cleanup_ms": 1, "trace_valid": True}
                    for case in ("type", "swipe") for _ in range(20)]
         before = {"version": 1, "plan_sha256": "same", "trace_valid": True,
                   "failure": None, "summary": summarize(samples)}
