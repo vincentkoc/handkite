@@ -5,10 +5,11 @@ use handkite_host::install_config;
 use handkite_host::service_layout::ServiceLayout;
 use handkite_host::service_lock::ServiceLock;
 use handkite_host::usb::PinnedUsb;
-use handkite_host::wda_runner::{OwnedWdaRunner, RunnerError};
+use handkite_host::wda_runner::{OwnedWdaRunner, ProfileExpiry, RunnerError, hours_until};
 use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::SystemTime;
 
 #[path = "handkited/signals.rs"]
 mod signals;
@@ -59,6 +60,10 @@ fn run() -> Result<(), &'static str> {
     let result = match startup {
         Ok(runner) => {
             println!("runner_check_stage=startup_ready");
+            println!(
+                "{}",
+                profile_line(runner.profile_expiry(), SystemTime::now())
+            );
             let alive = !runner.is_finished();
             let joined = runtime.block_on(async {
                 tokio::time::timeout(Duration::from_secs(5), runner.abort_and_join())
@@ -112,6 +117,20 @@ async fn wait_shutdown() {
     }
 }
 
+/// Hours only; never a team, device or certificate identifier.
+fn profile_line(expiry: Option<ProfileExpiry>, now: SystemTime) -> String {
+    let Some(expiry) = expiry else {
+        return "runner_check_profile=unavailable".into();
+    };
+    let certificate = expiry
+        .certificate
+        .map_or_else(|| "unknown".into(), |at| hours_until(at, now).to_string());
+    format!(
+        "runner_check_profile=observed profile_expires_in_hours={} certificate_expires_in_hours={certificate}",
+        hours_until(expiry.profile, now)
+    )
+}
+
 fn runner_reason(error: RunnerError) -> &'static str {
     match error {
         RunnerError::InvalidBundleId => "invalid_runner_id",
@@ -134,6 +153,8 @@ fn runner_reason(error: RunnerError) -> &'static str {
         RunnerError::OwnershipLost => "ownership_lost",
         RunnerError::ProcessIdentityUnproven => "process_identity_unproven",
         RunnerError::RunnerStopUnproven => "runner_stop_unproven",
+        RunnerError::ProfileExpired => "runner_profile_expired",
+        RunnerError::ProfileUnavailable => "runner_profile_unavailable",
         RunnerError::NativeProcess(step) => step.as_str(),
     }
 }
@@ -159,6 +180,8 @@ mod tests {
             RunnerError::InitializationFailed,
             RunnerError::BootstrapFailed,
             RunnerError::RunnerFailed,
+            RunnerError::ProfileExpired,
+            RunnerError::ProfileUnavailable,
         ] {
             let reason = runner_reason(error);
             assert!(
@@ -167,5 +190,19 @@ mod tests {
                     .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
             );
         }
+    }
+
+    #[test]
+    fn profile_line_reports_hours_only() {
+        let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let expiry = ProfileExpiry {
+            profile: now + Duration::from_secs(50 * 3600 + 10),
+            certificate: None,
+        };
+        assert_eq!(
+            profile_line(Some(expiry), now),
+            "runner_check_profile=observed profile_expires_in_hours=50 certificate_expires_in_hours=unknown"
+        );
+        assert_eq!(profile_line(None, now), "runner_check_profile=unavailable");
     }
 }

@@ -10,11 +10,12 @@ use crate::wda_http::HttpResponse;
 use crate::wda_transport::{UsbWda, WDA_PORT};
 use idevice::services::dvt::xctest::{TestConfig, XCUITestService, listener::XCUITestListener};
 use idevice::services::installation_proxy::InstallationProxyClient;
+use idevice::services::misagent::MisagentClient;
 use idevice::usbmuxd::errors::UsbmuxdError;
 use idevice::{IdeviceError, IdeviceService};
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 use tokio::sync::watch;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio::time::{Instant, sleep, sleep_until, timeout_at};
@@ -25,10 +26,15 @@ const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const VACANCY_TIMEOUT: Duration = Duration::from_secs(3);
 const POLL_INTERVAL: Duration = Duration::from_millis(250);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+/// Profile diagnosis must never consume the app lookup budget.
+const PROFILE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PAIRING_REQUIRED_MESSAGE: &str =
     "pairing_required: owner must accept trust/passcode on device";
 
 mod native_process;
+mod profile;
+
+pub use profile::{ProfileExpiry, hours_until};
 
 /// Fixed failure checkpoints; never native output, paths, PIDs or identifiers.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +109,11 @@ pub enum RunnerError {
     OwnershipLost,
     ProcessIdentityUnproven,
     RunnerStopUnproven,
+    /// The latest installed profile (or its certificates) covering the runner has expired.
+    ProfileExpired,
+    /// Installed profiles could not be read or none covers the runner. Diagnosis only:
+    /// startup logs this and continues, because profile state never admits a launch.
+    ProfileUnavailable,
     NativeProcess(NativeProcessStep),
 }
 
@@ -126,6 +137,7 @@ pub struct OwnedWdaRunner {
     usb: Option<PinnedUsb>,
     ownership: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     native: Option<native_process::Identity>,
+    profile: Option<ProfileExpiry>,
 }
 
 /// Read-only task liveness for a blocking action worker. It cannot cancel the runner.
@@ -159,7 +171,7 @@ impl OwnedWdaRunner {
         if !owns() {
             return Err(RunnerError::OwnershipLost);
         }
-        let (provider, config) = lookup_before_deadline(
+        let (provider, config, profile) = lookup_before_deadline(
             async {
                 let provider = usb
                     .provider()
@@ -172,8 +184,27 @@ impl OwnedWdaRunner {
                     TestConfig::from_installation_proxy(&mut proxy, runner_bundle_id, None)
                         .await
                         .map_err(|error| transport_failure(&error, RunnerError::LookupFailed))?;
+                let profile = match runner_profile(&*provider, runner_bundle_id, deadline).await {
+                    Ok(expiry) => {
+                        let hours = hours_until(expiry.effective(), SystemTime::now());
+                        if expiry.effective() <= SystemTime::now() + profile::EXPIRING_WITHIN {
+                            eprintln!(
+                                "handkited: runner_startup_stage=profile_expiring hours={hours}"
+                            );
+                        }
+                        Some(expiry)
+                    }
+                    Err(RunnerError::ProfileExpired) => {
+                        eprintln!("handkited: runner_startup_stage=profile_expired");
+                        return Err(RunnerError::ProfileExpired);
+                    }
+                    Err(_) => {
+                        eprintln!("handkited: runner_startup_stage=profile_unavailable");
+                        None
+                    }
+                };
                 require_port_vacant(provider.connect(WDA_PORT), deadline).await?;
-                Ok((provider, config))
+                Ok((provider, config, profile))
             },
             deadline,
         )
@@ -216,6 +247,7 @@ impl OwnedWdaRunner {
         .await?;
         runner.usb = Some(usb.clone());
         runner.ownership = Some(Arc::clone(&owns));
+        runner.profile = profile;
         let identity = target.observe(&usb, deadline, &*owns, None).await;
         match identity {
             Ok(Some(pid)) => runner.native = Some(native_process::Identity { target, pid }),
@@ -228,6 +260,11 @@ impl OwnedWdaRunner {
             }
         }
         Ok(runner)
+    }
+
+    /// Profile expiry observed before launch, if installed profiles were readable.
+    pub fn profile_expiry(&self) -> Option<ProfileExpiry> {
+        self.profile
     }
 
     /// A point-in-time host task observation; it is not an HTTP health check.
@@ -379,6 +416,7 @@ impl OwnedWdaRunner {
             usb: None,
             ownership: None,
             native: None,
+            profile: None,
         };
         if let Err(error) = runner.wait_ready(receiver, probe, deadline).await {
             let _ = runner.abort_and_join().await;
@@ -473,6 +511,38 @@ impl Drop for OwnedWdaRunner {
             task.abort();
         }
     }
+}
+
+/// Read installed provisioning profiles on the lookup provider, bounded by its own
+/// short deadline so a slow or locked device never delays the launch path.
+async fn runner_profile(
+    provider: &dyn idevice::provider::IdeviceProvider,
+    runner_bundle_id: &str,
+    deadline: Instant,
+) -> Result<ProfileExpiry, RunnerError> {
+    let profiles = timeout_at(deadline.min(Instant::now() + PROFILE_TIMEOUT), async {
+        let mut client = MisagentClient::connect(provider).await.ok()?;
+        client.copy_all().await.ok()
+    })
+    .await
+    .ok()
+    .flatten()
+    .ok_or(RunnerError::ProfileUnavailable)?;
+    classify_profile(
+        profile::runner_profile_expiry(&profiles, runner_bundle_id),
+        SystemTime::now(),
+    )
+}
+
+fn classify_profile(
+    expiry: Option<ProfileExpiry>,
+    now: SystemTime,
+) -> Result<ProfileExpiry, RunnerError> {
+    let expiry = expiry.ok_or(RunnerError::ProfileUnavailable)?;
+    if expiry.effective() <= now {
+        return Err(RunnerError::ProfileExpired);
+    }
+    Ok(expiry)
 }
 
 fn startup_deadline(timeout: Duration) -> Result<Instant, RunnerError> {

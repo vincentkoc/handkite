@@ -12,7 +12,7 @@ handkite-core = { path = "../handkite-core" }
 libc = "0.2"
 plist = "=1.8.0"
 quick-xml = "=0.38.4"
-idevice = { version = "=0.1.68", default-features = false, features = ["ring", "usbmuxd", "xctest"] }
+idevice = { version = "=0.1.68", default-features = false, features = ["misagent", "ring", "usbmuxd", "xctest"] }
 ring = "=0.17.14"
 serde_json = { version = "1.0", features = ["raw_value"] }
 serde = { version = "1.0", features = ["derive"] }

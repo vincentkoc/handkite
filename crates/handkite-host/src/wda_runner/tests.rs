@@ -1014,3 +1014,35 @@ async fn shutdown_without_pinned_endpoint_never_claims_cleanup() {
     );
     assert_eq!(dropped.load(Ordering::SeqCst), 1);
 }
+
+#[test]
+fn profile_expiry_refuses_only_when_effective_expiry_has_passed() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    let hour = Duration::from_secs(3600);
+    let live = ProfileExpiry {
+        profile: now + 100 * hour,
+        certificate: Some(now + 10 * hour),
+    };
+    assert_eq!(classify_profile(Some(live), now), Ok(live));
+    let certificate_expired = ProfileExpiry {
+        certificate: Some(now - hour),
+        ..live
+    };
+    assert_eq!(
+        classify_profile(Some(certificate_expired), now),
+        Err(RunnerError::ProfileExpired)
+    );
+    let profile_expired = ProfileExpiry {
+        profile: now,
+        certificate: None,
+    };
+    assert_eq!(
+        classify_profile(Some(profile_expired), now),
+        Err(RunnerError::ProfileExpired)
+    );
+    assert_eq!(
+        classify_profile(None, now),
+        Err(RunnerError::ProfileUnavailable)
+    );
+    assert_eq!(RunnerError::ProfileExpired.to_string(), "ProfileExpired");
+}

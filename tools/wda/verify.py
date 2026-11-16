@@ -19,6 +19,8 @@ SHA1 = re.compile(r"[0-9a-f]{40}\Z")
 RUNNER_ID = re.compile(r"[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\.xctrunner(?:\.[A-Z0-9]{10})?\Z")
 MAX_PROFILE_BYTES = 1024 * 1024
 MAX_TOOL_BYTES = 1024 * 1024
+DEFAULT_MIN_VALIDITY_HOURS = 72
+NOT_AFTER = re.compile(r"notAfter=([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}:\d{2}:\d{2}) (\d{4}) GMT\n?")
 
 
 def tool(command: list[str], *, cwd: Path | None = None) -> bytes:
@@ -94,14 +96,37 @@ def signature(path: Path, team: str) -> str:
     return values["Identifier"]
 
 
-def leaf_sha1(app: Path) -> str:
+def require_validity(expires: datetime, now: datetime, min_hours: float, kind: str) -> float:
+    """Refuse an expired or soon-expiring profile or certificate; return hours left."""
+    left = (expires - now).total_seconds() / 3600
+    if left <= 0:
+        raise ValueError(f"{kind}_expired")
+    if left < min_hours:
+        raise ValueError(f"{kind}_expires_soon")
+    return left
+
+
+def certificate_not_after(leaf: Path) -> datetime:
+    text = tool(["/usr/bin/openssl", "x509", "-inform", "DER", "-noout", "-enddate", "-in", str(leaf)])
+    match = NOT_AFTER.fullmatch(text.decode("ascii", errors="replace"))
+    if not match:
+        raise ValueError("signing_certificate_unavailable")
+    try:
+        parsed = datetime.strptime(" ".join(match.groups()), "%b %d %H:%M:%S %Y")
+    except ValueError as error:
+        raise ValueError("signing_certificate_unavailable") from error
+    return parsed.replace(tzinfo=timezone.utc)
+
+
+def leaf_certificate(app: Path) -> tuple[str, datetime]:
+    """Return the leaf signing certificate SHA-1 and its notAfter."""
     with tempfile.TemporaryDirectory(prefix="handkite-wda-cert-") as directory:
         root = Path(directory)
         tool(["/usr/bin/codesign", "-d", "--extract-certificates", str(app)], cwd=root)
         leaf = root / "codesign0"
         if not leaf.is_file() or leaf.is_symlink() or leaf.stat().st_size > MAX_PROFILE_BYTES:
             raise ValueError("signing_certificate_unavailable")
-        return hashlib.sha1(leaf.read_bytes()).hexdigest()
+        return hashlib.sha1(leaf.read_bytes()).hexdigest(), certificate_not_after(leaf)
 
 
 def allowed_claim(claim: object, allowance: object) -> bool:
@@ -125,7 +150,16 @@ def allowed_claim(claim: object, allowance: object) -> bool:
     raise ValueError("entitlement_allowance_unsupported")
 
 
-def profile(app: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -> None:
+def profile(
+    app: Path,
+    team: str,
+    udid: str,
+    runner_id: str,
+    cert_sha1: str,
+    min_hours: float = DEFAULT_MIN_VALIDITY_HOURS,
+    now: datetime | None = None,
+) -> tuple[float, float]:
+    """Admit the embedded profile; return (hours left, lifetime in days)."""
     embedded = app / "embedded.mobileprovision"
     if embedded.stat().st_size > MAX_PROFILE_BYTES:
         raise ValueError("profile_invalid")
@@ -133,15 +167,24 @@ def profile(app: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -> 
     try:
         fields = plistlib.loads(decoded)
         expires = fields["ExpirationDate"]
+        created = fields["CreationDate"]
         entitlements = fields["Entitlements"]
         certs = fields["DeveloperCertificates"]
     except (KeyError, TypeError, ValueError, plistlib.InvalidFileException) as error:
         raise ValueError("profile_invalid") from error
-    if not isinstance(fields, dict) or not isinstance(expires, datetime) or not isinstance(entitlements, dict):
+    if (
+        not isinstance(fields, dict)
+        or not isinstance(expires, datetime)
+        or not isinstance(created, datetime)
+        or not isinstance(entitlements, dict)
+    ):
         raise ValueError("profile_invalid")
     expires = expires.replace(tzinfo=timezone.utc) if expires.tzinfo is None else expires
-    if expires <= datetime.now(timezone.utc):
-        raise ValueError("profile_expired")
+    created = created.replace(tzinfo=timezone.utc) if created.tzinfo is None else created
+    left = require_validity(expires, now or datetime.now(timezone.utc), min_hours, "profile")
+    if created >= expires:
+        raise ValueError("profile_invalid")
+    lifetime_days = (expires - created).total_seconds() / 86400
     if (
         fields.get("TeamIdentifier") != [team]
         or udid not in fields.get("ProvisionedDevices", [])
@@ -165,6 +208,7 @@ def profile(app: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -> 
         raise ValueError("signed_entitlement_identity_mismatch")
     if any(key not in entitlements or not allowed_claim(value, entitlements[key]) for key, value in actual.items()):
         raise ValueError("entitlements_mismatch")
+    return left, lifetime_days
 
 
 def hash_file(path: Path) -> str:
@@ -188,8 +232,17 @@ def hash_tree(root: Path) -> str:
     return digest.hexdigest()
 
 
-def verify(output: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -> tuple[str, str]:
+def verify(
+    output: Path,
+    team: str,
+    udid: str,
+    runner_id: str,
+    cert_sha1: str,
+    min_hours: float = DEFAULT_MIN_VALIDITY_HOURS,
+) -> dict[str, str]:
     if (
+        not min_hours >= 0
+        or
         not output.is_absolute()
         or not TEAM.fullmatch(team)
         or not UDID.fullmatch(udid)
@@ -205,10 +258,20 @@ def verify(output: Path, team: str, udid: str, runner_id: str, cert_sha1: str) -
     identifiers = {item: signature(item, team) for item in signed_items(app)}
     if identifiers.get(app) != runner_id or test not in identifiers:
         raise ValueError("runner_signature_mismatch")
-    if leaf_sha1(app) != cert_sha1:
+    leaf_digest, cert_expires = leaf_certificate(app)
+    if leaf_digest != cert_sha1:
         raise ValueError("signing_certificate_mismatch")
-    profile(app, team, udid, runner_id, cert_sha1)
-    return hash_tree(app), hash_file(run)
+    now = datetime.now(timezone.utc)
+    cert_left = require_validity(cert_expires, now, min_hours, "certificate")
+    profile_left, lifetime_days = profile(app, team, udid, runner_id, cert_sha1, min_hours, now)
+    # Hours and lifetime only, never identifiers: a ~7-day lifetime marks a free-account profile.
+    return {
+        "runner_tree_sha256": hash_tree(app),
+        "xctestrun_sha256": hash_file(run),
+        "profile_expires_in_hours": str(int(profile_left)),
+        "certificate_expires_in_hours": str(int(cert_left)),
+        "profile_lifetime_days": f"{lifetime_days:.1f}",
+    }
 
 
 def main() -> int:
@@ -218,15 +281,26 @@ def main() -> int:
     parser.add_argument("--udid", required=True)
     parser.add_argument("--runner-id", required=True)
     parser.add_argument("--certificate-sha1", required=True)
+    parser.add_argument(
+        "--min-validity-hours",
+        type=float,
+        default=DEFAULT_MIN_VALIDITY_HOURS,
+        help="refuse a profile or certificate with less time left (default: %(default)s)",
+    )
     args = parser.parse_args()
     try:
-        runner_hash, test_run_hash = verify(
-            args.output, args.team, args.udid, args.runner_id, args.certificate_sha1
+        result = verify(
+            args.output,
+            args.team,
+            args.udid,
+            args.runner_id,
+            args.certificate_sha1,
+            args.min_validity_hours,
         )
     except (OSError, ValueError) as error:
         print(f"wda_verify={error.args[0] if isinstance(error, ValueError) else 'io_failed'}")
         return 1
-    print(f"wda_verify=pass runner_tree_sha256={runner_hash} xctestrun_sha256={test_run_hash}")
+    print("wda_verify=pass " + " ".join(f"{key}={value}" for key, value in result.items()))
     return 0
 
 

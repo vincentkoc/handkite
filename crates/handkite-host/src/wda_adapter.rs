@@ -121,6 +121,8 @@ impl OwnedStartupError {
                 RunnerError::OwnershipLost => "runner_ownership_lost",
                 RunnerError::ProcessIdentityUnproven => "runner_process_identity_unproven",
                 RunnerError::RunnerStopUnproven => "runner_stop_unproven",
+                RunnerError::ProfileExpired => "runner_profile_expired",
+                RunnerError::ProfileUnavailable => "runner_profile_unavailable",
                 RunnerError::NativeProcess(step) => step.as_str(),
             },
             Self::SessionUnavailable => "session_unavailable",

@@ -106,7 +106,8 @@ class VerifyTests(unittest.TestCase):
             fields = {
                 "TeamIdentifier": [TEAM],
                 "ProvisionedDevices": [MODERN_UDID],
-                "ExpirationDate": datetime.now(timezone.utc) + timedelta(days=1),
+                "CreationDate": datetime.now(timezone.utc) - timedelta(days=1),
+                "ExpirationDate": datetime.now(timezone.utc) + timedelta(days=6),
                 "DeveloperCertificates": [cert],
                 "Entitlements": entitlements,
             }
@@ -115,7 +116,9 @@ class VerifyTests(unittest.TestCase):
                 return plistlib.dumps(fields if arguments[0] == "/usr/bin/security" else signed)
 
             with mock.patch.object(verify, "tool", side_effect=command):
-                verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                left, lifetime = verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                self.assertAlmostEqual(left, 6 * 24, delta=0.1)
+                self.assertAlmostEqual(lifetime, 7.0, delta=0.01)
                 fields["ProvisionedDevices"] = ["other"]
                 with self.assertRaisesRegex(ValueError, "profile_identity_mismatch"):
                     verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
@@ -124,6 +127,18 @@ class VerifyTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "profile_expired"):
                     verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
                 fields["ExpirationDate"] = datetime.now(timezone.utc) + timedelta(days=1)
+                with self.assertRaisesRegex(ValueError, "profile_expires_soon"):
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                left, _ = verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest, min_hours=12)
+                self.assertAlmostEqual(left, 24, delta=0.1)
+                created = fields.pop("CreationDate")
+                with self.assertRaisesRegex(ValueError, "profile_invalid"):
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest)
+                fields["CreationDate"] = fields["ExpirationDate"]
+                with self.assertRaisesRegex(ValueError, "profile_invalid"):
+                    verify.profile(app, TEAM, MODERN_UDID, RUNNER, digest, min_hours=12)
+                fields["CreationDate"] = created
+                fields["ExpirationDate"] = datetime.now(timezone.utc) + timedelta(days=6)
                 signed["keychain-access-groups"] = [f"{TEAM}.unrelated"]
                 entitlements["keychain-access-groups"] = [f"{TEAM}.{RUNNER}"]
                 with self.assertRaisesRegex(ValueError, "entitlements_mismatch"):
@@ -150,17 +165,83 @@ class VerifyTests(unittest.TestCase):
     def test_complete_fixture_checks_each_nested_signature_and_returns_hashes(self):
         with tempfile.TemporaryDirectory() as directory:
             output, app, run = fixture(directory)
-            test = app / "PlugIns/HandkiteRunner.xctest"
+            cert_expires = datetime.now(timezone.utc) + timedelta(days=300, minutes=1)
             with (
                 mock.patch.object(verify, "signature", side_effect=lambda path, _: RUNNER if path == app else "test.id") as signer,
-                mock.patch.object(verify, "leaf_sha1", return_value=CERT),
-                mock.patch.object(verify, "profile") as profile,
+                mock.patch.object(verify, "leaf_certificate", return_value=(CERT, cert_expires)),
+                mock.patch.object(verify, "profile", return_value=(150.5, 7.0)) as profile,
             ):
-                runner_hash, run_hash = verify.verify(output, TEAM, MODERN_UDID, RUNNER, CERT)
+                result = verify.verify(output, TEAM, MODERN_UDID, RUNNER, CERT)
             self.assertEqual(signer.call_count, 2)
-            profile.assert_called_once_with(app, TEAM, MODERN_UDID, RUNNER, CERT)
-            self.assertEqual(len(runner_hash), 64)
-            self.assertEqual(run_hash, verify.hash_file(run))
+            profile.assert_called_once_with(app, TEAM, MODERN_UDID, RUNNER, CERT, 72, mock.ANY)
+            self.assertEqual(len(result["runner_tree_sha256"]), 64)
+            self.assertEqual(result["xctestrun_sha256"], verify.hash_file(run))
+            self.assertEqual(result["profile_expires_in_hours"], "150")
+            self.assertEqual(result["certificate_expires_in_hours"], str(300 * 24))
+            self.assertEqual(result["profile_lifetime_days"], "7.0")
+
+    def test_certificate_expiry_is_refused_before_profile_admission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            output, app, _ = fixture(directory)
+            for delta, outcome in (
+                (timedelta(hours=-1), "certificate_expired"),
+                (timedelta(hours=10), "certificate_expires_soon"),
+            ):
+                with (
+                    mock.patch.object(verify, "signature", side_effect=lambda path, _: RUNNER if path == app else "test.id"),
+                    mock.patch.object(
+                        verify, "leaf_certificate", return_value=(CERT, datetime.now(timezone.utc) + delta)
+                    ),
+                    mock.patch.object(verify, "profile") as profile,
+                ):
+                    with self.assertRaisesRegex(ValueError, outcome):
+                        verify.verify(output, TEAM, MODERN_UDID, RUNNER, CERT)
+                profile.assert_not_called()
+
+    def test_negative_or_nan_min_validity_is_refused(self):
+        for hours in (-1, float("nan")):
+            with self.assertRaisesRegex(ValueError, "pins_invalid"):
+                verify.verify(Path("/fixture"), TEAM, MODERN_UDID, RUNNER, CERT, hours)
+
+    def test_certificate_not_after_parses_openssl_enddate_only(self):
+        leaf = Path("/fixture/codesign0")
+        for output, expected in (
+            (b"notAfter=Nov 16 12:00:00 2027 GMT\n", datetime(2027, 11, 16, 12, tzinfo=timezone.utc)),
+            (b"notAfter=Jan  2 03:04:05 2027 GMT\n", datetime(2027, 1, 2, 3, 4, 5, tzinfo=timezone.utc)),
+        ):
+            with mock.patch.object(verify, "tool", return_value=output) as tool:
+                self.assertEqual(verify.certificate_not_after(leaf), expected)
+            self.assertEqual(tool.call_args.args[0][0], "/usr/bin/openssl")
+        for output in (b"", b"notAfter=garbage\n", b"notAfter=Feb 30 00:00:00 2027 GMT\n"):
+            with mock.patch.object(verify, "tool", return_value=output):
+                with self.assertRaisesRegex(ValueError, "signing_certificate_unavailable"):
+                    verify.certificate_not_after(leaf)
+
+    def test_pass_line_reports_hours_and_lifetime_without_identifiers(self):
+        result = {
+            "runner_tree_sha256": "c" * 64,
+            "xctestrun_sha256": "d" * 64,
+            "profile_expires_in_hours": "150",
+            "certificate_expires_in_hours": "7200",
+            "profile_lifetime_days": "7.0",
+        }
+        argv = [
+            "verify.py", "--output", "/fixture", "--team", TEAM, "--udid", MODERN_UDID,
+            "--runner-id", RUNNER, "--certificate-sha1", CERT, "--min-validity-hours", "24",
+        ]
+        with (
+            mock.patch("sys.argv", argv),
+            mock.patch.object(verify, "verify", return_value=result) as checked,
+            mock.patch("builtins.print") as printed,
+        ):
+            self.assertEqual(verify.main(), 0)
+        self.assertEqual(checked.call_args.args[-1], 24)
+        line = printed.call_args.args[0]
+        self.assertIn("profile_expires_in_hours=150", line)
+        self.assertIn("certificate_expires_in_hours=7200", line)
+        self.assertIn("profile_lifetime_days=7.0", line)
+        for secret in (TEAM, MODERN_UDID, CERT, RUNNER):
+            self.assertNotIn(secret, line)
 
 
 if __name__ == "__main__":
