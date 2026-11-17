@@ -138,6 +138,7 @@ fn runner_reason(error: RunnerError) -> &'static str {
         RunnerError::LookupFailed => "lookup_failed",
         RunnerError::LookupTimedOut => "lookup_timed_out",
         RunnerError::PairingRequired => "pairing_required",
+        RunnerError::AuthorizationRequired => "authorization_required",
         RunnerError::EndpointBusy => "endpoint_busy",
         RunnerError::EndpointUnproven => "endpoint_unproven",
         RunnerError::EndpointCleanupUnproven => "endpoint_cleanup_unproven",
@@ -167,6 +168,7 @@ mod tests {
     fn startup_errors_have_fixed_private_safe_reasons() {
         for error in [
             RunnerError::PairingRequired,
+            RunnerError::AuthorizationRequired,
             RunnerError::EndpointBusy,
             RunnerError::EndpointCleanupUnproven,
             RunnerError::OwnershipLost,

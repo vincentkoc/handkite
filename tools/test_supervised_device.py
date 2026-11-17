@@ -619,6 +619,25 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual((code, fake.calls), (3, 0))
         self.assertEqual(f.receipt, f.snapshot())
 
+    def test_lost_startup_progress_blocks_result_and_preserves_stop(self):
+        class ProgressFailure(io.StringIO):
+            def write(self, value):
+                if '"phase":"runner"' in value:
+                    raise BrokenPipeError()
+                return super().write(value)
+        original = Fake.pin
+        def pin(fake, stdin):
+            fake.pin_progress("STARTED")
+            return original(fake, stdin)
+        f = self.fixture(6)
+        with patch.object(Fake, "pin", pin):
+            code, fake, output = self.attempt(f, output=broker.Output(ProgressFailure()))
+        self.assertEqual((code, fake.calls, fake.cleanups), (3, 1, 1))
+        self.assertTrue(output.failed)
+        self.assertTrue(f.active.exists())
+        self.assertEqual(len(list(f.state.glob("*.hold"))), 7)
+        self.assertNotEqual(f.receipt, f.snapshot())
+
     def test_lost_final_response_does_not_replay_even_when_receipt_matches(self):
         class FinalFailure(io.StringIO):
             calls = 0
@@ -656,6 +675,117 @@ class BrokerTests(unittest.TestCase):
 
 
 class PureTests(unittest.TestCase):
+    def test_runner_startup_logs_preserve_exact_result_and_failure_contracts(self):
+        startup = (b"handkited: runner_startup_stage=profile_unavailable\n"
+                   b"handkited: runner_startup_stage=runner_ready\n"
+                   b"handkited: runner_startup_stage=ui_initializing\n"
+                   b"handkited: runner_startup_stage=authorization_required owner_window_seconds=180\n"
+                   b"handkited: runner_startup_stage=automation_waiting\n"
+                   b"handkited: runner_startup_stage=automation_finished\n")
+        for result in ((0, b"unlock_idle=code_submitted\n", b"", False),
+                       (0, b"unlock_idle=already_unlocked\n", b"", False),
+                       (1, b"", b"handkite-unlock-once: unlock_idle=refused "
+                        b"reason=runner_unavailable runner=AuthorizationRequired\n", False)):
+            logged = (result[0], result[1], startup + result[2], result[3])
+            self.assertEqual(broker.pin_result(logged), broker.pin_result(result))
+            self.assertEqual(broker.pin_diagnostic(logged), broker.pin_diagnostic(result))
+            self.assertEqual(broker.pin_result((*logged[:3], True)), (False, False))
+        for extra in (b"private detail\n", b"handkited: runner_startup_stage=runner_ready",
+                      b"handkited: runner_startup_stage=runner_ready \n",
+                      b"handkited: runner_startup_stage=authorization_required owner_window_seconds=181\n",
+                      b"handkited: runner_startup_stage=runner_ready\r\n"):
+            result = (0, b"unlock_idle=code_submitted\n", startup + extra, False)
+            self.assertEqual(broker.pin_result(result), (False, False))
+            self.assertEqual(broker.pin_diagnostic(result)["reported_outcome"], "unclassified")
+            self.assertEqual(broker.pin_stderr(startup + extra), extra)
+        self.assertEqual(broker.pin_result((0, b"unlock_idle=code_submitted\nextra\n",
+                                           startup, False)), (False, False))
+
+    def test_runner_progress_is_chunked_exact_and_once(self):
+        events = []
+        child = broker.Child.__new__(broker.Child)
+        child.progress, child.progress_offset, child.progress_seen = events.append, 0, set()
+        child.fault = False
+        child.data = {"stderr": bytearray(b"handkited: runner_startup_stage=runner_")}
+        child.report_progress()
+        self.assertEqual(events, [])
+        child.data["stderr"].extend(b"ready\nprivate detail\n"
+            b"handkited: runner_startup_stage=runner_ready\n"
+            b"handkited: runner_startup_stage=authorization_required owner_window_seconds=180\n")
+        child.report_progress()
+        child.report_progress()
+        self.assertEqual(events, ["STARTED", "authorization_required"])
+        self.assertIn(b"private detail\n", child.data["stderr"])
+
+    def test_structured_startup_records_accept_only_producer_value_ranges(self):
+        submitted = (0, b"unlock_idle=code_submitted\n", b"", False)
+        refused = (1, b"", b"handkite-unlock-once: unlock_idle=refused "
+                   b"reason=runner_unavailable runner=AutomationInitializationFailed\n", False)
+        profile = b"handkited: runner_startup_stage=profile_expiring hours="
+        initialization = (b"handkited: runner_initialization_failure automation_waiting="
+                          b"%s local_authentication=%s local_authentication_code=%s\n")
+        for hours in range(73):
+            logged = (*submitted[:2], profile + str(hours).encode() + b"\n", False)
+            self.assertEqual(broker.pin_result(logged), (True, False))
+            self.assertEqual(broker.pin_diagnostic(logged)["reported_outcome"], "code_submitted")
+        for waiting in (b"true", b"false"):
+            for auth in (b"true", b"false"):
+                for code in (b"None", b"Some(-2147483648)", b"Some(-4)", b"Some(0)",
+                             b"Some(2147483647)"):
+                    line = initialization % (waiting, auth, code)
+                    result = (*refused[:2], line + refused[2], False)
+                    self.assertEqual(broker.pin_result(result), (False, True))
+                    self.assertEqual(broker.pin_diagnostic(result)["runner"],
+                                     "AutomationInitializationFailed")
+        bad = [profile + value + b"\n" for value in
+               (b"73", b"-1", b"00", b"+1", b"18446744073709551615")]
+        bad += [initialization % (b"true", b"false", code) for code in
+                (b"Some(-2147483649)", b"Some(2147483648)", b"Some(00)", b"Some(-0)",
+                 b"Some(+1)", b"Some(99999999999999999999999999)")]
+        bad += [initialization % (b"True", b"false", b"None"),
+                initialization % (b"true", b"0", b"None"),
+                (initialization % (b"true", b"true", b"Some(-4)")).rstrip(b"\n"),
+                profile + b"12\r\n", profile + b"12 extra=private\n"]
+        for line in bad:
+            for baseline in (submitted, refused):
+                result = (*baseline[:2], line + baseline[2], False)
+                self.assertEqual(broker.pin_result(result), (False, False))
+                self.assertEqual(broker.pin_diagnostic(result)["reported_outcome"], "unclassified")
+                self.assertEqual(broker.pin_stderr(line), line)
+        child = broker.Child.__new__(broker.Child)
+        child.progress = unittest.mock.Mock()
+        child.progress_offset, child.progress_seen, child.fault = 0, set(), False
+        child.data = {"stderr": bytearray(profile + b"12\n" +
+            initialization % (b"true", b"true", b"Some(-4)"))}
+        child.report_progress()
+        child.progress.assert_not_called()
+
+    def test_runner_progress_arrives_before_child_exit(self):
+        events = []
+        with patch.object(broker.Child, "identity", return_value=None):
+            child = broker.Child([sys.executable, "-c", "import sys,time;"
+                "sys.stderr.write('handkited: runner_startup_stage=runner_ready\\n');"
+                "sys.stderr.flush();time.sleep(0.6)"], {}, subprocess.DEVNULL,
+                os.getcwd(), lambda: None,
+                progress=lambda event: events.append((event, child.process.poll())))
+            code, out, err, fault = child.wait()
+        self.assertEqual(events, [("STARTED", None)])
+        self.assertEqual((code, out, fault), (0, b"", False))
+        self.assertEqual(err, b"handkited: runner_startup_stage=runner_ready\n")
+
+    def test_runner_progress_callback_failure_keeps_child_fault(self):
+        child = broker.Child.__new__(broker.Child)
+        child.progress = unittest.mock.Mock(side_effect=BrokenPipeError())
+        child.progress_offset, child.progress_seen = 0, set()
+        child.fault, child.fault_reason = False, None
+        child.fault_lock = threading.Lock()
+        child.data = {"stderr": bytearray(b"handkited: runner_startup_stage=runner_ready\n")}
+        child.report_progress()
+        child.report_progress()
+        self.assertTrue(child.fault)
+        self.assertEqual(child.fault_reason, "child_check")
+        child.progress.assert_called_once_with("STARTED")
+
     def test_profile_preflight_checks_native_receipt_without_entering_supervision(self):
         for mode in broker.MODES:
             profile, backend, stops = (unittest.mock.Mock() for _ in range(3))

@@ -91,6 +91,8 @@ impl OwnedStartupError {
     pub fn message(self) -> &'static str {
         if self == Self::Runner(RunnerError::PairingRequired) {
             crate::wda_runner::PAIRING_REQUIRED_MESSAGE
+        } else if self == Self::Runner(RunnerError::AuthorizationRequired) {
+            crate::wda_runner::AUTHORIZATION_REQUIRED_MESSAGE
         } else {
             self.category()
         }
@@ -106,6 +108,7 @@ impl OwnedStartupError {
                 RunnerError::LookupFailed => "runner_lookup_failed",
                 RunnerError::LookupTimedOut => "runner_lookup_timed_out",
                 RunnerError::PairingRequired => "pairing_required",
+                RunnerError::AuthorizationRequired => "authorization_required",
                 RunnerError::EndpointBusy => "runner_endpoint_busy",
                 RunnerError::EndpointUnproven => "runner_endpoint_unproven",
                 RunnerError::EndpointCleanupUnproven => "runner_endpoint_cleanup_unproven",
@@ -1694,6 +1697,20 @@ mod tests {
         );
         let other = OwnedStartupError::Runner(RunnerError::AutomationInitializationFailed);
         assert_eq!(other.message(), other.category());
+    }
+
+    #[test]
+    fn authorization_startup_error_has_a_fixed_owner_action() {
+        let error = OwnedStartupError::Runner(RunnerError::AuthorizationRequired);
+        assert_eq!(error.category(), "authorization_required");
+        assert_eq!(
+            error.message(),
+            "authorization_required: owner must complete XCTest Enable UI Automation on device"
+        );
+        assert_eq!(
+            RunnerError::AuthorizationRequired.to_string(),
+            error.message()
+        );
     }
 
     #[test]

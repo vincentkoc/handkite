@@ -21,6 +21,7 @@ use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio::time::{Instant, sleep, sleep_until, timeout_at};
 
 const MAX_STARTUP_TIMEOUT: Duration = Duration::from_secs(120);
+const AUTHORIZATION_WINDOW: Duration = Duration::from_secs(180);
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_TIMEOUT: Duration = Duration::from_secs(5);
 const VACANCY_TIMEOUT: Duration = Duration::from_secs(3);
@@ -30,6 +31,8 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
 const PROFILE_TIMEOUT: Duration = Duration::from_secs(3);
 pub const PAIRING_REQUIRED_MESSAGE: &str =
     "pairing_required: owner must accept trust/passcode on device";
+pub const AUTHORIZATION_REQUIRED_MESSAGE: &str =
+    "authorization_required: owner must complete XCTest Enable UI Automation on device";
 
 mod native_process;
 mod profile;
@@ -92,6 +95,7 @@ pub enum RunnerError {
     LookupFailed,
     LookupTimedOut,
     PairingRequired,
+    AuthorizationRequired,
     EndpointBusy,
     EndpointUnproven,
     EndpointCleanupUnproven,
@@ -121,6 +125,7 @@ impl std::fmt::Display for RunnerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NativeProcess(step) => f.write_str(step.as_str()),
+            Self::AuthorizationRequired => f.write_str(AUTHORIZATION_REQUIRED_MESSAGE),
             // Every other variant is a fixed unit category.
             _ => write!(f, "{self:?}"),
         }
@@ -138,6 +143,7 @@ pub struct OwnedWdaRunner {
     ownership: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     native: Option<native_process::Identity>,
     profile: Option<ProfileExpiry>,
+    ready_deadline: Instant,
 }
 
 /// Read-only task liveness for a blocking action worker. It cannot cancel the runner.
@@ -154,7 +160,9 @@ impl OwnedWdaRunner {
     /// Look up one exact installed `.xctrunner` bundle and start it once.
     ///
     /// The timeout must be positive and at most 120 seconds. One absolute deadline
-    /// covers discovery, lookup, the test-plan callback, and HTTP readiness. Lookup
+    /// covers discovery, lookup, the test-plan callback, and HTTP readiness. An
+    /// explicit XCTest authorization wait receives one fixed 180-second window.
+    /// Repeated wait messages do not renew it. Lookup
     /// additionally has a 15-second time bound. No WDA session is created or adopted.
     /// The ownership callback must retain and validate the caller's ServiceLock;
     /// it remains required through exact native process cleanup.
@@ -184,6 +192,7 @@ impl OwnedWdaRunner {
                     TestConfig::from_installation_proxy(&mut proxy, runner_bundle_id, None)
                         .await
                         .map_err(|error| transport_failure(&error, RunnerError::LookupFailed))?;
+                let config = authorization_runner_config(config);
                 let profile = match runner_profile(&*provider, runner_bundle_id, deadline).await {
                     Ok(expiry) => {
                         let hours = hours_until(expiry.effective(), SystemTime::now());
@@ -248,7 +257,9 @@ impl OwnedWdaRunner {
         runner.usb = Some(usb.clone());
         runner.ownership = Some(Arc::clone(&owns));
         runner.profile = profile;
-        let identity = target.observe(&usb, deadline, &*owns, None).await;
+        let identity = target
+            .observe(&usb, runner.ready_deadline, &*owns, None)
+            .await;
         match identity {
             Ok(Some(pid)) => runner.native = Some(native_process::Identity { target, pid }),
             result => {
@@ -412,15 +423,22 @@ impl OwnedWdaRunner {
         let (phase, receiver) = watch::channel(PlanState::starting());
         // Install the abort-on-drop owner before the first await after spawn.
         let mut runner = Self {
-            task: Some(tokio::spawn(run(PlanListener { phase }))),
+            task: Some(tokio::spawn(run(PlanListener {
+                phase,
+                initial_deadline: deadline,
+            }))),
             usb: None,
             ownership: None,
             native: None,
             profile: None,
+            ready_deadline: deadline,
         };
-        if let Err(error) = runner.wait_ready(receiver, probe, deadline).await {
-            let _ = runner.abort_and_join().await;
-            return Err(error);
+        match runner.wait_ready(receiver, probe, deadline).await {
+            Ok(deadline) => runner.ready_deadline = deadline,
+            Err(error) => {
+                let _ = runner.abort_and_join().await;
+                return Err(error);
+            }
         }
         Ok(runner)
     }
@@ -430,7 +448,7 @@ impl OwnedWdaRunner {
         phase: watch::Receiver<PlanState>,
         mut probe: P,
         deadline: Instant,
-    ) -> Result<(), RunnerError>
+    ) -> Result<Instant, RunnerError>
     where
         P: FnMut() -> PF,
         PF: Future<Output = Option<HttpResponse>>,
@@ -462,7 +480,7 @@ impl OwnedWdaRunner {
                 self.task.take();
                 return Err(startup_exit_with_state(result, *phase.borrow()));
             }
-            _ = sleep_until(deadline) => return Err(startup_timeout_error(*phase.borrow())),
+            error = wait_startup_deadline(phase.clone(), deadline) => return Err(error),
             result = self.task.as_mut().expect("owned task") => {
                 self.task.take();
                 return Err(startup_exit_with_state(result, *phase.borrow()));
@@ -473,6 +491,7 @@ impl OwnedWdaRunner {
             result = readiness => result?,
         }
         // A ready response cannot override an observed deadline or task/plan exit.
+        let deadline = effective_startup_deadline(*phase.borrow(), deadline);
         if Instant::now() >= deadline {
             return Err(startup_timeout_error(*phase.borrow()));
         }
@@ -487,7 +506,7 @@ impl OwnedWdaRunner {
         if phase.borrow().phase != PlanPhase::Running {
             return Err(RunnerError::RunnerExited);
         }
-        Ok(())
+        Ok(deadline)
     }
 }
 
@@ -550,6 +569,17 @@ fn startup_deadline(timeout: Duration) -> Result<Instant, RunnerError> {
         return Err(RunnerError::InvalidTimeout);
     }
     Ok(Instant::now() + timeout)
+}
+
+fn authorization_runner_config(mut config: TestConfig) -> TestConfig {
+    // XCTest's enableAutomationMode future uses this process-local default.
+    // It also applies to other XCTest application-state waits; host action
+    // deadlines remain independent and unchanged.
+    config.runner_args.get_or_insert_with(Vec::new).extend([
+        "-XCUIApplicationStateTimeout".to_owned(),
+        AUTHORIZATION_WINDOW.as_secs().to_string(),
+    ]);
+    config
 }
 
 async fn lookup_before_deadline<T>(
@@ -633,6 +663,7 @@ enum PlanPhase {
 struct PlanState {
     phase: PlanPhase,
     automation_waiting: bool,
+    authorization_deadline: Option<Instant>,
     failure: Option<RunnerError>,
 }
 
@@ -641,7 +672,38 @@ impl PlanState {
         Self {
             phase: PlanPhase::Starting,
             automation_waiting: false,
+            authorization_deadline: None,
             failure: None,
+        }
+    }
+}
+
+fn effective_startup_deadline(state: PlanState, initial: Instant) -> Instant {
+    state
+        .authorization_deadline
+        .map_or(initial, |at| initial.max(at))
+}
+
+async fn wait_startup_deadline(
+    mut phase: watch::Receiver<PlanState>,
+    initial: Instant,
+) -> RunnerError {
+    loop {
+        let deadline = {
+            let state = phase.borrow();
+            let deadline = effective_startup_deadline(*state, initial);
+            if Instant::now() >= deadline {
+                return startup_timeout_error(*state);
+            }
+            deadline
+        };
+        tokio::select! {
+            _ = sleep_until(deadline) => {},
+            changed = phase.changed() => {
+                if changed.is_err() {
+                    return RunnerError::RunnerExited;
+                }
+            }
         }
     }
 }
@@ -651,7 +713,7 @@ fn startup_timeout_error(state: PlanState) -> RunnerError {
         error
     } else if state.phase == PlanPhase::Starting {
         if state.automation_waiting {
-            RunnerError::AutomationWaitTimedOut
+            RunnerError::AuthorizationRequired
         } else {
             RunnerError::PlanStartUnproven
         }
@@ -692,6 +754,8 @@ fn transport_failure(error: &IdeviceError, fallback: RunnerError) -> RunnerError
 fn initialization_failure(message: &str, automation_waiting: bool) -> RunnerError {
     if pairing_required(message) {
         RunnerError::PairingRequired
+    } else if message.contains("Timed out while enabling automation mode") {
+        RunnerError::AuthorizationRequired
     } else if automation_waiting
         || message.contains("enabling automation mode")
         || message.contains("com.apple.LocalAuthentication")
@@ -717,6 +781,7 @@ fn initialization_diagnostic(message: &str, automation_waiting: bool) -> String 
 
 struct PlanListener {
     phase: watch::Sender<PlanState>,
+    initial_deadline: Instant,
 }
 
 impl XCUITestListener for PlanListener {
@@ -757,8 +822,23 @@ impl XCUITestListener for PlanListener {
                     return false;
                 }
                 let next = !done;
+                let now = Instant::now();
+                if next
+                    && state.authorization_deadline.is_none()
+                    && (state.phase != PlanPhase::Starting
+                        || now >= self.initial_deadline)
+                {
+                    return false;
+                }
                 let changed = state.automation_waiting != next;
                 state.automation_waiting = next;
+                if next && state.authorization_deadline.is_none() {
+                    state.authorization_deadline = Some(now + AUTHORIZATION_WINDOW);
+                    eprintln!(
+                        "handkited: runner_startup_stage=authorization_required owner_window_seconds={}",
+                        AUTHORIZATION_WINDOW.as_secs()
+                    );
+                }
                 changed
             });
             if changed {

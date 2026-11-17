@@ -15,6 +15,10 @@ fn runner_failure_keeps_a_fixed_startup_reason() {
             "AutomationInitializationFailed",
         ),
         (RunnerError::LookupTimedOut, "LookupTimedOut"),
+        (RunnerError::AuthorizationRequired, "AuthorizationRequired"),
+        (RunnerError::PairingRequired, "PairingRequired"),
+        (RunnerError::ProfileExpired, "ProfileExpired"),
+        (RunnerError::ProfileUnavailable, "ProfileUnavailable"),
         (
             RunnerError::NativeProcess(NativeProcessStep::CommandExit),
             "process_command_exit",

@@ -135,7 +135,11 @@ pub(super) fn run(path: &Path, supervised: bool, coordinate: bool) -> Result<(),
 }
 
 fn runner_failure(error: RunnerError) -> String {
-    format!("unlock_idle=refused reason=runner_unavailable runner={error}")
+    let reason = match error {
+        RunnerError::AuthorizationRequired => "AuthorizationRequired".to_owned(),
+        other => other.to_string(),
+    };
+    format!("unlock_idle=refused reason=runner_unavailable runner={reason}")
 }
 
 fn admit_attempt(gate: &impl AttemptGate, owns: impl FnOnce() -> bool) -> Result<(), &'static str> {

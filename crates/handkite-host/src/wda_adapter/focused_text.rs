@@ -282,6 +282,17 @@ async fn app_matches(wda: &impl WdaRequest, session: &str, app: &str) -> Result<
     Ok(())
 }
 
+async fn context_in_app(
+    wda: &impl WdaRequest,
+    session: &str,
+    app: &str,
+) -> Result<Result<(Value, Instant, u64), AdapterError>, AdapterError> {
+    let (app, query) = tokio::join!(app_matches(wda, session, app), context(wda, session));
+    // Restoration errors must still poison the adapter, including on app mismatch.
+    let query = query?;
+    Ok(app.and(query))
+}
+
 async fn dispatch_to_focused(
     wda: &impl WdaRequest,
     session: &str,
@@ -337,12 +348,7 @@ impl WdaAdapter {
             .runtime
             .as_ref()
             .expect("adapter runtime")
-            .block_on(async {
-                if let Err(error) = app_matches(&wda, &key.session, app).await {
-                    return Ok(Err(error));
-                }
-                context(&wda, &key.session).await
-            });
+            .block_on(context_in_app(&wda, &key.session, app));
         let query = match query {
             Ok(query) => query,
             Err(error) => {
@@ -854,6 +860,64 @@ mod tests {
             1,
             "must not overwrite another writer"
         );
+    }
+
+    struct AppContextFake {
+        settings: SettingsFake,
+        context_started: tokio::sync::Notify,
+        app_matches: bool,
+    }
+
+    impl WdaRequest for AppContextFake {
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            body: &[u8],
+            timeout: Duration,
+        ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+            let result = if path.ends_with("/wda/activeAppInfo") {
+                self.context_started.notified().await;
+                json!({"bundleId": if self.app_matches { "example.editor" } else { "example.other" }})
+            } else if path.ends_with("/wda/locked") {
+                json!(false)
+            } else {
+                self.context_started.notify_one();
+                return self.settings.request(method, path, body, timeout).await;
+            };
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(&json!({"sessionId":"session","value":result})).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn context_and_app_check_overlap_without_skipping_restoration() {
+        for (app_matches, settings_mode) in [(true, 0), (false, 0), (false, 3)] {
+            let fake = AppContextFake {
+                settings: SettingsFake::new(settings_mode),
+                context_started: tokio::sync::Notify::new(),
+                app_matches,
+            };
+            let original = fake.settings.pair.borrow().clone();
+            let result = tokio::time::timeout(
+                Duration::from_millis(100),
+                context_in_app(&fake, "session", "example.editor"),
+            )
+            .await
+            .expect("context must start while the app check is pending");
+            assert_eq!(*fake.settings.pair.borrow(), original);
+            assert_eq!(fake.settings.writes.borrow().len(), 2);
+            if settings_mode == 3 {
+                assert!(
+                    result.is_err(),
+                    "restore failure must retain poison precedence"
+                );
+            } else {
+                assert_eq!(result.unwrap().is_ok(), app_matches);
+            }
+        }
     }
 
     #[test]

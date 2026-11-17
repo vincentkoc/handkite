@@ -25,6 +25,7 @@ MODES = ("pin-once", "clock-once", "lock-once")
 CHILD_FAILURES = frozenset("""child_exited child_identity child_argv child_check
     stdout_read stderr_read stdout_limit stderr_limit output_join""".split())
 RUNNER_REASONS = frozenset("""InvalidBundleId InvalidTimeout LookupFailed LookupTimedOut
+    PairingRequired AuthorizationRequired ProfileExpired ProfileUnavailable
     EndpointBusy EndpointUnproven EndpointCleanupUnproven StartupTimedOut
     PlanStartUnproven AutomationAuthorizationRequired AutomationInitializationFailed
     AutomationWaitTimedOut InitializationFailed BootstrapFailed
@@ -34,6 +35,36 @@ RUNNER_REASONS = frozenset("""InvalidBundleId InvalidTimeout LookupFailed Lookup
     process_metadata_limit process_metadata_decode process_metadata_contract process_inventory_schema
     process_inventory_pid process_inventory_path process_inventory_ambiguous process_identity_changed
     process_preexisting process_missing_after_start""".split())
+RUNNER_STARTUP_LINES = frozenset(b"handkited: runner_startup_stage=" + stage + b"\n"
+    for stage in (b"runner_ready", b"ui_initializing", b"automation_waiting",
+                  b"automation_finished", b"profile_unavailable", b"profile_expired",
+                  b"authorization_required owner_window_seconds=180"))
+RUNNER_PROGRESS = {
+    b"handkited: runner_startup_stage=runner_ready\n": "STARTED",
+    b"handkited: runner_startup_stage=authorization_required owner_window_seconds=180\n":
+        "authorization_required",
+}
+RUNNER_PROFILE_WARNING = re.compile(
+    rb"handkited: runner_startup_stage=profile_expiring hours=(?:[0-9]|[1-6][0-9]|7[0-2])\n")
+RUNNER_INITIALIZATION = re.compile(
+    rb"handkited: runner_initialization_failure automation_waiting=(?:true|false) "
+    rb"local_authentication=(?:true|false) local_authentication_code="
+    rb"(?:None|Some\((0|-?[1-9][0-9]{0,9})\))\n")
+
+
+def runner_startup_line(line):
+    if line in RUNNER_STARTUP_LINES or RUNNER_PROFILE_WARNING.fullmatch(line):
+        return True
+    match = RUNNER_INITIALIZATION.fullmatch(line)
+    return bool(match and (match[1] is None or -2147483648 <= int(match[1]) <= 2147483647))
+
+
+def pin_stderr(stderr):
+    """Remove only complete startup records with fixed fields and bounded values."""
+    return b"".join(line for line in stderr.splitlines(keepends=True)
+                    if not runner_startup_line(line))
+
+
 ROLES = {"config": 0o600, "binding": 0o600, "receipt": 0o600,
          "unlock_check": 0o500, "operator": 0o500, "probe": 0o500,
          "daemon": 0o500, "selected_daemon": 0o500, "selected_cli": 0o500,
@@ -159,8 +190,9 @@ class Output:
 
 class Child:
     """Retain one exact child identity and bounded private output; never replay."""
-    def __init__(self, args, env, stdin, cwd, check):
+    def __init__(self, args, env, stdin, cwd, check, progress=None):
         self.args, self.check = args, check
+        self.progress, self.progress_offset, self.progress_seen = progress, 0, set()
         self.process = subprocess.Popen(args, stdin=stdin, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, cwd=cwd, env=env, close_fds=True, bufsize=0)
         self.birth = None
@@ -217,6 +249,22 @@ class Child:
                 "child_argv")
         self.check()
 
+    def report_progress(self):
+        if getattr(self, "progress", None) is None or self.fault:
+            return
+        data = bytes(self.data["stderr"])
+        end = data.rfind(b"\n") + 1
+        for line in data[self.progress_offset:end].splitlines(keepends=True):
+            event = RUNNER_PROGRESS.get(line)
+            if event is not None and event not in self.progress_seen:
+                self.progress_seen.add(event)
+                try:
+                    self.progress(event)
+                except Exception:
+                    self.record_fault("child_check")
+                    break
+        self.progress_offset = end
+
     def wait(self):
         # Do not interrupt a native PIN/restoration/runner-join bracket on timeout.
         while self.process.poll() is None:
@@ -225,6 +273,7 @@ class Child:
             except Exception as error:
                 if self.process.poll() is None:
                     self.identity_fault(error)
+            self.report_progress()
             try:
                 self.process.wait(timeout=0.25)
             except subprocess.TimeoutExpired:
@@ -236,6 +285,7 @@ class Child:
         if not any(thread.is_alive() for thread in self.threads):
             self.process.stdout.close()
             self.process.stderr.close()
+        self.report_progress()
         return self.process.returncode, bytes(self.data["stdout"]), bytes(self.data["stderr"]), self.fault
 
 
@@ -341,7 +391,8 @@ class Native:
     def pin(self, stdin):
         self.child = Child([self.p.path("operator"), "--config", self.p.path("config"),
             "--owned-wda-session", "--temporary-idle-settings", "--supervised-visibility-fallback"],
-            self.env, stdin, self.p.root, self.p.files["operator"].check)
+            self.env, stdin, self.p.root, self.p.files["operator"].check,
+            progress=getattr(self, "pin_progress", None))
         result = self.child.wait()
         self.pin_fault_reason = self.child.fault_reason
         return result
@@ -434,6 +485,7 @@ def lock_confirmed(reply):
 
 def pin_result(result):
     code, out, err, fault = result
+    err = pin_stderr(err)
     submitted = code == 0 and out == b"unlock_idle=code_submitted\n" and not err and not fault
     zero = code == 0 and out == b"unlock_idle=already_unlocked\n" and not err
     zero |= code == 1 and not out and bool(re.fullmatch(
@@ -446,6 +498,7 @@ def pin_result(result):
 
 def pin_diagnostic(result, fault_reason=None):
     code, out, err, fault = result
+    err = pin_stderr(err)
     summary = {"exit_code": code if type(code) is int and -255 <= code <= 255 else None,
                "child_integrity": "unproven" if fault else "checked",
                "reported_outcome": "unclassified"}
@@ -554,6 +607,7 @@ def supervise(profile, backend, stops, output, stdin):
                 stops.rotate()
             dispatched = 1
             stage = "operator"
+            backend.pin_progress = lambda event: output.emit(mode, "runner", event, dispatched)
             result = backend.pin(stdin)
             stage = "operator_result"
             output.emit(mode, "operator", "returned", dispatched,

@@ -3,9 +3,14 @@ import copy
 import contextlib
 import io
 import json
+import hashlib
+import os
+from pathlib import Path
+import tempfile
 import sys
 import time
 import unittest
+from unittest.mock import patch
 from types import SimpleNamespace
 
 from benchmark_mcp import (BenchError, Campaign, CASES, Peer, compare, elements,
@@ -48,6 +53,54 @@ def image_result(action=False):
 
 
 class BenchmarkTests(unittest.TestCase):
+    def test_image_only_fixture_failure_names_predicate_without_private_state(self):
+        for predicate, value in (("app", "private.observed.app"), ("lock", "locked")):
+            with self.subTest(predicate=predicate):
+                class FakePeer:
+                    healthy = True
+
+                    def __init__(self):
+                        self.calls = []
+                        self.launched = False
+
+                    def initialize(self):
+                        pass
+
+                    def tool(self, name, arguments):
+                        call = {"id": len(self.calls) + 1, "operation": len(self.calls) + 1,
+                                "tool": name, "elapsed_ms": 1, "response_bytes": 100}
+                        self.calls.append(call)
+                        if name == "handkite_launch_app":
+                            self.launched = True
+                            return image_result(action=True), call
+                        result = screen_result()
+                        if self.launched and name == "handkite_observe":
+                            payload = json.loads(result["content"][0]["text"])
+                            key = "foreground_app" if predicate == "app" else "lock"
+                            payload["metadata"]["state"][key] = value
+                            result["content"][0]["text"] = json.dumps(payload)
+                        return result, call
+
+                scenario = plan()
+                scenario["cases"][3]["measure"]["expect"] = {
+                    "app": "example.notes", "lock": "unlocked"}
+                peer = FakePeer()
+                campaign = Campaign(peer, scenario, 20, 0,
+                                    selected_cases=["launch"], capture_mode="image_only")
+                campaign.run()
+                self.assertEqual(campaign.failure, "effect_mismatch")
+                self.assertEqual(campaign.failure_context["phase"], "fixture_verification")
+                self.assertEqual(campaign.failure_context["call"]["failed_expectations"], [predicate])
+                self.assertEqual(campaign.failure_context["call"]["failed_state"], {
+                    "lock": "locked" if predicate == "lock" else "unlocked",
+                    "same_app_as_previous": predicate == "lock"})
+                self.assertEqual(campaign.failure_kind, "fixture_failure")
+                self.assertNotIn("private.observed.app", json.dumps(campaign.failure_context))
+                self.assertEqual(sum(call["tool"] == "handkite_launch_app" for call in peer.calls), 1)
+                summary = summarize(campaign.samples)["launch"]
+                self.assertEqual((summary["completed"], summary["failures"], summary["input_failures"]),
+                                 (0, 1, 0))
+
     def test_focused_text_trace_requires_narrow_proof_and_one_real_capture(self):
         names = ("service_request", "service_serialization", "service_write", "controller_dispatch",
                  "wire_image_encode", "wda_read_request", "usb_discovery", "usb_connect",
@@ -354,6 +407,96 @@ class BenchmarkTests(unittest.TestCase):
             with self.assertRaisesRegex(BenchError, "invalid_selected_cases"):
                 Campaign(peer, fixture, 1, 0, selected_cases=selected)
 
+    def test_progress_pipe_failure_stops_without_repeating_completed_input(self):
+        class FakePeer:
+            healthy = True
+
+            def __init__(self):
+                self.calls = []
+
+            def initialize(self):
+                pass
+
+            def tool(self, tool, arguments):
+                call = dict(id=len(self.calls), operation=len(self.calls), elapsed_ms=1,
+                            response_bytes=1, tool=tool)
+                self.calls.append(call)
+                return (image_result(action=True) if tool == "handkite_tap"
+                        else screen_result()), call
+
+        class BrokenProgress(io.StringIO):
+            def __init__(self, fail_at, during_flush):
+                super().__init__()
+                self.rows = 0
+                self.fail_at = fail_at
+                self.during_flush = during_flush
+
+            def write(self, value):
+                if value.startswith("{"):
+                    self.rows += 1
+                if self.rows == self.fail_at and not self.during_flush:
+                    raise BrokenPipeError("private transport details")
+                return super().write(value)
+
+            def flush(self):
+                if self.rows == self.fail_at and self.during_flush:
+                    raise BrokenPipeError("private transport details")
+                return super().flush()
+
+        for fail_at in (1, 20):
+            for during_flush in (False, True):
+                with self.subTest(fail_at=fail_at, during_flush=during_flush):
+                    peer = FakePeer()
+                    fixture = plan()
+                    fixture["cases"][0]["cleanup"] = [{"tool": "handkite_observe"}]
+                    campaign = Campaign(peer, fixture, 20, 0, selected_cases=["tap"],
+                                        capture_mode="image_only")
+                    with contextlib.redirect_stdout(BrokenProgress(fail_at, during_flush)):
+                        campaign.run()
+                    self.assertEqual(campaign.failure, "progress_output_closed")
+                    self.assertEqual(campaign.failure_kind, "reporting_failure")
+                    self.assertEqual(campaign.failure_context["phase"], "progress")
+                    self.assertEqual(len(campaign.samples), fail_at)
+                    self.assertTrue(all(row["outcome"] == "pass" for row in campaign.samples))
+                    self.assertTrue(all(row["measurement_passed"] and "cleanup_ms" in row
+                                        for row in campaign.samples))
+                    self.assertEqual(sum(c["tool"] == "handkite_tap" for c in peer.calls), fail_at)
+                    self.assertEqual(peer.calls[-1]["tool"], "handkite_release_control")
+                    summary = summarize(campaign.samples)["tap"]
+                    self.assertEqual((summary["attempts"], summary["input_failures"]), (fail_at, 0))
+                    self.assertEqual(summary["completed"], 0)  # Trace validation is still required.
+                    report = {"version": 1, "trace_valid": True, "failure": campaign.failure}
+                    with self.assertRaisesRegex(BenchError, "incomplete_benchmark"):
+                        compare(report, report, ["tap"])
+                    self.assertNotIn("private transport details", json.dumps(campaign.samples))
+
+    def test_cli_writes_failed_report_without_reusing_closed_progress_pipe(self):
+        from benchmark_mcp import main
+
+        campaign = SimpleNamespace(run=lambda: None, samples=[], selected_cases=["tap"],
+                                   failure="progress_output_closed", failure_kind="reporting_failure",
+                                   failure_context={"phase": "progress"}, _failed_scroll_images=None)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, trace, output = (root / name for name in ("plan.json", "trace.jsonl", "report.json"))
+            source.write_text(json.dumps(plan()))
+            trace.write_text("")
+            argv = ["benchmark_mcp.py", "run", "--plan", str(source), "--output", str(output),
+                    "--service-trace", str(trace), "--service-pid", "1", "--service-build", "a" * 40,
+                    "--client-build", "b" * 40, "--", "unused-fixture-client"]
+            with patch.object(sys, "argv", argv), patch("benchmark_mcp.Peer") as peer, \
+                    patch("benchmark_mcp.Campaign", return_value=campaign), \
+                    patch("benchmark_mcp.attach_stages"), patch("benchmark_mcp.time.sleep"), \
+                    patch("builtins.print", side_effect=BrokenPipeError) as progress:
+                peer.return_value.calls = []
+                self.assertEqual(main(), 1)
+                peer.return_value.close.assert_called_once()
+                progress.assert_not_called()
+            report = json.loads(output.read_text())
+            self.assertEqual(report["failure"], "progress_output_closed")
+            self.assertEqual(report["failure_kind"], "reporting_failure")
+            self.assertFalse(report["qualified"])
+
     def test_nearest_rank_percentiles_and_invalid_samples(self):
         self.assertEqual(quantiles(list(range(1, 21))), {"n": 20, "p50": 10, "p95": 19})
         self.assertEqual(quantiles([9]), {"n": 1, "p50": 9, "p95": 9})
@@ -550,7 +693,7 @@ class BenchmarkTests(unittest.TestCase):
         with self.assertRaisesRegex(BenchError, "incomplete_client_trace"):
             validate_client_stages(rows[:-1], observed=False)
 
-    def test_plan_requires_all_six_cases_and_never_accepts_pin_or_lifecycle_tools(self):
+    def test_full_plan_never_accepts_pin_or_lifecycle_tools(self):
         self.assertEqual(validate_plan(plan()), plan())
         for tool in ("handkite_unlock", "handkite_home", "exec"):
             invalid = plan()
@@ -887,6 +1030,389 @@ class SettingsFixtureTests(unittest.TestCase):
         self.assertEqual(campaign.failure, "settings_reset_failed")
         self.assertNotIn("handkite_launch_app", events)
         self.assertNotIn("handkite_swipe", events)
+
+
+class FocusedPlanTests(unittest.TestCase):
+    def test_ordered_subset_and_full_plan_keep_measured_tool_mapping(self):
+        focused = {"version": 1, "cases": [plan()["cases"][1]]}
+        self.assertEqual(validate_plan(focused), focused)
+        self.assertEqual(validate_plan(plan()), plan())
+        focused["cases"][0]["measure"]["tool"] = "handkite_tap"
+        with self.assertRaisesRegex(BenchError, "invalid_measured_tool"):
+            validate_plan(focused)
+
+    def test_empty_unknown_duplicate_and_unordered_cases_are_rejected(self):
+        for names in ([], ["unknown"], ["type", "type"], ["type", "tap"], [None]):
+            with self.subTest(names=names), self.assertRaisesRegex(BenchError, "invalid_case_matrix"):
+                validate_plan({"version": 1, "cases": [{"name": name} for name in names]})
+
+    def test_campaign_defaults_to_available_cases_and_rejects_missing_selection(self):
+        focused = validate_plan({"version": 1, "cases": [plan()["cases"][1]]})
+        self.assertEqual(Campaign(None, focused, 20, 0).selected_cases, ["type"])
+        self.assertEqual(Campaign(None, plan(), 20, 0).selected_cases, list(CASES))
+        for selected in ([], ["tap"], ["type", "tap"], ["type", "type"], ["unknown"]):
+            with self.subTest(selected=selected), self.assertRaisesRegex(BenchError, "invalid_selected_cases"):
+                Campaign(None, focused, 20, 0, selected_cases=selected)
+
+    def test_cli_rejects_missing_requested_case_before_opening_trace_or_client(self):
+        from benchmark_mcp import main
+
+        raw = json.dumps({"version": 1, "cases": [plan()["cases"][1]]}).encode()
+        argv = ["benchmark_mcp.py", "run", "--plan", "fixture.json", "--output", "result.json",
+                "--service-trace", "trace.jsonl", "--service-pid", "1",
+                "--service-build", "0" * 40, "--client-build", "0" * 40,
+                "--cases", "tap", "--", "never-start"]
+        with patch.object(sys, "argv", argv), patch.object(Path, "read_bytes", return_value=raw), \
+                patch.object(Path, "open") as trace, patch("benchmark_mcp.Peer") as peer:
+            with self.assertRaisesRegex(BenchError, "invalid_selected_cases"):
+                main()
+            trace.assert_not_called()
+            peer.assert_not_called()
+
+    def test_typing_fixture_requires_exact_append_and_guarded_single_backspace(self):
+        from benchmark_mcp import BUDGETS_MS
+        from xml.sax.saxutils import quoteattr
+
+        source = Path(__file__).parent / "benchmarks" / "notes-typing.json"
+        fixture = validate_plan(json.loads(source.read_text()))
+        self.assertEqual([case["name"] for case in fixture["cases"]], ["type"])
+        case = fixture["cases"][0]
+        body = "Alpha " + "".join(chr(0x4e00 + n) for n in range(480)) + "Z"
+        self.assertEqual(len(body.encode("utf-16-le")) // 2, 487)
+        self.assertEqual(BUDGETS_MS["type"], 2000)
+        steps = case["prepare"] + [case["measure"]] + case["cleanup"]
+        self.assertEqual([step["tool"] for step in steps],
+                         ["handkite_observe", "handkite_text", "handkite_observe",
+                          "handkite_key", "handkite_observe"])
+        self.assertEqual(case["measure"]["arguments"], {"value": "X", "selection": "current"})
+        self.assertEqual(case["cleanup"][1]["arguments"], {"key": "backspace", "selection": "current"})
+        for step, value in zip(steps, (body, body + "X", body + "X", body, body)):
+            self.assertNotIn("when", step)
+            self.assertEqual(step["expect"], {"app": "com.apple.mobilenotes", "lock": "unlocked",
+                                             "keyboard": True, "text": {"type": "TextView", "value": value}})
+        for value, accepted in ((body + "X", True), (body[:25] + "X" + body[25:], False)):
+            result = screen_result("<XCUIElementTypeApplication><XCUIElementTypeKeyboard/>"
+                                   "<XCUIElementTypeTextView value=" + quoteattr(value) + "/></XCUIElementTypeApplication>")
+            screen = parse_screen(result)
+            screen["metadata"]["state"]["foreground_app"] = "com.apple.mobilenotes"
+            self.assertEqual(matches(screen, case["cleanup"][0]["expect"]), accepted)
+
+
+class NotesScrollPlanTests(unittest.TestCase):
+    def test_plan_keeps_exact_bounded_text_and_avoids_settings(self):
+        from pathlib import Path
+
+        source = Path(__file__).parent / "benchmarks" / "notes-scroll.json"
+        fixture = validate_plan(json.loads(source.read_text()))
+        self.assertNotIn("com.apple.Preferences", source.read_text())
+        self.assertNotIn("fresh_launch", source.read_text())
+        body = "Alpha\n" + "".join(chr(0x4e00 + n) for n in range(480)) + "\n"
+        self.assertLess(len(body.encode("utf-16-le")) // 2, 512)
+        self.assertEqual(len(body.splitlines()), 2)
+        self.assertEqual(len(set(body[6:-1])), 480)
+        cases = {case["name"]: case for case in fixture["cases"]}
+        self.assertEqual(cases["swipe"]["measure"]["expect"], {
+            "app": "com.apple.mobilenotes", "lock": "unlocked", "keyboard": True,
+            "text": {"type": "TextView", "value": body},
+            "scroll": {"viewport": [393, 852], "roi": [15, 115, 360, 325], "direction": "up"},
+        })
+        self.assertEqual(cases["type"]["measure"]["expect"]["text"]["value"],
+                         "AlphaX\n" + body[6:])
+        self.assertEqual(cases["launch"]["prepare"][1]["arguments"],
+                         {"bundle_id": "com.apple.mobiletimer"})
+        gesture = cases["swipe"]["measure"]["arguments"]
+        self.assertEqual((gesture["from"]["y"], gesture["to"]["y"]), (420, 300))
+        for case in fixture["cases"]:
+            for step in case.get("cleanup", []):
+                text = step.get("expect", {}).get("text")
+                if text and "value" in text:
+                    self.assertIn(text["value"], (body, "AlphaX\n" + body[6:]))
+
+    def test_scroll_proof_is_opt_in_and_rejects_missing_or_stationary_images(self):
+        from scroll_image import MotionResult
+
+        result = screen_result()
+        self.assertNotIn("image_bytes", parse_screen(result))
+        before = parse_screen(result, retain_image=True)
+        after = parse_screen(result, retain_image=True)
+        expected = {"scroll": {"viewport": [393, 852], "roi": [15, 115, 360, 325],
+                               "direction": "up"}}
+        calls = []
+
+        def verify(left, right, **kwargs):
+            calls.append((left, right, kwargs))
+            return MotionResult(False, "insufficient_change")
+
+        with patch.dict(sys.modules, {"scroll_image": SimpleNamespace(verify_vertical_motion=verify)}):
+            self.assertFalse(matches(after, expected, before))
+        self.assertEqual(after["scroll_proof"]["reason"], "insufficient_change")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][2], {"viewport": (393, 852), "roi": (15, 115, 360, 325),
+                                     "direction": "up"})
+        with self.assertRaisesRegex(BenchError, "scroll_images_unavailable"):
+            matches(after, expected, parse_screen(result))
+
+    def test_invalid_scroll_region_is_rejected_by_plan_before_execution(self):
+        for region in ([0, 0, 500, 400], [0, 0, True, 40], [0, 0, 1, 40],
+                       [0, 0, 63, 90], [0, 0, 64, 89]):
+            fixture = plan()
+            fixture["cases"][2]["measure"]["expect"] = {"scroll": {
+                "viewport": [393, 852], "roi": region, "direction": "up"}}
+            with self.assertRaisesRegex(BenchError, "invalid_scroll_expectation"):
+                validate_plan(fixture)
+        fixture["cases"][2]["measure"]["expect"]["scroll"]["roi"] = [0, 0, 64, 90]
+        self.assertIs(validate_plan(fixture), fixture)
+
+
+class CleanupScrollTests(unittest.TestCase):
+    @staticmethod
+    def result(image, *, action=False, body="body", refused=False):
+        result = screen_result(f'<TextView type="TextView" value="{body}"/>')
+        result["content"][-1]["data"] = base64.b64encode(b"\x89PNG\r\n\x1a\n" + image).decode()
+        if action:
+            result["content"].insert(0, {"type": "text", "text": json.dumps({
+                "receipt": {"accepted": not refused}, "effect": "changed",
+                "after": {}})})
+        return result
+
+    @staticmethod
+    def step():
+        return {"tool": "handkite_swipe", "arguments": {"duration_ms": 500}, "expect": {
+            "app": "example.notes", "lock": "unlocked", "keyboard": False,
+            "text": {"type": "TextView", "value": "body"},
+            "scroll": {"viewport": [393, 852], "roi": [15, 115, 360, 325], "direction": "down"}}}
+
+    class Peer:
+        healthy = True
+        def __init__(self, results):
+            self.results = iter(results)
+            self.calls = []
+        def initialize(self):
+            pass
+        def tool(self, name, arguments):
+            call = {"id": len(self.calls), "operation": len(self.calls), "tool": name,
+                    "elapsed_ms": 10, "response_bytes": 1}
+            self.calls.append(call)
+            result = {} if name in ("handkite_acquire_control", "handkite_release_control") else next(self.results)
+            return result, call
+
+    def campaign(self, results, phase="cleanup"):
+        fixture = plan()
+        fixture["cases"][2]["cleanup"] = [self.step()]
+        peer = self.Peer(results)
+        campaign = Campaign(peer, fixture, 1, 0)
+        campaign.phase = phase
+        campaign.lease_started = time.monotonic()
+        campaign.screen = parse_screen(self.result(b"before"), retain_image=True)
+        return campaign, peer
+
+    def test_transition_then_later_valid_uses_original_baseline_once(self):
+        from scroll_image import MotionResult
+        campaign, peer = self.campaign([self.result(b"transition", action=True), self.result(b"later")])
+        with patch("scroll_image.verify_vertical_motion", return_value=MotionResult(True, "verified", 40)) as verify:
+            call = campaign.step(self.step())
+        self.assertEqual([c["tool"] for c in peer.calls], ["handkite_swipe", "handkite_observe"])
+        self.assertEqual(verify.call_count, 1)
+        self.assertEqual(verify.call_args.args, (b"\x89PNG\r\n\x1a\nbefore", b"\x89PNG\r\n\x1a\nlater"))
+        self.assertEqual(verify.call_args.kwargs, {"viewport": (393, 852), "roi": (15, 115, 360, 325), "direction": "down"})
+        self.assertIs(call, peer.calls[0])
+        self.assertEqual(call["elapsed_ms"], 10)
+        self.assertEqual(call["scroll_proof"]["shift_y"], 40)
+        self.assertIsNone(campaign._failed_scroll_images)
+
+    def test_later_noop_wrong_direction_and_body_drift_refuse_without_extra_reads(self):
+        from scroll_image import MotionResult
+        for reason, body in (("insufficient_change", "body"), ("no_coherent_translation", "body"),
+                             ("verified", "changed-body")):
+            with self.subTest(reason=reason, body=body):
+                campaign, peer = self.campaign([self.result(b"transition", action=True), self.result(b"later", body=body)])
+                with patch("scroll_image.verify_vertical_motion", return_value=MotionResult(reason == "verified", reason)):
+                    with self.assertRaisesRegex(BenchError, "effect_mismatch"):
+                        campaign.step(self.step())
+                self.assertEqual([c["tool"] for c in peer.calls], ["handkite_swipe", "handkite_observe"])
+                self.assertTrue(campaign._suppress_failure_observe)
+                if reason != "verified":
+                    self.assertEqual(campaign._failed_scroll_images,
+                                     (b"\x89PNG\r\n\x1a\nbefore", b"\x89PNG\r\n\x1a\nlater"))
+
+    def test_immediate_non_scroll_refusal_does_not_observe(self):
+        campaign, peer = self.campaign([self.result(b"transition", action=True, body="wrong")])
+        with patch("scroll_image.verify_vertical_motion") as verify:
+            with self.assertRaisesRegex(BenchError, "effect_mismatch"):
+                campaign.step(self.step())
+        verify.assert_not_called()
+        self.assertEqual([c["tool"] for c in peer.calls], ["handkite_swipe"])
+
+    def test_campaign_failure_does_not_add_recovery_observe_and_still_releases(self):
+        from scroll_image import MotionResult
+        for refused in (False, True):
+            with self.subTest(refused=refused):
+                fixture = plan()
+                fixture["cases"][5]["cleanup"] = [self.step()]
+                results = [self.result(b"initial"), self.result(b"before"),
+                           self.result(b"transition", action=True, refused=refused)]
+                if not refused:
+                    results.append(self.result(b"later"))
+                peer = self.Peer(results)
+                campaign = Campaign(peer, fixture, 1, 0, selected_cases=["observe_tree"])
+                with patch("scroll_image.verify_vertical_motion", return_value=MotionResult(False, "insufficient_change")) as verify:
+                    campaign.run()
+                names = [c["tool"] for c in peer.calls]
+                self.assertEqual(names.count("handkite_swipe"), 1)
+                self.assertEqual(names.count("handkite_observe"), 2 if refused else 3)
+                self.assertEqual(names[-1], "handkite_release_control")
+                self.assertEqual(campaign.failure, "action_unconfirmed" if refused else "effect_mismatch")
+                self.assertEqual(verify.call_count, 0 if refused else 1)
+
+    def test_measured_scroll_remains_immediate_without_extra_observation(self):
+        from scroll_image import MotionResult
+        campaign, peer = self.campaign([self.result(b"immediate", action=True)], phase="measure")
+        with patch("scroll_image.verify_vertical_motion", return_value=MotionResult(True, "verified")) as verify:
+            campaign.step(self.step())
+        self.assertEqual([c["tool"] for c in peer.calls], ["handkite_swipe"])
+        self.assertEqual(verify.call_args.args[-1], b"\x89PNG\r\n\x1a\nimmediate")
+
+    def test_failed_pair_writer_is_explicit_private_exclusive_and_hash_only(self):
+        from scroll_image import MotionResult
+        campaign, _ = self.campaign([self.result(b"transition", action=True), self.result(b"later")])
+        with patch("scroll_image.verify_vertical_motion", return_value=MotionResult(False, "no_coherent_translation")):
+            with self.assertRaises(BenchError):
+                campaign.step(self.step())
+        with tempfile.TemporaryDirectory() as directory:
+            prefix = Path(directory) / "proof"
+            self.assertEqual(list(Path(directory).iterdir()), [])
+            result = campaign.write_failed_scroll_images(prefix)
+            files = [Path(str(prefix) + suffix) for suffix in (".before.image", ".after.image")]
+            self.assertEqual(len(list(Path(directory).iterdir())), 2)
+            for path, data in zip(files, campaign._failed_scroll_images):
+                self.assertEqual(path.read_bytes(), data)
+                self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(result, dict(zip(("before_sha256", "after_sha256"),
+                (hashlib.sha256(data).hexdigest() for data in campaign._failed_scroll_images))))
+            self.assertNotIn(directory, json.dumps(result))
+            with self.assertRaisesRegex(BenchError, "failure_image_write_failed"):
+                campaign.write_failed_scroll_images(prefix)
+            self.assertEqual([path.read_bytes() for path in files], list(campaign._failed_scroll_images))
+            # Existing second output must survive and a newly-created first is rolled back.
+            files[0].unlink()
+            with self.assertRaisesRegex(BenchError, "failure_image_write_failed"):
+                campaign.write_failed_scroll_images(prefix)
+            self.assertFalse(files[0].exists())
+            self.assertTrue(files[1].exists())
+        with tempfile.TemporaryDirectory() as directory:
+            os.chmod(directory, 0o755)
+            with self.assertRaisesRegex(BenchError, "failure_image_write_failed"):
+                campaign.write_failed_scroll_images(Path(directory) / "proof")
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+
+class RegionSettleTests(unittest.TestCase):
+    REGION = {"viewport": [393, 852], "roi": [15, 115, 360, 325]}
+
+    def step(self):
+        return {"tool": "handkite_observe", "settle": 3,
+                "settle_region": copy.deepcopy(self.REGION),
+                "expect": {"app": "example.notes", "lock": "unlocked",
+                           "text": {"type": "TextView", "value": "body"}}}
+
+    def result(self, image, revision=1, body="body", app="example.notes"):
+        result = CleanupScrollTests.result(image, body=body)
+        payload = json.loads(result["content"][0]["text"])
+        payload["metadata"]["revision"] = revision
+        payload["metadata"]["state"]["foreground_app"] = app
+        result["content"][0]["text"] = json.dumps(payload)
+        return result
+
+    def campaign(self, results):
+        fixture = plan()
+        fixture["cases"][2]["cleanup"] = [self.step()]
+        peer = CleanupScrollTests.Peer(results)
+        campaign = Campaign(peer, validate_plan(fixture), 1, 0)
+        campaign.phase = "cleanup"
+        campaign.lease_started = time.monotonic()
+        return campaign, peer
+
+    def test_outside_region_drift_passes_and_keeps_latest_real_revision(self):
+        campaign, peer = self.campaign([self.result(b"first", 10), self.result(b"second", 11)])
+        with patch("scroll_image.exact_rgb_region_digest", return_value="same-exact-region") as digest:
+            call = campaign.step(self.step())
+        self.assertEqual([c["tool"] for c in peer.calls], ["handkite_observe"] * 2)
+        self.assertEqual(digest.call_count, 2)
+        self.assertEqual(digest.call_args.kwargs, {"viewport": (393, 852), "roi": (15, 115, 360, 325)})
+        self.assertEqual(campaign.screen["metadata"]["revision"], 11)
+        self.assertEqual(campaign.screen["image_bytes"], b"\x89PNG\r\n\x1a\nsecond")
+        self.assertEqual(call["settle_changed"], {"device": False, "state": False, "tree": False, "region": False})
+
+    def test_inside_region_drift_and_full_tree_or_state_drift_refuse(self):
+        for kind in ("region", "tree", "state"):
+            with self.subTest(kind=kind):
+                results = [self.result(str(i).encode(), body=str(i) if kind == "tree" else "body",
+                                       app=str(i) if kind == "state" else "example.notes") for i in range(3)]
+                campaign, peer = self.campaign(results)
+                with patch("scroll_image.exact_rgb_region_digest",
+                           side_effect=["a", "b", "c"] if kind == "region" else ["same"] * 3):
+                    with self.assertRaisesRegex(BenchError, "view_unsettled"):
+                        campaign.step(self.step())
+                self.assertEqual(len(peer.calls), 3)
+                self.assertTrue(peer.calls[-1]["settle_changed"][kind])
+
+    def test_exact_region_never_skips_body_expectation_or_decode_failure(self):
+        campaign, _ = self.campaign([self.result(b"a", body="wrong"), self.result(b"b", body="wrong")])
+        with patch("scroll_image.exact_rgb_region_digest", return_value="same"):
+            with self.assertRaisesRegex(BenchError, "effect_mismatch"):
+                campaign.step(self.step())
+        campaign, peer = self.campaign([self.result(b"a")])
+        with patch("scroll_image.exact_rgb_region_digest", side_effect=ValueError("private detail")):
+            with self.assertRaisesRegex(BenchError, "^settle_region_unavailable$"):
+                campaign.step(self.step())
+        self.assertEqual(len(peer.calls), 1)
+
+    def test_default_still_requires_whole_image_equality(self):
+        campaign, peer = self.campaign([self.result(str(i).encode()) for i in range(3)])
+        step = self.step()
+        del step["settle_region"]
+        with patch("scroll_image.exact_rgb_region_digest") as digest:
+            with self.assertRaisesRegex(BenchError, "view_unsettled"):
+                campaign.step(step)
+        digest.assert_not_called()
+        self.assertEqual(len(peer.calls), 3)
+        self.assertTrue(peer.calls[-1]["settle_changed"]["image"])
+
+    def test_region_only_allowed_on_non_measured_swipe_cleanup_observation(self):
+        for location in ("measure", "prepare", "input", "missing_settle"):
+            with self.subTest(location=location):
+                fixture = plan()
+                step = self.step()
+                if location == "measure":
+                    fixture["cases"][5]["measure"] = step
+                elif location == "prepare":
+                    fixture["cases"][2]["prepare"] = [step]
+                else:
+                    fixture["cases"][2]["cleanup"] = [step]
+                    if location == "input": step["tool"] = "handkite_swipe"
+                    else: del step["settle"]
+                with self.assertRaises(BenchError): validate_plan(fixture)
+        for region in ({"viewport": [393, 852], "roi": [0, 0, 500, 100]},
+                       dict(self.REGION, tolerance=1)):
+            fixture = plan()
+            step = self.step(); step["settle_region"] = region
+            fixture["cases"][2]["cleanup"] = [step]
+            with self.assertRaises(BenchError): validate_plan(fixture)
+
+    def test_notes_plan_has_only_two_opt_in_regions(self):
+        source = Path(__file__).parent / "benchmarks" / "notes-scroll.json"
+        fixture = validate_plan(json.loads(source.read_text()))
+        regions = [(case["name"], phase, step) for case in fixture["cases"]
+                   for phase in ("prepare", "cleanup") for step in case.get(phase, []) if "settle_region" in step]
+        self.assertEqual(len(regions), 2)
+        expected_regions = [self.REGION, {"viewport": [393, 852], "roi": [15, 180, 360, 260]}]
+        for (case, phase, step), region in zip(regions, expected_regions):
+            self.assertEqual((case, phase, step["tool"], step["settle_region"]),
+                             ("swipe", "cleanup", "handkite_observe", region))
+        swipe = fixture["cases"][2]
+        for step in [swipe["measure"], *swipe["cleanup"]]:
+            if "scroll" in step.get("expect", {}):
+                self.assertEqual(step["expect"]["scroll"]["roi"], self.REGION["roi"])
 
 
 if __name__ == "__main__":

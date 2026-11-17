@@ -149,6 +149,7 @@ impl ReceiptFailure {
                     RunnerError::LookupFailed => "runner_lookup_failed",
                     RunnerError::LookupTimedOut => "runner_lookup_timed_out",
                     RunnerError::PairingRequired => "runner_pairing_required",
+                    RunnerError::AuthorizationRequired => "runner_authorization_required",
                     RunnerError::EndpointBusy => "runner_endpoint_busy",
                     RunnerError::EndpointUnproven => "runner_endpoint_unproven",
                     RunnerError::EndpointCleanupUnproven => "runner_endpoint_cleanup_unproven",
@@ -2175,6 +2176,10 @@ mod tests {
             (RunnerError::LookupFailed, "runner_lookup_failed"),
             (RunnerError::LookupTimedOut, "runner_lookup_timed_out"),
             (RunnerError::PairingRequired, "runner_pairing_required"),
+            (
+                RunnerError::AuthorizationRequired,
+                "runner_authorization_required",
+            ),
             (RunnerError::EndpointBusy, "runner_endpoint_busy"),
             (RunnerError::EndpointUnproven, "runner_endpoint_unproven"),
             (

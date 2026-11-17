@@ -6,12 +6,14 @@ Its subprocess owns one MCP session; reports contain no arguments or UI content.
 """
 import argparse
 import base64
+from dataclasses import asdict
 import hashlib
 import json
 import math
 import os
 from pathlib import Path
 import queue
+import stat
 import subprocess
 import sys
 import threading
@@ -340,7 +342,7 @@ class Peer:
         self.process.stderr.close()
 
 
-def parse_screen(result):
+def parse_screen(result, retain_image=False):
     require(result.get("isError") is not True, "tool_error")
     payloads = [decode(item["text"]) for item in result.get("content", [])
                 if item.get("type") == "text" and isinstance(item.get("text"), str)]
@@ -381,8 +383,11 @@ def parse_screen(result):
         require(not image_only, "fabricated_image_tree")
         require(isinstance(tree, str) and 0 < len(tree) <= 2 * 1024 * 1024
                 and "<!DOCTYPE" not in tree and "<!ENTITY" not in tree, "invalid_tree")
-    return {"metadata": metadata, "tree": tree, "capture_kind": screen.get("capture_kind", "paired"),
-            "image_digest": hashlib.sha256(image).hexdigest()}
+    parsed = {"metadata": metadata, "tree": tree, "capture_kind": screen.get("capture_kind", "paired"),
+              "image_digest": hashlib.sha256(image).hexdigest()}
+    if retain_image:
+        parsed["image_bytes"] = image
+    return parsed
 
 
 def elements(screen, selector):
@@ -621,18 +626,19 @@ def write_report(path, report):
 def validate_plan(plan):
     require(isinstance(plan, dict) and plan.get("version") == 1, "invalid_plan")
     cases = plan.get("cases")
-    require(isinstance(cases, list) and all(isinstance(case, dict) for case in cases)
-            and [case.get("name") for case in cases] == list(CASES),
-            "invalid_case_matrix")
-    expected = ("handkite_tap", "handkite_text", "handkite_swipe", "handkite_launch_app",
-                "handkite_observe", "handkite_observe")
-    for case, tool in zip(cases, expected):
-        require(case.get("measure", {}).get("tool") == tool, "invalid_measured_tool")
+    require(isinstance(cases, list) and bool(cases)
+            and all(isinstance(case, dict) for case in cases), "invalid_case_matrix")
+    names = [case.get("name") for case in cases]
+    require(names == [name for name in CASES if name in names], "invalid_case_matrix")
+    expected = dict(zip(CASES, ("handkite_tap", "handkite_text", "handkite_swipe",
+                               "handkite_launch_app", "handkite_observe", "handkite_observe")))
+    for case in cases:
+        require(case.get("measure", {}).get("tool") == expected[case["name"]], "invalid_measured_tool")
         require(all(isinstance(case.get(key, []), list) and len(case.get(key, [])) <= 20
                     for key in ("prepare", "cleanup")), "invalid_step_count")
         for step in case.get("prepare", []) + [case["measure"]] + case.get("cleanup", []):
             require(isinstance(step, dict) and step.get("tool") in ALLOWED
-                    and set(step) <= {"tool", "arguments", "selector", "when", "expect", "settle", "fresh_launch"},
+                    and set(step) <= {"tool", "arguments", "selector", "when", "expect", "settle", "settle_region", "fresh_launch"},
                     "invalid_step")
             require(isinstance(step.get("arguments", {}), dict), "invalid_arguments")
             if "fresh_launch" in step:
@@ -646,15 +652,52 @@ def validate_plan(plan):
                 require(type(step["settle"]) is int and 3 <= step["settle"] <= 5
                         and step["tool"] == "handkite_observe" and not step.get("arguments")
                         and "selector" not in step and step is not case["measure"], "invalid_settle")
+            if "settle_region" in step:
+                require("settle" in step and case["name"] == "swipe"
+                        and any(step is candidate for candidate in case.get("cleanup", [])),
+                        "invalid_settle_region")
+                settle_region(step["settle_region"])
             for key in ("expect", "when"):
                 expectations = step.get(key, {})
                 require(isinstance(expectations, dict)
                         and set(expectations) <= {"app", "app_not", "lock", "keyboard",
-                                                  "text", "row_moved", "tree_changed"},
+                                                  "text", "row_moved", "tree_changed", "scroll"},
                         "invalid_expectation")
+                if "scroll" in expectations:
+                    scroll_expectation(expectations["scroll"])
         image_only = case["measure"].get("arguments", {}).get("tree_format") == "omit"
         require(image_only == (case["name"] == "observe_image"), "invalid_observation_matrix")
     return plan
+
+
+def select_cases(plan, selected=None):
+    available = [case["name"] for case in plan["cases"]]
+    selected = available if selected is None else selected
+    require(bool(selected) and len(set(selected)) == len(selected)
+            and set(selected) <= set(CASES) and set(selected) <= set(available),
+            "invalid_selected_cases")
+    return selected
+
+
+def scroll_expectation(value):
+    require(isinstance(value, dict) and set(value) == {"viewport", "roi", "direction"},
+            "invalid_scroll_expectation")
+    viewport, roi = value["viewport"], value["roi"]
+    require(isinstance(viewport, list) and len(viewport) == 2
+            and all(type(n) is int and 1 <= n <= 4096 for n in viewport)
+            and isinstance(roi, list) and len(roi) == 4
+            and all(type(n) is int and n >= 0 for n in roi)
+            and roi[2] >= 64 and roi[3] >= 90
+            and roi[0] + roi[2] <= viewport[0] and roi[1] + roi[3] <= viewport[1]
+            and value["direction"] in ("up", "down"), "invalid_scroll_expectation")
+    return tuple(viewport), tuple(roi), value["direction"]
+
+
+def settle_region(value):
+    require(isinstance(value, dict) and set(value) == {"viewport", "roi"},
+            "invalid_settle_region")
+    viewport, roi, _ = scroll_expectation(dict(value, direction="up"))
+    return viewport, roi
 
 
 def matches(screen, expected, previous=None):
@@ -694,7 +737,20 @@ def matches(screen, expected, previous=None):
             require(type(value) is bool, "invalid_tree_change_expectation")
             if previous is None or (screen["tree"] != previous["tree"]) != value:
                 return False
-        require(key in {"app", "app_not", "lock", "keyboard", "text", "row_moved", "tree_changed"},
+        if key == "scroll":
+            viewport, roi, direction = scroll_expectation(value)
+            require(previous is not None and isinstance(previous.get("image_bytes"), bytes)
+                    and isinstance(screen.get("image_bytes"), bytes), "scroll_images_unavailable")
+            try:
+                from scroll_image import verify_vertical_motion
+                motion = verify_vertical_motion(previous["image_bytes"], screen["image_bytes"],
+                                                viewport=viewport, roi=roi, direction=direction)
+            except (ImportError, ValueError):
+                raise BenchError("scroll_verification_unavailable") from None
+            screen["scroll_proof"] = asdict(motion)
+            if not motion.verified:
+                return False
+        require(key in {"app", "app_not", "lock", "keyboard", "text", "row_moved", "tree_changed", "scroll"},
                 "unknown_expectation")
     return True
 
@@ -708,6 +764,8 @@ class Campaign:
         self.lease_started = None
         self.samples = []
         self.failure = None
+        self._failed_scroll_images = None
+        self._suppress_failure_observe = False
         self.failure_kind = None
         self.failure_context = None
         self.phase, self.case, self.step_index = "initialize", None, None
@@ -715,9 +773,84 @@ class Campaign:
         self.settings_reset = settings_reset
         require(capture_mode in ("paired", "image_only"), "invalid_capture_mode")
         self.capture_mode = capture_mode
-        self.selected_cases = list(CASES) if selected_cases is None else selected_cases
-        require(bool(self.selected_cases) and len(set(self.selected_cases)) == len(self.selected_cases)
-                and set(self.selected_cases) <= set(CASES), "invalid_selected_cases")
+        self.selected_cases = select_cases(plan, selected_cases)
+        self.retain_images = any("settle_region" in step or "scroll" in step.get("expect", {})
+                                 for case in plan.get("cases", [])
+                                 for step in case.get("prepare", []) + [case["measure"]] + case.get("cleanup", []))
+
+    def write_failed_scroll_images(self, output_prefix):
+        """Explicit private evidence export; no image bytes or paths enter reports."""
+        require(self._failed_scroll_images is not None, "no_failed_scroll_images")
+        prefix = Path(output_prefix)
+        require(prefix.name not in ("", ".", ".."), "invalid_failure_image_prefix")
+        directory = None
+        created = []
+        try:
+            directory = os.open(prefix.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            metadata = os.fstat(directory)
+            require(stat.S_ISDIR(metadata.st_mode) and metadata.st_uid == os.getuid()
+                    and metadata.st_mode & 0o077 == 0, "failure_image_directory_not_private")
+            names = [prefix.name + suffix for suffix in (".before.image", ".after.image")]
+            for name, data in zip(names, self._failed_scroll_images):
+                fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             0o600, dir_fd=directory)
+                created.append(name)
+                with os.fdopen(fd, "wb") as output:
+                    output.write(data)
+            return dict(zip(("before_sha256", "after_sha256"),
+                            (hashlib.sha256(data).hexdigest() for data in self._failed_scroll_images)))
+        except (OSError, BenchError):
+            if directory is not None:
+                for name in created:
+                    try:
+                        os.unlink(name, dir_fd=directory)
+                    except OSError:
+                        pass
+            raise BenchError("failure_image_write_failed") from None
+        finally:
+            if directory is not None:
+                os.close(directory)
+
+    def _expect(self, expected, previous, call):
+        failed = [key for key, value in expected.items()
+                  if not matches(self.screen, {key: value}, previous)]
+        if "scroll_proof" in self.screen:
+            call["scroll_proof"] = self.screen["scroll_proof"]
+        if "scroll" in failed and self._failed_scroll_images is None:
+            images = (previous.get("image_bytes"), self.screen.get("image_bytes"))
+            if all(isinstance(data, bytes) and 0 < len(data) <= MAX_FRAME
+                   and data.startswith((b"\x89PNG\r\n\x1a\n", b"\xff\xd8")) for data in images):
+                self._failed_scroll_images = images
+        if failed:
+            call["failed_expectations"] = failed
+            state = self.screen["metadata"]["state"]
+            lock = state.get("lock")
+            app = state.get("foreground_app")
+            previous_app = previous["metadata"]["state"].get("foreground_app") if previous else None
+            call["failed_state"] = {
+                "lock": lock if lock in ("locked", "unlocked", "uncertain") else "unknown",
+                "same_app_as_previous": app == previous_app if app and previous_app else None,
+            }
+            raise BenchError("effect_mismatch")
+
+    def _cleanup_scroll(self, step):
+        # The later frame is unconditional after ACK, not a retry after failed
+        # motion proof. Compare it to the original pre-action image.
+        previous = self.screen
+        immediate = dict(step, expect={key: value for key, value in step["expect"].items()
+                                     if key != "scroll"})
+        try:
+            call = self.step(immediate)
+            require(call is not None, "missing_cleanup_action")
+            later = self.step({"tool": "handkite_observe"})
+            self._expect(step["expect"], previous, later)
+            call["scroll_proof"] = self.screen["scroll_proof"]
+            return call
+        except BenchError:
+            # No second observation after failed proof, and no observation at
+            # all after refused input. Normal release/close remain unchanged.
+            self._suppress_failure_observe = True
+            raise
 
     def renew(self):
         if self.lease_started is not None:
@@ -733,6 +866,9 @@ class Campaign:
     def step(self, step, image_only=False):
         if not matches(self.screen, step.get("when")):
             return None
+        if (self.phase == "cleanup" and step.get("tool") == "handkite_swipe"
+                and "scroll" in step.get("expect", {})):
+            return self._cleanup_scroll(step)
         if step.get("fresh_launch"):
             require(step["fresh_launch"] is True and self.phase == "prepare"
                     and step.get("tool") == "handkite_launch_app"
@@ -750,14 +886,24 @@ class Campaign:
             require(confirmed is True, "settings_reset_unconfirmed")
             self.step({"tool": "handkite_observe"})
         if "settle" in step:
+            region = settle_region(step["settle_region"]) if "settle_region" in step else None
             previous = None
             for _ in range(step["settle"]):
                 call = self.step({"tool": "handkite_observe"})
+                image_digest = self.screen["image_digest"]
+                if region is not None:
+                    try:
+                        from scroll_image import exact_rgb_region_digest
+                        image_digest = exact_rgb_region_digest(
+                            self.screen.get("image_bytes"), viewport=region[0], roi=region[1])
+                    except (ImportError, ValueError):
+                        raise BenchError("settle_region_unavailable") from None
                 current = (self.screen["metadata"]["device"], self.screen["metadata"]["state"],
-                           self.screen["tree"], self.screen["image_digest"])
+                           self.screen["tree"], image_digest)
                 if previous is not None:
                     call["settle_changed"] = {key: left != right for key, left, right in
-                                              zip(("device", "state", "tree", "image"), previous, current)}
+                                              zip(("device", "state", "tree", "region" if region else "image"),
+                                                  previous, current)}
                 if current == previous:
                     require(matches(self.screen, step.get("expect")), "effect_mismatch")
                     return call
@@ -821,7 +967,7 @@ class Campaign:
         if tool in ACTIONS:
             require(call["action_result"] == {"accepted": True, "effect": "changed", "observed": True},
                     "action_unconfirmed")
-        self.screen = parse_screen(result)
+        self.screen = parse_screen(result, retain_image=self.retain_images)
         require((self.screen["capture_kind"] == "image_only") == image_only, "wrong_capture_mode")
         if image_only and tool in ACTIONS:
             require(previous is not None and self.screen["image_digest"] != previous["image_digest"],
@@ -829,16 +975,13 @@ class Campaign:
         if self.device is None:
             self.device = self.screen["metadata"]["device"]
         require(self.screen["metadata"]["device"] == self.device, "device_changed")
-        failed = [key for key, value in ({} if image_only else step.get("expect", {})).items()
-                  if not matches(self.screen, {key: value}, previous)]
-        if failed:
-            call["failed_expectations"] = failed
-            raise BenchError("effect_mismatch")
+        self._expect({} if image_only else step.get("expect", {}), previous, call)
         return call
 
     def run(self):
         sample = None
         trial_call_start = 0
+        fixture_observed = False
         try:
             self.peer.initialize()
             self.renew()
@@ -855,6 +998,7 @@ class Campaign:
                     continue
                 self.case = case["name"]
                 for ordinal in range(self.warmups + self.count):
+                    fixture_observed = False
                     sample = {"case": case["name"], "ordinal": ordinal - self.warmups + 1,
                               "warmup": ordinal < self.warmups, "outcome": "not_started"}
                     self.samples.append(sample)
@@ -878,9 +1022,15 @@ class Campaign:
                             # This read qualifies the fixture outside the image-only request.
                             self.phase = "fixture_verification"
                             started = time.monotonic()
-                            self.step({"tool": "handkite_observe"})
+                            verification_call = self.step({"tool": "handkite_observe"})
+                            fixture_observed = verification_call is not None
+                            try:
+                                self._expect(case["measure"].get("expect") or {}, previous,
+                                             verification_call)
+                            finally:
+                                if "scroll_proof" in self.screen:
+                                    sample["scroll_proof"] = self.screen["scroll_proof"]
                             sample["fixture_verification_ms"] = (time.monotonic() - started) * 1000
-                            require(matches(self.screen, case["measure"].get("expect"), previous), "effect_mismatch")
                         sample["measurement_passed"] = True
                     except BenchError as error:
                         sample["outcome"] = str(error)
@@ -895,8 +1045,12 @@ class Campaign:
                         self.step(step)
                     sample["cleanup_ms"] = (time.monotonic() - cleanup_start) * 1000
                     sample["outcome"] = "pass"
-                    print(json.dumps({key: sample[key] for key in
-                                      ("case", "ordinal", "warmup", "outcome", "elapsed_ms")}), flush=True)
+                    self.phase, self.step_index = "progress", None
+                    try:
+                        print(json.dumps({key: sample[key] for key in
+                                          ("case", "ordinal", "warmup", "outcome", "elapsed_ms")}), flush=True)
+                    except BrokenPipeError:
+                        raise BenchError("progress_output_closed") from None
         except BenchError as error:
             self.failure = str(error)
             call = self.peer.calls[-1] if len(self.peer.calls) > trial_call_start else None
@@ -904,14 +1058,20 @@ class Campaign:
             infrastructure = (self.failure == "AdapterNativeBefore" and call is not None
                               and call.get("tool") in ACTIONS
                               and call.get("error_code") == self.failure)
-            self.failure_kind = "infrastructure_stop" if infrastructure else "input_or_unknown_failure"
-            if sample is not None:
+            fixture = (self.phase == "fixture_verification" and self.failure == "effect_mismatch"
+                       and fixture_observed)
+            reporting = self.phase == "progress" and self.failure == "progress_output_closed"
+            self.failure_kind = ("reporting_failure" if reporting else
+                                 "infrastructure_stop" if infrastructure else
+                                 "fixture_failure" if fixture else "input_or_unknown_failure")
+            if sample is not None and not reporting:
                 sample.update(outcome=self.failure, failure_kind=self.failure_kind, failed_phase=self.phase)
             self.failure_context = {"phase": self.phase, "case": self.case,
                                     "step_index": self.step_index,
                                     "call": dict(self.peer.calls[-1]) if self.peer.calls else None}
             # A fresh read can diagnose a failed action; never repeat its input.
-            if self.failure in {"action_unconfirmed", "effect_mismatch", "tool_error"}:
+            if (not self._suppress_failure_observe
+                    and self.failure in {"action_unconfirmed", "effect_mismatch", "tool_error"}):
                 try:
                     self.step({"tool": "handkite_observe"})
                 except BenchError:
@@ -997,6 +1157,8 @@ def main():
     run = commands.add_parser("run")
     run.add_argument("--plan", type=Path, required=True)
     run.add_argument("--output", type=Path, required=True)
+    run.add_argument("--failure-images-prefix", type=Path,
+                     help="export a failed scroll pair into an existing private directory")
     run.add_argument("--service-trace", type=Path, required=True)
     run.add_argument("--service-pid", type=int, required=True)
     run.add_argument("--service-build", required=True)
@@ -1007,7 +1169,7 @@ def main():
     run.add_argument("--capture", choices=("paired", "image_only"), default="paired",
                      help="image_only measures opt-in image results, then separately times full fixture verification")
     run.add_argument("--cases", nargs="+", choices=CASES,
-                     help="run selected cohorts only; a partial report cannot pass the full gate")
+                     help="run selected plan cases; omitted means all available plan cases")
     run.add_argument("command", nargs=argparse.REMAINDER)
     diff = commands.add_parser("compare")
     diff.add_argument("before", type=Path)
@@ -1058,6 +1220,7 @@ def main():
         require(len(pin) in (40, 64) and all(c in "0123456789abcdef" for c in pin), "invalid_build_pin")
     plan_bytes = args.plan.read_bytes()
     plan = validate_plan(decode(plan_bytes))
+    selected = select_cases(plan, args.cases)
     require(not args.output.exists(), "output_already_exists")
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
     with args.service_trace.open("rb") as trace:
@@ -1082,7 +1245,7 @@ def main():
                     return
                 time.sleep(.025)
             raise BenchError("timing_not_enabled")
-        campaign = Campaign(peer, plan, args.count, args.warmups, preflight, args.cases, args.capture)
+        campaign = Campaign(peer, plan, args.count, args.warmups, preflight, selected, args.capture)
         try:
             campaign.run()
         finally:
@@ -1124,8 +1287,15 @@ def main():
         compact = {name: {key: value[key] for key in ("attempts", "passed", "completed",
                                                    "infrastructure_stops", "input_failures", "failures", "client_ms")}
                    for name, value in report["summary"].items()}
-        print(json.dumps({"complete": campaign.failure is None, "qualified": report["qualified"],
-                          "summary": compact}), flush=True)
+        result = {"complete": campaign.failure is None, "qualified": report["qualified"],
+                  "summary": compact}
+        if args.failure_images_prefix is not None and campaign._failed_scroll_images is not None:
+            try:
+                result["failure_image_hashes"] = campaign.write_failed_scroll_images(args.failure_images_prefix)
+            except BenchError as error:
+                result["failure_image_error"] = str(error)
+        if campaign.failure != "progress_output_closed":
+            print(json.dumps(result), flush=True)
         return int(campaign.failure is not None)
 
 

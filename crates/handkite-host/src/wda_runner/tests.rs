@@ -31,6 +31,170 @@ fn deadline() -> Instant {
 }
 
 #[tokio::test(start_paused = true)]
+async fn authorization_wait_survives_sixty_seconds_without_claiming_readiness() {
+    let dropped = Arc::new(AtomicUsize::new(0));
+    let probes = AtomicUsize::new(0);
+    let started = Instant::now();
+    let runner = OwnedWdaRunner::start_task(
+        |mut listener| {
+            let dropped = dropped.clone();
+            async move {
+                let _guard = OnDrop(dropped);
+                listener
+                    .log_debug_message("entering wait loop for enabling automation mode")
+                    .await
+                    .unwrap();
+                sleep(Duration::from_secs(90)).await;
+                listener
+                    .log_debug_message("cleaning up enabling automation mode")
+                    .await
+                    .unwrap();
+                listener.did_begin_executing_test_plan().await.unwrap();
+                pending().await
+            }
+        },
+        || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            async { ready() }
+        },
+        deadline(),
+    )
+    .await
+    .expect("owner authorization within the bounded window must reach readiness");
+    assert_eq!(Instant::now() - started, Duration::from_secs(90));
+    assert_eq!(runner.ready_deadline, started + Duration::from_secs(180));
+    assert_eq!(probes.load(Ordering::SeqCst), 1);
+    runner
+        .abort_and_join_with(|| async { Ok(()) })
+        .await
+        .unwrap();
+    assert_eq!(dropped.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_authorization_notices_do_not_renew_the_window() {
+    let started = Instant::now();
+    let probes = AtomicUsize::new(0);
+    let result = OwnedWdaRunner::start_task(
+        |mut listener| async move {
+            for delay in [0, 100] {
+                sleep(Duration::from_secs(delay)).await;
+                listener
+                    .log_debug_message("entering wait loop for enabling automation mode")
+                    .await
+                    .unwrap();
+            }
+            pending().await
+        },
+        || {
+            probes.fetch_add(1, Ordering::SeqCst);
+            async { ready() }
+        },
+        deadline(),
+    )
+    .await;
+    assert_eq!(result.err(), Some(RunnerError::AuthorizationRequired));
+    assert_eq!(Instant::now() - started, Duration::from_secs(180));
+    assert_eq!(probes.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn first_authorization_notice_cannot_rescue_expired_or_running_startup() {
+    for (phase, delay) in [
+        (PlanPhase::Starting, 30),
+        (PlanPhase::Starting, 31),
+        (PlanPhase::Running, 0),
+        (PlanPhase::Finished, 0),
+    ] {
+        let initial_deadline = Instant::now() + Duration::from_secs(30);
+        let (sender, receiver) = watch::channel(PlanState {
+            phase,
+            ..PlanState::starting()
+        });
+        let mut listener = PlanListener {
+            phase: sender,
+            initial_deadline,
+        };
+        sleep(Duration::from_secs(delay)).await;
+        listener
+            .log_debug_message("entering wait loop for enabling automation mode")
+            .await
+            .unwrap();
+        let state = *receiver.borrow();
+        assert!(state.authorization_deadline.is_none());
+        assert!(!state.automation_waiting);
+        assert_eq!(
+            effective_startup_deadline(state, initial_deadline),
+            initial_deadline
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn explicit_errors_still_end_an_authorization_wait_immediately() {
+    for pairing in [false, true] {
+        let started = Instant::now();
+        let result = OwnedWdaRunner::start_task(
+            |mut listener| async move {
+                listener
+                    .log_debug_message("entering wait loop for enabling automation mode")
+                    .await
+                    .unwrap();
+                sleep(Duration::from_secs(70)).await;
+                listener
+                    .initialization_for_ui_testing_did_fail(if pairing {
+                        "InvalidHostID"
+                    } else {
+                        "Error Domain=com.apple.LocalAuthentication Code=-2"
+                    })
+                    .await
+                    .unwrap();
+                pending().await
+            },
+            || async { panic!("failed authorization cannot probe readiness") },
+            deadline(),
+        )
+        .await;
+        assert_eq!(
+            result.err(),
+            Some(if pairing {
+                RunnerError::PairingRequired
+            } else {
+                RunnerError::AutomationInitializationFailed
+            })
+        );
+        assert_eq!(Instant::now() - started, Duration::from_secs(70));
+    }
+}
+
+#[test]
+fn authorization_timeout_is_a_runner_argument_without_changing_environment_or_filters() {
+    let config = TestConfig {
+        runner_bundle_id: "com.example.Runner.xctrunner".into(),
+        runner_app_path: "/fixture/Runner.app".into(),
+        runner_app_container: "/fixture/container".into(),
+        runner_bundle_executable: "Runner-Runner".into(),
+        target_bundle_id: None,
+        target_app_path: None,
+        target_app_env: None,
+        target_app_args: None,
+        tests_to_run: Some(vec!["ExistingTest".into()]),
+        tests_to_skip: None,
+        runner_env: None,
+        runner_args: Some(vec!["existing-argument".into()]),
+    };
+    let updated = authorization_runner_config(config);
+    assert_eq!(
+        updated.runner_args.unwrap(),
+        ["existing-argument", "-XCUIApplicationStateTimeout", "180",]
+    );
+    assert_eq!(updated.tests_to_run.unwrap(), ["ExistingTest"]);
+    assert!(updated.runner_env.is_none());
+    assert!(updated.target_app_env.is_none());
+    assert!(updated.target_app_args.is_none());
+}
+
+#[tokio::test(start_paused = true)]
 async fn explicit_pairing_requests_stop_before_readiness_or_timeout() {
     for mode in 0..3 {
         let dropped = Arc::new(AtomicUsize::new(0));
@@ -104,7 +268,11 @@ fn pairing_transport_errors_keep_other_failures_distinct() {
     ] {
         assert_eq!(
             initialization_failure(message, true),
-            RunnerError::AutomationInitializationFailed,
+            if message == "Timed out while enabling automation mode" {
+                RunnerError::AuthorizationRequired
+            } else {
+                RunnerError::AutomationInitializationFailed
+            },
         );
     }
     assert!(!pairing_required("Trust This Computer dialog dismissed"));
@@ -305,7 +473,8 @@ async fn automation_wait_is_bounded_and_done_does_not_establish_plan() {
     for done in [false, true] {
         let dropped = Arc::new(AtomicUsize::new(0));
         let probes = AtomicUsize::new(0);
-        let expires = deadline();
+        let started = Instant::now();
+        let expires = started + AUTHORIZATION_WINDOW;
         let result = OwnedWdaRunner::start_task(
             |mut listener| {
                 let dropped = dropped.clone();
@@ -328,7 +497,7 @@ async fn automation_wait_is_bounded_and_done_does_not_establish_plan() {
                 probes.fetch_add(1, Ordering::SeqCst);
                 async { ready() }
             },
-            expires,
+            deadline(),
         )
         .await;
         assert_eq!(
@@ -336,7 +505,7 @@ async fn automation_wait_is_bounded_and_done_does_not_establish_plan() {
             Some(if done {
                 RunnerError::PlanStartUnproven
             } else {
-                RunnerError::AutomationWaitTimedOut
+                RunnerError::AuthorizationRequired
             })
         );
         assert_eq!(Instant::now(), expires);
@@ -476,7 +645,11 @@ async fn automation_initialization_failures_are_distinct_from_wait_timeouts() {
         .await;
         assert_eq!(
             result.err(),
-            Some(RunnerError::AutomationInitializationFailed)
+            Some(if mode == 1 {
+                RunnerError::AuthorizationRequired
+            } else {
+                RunnerError::AutomationInitializationFailed
+            })
         );
         assert_eq!(probes.load(Ordering::SeqCst), 0);
     }

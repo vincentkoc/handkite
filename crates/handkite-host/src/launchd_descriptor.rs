@@ -31,7 +31,7 @@ pub fn render(layout: &ServiceLayout) -> Result<String, &'static str> {
     <string>--owned-wda</string>
   </array>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
@@ -125,7 +125,7 @@ mod tests {
                     "/fixture/account/Library/Application Support/Handkite/releases/current/handkited",
                     "--owned-wda"
                 ],
-                "ProcessType": "Background",
+                "ProcessType": "Interactive",
                 "RunAtLoad": true,
                 "KeepAlive": true,
                 "ExitTimeOut": 180,
