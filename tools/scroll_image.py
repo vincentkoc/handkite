@@ -132,7 +132,8 @@ def _grid(bitmap, viewport, roi):
     sx, sy = bitmap.width / vw, bitmap.height / vh
     if abs(sx - sy) > max(sx, sy) * 0.02:
         raise ValueError("aspect_ratio")
-    rows, cols = min(1600, math.ceil(height)), 64
+    # Keep raster-row precision: a 3x image can move by a third of a point.
+    rows, cols = min(1600, math.ceil(height * sy)), 64
     return [bytes(bitmap.gray(min(bitmap.width - 1, int((x + (c + .5) * width / cols) * sx)),
                               min(bitmap.height - 1, int((y + (r + .5) * height / rows) * sy)))
                   for c in range(cols)) for r in range(rows)]

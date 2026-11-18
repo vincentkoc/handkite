@@ -65,6 +65,31 @@ class MotionTests(unittest.TestCase):
         self.assertTrue(result.verified, result)
         self.assertEqual(result.shift_y, -80)
 
+    def test_native_pixel_translation_at_three_times_scale(self):
+        before = content(width=192, height=975)
+        for shift, direction in ((304, 'down'), (-304, 'up')):
+            with self.subTest(shift=shift):
+                images = [_bmp(bmp(rows))
+                          for rows in (before, translated(before, shift))]
+                grids = [_grid(image, (64, 325), (0, 0, 64, 325))
+                         for image in images]
+                result = _analyze(*grids, 325, direction)
+                self.assertTrue(result.verified, result)
+                self.assertAlmostEqual(result.shift_y, shift / 3)
+
+    def test_scaled_raster_keeps_negative_motion_checks(self):
+        before = content(width=192, height=975)
+        rng = random.Random(19)
+        unrelated = [bytes(rng.randrange(256) for _ in row) for row in before]
+        cases = [(translated(before, 304), 'up'),
+                 (unrelated, 'down'), (translated(before, 42), 'down'),
+                 (translated(before, 603), 'down')]
+        old = _grid(_bmp(bmp(before)), (64, 325), (0, 0, 64, 325))
+        for after, direction in cases:
+            with self.subTest(direction=direction, changed=after is unrelated):
+                new = _grid(_bmp(bmp(after)), (64, 325), (0, 0, 64, 325))
+                self.assertFalse(_analyze(old, new, 325, direction).verified)
+
     def test_identical_and_caret_blink_fail(self):
         before = content()
         caret = [bytearray(row) for row in before]
