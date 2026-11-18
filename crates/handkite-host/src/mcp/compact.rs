@@ -9,6 +9,9 @@ const MAX_DEPTH: usize = 32;
 const MAX_VALUE: usize = 64 * 1024;
 const ATTRIBUTES: &[&str] = &[
     "type",
+    "source",
+    "input_source",
+    "target_id",
     "name",
     "label",
     "value",

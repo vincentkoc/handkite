@@ -312,7 +312,7 @@ fn catalog_exposes_only_optional_compact_on_observe() {
         .unwrap()["inputSchema"];
     assert_eq!(
         schema["properties"]["tree_format"]["enum"],
-        json!(["full", "compact", "outline", "omit"])
+        json!(["full", "compact", "elements", "outline", "omit"])
     );
     assert_eq!(schema["additionalProperties"], false);
     assert!(schema.get("required").is_none());
@@ -553,7 +553,7 @@ fn action_delta_uses_its_post_action_capture_and_preserves_the_receipt() {
             .unwrap()
             .replacen("Example", "Changed", 2)
     );
-    let receipt = json!({"accepted":true,"action_kind":"launch_app"});
+    let receipt = json!({"accepted":true,"action_kind":"tap"});
     let token = "0123456789abcdef0123456789abcdef";
     let mut replies = [before, json!({"type":"acquired","lease":token}),
         json!({"type":"acted","receipt":receipt,"after":after,"native_lock":null,"effect":"changed"})].into_iter();
@@ -567,7 +567,7 @@ fn action_delta_uses_its_post_action_capture_and_preserves_the_receipt() {
     process(
         &request(json!({"tree_format":"outline","image":"changed"})),
         &device,
-        Capabilities::ObservationAndNavigation,
+        Capabilities::ObservationNavigationInteraction,
         &mut session,
         &mut exchange,
     )
@@ -577,18 +577,18 @@ fn action_delta_uses_its_post_action_capture_and_preserves_the_receipt() {
     process(
         &acquire,
         &device,
-        Capabilities::ObservationAndNavigation,
+        Capabilities::ObservationNavigationInteraction,
         &mut session,
         &mut exchange,
     )
     .unwrap();
-    let mut action = request(json!({"expected_revision":3,
+    let mut action = request(json!({"expected_revision":3,"at":{"x":10,"y":20},
         "response":{"tree_format":"outline","image":"changed","since_revision":3}}));
-    action["params"]["name"] = json!("handkite_launch_clock");
+    action["params"]["name"] = json!("handkite_tap");
     let result = process(
         &action,
         &device,
-        Capabilities::ObservationAndNavigation,
+        Capabilities::ObservationNavigationInteraction,
         &mut session,
         &mut exchange,
     )
@@ -610,4 +610,68 @@ fn action_delta_uses_its_post_action_capture_and_preserves_the_receipt() {
     assert_eq!(calls[2]["request"]["expected_revision"], 3);
     assert!(calls[2]["request"].get("response").is_none());
     assert!(!result.to_string().contains(token));
+}
+
+#[test]
+fn visible_elements_are_structured_without_raw_xml_or_a_required_image() {
+    let tree = "<AppiumAUT><XCUIElementTypeButton visible='true' enabled='true' label='Continue' x='1' y='2' width='30' height='40'/></AppiumAUT>";
+    let reply = call(
+        &request(json!({"tree_format":"elements","image":"omit"})),
+        &captured(tree, "png"),
+    );
+    let value = payload(&reply);
+    assert_eq!(reply["result"]["structuredContent"], value);
+    assert_eq!(value["elements"][0]["role"], "Button");
+    assert_eq!(value["elements"][0]["label"], "Continue");
+    assert!(value.get("accessibility_tree").is_none());
+    assert_eq!(reply["result"]["content"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn element_action_returns_effect_and_delta_in_one_text_payload() {
+    let mut session = Session::default();
+    let options: presentation::Options =
+        serde_json::from_value(json!({"tree_format":"elements","image":"omit"})).unwrap();
+    let tree = "<AppiumAUT><XCUIElementTypeTextField visible='true' enabled='true' label='Editor' value='A' x='1' y='2' width='30' height='40'/></AppiumAUT>";
+    let mut capture: Value = serde_json::from_slice(&captured(tree, "png")).unwrap();
+    session.presentation.content(
+        serde_json::from_value(capture["observation"].clone()).unwrap(),
+        options,
+    );
+    session.acquire(&mut |_| {
+        Ok(serde_json::to_vec(
+            &json!({"type":"acquired","lease":"0123456789abcdef0123456789abcdef"}),
+        )
+        .unwrap())
+    });
+    capture["observation"]["revision"] = json!(4);
+    capture["observation"]["accessibility_tree"] = json!(tree.replace("value='A'", "value='AB'"));
+    let mut count = 0;
+    let reply = session.act(
+        &DeviceKey::new("phone").unwrap(),
+        Revision(3),
+        Action::TextCurrent { value: "B".into() },
+        true,
+        serde_json::from_value(json!({"tree_format":"elements","image":"omit","since_revision":3}))
+            .unwrap(),
+        &mut |_| {
+            count += 1;
+            Ok(serde_json::to_vec(
+                &json!({"type":"acted","receipt":{"accepted":true,"action_kind":"text"},
+            "after":capture["observation"],"native_lock":null,"effect":"changed"}),
+            )
+            .unwrap())
+        },
+    );
+    assert_eq!(count, 1);
+    let value: Value = serde_json::from_str(reply["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(reply["content"].as_array().unwrap().len(), 1);
+    assert_eq!(value, reply["structuredContent"]);
+    assert_eq!(value["effect"], "changed");
+    assert_eq!(value["observation"]["metadata"]["revision"], 4);
+    assert_eq!(
+        value["observation"]["elements_delta"]["changed"][0]["value"],
+        "AB"
+    );
+    assert!(!reply.to_string().contains("accessibility_tree"));
 }

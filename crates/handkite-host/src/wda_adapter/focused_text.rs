@@ -2,7 +2,7 @@ use super::*;
 use crate::wda_ui_admission::Attributes;
 use serde_json::{Value, json};
 
-const ATTRIBUTES: &str = "type,enabled,displayed,rect,label,attribute/name,attribute/value,attribute/placeholderValue,attribute/focused";
+pub(super) const ATTRIBUTES: &str = "type,enabled,displayed,rect,label,attribute/name,attribute/value,attribute/placeholderValue,attribute/focused";
 const MARKERS: [&str; 4] = [
     "proud-lock",
     "passcode-view",
@@ -11,17 +11,17 @@ const MARKERS: [&str; 4] = [
 ];
 
 pub(super) struct Input {
-    token: u64,
-    key: cache::Key,
-    field: String,
-    before: String,
-    text: String,
-    app: String,
-    until: Instant,
-    sent: bool,
+    pub(super) token: u64,
+    pub(super) key: cache::Key,
+    pub(super) field: String,
+    pub(super) before: String,
+    pub(super) text: String,
+    pub(super) app: String,
+    pub(super) until: Instant,
+    pub(super) sent: bool,
 }
 
-async fn value(
+pub(super) async fn value(
     wda: &impl WdaRequest,
     session: &str,
     method: &str,
@@ -45,7 +45,7 @@ async fn value(
         .ok_or(AdapterError)
 }
 
-fn id(item: &Value) -> Result<String, AdapterError> {
+pub(super) fn id(item: &Value) -> Result<String, AdapterError> {
     let read = |key| match item.get(key) {
         None => Ok(None),
         Some(value) => value
@@ -78,18 +78,7 @@ async fn context(
     session: &str,
 ) -> Result<Result<(Value, Instant, u64), AdapterError>, AdapterError> {
     let _format = crate::timing::Span::new("text_context_transaction");
-    let path = format!("/session/{session}/appium/settings");
-    let original = settings_pair(&value(wda, session, "GET", &path, b"").await?)?;
-    if settings_pair(&value(wda, session, "GET", &path, b"").await?)? != original {
-        return Err(AdapterError);
-    }
-    let target = json!({"shouldUseCompactResponses":false,"elementResponseAttributes":ATTRIBUTES});
-    let set = serde_json::to_vec(&json!({"settings":target})).map_err(|_| AdapterError)?;
-    let result = async {
-        value(wda, session, "POST", &path, &set).await?;
-        if settings_pair(&value(wda, session, "GET", &path, b"").await?)? != target {
-            return Err(AdapterError);
-        }
+    rich_context(wda, session, ATTRIBUTES, async {
         let types = [
             "Alert",
             "Sheet",
@@ -108,36 +97,74 @@ async fn context(
                 terms.push(format!("{attr} CONTAINS '{marker}'"));
             }
         }
-        let query =
-            serde_json::to_vec(&json!({"using":"predicate string", "value":terms.join(" OR ")}))
-                .map_err(|_| AdapterError)?;
-        let _query = crate::timing::Span::new("text_context_query");
+        let predicate = terms.join(" OR ");
         let items = value(
             wda,
             session,
             "POST",
             &format!("/session/{session}/elements"),
-            &query,
+            &serde_json::to_vec(&json!({"using":"predicate string", "value":predicate}))
+                .map_err(|_| AdapterError)?,
         )
         .await?;
         Ok((items, Instant::now(), unix_ms()?))
+    })
+    .await
+}
+
+/// Restoration is outside the cancellable work window. Callers must await this
+/// whole transaction; an unknown restoration poisons all subsequent input.
+pub(super) async fn rich_context<T>(
+    wda: &impl WdaRequest,
+    session: &str,
+    attributes: &str,
+    work: impl Future<Output = Result<T, AdapterError>>,
+) -> Result<Result<T, AdapterError>, AdapterError> {
+    let path = format!("/session/{session}/appium/settings");
+    let original = settings_pair(&value(wda, session, "GET", &path, b"").await?)?;
+    if settings_pair(&value(wda, session, "GET", &path, b"").await?)? != original {
+        return Err(AdapterError);
     }
-    .await;
-    // One restoration attempt after every attempted set, including an unknown ACK.
-    let current = settings_pair(&value(wda, session, "GET", &path, b"").await?)?;
-    if current != original {
-        if current != target {
+    let target = json!({"shouldUseCompactResponses":false,"elementResponseAttributes":attributes});
+    let result = tokio::time::timeout(Duration::from_secs(45), async {
+        value(
+            wda,
+            session,
+            "POST",
+            &path,
+            &serde_json::to_vec(&json!({"settings":target})).map_err(|_| AdapterError)?,
+        )
+        .await?;
+        if settings_pair(&value(wda, session, "GET", &path, b"").await?)? != target {
             return Err(AdapterError);
         }
-        let restore =
-            serde_json::to_vec(&json!({"settings":original})).map_err(|_| AdapterError)?;
-        let receipt = value(wda, session, "POST", &path, &restore).await;
-        let readback = settings_pair(&value(wda, session, "GET", &path, b"").await?)?;
-        if readback != original {
+        work.await
+    })
+    .await
+    .unwrap_or(Err(AdapterError));
+    let restored = tokio::time::timeout(Duration::from_secs(15), async {
+        let current = settings_pair(&value(wda, session, "GET", &path, b"").await?)?;
+        if current != original {
+            if current != target {
+                return Err(AdapterError);
+            }
+            value(
+                wda,
+                session,
+                "POST",
+                &path,
+                &serde_json::to_vec(&json!({"settings":original})).map_err(|_| AdapterError)?,
+            )
+            .await?;
+        }
+        if settings_pair(&value(wda, session, "GET", &path, b"").await?)? != original {
             return Err(AdapterError);
         }
-        receipt?;
-    }
+        Ok(())
+    })
+    .await
+    .map_err(|_| AdapterError)?;
+    restored?;
     Ok(result)
 }
 
@@ -165,9 +192,12 @@ fn field_from_context(
     let screen = rect(&snapshot.screen).ok_or(AdapterError)?;
     let items = items
         .as_array()
-        .filter(|items| !items.is_empty() && items.len() <= 64)
+        .filter(|items| {
+            !items.is_empty() && items.len() <= 64 && items.len() == snapshot.context.len()
+        })
         .ok_or(AdapterError)?;
     let mut ids = std::collections::BTreeSet::new();
+    let mut matched = std::collections::BTreeSet::new();
     let mut field = None;
     let mut keyboards = 0;
     let mut emoji_search_seen = false;
@@ -184,29 +214,23 @@ fn field_from_context(
         if !matches!(kind, "TextField" | "TextView" | "SearchField" | "Keyboard") {
             return Err(AdapterError);
         }
-        let mut attrs = Attributes::new();
-        attrs.insert("type".into(), format!("XCUIElementType{kind}"));
-        for (source, dest) in [
-            ("label", "label"),
-            ("attribute/name", "name"),
-            ("attribute/value", "value"),
-            ("attribute/placeholderValue", "placeholderValue"),
-        ] {
-            let content = item.get(source).ok_or(AdapterError)?;
-            if content.is_null() {
-                continue;
-            }
-            let content = content.as_str().ok_or(AdapterError)?;
-            if MARKERS.iter().any(|marker| content.contains(marker)) {
-                return Err(AdapterError);
-            }
-            attrs.insert(dest.into(), content.into());
-        }
+        let attrs = context_attributes(item)?;
         let displayed = item["displayed"].as_bool().ok_or(AdapterError)?;
         let enabled = item["enabled"].as_bool().ok_or(AdapterError)?;
         // This attribute is false on iOS even for /element/active. The active
         // endpoint's identity is checked immediately before input instead.
         let focused = item["attribute/focused"].as_bool().ok_or(AdapterError)?;
+        let mut matches = snapshot.context.iter().enumerate().filter(|(_, expected)| {
+            context_matches(item, &attrs, expected)
+                && expected.get("visible").map(String::as_str)
+                    == Some(if displayed { "true" } else { "false" })
+                && expected.get("enabled").map(String::as_str)
+                    == Some(if enabled { "true" } else { "false" })
+        });
+        let (index, expected) = matches.next().ok_or(AdapterError)?;
+        if matches.next().is_some() || !matched.insert(index) {
+            return Err(AdapterError);
+        }
         if !displayed || !enabled {
             continue;
         }
@@ -248,6 +272,9 @@ fn field_from_context(
             emoji_search_seen = true;
             continue;
         }
+        if expected != baseline {
+            continue;
+        }
         if field.is_some() || rect(baseline) != Some(bounds) {
             return Err(AdapterError);
         }
@@ -273,6 +300,62 @@ fn field_from_context(
     field.ok_or(AdapterError)
 }
 
+fn context_attributes(item: &Value) -> Result<Attributes, AdapterError> {
+    let kind = item["type"].as_str().ok_or(AdapterError)?;
+    let kind = kind.strip_prefix("XCUIElementType").unwrap_or(kind);
+    if !matches!(kind, "TextField" | "TextView" | "SearchField" | "Keyboard") {
+        return Err(AdapterError);
+    }
+    let mut attrs = Attributes::new();
+    attrs.insert("type".into(), format!("XCUIElementType{kind}"));
+    for (source, dest) in [
+        ("label", "label"),
+        ("attribute/name", "name"),
+        ("attribute/value", "value"),
+        ("attribute/placeholderValue", "placeholderValue"),
+    ] {
+        let content = item.get(source).ok_or(AdapterError)?;
+        if content.is_null() {
+            continue;
+        }
+        let content = content.as_str().ok_or(AdapterError)?;
+        if MARKERS.iter().any(|marker| content.contains(marker)) {
+            return Err(AdapterError);
+        }
+        attrs.insert(dest.into(), content.into());
+    }
+    Ok(attrs)
+}
+
+fn active_field_from_context(
+    items: &Value,
+    xml: &str,
+    active: &str,
+) -> Result<(String, String), AdapterError> {
+    let (_, fields) = crate::wda_ui_admission::text_context(xml).ok_or(AdapterError)?;
+    let rows = items.as_array().ok_or(AdapterError)?;
+    let mut native = rows.iter().filter(|row| id(row).as_deref() == Ok(active));
+    let item = native.next().ok_or(AdapterError)?;
+    if native.next().is_some() {
+        return Err(AdapterError);
+    }
+    let attrs = context_attributes(item)?;
+    let mut candidates = fields
+        .iter()
+        .filter(|field| context_matches(item, &attrs, field));
+    let selected = candidates.next().ok_or(AdapterError)?;
+    if candidates.next().is_some() {
+        return Err(AdapterError);
+    }
+    let snapshot =
+        crate::wda_ui_admission::selected_text_snapshot(xml, selected).ok_or(AdapterError)?;
+    let recipient = field_from_context(items, &snapshot)?;
+    if recipient.0 != active {
+        return Err(AdapterError);
+    }
+    Ok(recipient)
+}
+
 fn context_matches(item: &Value, attrs: &Attributes, expected: &Attributes) -> bool {
     let bounds_match = ["x", "y", "width", "height"].iter().all(|key| {
         item["rect"][*key].as_f64().is_some_and(|actual| {
@@ -293,7 +376,7 @@ fn context_matches(item: &Value, attrs: &Attributes, expected: &Attributes) -> b
         }
 }
 
-async fn active(wda: &impl WdaRequest, session: &str) -> Result<String, AdapterError> {
+pub(super) async fn active(wda: &impl WdaRequest, session: &str) -> Result<String, AdapterError> {
     id(&value(
         wda,
         session,
@@ -304,7 +387,11 @@ async fn active(wda: &impl WdaRequest, session: &str) -> Result<String, AdapterE
     .await?)
 }
 
-async fn app_matches(wda: &impl WdaRequest, session: &str, app: &str) -> Result<(), AdapterError> {
+pub(super) async fn app_matches(
+    wda: &impl WdaRequest,
+    session: &str,
+    app: &str,
+) -> Result<(), AdapterError> {
     let app_path = format!("/session/{session}/wda/activeAppInfo");
     let lock_path = format!("/session/{session}/wda/locked");
     let (foreground, locked) = tokio::join!(
@@ -321,11 +408,17 @@ async fn context_in_app(
     wda: &impl WdaRequest,
     session: &str,
     app: &str,
-) -> Result<Result<(Value, Instant, u64), AdapterError>, AdapterError> {
-    let (app, query) = tokio::join!(app_matches(wda, session, app), context(wda, session));
+) -> Result<Result<(Value, String, Instant, u64), AdapterError>, AdapterError> {
+    let (app, query, active) = tokio::join!(
+        app_matches(wda, session, app),
+        context(wda, session),
+        active(wda, session)
+    );
     // Restoration errors must still poison the adapter, including on app mismatch.
     let query = query?;
-    Ok(app.and(query))
+    Ok(app
+        .and(query)
+        .and_then(|(items, at, unix_ms)| Ok((items, active?, at, unix_ms))))
 }
 
 async fn dispatch_to_focused(
@@ -357,11 +450,9 @@ impl WdaAdapter {
         if text.is_empty() {
             return Ok(None);
         }
-        let Some(snapshot) =
-            crate::wda_ui_admission::current_text_snapshot(&baseline.accessibility_tree)
-        else {
+        if crate::wda_ui_admission::text_context(&baseline.accessibility_tree).is_none() {
             return Ok(None);
-        };
+        }
         let Some(key) = self.cache_key() else {
             return Ok(None);
         };
@@ -395,14 +486,15 @@ impl WdaAdapter {
         if self.cache_key().as_ref() != Some(&key) {
             return Err(AdapterError);
         }
-        let (items, captured_at, finished_unix_ms) = match query {
+        let (items, active, captured_at, finished_unix_ms) = match query {
             Ok(query) => query,
             Err(_) => return Ok(None),
         };
-        let (field, before) = match field_from_context(&items, &snapshot) {
-            Ok(field) => field,
-            Err(_) => return Ok(None),
-        };
+        let (field, before) =
+            match active_field_from_context(&items, &baseline.accessibility_tree, &active) {
+                Ok(field) => field,
+                Err(_) => return Ok(None),
+            };
         self.text_token = self.text_token.checked_add(1).ok_or(AdapterError)?;
         let until = captured_at + TEXT_INPUT_AGE;
         self.focused_text = Some(Input {
@@ -694,6 +786,100 @@ mod tests {
         field_from_context(items, &snapshot)
     }
 
+    fn multiple_fields() -> (String, Value) {
+        let mut extra = String::new();
+        let mut data = items();
+        for index in 0..5 {
+            let y = 410 + index * 15;
+            extra.push_str(&format!(
+                r#"<XCUIElementTypeTextField name="field-{index}" visible="true" enabled="true" focused="false" x="10" y="{y}" width="200" height="12"/>"#
+            ));
+            let mut field = element("TextField", &format!("field-{index}"));
+            field["attribute/name"] = json!(format!("field-{index}"));
+            field["rect"] = json!({"x":10,"y":y,"width":200,"height":12});
+            data.as_array_mut().unwrap().push(field);
+        }
+        (
+            XML.replace(
+                "</XCUIElementTypeApplication>",
+                &format!("{extra}</XCUIElementTypeApplication>"),
+            ),
+            data,
+        )
+    }
+
+    #[test]
+    fn native_active_identity_selects_one_of_six_complete_public_fields() {
+        let (xml, data) = multiple_fields();
+        assert!(crate::wda_ui_admission::current_text_snapshot(&xml).is_none());
+        assert_eq!(
+            active_field_from_context(&data, &xml, "editor").unwrap(),
+            ("editor".into(), "Alpha\n".into())
+        );
+        assert_eq!(
+            active_field_from_context(&data, &xml, "field-3").unwrap(),
+            ("field-3".into(), String::new())
+        );
+        for active in ["missing", "keyboard"] {
+            assert!(active_field_from_context(&data, &xml, active).is_err());
+        }
+        assert!(active_field_from_context(&emoji_items(), EMOJI_XML, "emoji-search").is_err());
+    }
+
+    #[test]
+    fn multiple_fields_require_exact_complete_native_context() {
+        let (xml, data) = multiple_fields();
+        let mut missing = data.clone();
+        missing.as_array_mut().unwrap().pop();
+        let mut duplicate = data.clone();
+        duplicate.as_array_mut().unwrap().push(data[2].clone());
+        for invalid in [missing, duplicate] {
+            assert!(active_field_from_context(&invalid, &xml, "editor").is_err());
+        }
+        for (key, value) in [
+            ("attribute/name", json!("other")),
+            ("attribute/value", json!("changed")),
+            ("attribute/focused", Value::Null),
+            ("displayed", json!(false)),
+            ("enabled", json!(false)),
+            ("type", json!("XCUIElementTypeSecureTextField")),
+            ("label", json!("Enter Passcode")),
+            ("ELEMENT", json!("editor")),
+            ("rect", json!({"x":10,"y":411,"width":200,"height":12})),
+        ] {
+            let mut changed = data.clone();
+            changed[2][key] = value;
+            assert!(
+                active_field_from_context(&changed, &xml, "editor").is_err(),
+                "{key}"
+            );
+        }
+        let extra_xml = xml.replace(
+            "</XCUIElementTypeApplication>",
+            r#"<XCUIElementTypeTextField name="extra" visible="false" enabled="false" x="0" y="0" width="1" height="1"/></XCUIElementTypeApplication>"#,
+        );
+        assert!(active_field_from_context(&data, &extra_xml, "editor").is_err());
+    }
+
+    #[test]
+    fn native_active_identity_never_admits_hidden_or_disabled_stale_fields() {
+        let (xml, data) = multiple_fields();
+        for (xml_key, native_key) in [("visible", "displayed"), ("enabled", "enabled")] {
+            let xml = xml.replacen(
+                &format!(r#"{xml_key}="true""#),
+                &format!(r#"{xml_key}="false""#),
+                1,
+            );
+            let mut data = data.clone();
+            data[0][native_key] = json!(false);
+            assert!(active_field_from_context(&data, &xml, "editor").is_err());
+            assert!(active_field_from_context(&data, &xml, "field-3").is_ok());
+        }
+        let mut hidden_native = data;
+        hidden_native[0]["displayed"] = json!(false);
+        assert!(active_field_from_context(&hidden_native, &xml, "editor").is_err());
+    }
+
     #[test]
     fn explicit_null_value_matches_a_guarded_empty_public_editor() {
         for kind in ["TextView", "TextField", "SearchField"] {
@@ -793,8 +979,10 @@ mod tests {
         ] {
             for marker in MARKERS {
                 let mut data = items();
-                data[1][key] = json!(marker);
-                assert!(classify(&data).is_err());
+                for surrounded in [format!("prefix{marker}"), format!("{marker}suffix")] {
+                    data[1][key] = json!(surrounded);
+                    assert!(classify(&data).is_err());
+                }
             }
         }
         for (key, value) in [
@@ -970,7 +1158,14 @@ mod tests {
                 let query: Value = serde_json::from_slice(body).unwrap();
                 assert_eq!(query["using"], "predicate string");
                 for marker in MARKERS {
-                    assert!(query["value"].as_str().unwrap().contains(marker));
+                    for attr in ["name", "label", "value", "placeholderValue"] {
+                        assert!(
+                            query["value"]
+                                .as_str()
+                                .unwrap()
+                                .contains(&format!("{attr} CONTAINS '{marker}'"))
+                        );
+                    }
                 }
                 if self.mode == 1 {
                     status = 500;
@@ -1030,6 +1225,8 @@ mod tests {
                 json!({"bundleId": if self.app_matches { "example.editor" } else { "example.other" }})
             } else if path.ends_with("/wda/locked") {
                 json!(false)
+            } else if path.ends_with("/element/active") {
+                json!({"ELEMENT":"editor"})
             } else {
                 self.context_started.notify_one();
                 return self.settings.request(method, path, body, timeout).await;
@@ -1140,5 +1337,71 @@ mod tests {
                 accepted
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod restoration_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    struct Fake {
+        settings: RefCell<Value>,
+        fail_restore: bool,
+        writes: Cell<u8>,
+    }
+    impl WdaRequest for Fake {
+        async fn request(
+            &self,
+            method: &str,
+            _path: &str,
+            body: &[u8],
+            _: Duration,
+        ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+            if method == "POST" {
+                let next: Value = serde_json::from_slice(body).unwrap();
+                self.writes.set(self.writes.get() + 1);
+                if !(self.fail_restore && self.writes.get() > 1) {
+                    *self.settings.borrow_mut() = next["settings"].clone();
+                }
+            }
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(
+                    &json!({"sessionId":"session","value":self.settings.borrow().clone()}),
+                )
+                .unwrap(),
+            })
+        }
+    }
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_work_restores_settings_outside_capture_deadline() {
+        let original = json!({"shouldUseCompactResponses":true,"elementResponseAttributes":"type"});
+        let fake = Fake {
+            settings: RefCell::new(original.clone()),
+            fail_restore: false,
+            writes: Cell::new(0),
+        };
+        let result = rich_context(&fake, "session", ATTRIBUTES, async {
+            std::future::pending::<Result<(), AdapterError>>().await
+        })
+        .await;
+        assert!(result.unwrap().is_err());
+        assert_eq!(*fake.settings.borrow(), original);
+        assert_eq!(fake.writes.get(), 2);
+    }
+    #[tokio::test]
+    async fn restoration_failure_is_distinct_from_work_refusal() {
+        let fake = Fake {
+            settings: RefCell::new(
+                json!({"shouldUseCompactResponses":true,"elementResponseAttributes":"type"}),
+            ),
+            fail_restore: true,
+            writes: Cell::new(0),
+        };
+        assert!(
+            rich_context(&fake, "session", ATTRIBUTES, async { Ok(()) })
+                .await
+                .is_err()
+        );
     }
 }

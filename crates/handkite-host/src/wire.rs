@@ -10,8 +10,28 @@ use std::time::Duration;
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    ObserveNavigation {
+        device: DeviceKey,
+    },
+    Navigate {
+        owner: String,
+        lease: LeaseId,
+        request: ActionRequest,
+    },
     Status {
         device: DeviceKey,
+    },
+    ObserveTargets {
+        device: DeviceKey,
+        #[serde(default)]
+        since_revision: Option<Revision>,
+    },
+    ActElement {
+        owner: String,
+        lease: LeaseId,
+        device: DeviceKey,
+        expected_revision: Revision,
+        action: handkite_core::controller::ElementAction,
     },
     Observe {
         device: DeviceKey,
@@ -22,6 +42,8 @@ pub enum Request {
     Acquire {
         owner: String,
         ttl_ms: u64,
+        #[serde(default)]
+        renew_on_success: bool,
     },
     Release {
         owner: String,
@@ -39,8 +61,31 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
+    ObservedNavigation {
+        observation: WireObservation,
+    },
+    Navigated {
+        receipt: TransportReceipt,
+        effect: ObservedEffect,
+        after: Option<WireObservation>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        effect_updates: Vec<handkite_core::controller::TargetEffect>,
+    },
     Status {
         status: WireStatus,
+    },
+    ElementActed {
+        receipt: TransportReceipt,
+        effect: ObservedEffect,
+        next: Option<WireObservation>,
+        targets: Vec<handkite_core::controller::ElementTarget>,
+        after_image: Option<WireImageObservation>,
+        #[serde(default)]
+        effect_updates: Vec<handkite_core::controller::TargetEffect>,
+    },
+    ObservedTargets {
+        observation: WireObservation,
+        targets: Vec<handkite_core::controller::ElementTarget>,
     },
     Observed {
         observation: WireObservation,
@@ -59,6 +104,8 @@ pub enum Reply {
         after_image: Option<WireImageObservation>,
         native_lock: Option<LockState>,
         effect: ObservedEffect,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        effect_updates: Vec<handkite_core::controller::TargetEffect>,
     },
     Error {
         code: String,
@@ -96,6 +143,8 @@ pub struct WireObservation {
     pub accessibility_tree: String,
     pub screenshot_format: ImageFormat,
     pub screenshot_base64: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_updates: Vec<handkite_core::controller::TargetEffect>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -104,6 +153,8 @@ pub struct WireImageObservation {
     pub window: ObservationWindow,
     pub screenshot_format: ImageFormat,
     pub screenshot_base64: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub effect_updates: Vec<handkite_core::controller::TargetEffect>,
 }
 
 impl From<ImageObservation> for WireImageObservation {
@@ -115,6 +166,7 @@ impl From<ImageObservation> for WireImageObservation {
             screenshot_format: value.screenshot.format,
             screenshot_base64: base64::engine::general_purpose::STANDARD
                 .encode(value.screenshot.bytes),
+            effect_updates: Vec::new(),
         }
     }
 }
@@ -131,6 +183,23 @@ impl From<Observation> for WireObservation {
             screenshot_format: value.screenshot.format,
             screenshot_base64: base64::engine::general_purpose::STANDARD
                 .encode(value.screenshot.bytes),
+            effect_updates: Vec::new(),
+        }
+    }
+}
+
+impl From<handkite_core::controller::NavigationObservation> for WireObservation {
+    fn from(value: handkite_core::controller::NavigationObservation) -> Self {
+        Self {
+            device: value.device,
+            revision: value.revision,
+            window: value.window,
+            state: value.state,
+            accessibility_tree: String::new(),
+            screenshot_format: value.screenshot.format,
+            screenshot_base64: base64::engine::general_purpose::STANDARD
+                .encode(value.screenshot.bytes),
+            effect_updates: Vec::new(),
         }
     }
 }
@@ -146,13 +215,70 @@ fn valid_owner(owner: &str) -> bool {
 pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) -> Reply {
     let _timing = crate::timing::Span::new("controller_dispatch");
     let result = match request {
-        Request::Status { device } => {
+        Request::ObserveNavigation { device } => {
             controller
-                .observe(&device)
-                .map(|observation| Reply::Status {
-                    status: observation.into(),
+                .observe_navigation(&device)
+                .map(|observation| Reply::ObservedNavigation {
+                    observation: observation.into(),
                 })
         }
+        Request::Navigate {
+            owner,
+            lease,
+            request,
+        } if valid_owner(&owner) => {
+            controller
+                .navigate(&owner, lease, request)
+                .map(|result| Reply::Navigated {
+                    effect_updates: Vec::new(),
+                    receipt: result.receipt,
+                    effect: result.effect,
+                    after: result.after.map(Into::into),
+                })
+        }
+        Request::Status { device } => {
+            controller
+                .observe_navigation(&device)
+                .map(|observation| Reply::Status {
+                    status: WireStatus {
+                        device: observation.device,
+                        revision: observation.revision,
+                        window: observation.window,
+                        state: observation.state,
+                    },
+                })
+        }
+        Request::ObserveTargets {
+            device,
+            since_revision,
+        } => controller
+            .observe_targets_since(&device, since_revision)
+            .map(|result| Reply::ObservedTargets {
+                observation: result.observation.into(),
+                targets: result.targets,
+            }),
+        Request::ActElement {
+            owner,
+            lease,
+            device,
+            expected_revision,
+            action,
+        } if valid_owner(&owner) => controller
+            .act_element(&owner, lease, &device, expected_revision, action)
+            .map(|outcome| {
+                let (next, targets) = outcome
+                    .next
+                    .map(|next| (Some(next.observation.into()), next.targets))
+                    .unwrap_or_default();
+                Reply::ElementActed {
+                    receipt: outcome.result.receipt,
+                    effect: outcome.result.effect,
+                    next,
+                    targets,
+                    after_image: outcome.result.after_image.map(Into::into),
+                    effect_updates: Vec::new(),
+                }
+            }),
         Request::Observe { device } => {
             controller
                 .observe(&device)
@@ -167,8 +293,12 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
                     observation: observation.into(),
                 })
         }
-        Request::Acquire { owner, ttl_ms } if valid_owner(&owner) => controller
-            .acquire(owner, Duration::from_millis(ttl_ms))
+        Request::Acquire {
+            owner,
+            ttl_ms,
+            renew_on_success,
+        } if valid_owner(&owner) => controller
+            .acquire_with_renewal(owner, Duration::from_millis(ttl_ms), renew_on_success)
             .map(|lease| Reply::Acquired { lease }),
         Request::Release { owner, lease } if valid_owner(&owner) => {
             controller.release(&owner, lease).map(|()| Reply::Released)
@@ -181,6 +311,7 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
         } if valid_owner(&owner) => controller
             .act_with_capture(&owner, lease, request, capture)
             .map(|result| Reply::Acted {
+                effect_updates: Vec::new(),
                 receipt: result.receipt,
                 after: result.after.map(Into::into),
                 after_image: result.after_image.map(Into::into),
@@ -193,7 +324,19 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
             };
         }
     };
-    result.unwrap_or_else(error_reply)
+    let mut reply = result.unwrap_or_else(error_reply);
+    let updates = controller.target_effect_updates();
+    match &mut reply {
+        Reply::ElementActed { effect_updates, .. }
+        | Reply::Acted { effect_updates, .. }
+        | Reply::Navigated { effect_updates, .. } => *effect_updates = updates,
+        Reply::ObservedTargets { observation, .. }
+        | Reply::Observed { observation }
+        | Reply::ObservedNavigation { observation } => observation.effect_updates = updates,
+        Reply::ObservedImage { observation } => observation.effect_updates = updates,
+        _ => {}
+    }
+    reply
 }
 
 fn error_reply(error: ControllerError) -> Reply {
@@ -318,6 +461,7 @@ mod tests {
             ),
         ] {
             let reply = Reply::Acted {
+                effect_updates: Vec::new(),
                 receipt: TransportReceipt {
                     accepted,
                     action_kind: if native_lock.is_some() {

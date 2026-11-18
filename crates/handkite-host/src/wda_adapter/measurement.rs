@@ -8,6 +8,12 @@ use std::time::Instant;
 #[serde(rename_all = "snake_case")]
 pub(super) enum Stage {
     OwnershipBefore,
+    ScreenshotBeforeRequest,
+    ScreenshotBeforeJson,
+    AppBeforeRequest,
+    AppBeforeJson,
+    LockBeforeRequest,
+    LockBeforeJson,
     ScreenshotRequest,
     SourceRequest,
     AppRequest,
@@ -17,6 +23,7 @@ pub(super) enum Stage {
     AppJson,
     LockJson,
     ImageDecode,
+    CaptureCoherence,
     PayloadValidation,
     OwnershipAfter,
     CaptureTotal,
@@ -159,6 +166,124 @@ mod tests {
         calls: RefCell<Vec<String>>,
     }
 
+    struct ChangingScreen {
+        screenshots: Cell<usize>,
+        apps: Cell<usize>,
+        locks: Cell<usize>,
+        change: u8,
+    }
+
+    impl ChangingScreen {
+        fn new(change: u8) -> Self {
+            Self {
+                screenshots: Cell::new(0),
+                apps: Cell::new(0),
+                locks: Cell::new(0),
+                change,
+            }
+        }
+    }
+
+    impl WdaRequest for ChangingScreen {
+        async fn request(
+            &self,
+            _: &str,
+            path: &str,
+            _: &[u8],
+            _: Duration,
+        ) -> Result<HttpResponse, WdaError> {
+            if self.change == 4 {
+                tokio::time::sleep(Duration::from_secs(8)).await;
+            }
+            let value = match path {
+                "/screenshot" => {
+                    let call = self.screenshots.get();
+                    self.screenshots.set(call + 1);
+                    let drifts = matches!(self.change, 1 | 5..=10);
+                    if (self.change == 9 && call == 0) || (self.change == 10 && call > 0) {
+                        return Ok(HttpResponse {
+                            status: 200,
+                            body: br#"{"value":"not-a-png"}"#.to_vec(),
+                        });
+                    }
+                    let pixels: &[u8] = if call == 0 || !drifts {
+                        b"\x89PNG\r\n\x1a\nfirst-picker"
+                    } else {
+                        b"\x89PNG\r\n\x1a\nsecond-picker"
+                    };
+                    json!(base64::engine::general_purpose::STANDARD.encode(pixels))
+                }
+                SCREEN_SOURCE if self.change == 8 => json!(""),
+                SCREEN_SOURCE => json!("<Application><Cell label=\"first-picker\"/></Application>"),
+                "/wda/activeAppInfo" => {
+                    let call = self.apps.get();
+                    self.apps.set(call + 1);
+                    json!({"bundleId": if matches!(self.change, 2 | 5) && call > 0 { "other.app" } else { "fixture.app" }})
+                }
+                "/wda/locked" => {
+                    let call = self.locks.get();
+                    self.locks.set(call + 1);
+                    if self.change == 7 {
+                        json!(null)
+                    } else {
+                        json!(matches!(self.change, 3 | 6) && call > 0)
+                    }
+                }
+                _ => panic!("unexpected request"),
+            };
+            Ok(HttpResponse {
+                status: 200,
+                body: serde_json::to_vec(&json!({"value":value})).unwrap(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn changing_picker_cannot_publish_a_paired_observation() {
+        for change in (1..=3).chain(5..=10) {
+            let reads = ChangingScreen::new(change);
+            let result = WdaAdapter::capture_using(
+                &reads,
+                &HardwareId::new("fixture-device").unwrap(),
+                SCREEN_SOURCE,
+                17,
+                &Instant::now,
+                &|| Ok(21),
+                None,
+            )
+            .await;
+            assert_eq!(
+                result.err(),
+                Some(if change == 1 {
+                    super::super::CaptureFailure::ImageDrift
+                } else {
+                    super::super::CaptureFailure::Adapter
+                }),
+                "only valid image drift, without app/lock/schema errors, is recoverable: {change}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn coherence_reads_share_one_total_capture_deadline() {
+        let start = tokio::time::Instant::now();
+        let reads = ChangingScreen::new(4);
+        assert!(
+            WdaAdapter::capture_using(
+                &reads,
+                &HardwareId::new("fixture-device").unwrap(),
+                SCREEN_SOURCE,
+                17,
+                &Instant::now,
+                &|| Ok(21),
+                None,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(20));
+    }
+
     impl WdaRequest for Reads {
         async fn request(
             &self,
@@ -254,20 +379,29 @@ mod tests {
                 }
                 let mut calls = reads.calls.into_inner();
                 calls.sort();
-                let mut expected = vec![
-                    "/screenshot",
-                    SCREEN_SOURCE,
-                    "/wda/activeAppInfo",
-                    "/wda/locked",
-                ];
+                let early_failure = matches!(case, 1 | 3 | 5 | 7);
+                let mut expected = if early_failure {
+                    vec!["/screenshot", "/wda/activeAppInfo", "/wda/locked"]
+                } else {
+                    vec![
+                        "/screenshot",
+                        "/screenshot",
+                        SCREEN_SOURCE,
+                        "/wda/activeAppInfo",
+                        "/wda/locked",
+                        "/wda/activeAppInfo",
+                        "/wda/locked",
+                    ]
+                };
                 expected.sort();
                 assert_eq!(calls, expected);
-                assert_eq!(clock().duration_since(anchor), Duration::from_millis(4));
+                let elapsed = Duration::from_millis(if early_failure { 4 } else { 9 });
+                assert_eq!(clock().duration_since(anchor), elapsed);
                 if let Ok((raw, finished, lock)) = result {
                     assert_eq!(raw.accessibility_tree, "private-tree");
                     assert_eq!(raw.window.started_unix_ms, 17);
                     assert_eq!(raw.window.finished_unix_ms, 21);
-                    assert_eq!(finished.duration_since(anchor), Duration::from_millis(4));
+                    assert_eq!(finished.duration_since(anchor), elapsed);
                     assert_eq!(lock, if case == 6 { None } else { Some(false) });
                 }
                 let report = serde_json::to_value(&timings).unwrap();
@@ -278,11 +412,18 @@ mod tests {
                     continue;
                 }
                 assert_eq!(stages[0]["elapsed_us"], 4000);
-                assert_eq!(stages[1]["elapsed_us"], 1000);
-                assert_eq!(stages[2]["elapsed_us"], 2000);
-                assert_eq!(stages[3]["elapsed_us"], 3000);
                 assert_eq!(stages[0]["ok"], case != 1);
-                assert_eq!(stages[3]["ok"], case != 7);
+                if !early_failure {
+                    for (name, elapsed) in [
+                        ("source_request", 1000),
+                        ("app_request", 2000),
+                        ("lock_request", 3000),
+                    ] {
+                        let stage = stages.iter().find(|stage| stage["stage"] == name).unwrap();
+                        assert_eq!(stage["elapsed_us"], elapsed);
+                        assert_eq!(stage["ok"], !(name == "lock_request" && case == 7));
+                    }
+                }
                 if !matches!(case, 0 | 1 | 6) {
                     assert!(stages.iter().any(|stage| stage["ok"] == false));
                 }

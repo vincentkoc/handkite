@@ -72,6 +72,38 @@ impl DeviceAdapter for FakeAdapter {
         })
     }
 
+    fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
+        let mut raw = self.observe()?;
+        if raw.state.foreground_app.is_none() {
+            raw.state.foreground_app = Some("com.apple.springboard".into());
+        }
+        if raw.accessibility_tree.len() >= MAX_RESPONSE {
+            return Err(AdapterError);
+        }
+        raw.accessibility_tree.clear();
+        Ok(raw)
+    }
+    fn prepare_navigation(
+        &mut self,
+        action: &Action,
+    ) -> Result<(RawObservation, handkite_core::controller::ActionAdmission), AdapterError> {
+        use handkite_core::controller::ActionAdmission;
+        let until = Instant::now() + Duration::from_secs(1);
+        let admission = match action {
+            Action::Home => ActionAdmission::NativeHome { until },
+            _ => ActionAdmission::NativeAppLaunch { until },
+        };
+        Ok((self.observe_navigation()?, admission))
+    }
+    fn execute_navigation(
+        &mut self,
+        action: &Action,
+        until: Instant,
+        _: handkite_core::controller::ActionAdmission,
+        _: &str,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.execute(action, until)
+    }
     fn execute(
         &mut self,
         action: &Action,
@@ -165,6 +197,7 @@ impl SocketFixture {
         self.requests.push(request.clone());
         if request["method"] == "acquire" {
             assert_eq!(request["ttl_ms"], session::CONTROL_TTL_MS);
+            assert_eq!(request["renew_on_success"], true);
             if self.short_ttl {
                 request["ttl_ms"] = json!(10);
             }
@@ -255,6 +288,8 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
         "handkite_launch_clock",
     ];
     let interaction = [
+        "handkite_tap_element",
+        "handkite_text_element",
         "handkite_tap",
         "handkite_click_button",
         "handkite_double_tap",
@@ -514,12 +549,16 @@ fn socket_transcript_returns_post_action_screen_without_another_observation() {
     );
     for reply in &replies[2..4] {
         let content = reply["result"]["content"].as_array().unwrap();
-        assert_eq!(content.len(), 3);
-        let screen: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(screen["metadata"], payload(reply)["after"]);
-        assert_eq!(screen["accessibility_tree"], "<private-screen/>");
-        assert_eq!(content[2]["type"], "image");
-        assert_eq!(content[2]["data"], "cHJpdmF0ZS1zY3JlZW4=");
+        assert_eq!(content.len(), 2);
+        let screen = payload(reply)["observation"].clone();
+        assert_eq!(
+            screen["metadata"]["revision"],
+            payload(reply)["after"]["revision"]
+        );
+        assert_eq!(screen["revision_scope"], "navigation");
+        assert_eq!(screen["tree"]["included"], false);
+        assert_eq!(content[1]["type"], "image");
+        assert_eq!(content[1]["data"], "cHJpdmF0ZS1zY3JlZW4=");
     }
     assert_eq!(
         fixture.state.lock().unwrap().actions,
@@ -531,12 +570,12 @@ fn socket_transcript_returns_post_action_screen_without_another_observation() {
             .iter()
             .map(|request| request["method"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["status", "acquire", "act", "act", "release"]
+        ["status", "acquire", "navigate", "navigate", "release"]
     );
     for request in fixture
         .requests
         .iter()
-        .filter(|request| request["method"] == "act")
+        .filter(|request| request["method"] == "navigate")
     {
         assert_eq!(request["request"]["device"], "fixture-phone");
         assert!(request["request"]["expected_revision"].is_u64());
@@ -574,9 +613,12 @@ fn action_response_options_do_not_change_device_requests_or_receipts() {
         .collect();
     assert_eq!(payload(&replies[2])["receipt"]["accepted"], true);
     let content = replies[2]["result"]["content"].as_array().unwrap();
-    assert_eq!(content.len(), 2);
-    let screen: Value = serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
-    assert_eq!(screen["metadata"], payload(&replies[2])["after"]);
+    assert_eq!(content.len(), 1);
+    let screen = payload(&replies[2])["observation"].clone();
+    assert_eq!(
+        screen["metadata"]["revision"],
+        payload(&replies[2])["after"]["revision"]
+    );
     assert_eq!(screen["image"]["reason"], "requested");
     assert_eq!(fixture.state.lock().unwrap().actions, ["launch_app"]);
     assert_eq!(
@@ -585,7 +627,7 @@ fn action_response_options_do_not_change_device_requests_or_receipts() {
             .iter()
             .map(|r| r["method"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["status", "acquire", "act", "release"]
+        ["status", "acquire", "navigate", "release"]
     );
     assert!(fixture.requests.iter().all(|r| r.get("response").is_none()));
 }
@@ -646,12 +688,12 @@ fn stale_revision_and_changed_view_do_not_send_input() {
     assert_eq!(changed["result"]["isError"], true);
     assert_eq!(
         changed["result"]["content"][0]["text"],
-        "ViewChanged: screen context changed before input; obtain a fresh observation"
+        "StaleObservation: app context changed before navigation; obtain a fresh observation"
     );
     assert_eq!(
         changed["result"]["structuredContent"],
         json!({
-            "code":"ViewChanged", "changed":{"state":true,"accessibility_tree":false,"screenshot":false}
+            "code":"StaleObservation"
         })
     );
     for private in ["private-screen", "com.example.changed", "fixture-usb"] {
@@ -812,7 +854,7 @@ fn valid_action_outcomes_preserve_evidence_and_flag_failures_without_replay() {
                 &mut |bytes| {
                     requests.push(serde_json::from_slice::<Value>(bytes).unwrap());
                     Ok(serde_json::to_vec(&json!({
-                        "type": "acted", "receipt": receipt, "effect": effect,
+                        "type": "navigated", "receipt": receipt, "effect": effect,
                         "after": after, "native_lock": null
                     }))
                     .unwrap())
@@ -823,21 +865,20 @@ fn valid_action_outcomes_preserve_evidence_and_flag_failures_without_replay() {
                 reply["result"].get("isError"),
                 is_error.then_some(&json!(true))
             );
-            assert_eq!(
-                payload(&reply),
-                json!({"receipt": receipt, "effect": effect, "after": after_metadata})
-            );
+            assert_eq!(payload(&reply)["receipt"], receipt);
+            assert_eq!(payload(&reply)["effect"], effect);
+            assert_eq!(payload(&reply)["after"], after_metadata);
             assert_eq!(requests.len(), 1);
-            assert_eq!(requests[0]["method"], "act");
+            assert_eq!(requests[0]["method"], "navigate");
             let content = reply["result"]["content"].as_array().unwrap();
             if let Some(mime) = mime {
-                assert_eq!(content.len(), 3);
-                let screen: Value =
-                    serde_json::from_str(content[1]["text"].as_str().unwrap()).unwrap();
-                assert_eq!(screen["metadata"], after_metadata);
-                assert_eq!(screen["accessibility_tree"], "<private-screen/>");
-                assert_eq!(content[2]["mimeType"], mime);
-                assert_eq!(content[2]["data"], "cHJpdmF0ZS1zY3JlZW4=");
+                assert_eq!(content.len(), 2);
+                assert_eq!(
+                    payload(&reply)["observation"]["revision_scope"],
+                    "navigation"
+                );
+                assert_eq!(content[1]["mimeType"], mime);
+                assert_eq!(content[1]["data"], "cHJpdmF0ZS1zY3JlZW4=");
             } else {
                 assert_eq!(content.len(), 1);
                 assert!(!reply.to_string().contains("private-screen"));
@@ -848,7 +889,7 @@ fn valid_action_outcomes_preserve_evidence_and_flag_failures_without_replay() {
 }
 
 #[test]
-fn accepted_unchanged_view_and_failed_capture_are_errors_over_socket() {
+fn home_already_reached_is_verified_but_failed_capture_is_unconfirmed() {
     for fail_capture in [false, true] {
         let mut fixture = SocketFixture::new();
         {
@@ -865,12 +906,19 @@ fn accepted_unchanged_view_and_failed_capture_are_errors_over_socket() {
             json!({"expected_revision": 1}),
         );
         let result = payload(&reply);
-        assert_eq!(reply["result"]["isError"], true);
+        assert_eq!(reply["result"]["isError"] == true, fail_capture);
         assert_eq!(
             result["receipt"],
             json!({"accepted": true, "action_kind": "home"})
         );
-        assert_eq!(result["effect"], "unconfirmed");
+        assert_eq!(
+            result["effect"],
+            if fail_capture {
+                "unconfirmed"
+            } else {
+                "changed"
+            }
+        );
         assert!(result.get("delivery").is_none());
         if fail_capture {
             assert_eq!(result["after"], Value::Null);
@@ -884,7 +932,7 @@ fn accepted_unchanged_view_and_failed_capture_are_errors_over_socket() {
         }
         assert_eq!(
             reply["result"]["content"].as_array().unwrap().len(),
-            if fail_capture { 1 } else { 3 }
+            if fail_capture { 1 } else { 2 }
         );
         assert_eq!(fixture.state.lock().unwrap().actions, ["home"]);
         assert_eq!(
@@ -893,7 +941,7 @@ fn accepted_unchanged_view_and_failed_capture_are_errors_over_socket() {
                 .iter()
                 .map(|request| request["method"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["status", "acquire", "act"]
+            ["status", "acquire", "navigate"]
         );
         session.cleanup(&mut |bytes| fixture.exchange(bytes));
     }
@@ -907,7 +955,7 @@ fn uncertain_action_delivery_is_reported_without_replay() {
         fixture.call(&mut session, "handkite_status", json!({}));
         fixture.call(&mut session, "handkite_acquire_control", json!({}));
         if lose_socket_reply {
-            fixture.lose_reply = Some("act");
+            fixture.lose_reply = Some("navigate");
         } else {
             fixture.state.lock().unwrap().fail_action = true;
         }
@@ -933,7 +981,7 @@ fn uncertain_action_delivery_is_reported_without_replay() {
             fixture
                 .requests
                 .iter()
-                .filter(|request| request["method"] == "act")
+                .filter(|request| request["method"] == "navigate")
                 .count(),
             1
         );
@@ -959,14 +1007,21 @@ fn post_input_identity_and_response_size_failures_report_unknown_delivery() {
             json!({"expected_revision": 1}),
         );
         assert_eq!(reply["result"]["isError"], true);
-        assert_eq!(payload(&reply)["receipt"]["accepted"], Value::Null);
-        assert_eq!(payload(&reply)["delivery"], "unknown");
+        assert_eq!(
+            payload(&reply)["receipt"]["accepted"],
+            if mismatch { Value::Null } else { json!(true) }
+        );
+        if mismatch {
+            assert_eq!(payload(&reply)["delivery"], "unknown");
+        } else {
+            assert_eq!(payload(&reply)["effect"], "unconfirmed");
+        }
         assert_eq!(fixture.state.lock().unwrap().actions, ["home"]);
         assert_eq!(
             fixture
                 .requests
                 .iter()
-                .filter(|request| request["method"] == "act")
+                .filter(|request| request["method"] == "navigate")
                 .count(),
             1
         );
@@ -1103,4 +1158,44 @@ fn release_failure_retains_cleanup_attempt_without_reacquiring() {
             .collect::<Vec<_>>(),
         ["acquire", "release", "release"]
     );
+}
+
+#[test]
+fn completed_target_verdict_is_attached_to_the_next_action_without_a_capture() {
+    let updates = json!([{"token":7,"target_id":"t_0123456789abcdef0123456789abcdef",
+        "effect":"changed","region":[1.0,2.0,3.0,4.0]}]);
+    for action in [
+        Action::Home,
+        Action::Tap {
+            at: handkite_core::protocol::Point { x: 1.0, y: 2.0 },
+        },
+    ] {
+        let mut session = Session::default();
+        session.acquire(&mut |_| {
+            Ok(serde_json::to_vec(&json!({
+                "type":"acquired","lease":"0123456789abcdef0123456789abcdef"
+            }))
+            .unwrap())
+        });
+        let reply = json!({"type": if matches!(action, Action::Home) {"navigated"} else {"acted"},
+            "receipt":{"accepted":true,"action_kind":action.kind()},
+            "effect":"changed","after":null,"native_lock":null,"effect_updates":updates});
+        let mut calls = 0;
+        let result = session.act(
+            &device(),
+            Revision(1),
+            action,
+            false,
+            presentation::Options::default(),
+            &mut |_| {
+                calls += 1;
+                Ok(serde_json::to_vec(&reply).unwrap())
+            },
+        );
+        assert_eq!(calls, 1);
+        assert_eq!(result["structuredContent"]["effect_updates"], updates);
+        let text: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(text["effect_updates"], updates);
+    }
 }

@@ -259,6 +259,29 @@ See the [diagnostic contract](RELEASE.md#device-agreement-diagnostic).
 
 ## MCP bridge
 
+For a persistent agent client, use `tools/handkitectl.py` or import its `Session`
+class. The [Drive Handkite skill](skills/drive-handkite/SKILL.md) describes the
+compact response loop, private-data handling and recovery. The client never
+retries input or acquires control implicitly. Closing it releases the MCP
+session; each request has a bounded dispatch-and-response deadline.
+
+Register the selected local service with native clients:
+
+```sh
+claude mcp add --scope user handkite -- "$HOME/Library/Application Support/Handkite/releases/current/handkite-mcp" --service --capabilities observation,navigation,interaction
+```
+
+New client sessions load the registration. One executor acquires the lease;
+other agents can plan or review but must not compete for input. Registration
+does not start a device runner or unlock the phone.
+
+With a matching daemon and MCP build, `tree_format: "elements"` returns compact
+visible nodes and `since_revision` requests an added/removed/changed delta.
+Use the paired action response as the next view instead of observing twice.
+These IDs currently identify presentation entries; native element targeting
+remains unqualified. See [validation](VALIDATION.md) for the Taobao stale-tree
+blocker. Do not infer screenshot/tree agreement from a matching image alone.
+
 [OpenClaw integration](OPENCLAW.md) is deferred. Direct MCP operation is described below.
 
 `handkite-mcp --socket /path/to/private-dir/handkite.sock --device phone` speaks MCP over stdio. Its default observation capability advertises only `handkite_status` and `handkite_observe`; the latter returns a paired screenshot and accessibility tree from one capture. The device key and socket are fixed when the process starts. Run it as the socket owner.
@@ -287,7 +310,9 @@ on `handkite_observe`, or in an action's `response` object for its final capture
 The result has `capture_kind: "image_only"`, a device, capture window and image;
 it has no inferred lock state, tree or actionable revision. Obtain a full
 observation before another revision-bound action. Input admission still uses
-a full observation, and Home and Lock retain their paired verification.
+its existing guarded path. Lock retains paired verification; Home and app launch
+use a separate navigation-only image revision with native lock and foreground
+checks.
 Changed pixels can confirm an acknowledged action; unchanged pixels leave its
 effect unconfirmed. Full paired capture remains the default.
 
@@ -351,6 +376,34 @@ with unknown delivery reported without replay. These tools can perform real
 purchases or send messages; grant this profile only to a trusted personal agent
 with approval bound to the concrete action. OpenClaw integration is deferred;
 the former separate deployment is retired.
+
+Element target input is separately opt-in: `handkite_observe` with
+`{"targets":true}` (or `Session.observe_targets()`) returns compact target rows
+with opaque `target_id` values, rectangles and bounded public values. These are
+not the presentation `eN` IDs. Use `handkite_tap_element` or
+`handkite_text_element` with `target_id` and `expected_revision`; text also takes
+`value` and requires that exact native field already focused. Target revisions
+cannot be used for legacy coordinate actions. Native action replies include the
+next compact targets/delta when available; `response:{"image":"always"}` opts
+into a screenshot. Images default to omitted for this path.
+
+Rows carry `source:"xml"` or `source:"ocr"`. On macOS, Apple Vision recognizes
+text missing from the native hierarchy. When a unique native text row already
+covers the exact text, that row carries `input_source:"ocr"` and its opaque
+`target_id`; no duplicate row is added. Its XML identity stays intact. OCR input
+uses the recognized glyph bounds, not the native row center. OCR targets are tap-only; they never claim
+to be editable native fields. Recognition stays on the host and reuses unchanged
+image tiles. An OCR tap rechecks native state, safe context, the surrounding
+pixels and fresh recognized text before one coordinate dispatch. Missing or
+ambiguous recognition refuses input. Uncertain effects are never replayed.
+
+Native targets require stable target-region pixels, exact native identity and
+full attributes, verified viewport mapping, safe context and restored WDA
+settings. Handles are one-use and expire after 15 seconds. Outside-region
+animation is allowed, but unstable targets are omitted. This does not establish
+semantic accessibility freshness; OCR supplies separate image evidence, not a
+claim that missing native nodes exist. Live qualification is recorded separately.
+See [the agent-driving skill](skills/drive-handkite/SKILL.md).
 
 `handkite_click_button` takes an observed `target` with exact `label`, `x`, `y`,
 `width` and `height`. It resolves one visible, enabled, session-bound Button or MenuItem,
@@ -436,7 +489,7 @@ device override. It writes no files, enrolls no key, and is excluded from the
 three-artifact release inventory. Review the output and the actual SSH account
 policy separately before any enrollment.
 
-Acquire control explicitly before an action. The process holds the controller's random lease token internally for a fixed two-minute TTL; neither the token nor an owner override is exposed through MCP. Acquire never renews an existing lease. A competing session receives `Busy`. Release is explicit, with best-effort release again on EOF or input/output failure. A killed process relies on expiry. If the acquire response is lost, that process refuses further acquisition: close it and wait two minutes before starting a new session.
+Acquire control explicitly before an action. The process holds the controller's random lease token internally for a two-minute idle TTL, renewed only after a verified successful action; neither the token nor an owner override is exposed through MCP. Acquire never renews an existing lease. A competing session receives `Busy`. Release is explicit, with best-effort release again on EOF or input/output failure. A killed process relies on expiry. If the acquire response is lost, that process refuses further acquisition: close it and wait two minutes before starting a new session.
 
 Actions return a delivery receipt, observed effect, and optional post-action metadata. When the host grants observation capability, the same response also includes the already captured post-action screenshot and accessibility tree. This adds no device request. Navigation-only clients receive metadata alone. A lost acknowledgment, unexpected reply, post-input identity mismatch, or oversized response reports unknown delivery with `receipt.accepted: null` and `effect: "unconfirmed"`. No action is automatically replayed. A stale revision requires a fresh authorized observation; an expired lease requires another explicit acquisition.
 
@@ -462,12 +515,17 @@ The owned local path has passed real-device Clock launch, Home return, Settings 
 An authorized client with both capabilities follows this sequence after MCP initialization:
 
 1. Call `handkite_acquire_control` with `{}`.
-2. Call `handkite_observe` with `{}` and inspect its screen and `revision`.
+2. Call `handkite_status` with `{}` for a navigation-only revision, or observe targets when element input is needed.
 3. Call `handkite_launch_clock` with only `expected_revision` set to that integer.
 4. Inspect the receipt, effect and returned screen. Use its `after.revision` for the next action. Observe again if no post-action screen was returned or the view has since changed.
 5. Call `handkite_release_control` with `{}` when finished.
 
-Use `handkite_observe` only when the agent needs private screen content. A navigation-only client needs a current revision supplied through a separately authorized observation path. A stale or missing revision cannot authorize input; do not guess revisions. After unknown delivery, inspect a fresh observation before deciding on a new action; repeating the earlier request is not recovery proof. The bridge never switches to another device or fallback route.
+Use `handkite_observe` when the agent needs screen content or element handles.
+With the observation/navigation profile, `handkite_status` supplies a fresh
+`revision_scope: "navigation"` revision without XML. Only Home and app launch can
+consume it. Animated feeds therefore do not trap navigation behind a drifting
+tree. Drifted paired observations can fall back to locally stable XML/OCR targets,
+or an image with navigation-only authority. A stale or missing revision cannot authorize input; do not guess revisions. After unknown delivery, inspect a fresh observation before deciding on a new action; repeating the earlier request is not recovery proof. The bridge never switches to another device or fallback route.
 
 ## Device doctor
 

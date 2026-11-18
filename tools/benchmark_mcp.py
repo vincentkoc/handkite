@@ -50,6 +50,8 @@ SPAN_NAMES = {"button_find", "button_attributes", "wire_image_encode", "controll
 CAPTURE_NAMES = {"ownership_before", "screenshot_request", "source_request", "app_request",
                  "lock_request", "screenshot_json", "source_json", "app_json", "lock_json",
                  "image_decode", "payload_validation", "ownership_after", "capture_total"}
+COHERENCE_NAMES = {"screenshot_before_request", "screenshot_before_json", "capture_coherence",
+                   "app_before_request", "app_before_json", "lock_before_request", "lock_before_json"}
 
 
 class BenchError(Exception):
@@ -141,7 +143,7 @@ def operation_stages(rows):
                 writes.append((interval, value / 1000))
         if "capture" in row:
             for sample in row["capture"]["stages"]:
-                require(sample.get("stage") in CAPTURE_NAMES, "unknown_capture_stage")
+                require(sample.get("stage") in CAPTURE_NAMES | COHERENCE_NAMES, "unknown_capture_stage")
                 require(sample.get("ok") is True, "failed_capture_trace")
                 require(type(sample.get("elapsed_us")) is int and sample["elapsed_us"] >= 0,
                         "invalid_trace_duration")
@@ -193,6 +195,10 @@ def validate_measured_stages(case, rows, capture_kind):
         if capture_kind == "image_only" and index == len(captures) - 1:
             expected -= {"source_request", "source_json"}
         samples = capture["stages"]
+        present = {sample.get("stage") for sample in samples}
+        if present & COHERENCE_NAMES:
+            require(not reused and "source_request" in expected, "invalid_coherence_trace")
+            expected |= COHERENCE_NAMES
         require(expected == {sample.get("stage") for sample in samples}
                 and len(expected) == len(samples), "missing_capture_stage")
     if case in CASES[:4]:

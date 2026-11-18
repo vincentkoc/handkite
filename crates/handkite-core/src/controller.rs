@@ -7,7 +7,14 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod focused_text;
+mod navigation;
+mod targets;
 pub use focused_text::{PreparedText, TextReadback};
+pub use navigation::{NavigationObservation, NavigationResult};
+pub use targets::{
+    ElementAction, ElementTarget, PreparedTarget, TargetActionResult, TargetCompletion,
+    TargetEffect, TargetEffectReport, TargetObservation,
+};
 
 #[derive(Clone)]
 pub struct RawObservation {
@@ -19,6 +26,7 @@ pub struct RawObservation {
     pub screenshot: ScreenImage,
 }
 
+#[derive(Clone)]
 pub struct RawImageObservation {
     pub connected_usb: HardwareId,
     pub wda_target: HardwareId,
@@ -33,6 +41,7 @@ pub struct AdapterError;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AdapterDiagnostic {
     IdentityCheck,
+    CaptureImageDrift,
     PreActionCapture,
     OwnedBefore,
     NativeBefore,
@@ -48,11 +57,19 @@ pub enum AdapterDiagnostic {
     InputTimedOutAfterSend,
     InputResponseRejected,
     OwnershipAfterAck,
+    TargetCapture,
+    TargetCandidates,
+    TargetMapping,
+    TargetOcr,
+    TargetSettings,
+    TargetPrepare,
+    TargetRevalidation,
 }
 
 impl AdapterDiagnostic {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 24] = [
         Self::IdentityCheck,
+        Self::CaptureImageDrift,
         Self::PreActionCapture,
         Self::OwnedBefore,
         Self::NativeBefore,
@@ -68,11 +85,19 @@ impl AdapterDiagnostic {
         Self::InputTimedOutAfterSend,
         Self::InputResponseRejected,
         Self::OwnershipAfterAck,
+        Self::TargetCapture,
+        Self::TargetCandidates,
+        Self::TargetMapping,
+        Self::TargetOcr,
+        Self::TargetSettings,
+        Self::TargetPrepare,
+        Self::TargetRevalidation,
     ];
 
     pub const fn code(self) -> &'static str {
         match self {
             Self::IdentityCheck => "AdapterIdentityCheck",
+            Self::CaptureImageDrift => "AdapterCaptureImageDrift",
             Self::PreActionCapture => "AdapterPreActionCapture",
             Self::OwnedBefore => "AdapterOwnedBefore",
             Self::NativeBefore => "AdapterNativeBefore",
@@ -88,6 +113,13 @@ impl AdapterDiagnostic {
             Self::InputTimedOutAfterSend => "AdapterInputTimedOutAfterSend",
             Self::InputResponseRejected => "AdapterInputResponseRejected",
             Self::OwnershipAfterAck => "AdapterOwnershipAfterAck",
+            Self::TargetCapture => "AdapterTargetCapture",
+            Self::TargetCandidates => "AdapterTargetCandidates",
+            Self::TargetMapping => "AdapterTargetMapping",
+            Self::TargetOcr => "AdapterTargetOcr",
+            Self::TargetSettings => "AdapterTargetSettings",
+            Self::TargetPrepare => "AdapterTargetPrepare",
+            Self::TargetRevalidation => "AdapterTargetRevalidation",
         }
     }
 }
@@ -134,13 +166,82 @@ pub enum ActionAdmission {
 }
 
 pub trait DeviceAdapter {
+    /// Image plus fresh native lock, foreground and ownership evidence. No XML authority.
+    fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
+        Err(AdapterError)
+    }
+    fn prepare_navigation(
+        &mut self,
+        _action: &Action,
+    ) -> Result<(RawObservation, ActionAdmission), AdapterError> {
+        Err(AdapterError)
+    }
+    fn execute_navigation(
+        &mut self,
+        _action: &Action,
+        _deadline: Instant,
+        _admission: ActionAdmission,
+        _expected_app: &str,
+    ) -> Result<TransportReceipt, AdapterError> {
+        Err(AdapterError)
+    }
     /// Consume the fixed diagnostic from the immediately preceding failure.
     fn take_error_diagnostic(&mut self) -> Option<AdapterDiagnostic> {
         None
     }
 
     fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError>;
+    fn settle_target_effects(&mut self) -> Result<(), AdapterError> {
+        Ok(())
+    }
+    fn target_effect_updates(&mut self) -> Vec<TargetEffectReport> {
+        Vec::new()
+    }
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
+    fn observe_targets(&mut self) -> Result<(RawObservation, Vec<ElementTarget>), AdapterError> {
+        Err(AdapterError)
+    }
+
+    fn observe_targets_since(
+        &mut self,
+        _revision: Option<Revision>,
+    ) -> Result<(RawObservation, Vec<ElementTarget>), AdapterError> {
+        self.observe_targets()
+    }
+
+    fn bind_targets(&mut self, _revision: Revision) -> Result<(), AdapterError> {
+        Err(AdapterError)
+    }
+
+    fn prepare_target(
+        &mut self,
+        _revision: Revision,
+        _action: &ElementAction,
+        _baseline: &Observation,
+    ) -> Result<PreparedTarget, AdapterError> {
+        Err(AdapterError)
+    }
+
+    fn execute_target(
+        &mut self,
+        _action: &ElementAction,
+        _token: u64,
+        _deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        Err(AdapterError)
+    }
+
+    fn target_readback(&mut self, _token: u64) -> Result<TextReadback, AdapterError> {
+        Err(AdapterError)
+    }
+    /// One post-input capture may provide both proof and the next targets.
+    /// Neither a missing proof nor a failed next capture permits replay.
+    fn complete_target(&mut self, token: u64) -> TargetCompletion {
+        let readback = self.target_readback(token);
+        let next = self.observe_targets();
+        TargetCompletion { readback, next }
+    }
+
     fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
         Err(AdapterError)
     }
@@ -358,13 +459,42 @@ struct Lease {
     id: LeaseId,
     owner: String,
     expires_at: Instant,
+    renew_on_success: Option<Duration>,
+}
+
+fn renew_verified_action(
+    lease: &mut Option<Lease>,
+    owner: &str,
+    id: LeaseId,
+    result: &ActionResult,
+    now: Instant,
+) {
+    if result.receipt.accepted != Some(true)
+        || !matches!(
+            result.effect,
+            ObservedEffect::Changed | ObservedEffect::LockConfirmed
+        )
+    {
+        return;
+    }
+    if let Some(lease) = lease
+        && lease.id == id
+        && lease.owner == owner
+        && lease.expires_at > now
+        && let Some(ttl) = lease.renew_on_success
+    {
+        lease.expires_at = now + ttl;
+    }
 }
 
 struct Inner<A> {
     adapter: A,
     last: Option<Observation>,
+    target_last: Option<Observation>,
+    navigation_last: Option<NavigationObservation>,
     revision: Revision,
     lease: Option<Lease>,
+    pending_target_lease: Option<(String, LeaseId, String, u64)>,
 }
 
 /// Serializes all device access. Authentication of the caller precedes this controller.
@@ -384,13 +514,26 @@ impl<A: DeviceAdapter> Controller<A> {
             inner: Mutex::new(Inner {
                 adapter,
                 last: None,
+                target_last: None,
+                navigation_last: None,
                 revision: Revision(0),
                 lease: None,
+                pending_target_lease: None,
             }),
         }
     }
 
     pub fn acquire(&self, owner: String, ttl: Duration) -> Result<LeaseId, ControllerError> {
+        self.acquire_with_renewal(owner, ttl, false)
+    }
+
+    /// Renew only a still-live lease after verified input, never after observation or refusal.
+    pub fn acquire_with_renewal(
+        &self,
+        owner: String,
+        ttl: Duration,
+        renew_on_success: bool,
+    ) -> Result<LeaseId, ControllerError> {
         let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
         if owner.is_empty() || ttl.is_zero() || ttl > Duration::from_secs(300) {
             return Err(ControllerError::InvalidLease);
@@ -403,12 +546,18 @@ impl<A: DeviceAdapter> Controller<A> {
             return Err(ControllerError::Busy);
         }
         let mut token = [0_u8; 16];
+        inner
+            .adapter
+            .settle_target_effects()
+            .map_err(|_| Self::adapter_error(&mut inner))?;
+        inner.pending_target_lease = None;
         getrandom::fill(&mut token).map_err(|_| ControllerError::Randomness)?;
         let id = LeaseId(u128::from_be_bytes(token));
         inner.lease = Some(Lease {
             id,
             owner,
             expires_at: Instant::now() + ttl,
+            renew_on_success: renew_on_success.then_some(ttl),
         });
         Ok(id)
     }
@@ -418,7 +567,12 @@ impl<A: DeviceAdapter> Controller<A> {
         if !matches!(&inner.lease, Some(lease) if lease.id == id && lease.owner == owner) {
             return Err(ControllerError::InvalidLease);
         }
+        inner
+            .adapter
+            .settle_target_effects()
+            .map_err(|_| Self::adapter_error(&mut inner))?;
         inner.lease = None;
+        inner.pending_target_lease = None;
         Ok(())
     }
 
@@ -444,6 +598,23 @@ impl<A: DeviceAdapter> Controller<A> {
         capture: CaptureMode,
     ) -> Result<ActionResult, ControllerError> {
         let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
+        inner.target_last = None;
+        inner.navigation_last = None;
+        let result = self.act_inner(&mut inner, owner, lease_id, request, capture);
+        if let Ok(result) = &result {
+            renew_verified_action(&mut inner.lease, owner, lease_id, result, Instant::now());
+        }
+        result
+    }
+
+    fn act_inner(
+        &self,
+        mut inner: &mut Inner<A>,
+        owner: &str,
+        lease_id: LeaseId,
+        request: ActionRequest,
+        capture: CaptureMode,
+    ) -> Result<ActionResult, ControllerError> {
         if !matches!(&inner.lease, Some(lease) if lease.id == lease_id && lease.owner == owner && lease.expires_at > Instant::now())
         {
             return Err(ControllerError::InvalidLease);
@@ -749,6 +920,9 @@ impl<A: DeviceAdapter> Controller<A> {
         inner: &mut Inner<A>,
         requested: &DeviceKey,
     ) -> Result<Observation, ControllerError> {
+        inner.last = None;
+        inner.target_last = None;
+        inner.navigation_last = None;
         let (observation, _) = self.capture(inner, requested, None)?;
         inner.last = Some(observation.clone());
         Ok(observation)
@@ -760,6 +934,8 @@ impl<A: DeviceAdapter> Controller<A> {
     ) -> Result<ImageObservation, ControllerError> {
         let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
         inner.last = None;
+        inner.target_last = None;
+        inner.navigation_last = None;
         let raw = inner
             .adapter
             .observe_image()

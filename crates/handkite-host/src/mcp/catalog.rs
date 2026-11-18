@@ -19,6 +19,8 @@ pub(super) enum Tool {
     Home,
     Clock,
     Tap,
+    TapElement,
+    TextElement,
     ClickButton,
     DoubleTap,
     LongPress,
@@ -37,6 +39,8 @@ impl Tool {
             "handkite_release_control" => Some(Self::Release),
             "handkite_home" => Some(Self::Home),
             "handkite_launch_clock" => Some(Self::Clock),
+            "handkite_tap_element" => Some(Self::TapElement),
+            "handkite_text_element" => Some(Self::TextElement),
             "handkite_tap" => Some(Self::Tap),
             "handkite_click_button" => Some(Self::ClickButton),
             "handkite_double_tap" => Some(Self::DoubleTap),
@@ -51,7 +55,9 @@ impl Tool {
 
     pub(super) fn allowed(self, capabilities: Capabilities) -> bool {
         match self {
-            Self::Tap
+            Self::TapElement
+            | Self::TextElement
+            | Self::Tap
             | Self::ClickButton
             | Self::DoubleTap
             | Self::LongPress
@@ -105,7 +111,7 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         ),
         (
             "handkite_acquire_control",
-            "Explicitly acquire exclusive navigation control for this session for at most two minutes. Does not renew an existing lease.",
+            "Explicitly acquire exclusive navigation control. Verified successful actions renew the two-minute lease; observations, refusals and uncertain input do not. Release explicitly when finished.",
         ),
         (
             "handkite_release_control",
@@ -118,6 +124,14 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         (
             "handkite_launch_clock",
             "Launch the fixed Clock app once using an expected observation revision. Returns delivery, observed effect, and the captured screen when observation is authorized.",
+        ),
+        (
+            "handkite_tap_element",
+            "Click one opaque native target once. Owned native taps return an image and pending effect; read the correlated effect_updates on the next observation. Pending never permits replay. No coordinate fallback.",
+        ),
+        (
+            "handkite_text_element",
+            "Type once into an already focused opaque native target; never changes focus. Exact readback required.",
         ),
         (
             "handkite_tap",
@@ -157,7 +171,9 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         .filter_map(|(name, description)| {
             let tool = Tool::from_name(name)?;
             tool.allowed(capabilities).then(|| {
-                let schema = if tool.is_action() {
+                let schema = if matches!(tool, Tool::TapElement | Tool::TextElement) {
+                    super::target_tools::schema(tool == Tool::TextElement)
+                } else if tool.is_action() {
                     super::interaction::schema(tool)
                 } else if tool == Tool::Observe {
                     super::presentation::schema()

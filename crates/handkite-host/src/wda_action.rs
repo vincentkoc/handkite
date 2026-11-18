@@ -246,7 +246,7 @@ impl WdaActions {
         Self::tap_on(wda, self.session.as_deref().ok_or(AdapterError)?, at).await
     }
 
-    async fn tap_on(
+    pub(crate) async fn tap_on(
         wda: &impl WdaRequest,
         session: &str,
         at: Point,

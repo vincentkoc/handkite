@@ -10,6 +10,7 @@ publish.workspace = true
 base64 = "=0.22.1"
 handkite-core = { path = "../handkite-core" }
 libc = "0.2"
+png = "=0.18.1"
 plist = "=1.8.0"
 quick-xml = "=0.38.4"
 idevice = { version = "=0.1.68", default-features = false, features = ["misagent", "ring", "usbmuxd", "xctest"] }

@@ -10,6 +10,7 @@ pub(super) enum TreeFormat {
     #[default]
     Full,
     Compact,
+    Elements,
     Outline,
     Omit,
 }
@@ -27,6 +28,7 @@ pub(super) enum ImageMode {
 #[serde(try_from = "UncheckedOptions")]
 pub(super) struct Options {
     pub capture: CaptureMode,
+    pub targets: bool,
     pub tree_format: TreeFormat,
     pub image: ImageMode,
     pub since_revision: Option<Revision>,
@@ -38,9 +40,11 @@ struct UncheckedOptions {
     #[serde(default)]
     pub capture: CaptureMode,
     #[serde(default)]
-    pub tree_format: TreeFormat,
-    #[serde(default)]
-    pub image: ImageMode,
+    pub targets: bool,
+    #[serde(default, deserialize_with = "present_tree_format")]
+    pub tree_format: Option<TreeFormat>,
+    #[serde(default, deserialize_with = "present_image")]
+    pub image: Option<ImageMode>,
     #[serde(default, deserialize_with = "present_revision")]
     pub since_revision: Option<Revision>,
 }
@@ -49,21 +53,46 @@ impl TryFrom<UncheckedOptions> for Options {
     type Error = &'static str;
 
     fn try_from(value: UncheckedOptions) -> Result<Self, Self::Error> {
-        if value.capture == CaptureMode::ImageOnly && value.tree_format != TreeFormat::Omit {
+        let tree_format = value.tree_format.unwrap_or(if value.targets {
+            TreeFormat::Elements
+        } else {
+            TreeFormat::Full
+        });
+        let image = value.image.unwrap_or(if value.targets {
+            ImageMode::Omit
+        } else {
+            ImageMode::Always
+        });
+        if value.targets && value.capture == CaptureMode::ImageOnly {
+            return Err("targets require paired capture");
+        }
+        if value.capture == CaptureMode::ImageOnly && tree_format != TreeFormat::Omit {
             return Err("image-only capture requires tree_format=omit");
         }
-        if value.tree_format == TreeFormat::Omit
-            && (value.image != ImageMode::Always || value.since_revision.is_some())
+        if tree_format == TreeFormat::Omit
+            && (image != ImageMode::Always || value.since_revision.is_some())
         {
             return Err("tree omission requires an image without a delta baseline");
         }
         Ok(Self {
             capture: value.capture,
-            tree_format: value.tree_format,
-            image: value.image,
+            targets: value.targets,
+            tree_format,
+            image,
             since_revision: value.since_revision,
         })
     }
+}
+
+fn present_tree_format<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<TreeFormat>, D::Error> {
+    TreeFormat::deserialize(deserializer).map(Some)
+}
+fn present_image<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<ImageMode>, D::Error> {
+    ImageMode::deserialize(deserializer).map(Some)
 }
 
 fn present_revision<'de, D: serde::Deserializer<'de>>(
@@ -74,10 +103,11 @@ fn present_revision<'de, D: serde::Deserializer<'de>>(
 
 pub(super) fn schema() -> Value {
     json!({"type":"object", "additionalProperties":false, "properties":{
+        "targets":{"type":"boolean","description":"Opt in to one-use opaque native element handles. Requires paired capture; eN presentation IDs cannot be used for input."},
         "capture":{"type":"string","enum":["paired","image_only"],
             "description":"Default paired. image_only skips XML for the returned observation, requires tree_format=omit, and has no state or actionable revision. Actions retain full pre-input admission; Home and Lock retain paired verification."},
-        "tree_format":{"type":"string","enum":["full","compact","outline","omit"],
-            "description":"Response presentation only; internal checks retain the full capture. omit returns an image only and requires image=always without since_revision."},
+        "tree_format":{"type":"string","enum":["full","compact","elements","outline","omit"],
+            "description":"elements returns visible nodes with session-local ids and optional added/removed/changed deltas. Response presentation only; internal checks retain the full capture. omit returns an image only and requires image=always without since_revision."},
         "image":{"type":"string","enum":["always","omit","changed"],
             "description":"Include, explicitly omit, or omit an identical acknowledged image. Does not skip internal capture."},
         "since_revision":{"type":"integer","minimum":0,"maximum":u64::MAX,
@@ -101,11 +131,19 @@ struct Baseline {
 #[derive(Default)]
 pub(super) struct Cache {
     last: Option<Baseline>,
+    elements: super::elements::Cache,
 }
 
 impl Cache {
+    pub(super) fn has_element_baseline(&self, revision: Revision) -> bool {
+        self.last
+            .as_ref()
+            .is_some_and(|b| b.revision == revision && b.format == TreeFormat::Elements)
+    }
+
     pub(super) fn clear(&mut self) {
         self.last = None;
+        self.elements.clear();
     }
 
     pub(super) fn content(
@@ -130,6 +168,47 @@ impl Cache {
         });
         digest.update(observation.screenshot_base64.as_bytes());
         let image_digest: [u8; 32] = digest.finish().as_ref().try_into().unwrap();
+        if options.tree_format == TreeFormat::Elements {
+            let projected = self.elements.project(&observation, options.since_revision);
+            let baseline = self.last.as_ref().filter(|last| {
+                Some(last.revision) == options.since_revision
+                    && last.device == observation.device
+                    && last.state == observation.state
+                    && last.format == TreeFormat::Elements
+            });
+            let mut include_image = match options.image {
+                ImageMode::Always => true,
+                ImageMode::Omit => false,
+                ImageMode::Changed => !baseline
+                    .is_some_and(|last| last.image_known && last.image_digest == image_digest),
+            };
+            let mut payload = match projected {
+                Ok(payload) => payload,
+                Err(reason) => {
+                    self.clear();
+                    include_image = true;
+                    json!({"metadata":response::metadata(&observation), "tree_format":"elements",
+                        "elements":[], "actionable":false, "tree_error":reason})
+                }
+            };
+            let usable = payload.get("tree_error").is_none();
+            payload["image"] = json!({"included":include_image});
+            self.last = usable.then(|| Baseline {
+                revision: observation.revision,
+                device: observation.device.clone(),
+                state: observation.state.clone(),
+                format: TreeFormat::Elements,
+                tree: String::new(),
+                image_digest,
+                image_known: include_image || options.image == ImageMode::Changed,
+            });
+            return response::finish_observation_content(
+                payload,
+                observation.screenshot_format,
+                observation.screenshot_base64,
+                include_image,
+            );
+        }
         let mut payload = response::project_payload(&mut observation, options.tree_format);
         let tree = payload["accessibility_tree"]
             .as_str()

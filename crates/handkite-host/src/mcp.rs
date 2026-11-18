@@ -8,11 +8,13 @@ use std::io::{self, BufRead, Write};
 
 mod catalog;
 mod compact;
+mod elements;
 mod interaction;
 mod outline;
 mod presentation;
 mod response;
 mod session;
+mod target_tools;
 pub use catalog::Capabilities;
 use catalog::Tool;
 use response::exchange_reply;
@@ -200,7 +202,14 @@ where
             else {
                 return Some(error(id, -32602, "unknown or unauthorized tool"));
             };
-            if tool.is_action() {
+            if matches!(tool, Tool::TapElement | Tool::TextElement) {
+                session.act_element(
+                    tool == Tool::TextElement,
+                    params.arguments,
+                    device,
+                    exchange,
+                )
+            } else if tool.is_action() {
                 let Ok((revision, action, options)) =
                     interaction::parse_response(tool, params.arguments)
                 else {
@@ -298,6 +307,8 @@ fn valid_tool_frame(bytes: &[u8]) -> bool {
     };
     let arguments = envelope.params.arguments.map_or("{}", |raw| raw.get());
     match Tool::from_name(&envelope.params.name) {
+        Some(Tool::TapElement) => target_tools::valid_raw(false, arguments),
+        Some(Tool::TextElement) => target_tools::valid_raw(true, arguments),
         Some(tool) if tool.is_action() => interaction::valid_raw(tool, arguments),
         Some(Tool::Observe) => {
             arguments.trim_start().starts_with('{')
@@ -313,7 +324,7 @@ fn empty_arguments() -> Value {
 
 fn tool_result<F>(
     tool: Tool,
-    options: presentation::Options,
+    mut options: presentation::Options,
     device: &DeviceKey,
     session: &mut Session,
     exchange: &mut F,
@@ -323,12 +334,33 @@ where
 {
     let method = if tool == Tool::Status {
         "status"
+    } else if options.targets {
+        "observe_targets"
     } else if options.capture == handkite_core::protocol::CaptureMode::ImageOnly {
         "observe_image"
     } else {
         "observe"
     };
-    let observation = match exchange_reply(json!({"method": method, "device": device}), exchange) {
+    let mut native_targets = None;
+    let mut request = json!({"method": method, "device": device});
+    if method == "observe_targets"
+        && let Some(revision) = options.since_revision
+        && session.presentation.has_element_baseline(revision)
+        && session
+            .target_inventory
+            .as_ref()
+            .is_some_and(|b| b.0 == revision)
+    {
+        request["since_revision"] = json!(revision);
+    }
+    let observation = match exchange_reply(request, exchange) {
+        Ok(Reply::ObservedTargets {
+            observation,
+            targets,
+        }) if method == "observe_targets" => {
+            native_targets = Some(targets);
+            observation
+        }
         Ok(Reply::ObservedImage { observation }) if method == "observe_image" => {
             session.presentation.clear();
             if &observation.device != device {
@@ -346,16 +378,45 @@ where
                     "DeviceMismatch",
                 );
             }
-            return response::text_result(json!(status));
+            let mut payload = json!(status);
+            payload["revision_scope"] = json!("navigation");
+            payload["allowed_actions"] = json!(["home", "launch_app"]);
+            return response::text_result(payload);
         }
         Ok(Reply::Observed { observation }) if method == "observe" => observation,
+        Ok(Reply::Error { code })
+            if matches!(method, "observe" | "observe_targets")
+                && code == "AdapterCaptureImageDrift" =>
+        {
+            session.presentation.clear();
+            // A drifting full pair may still have locally stable XML/OCR targets.
+            // This is one read-only fallback, never a retry of an input.
+            if method == "observe" && options.tree_format == presentation::TreeFormat::Elements {
+                let mut target_options = options;
+                target_options.targets = true;
+                let result = tool_result(Tool::Observe, target_options, device, session, exchange);
+                return result;
+            }
+            return navigation_fallback(device, session, exchange);
+        }
+
         Ok(Reply::Error { code }) => {
             return response::with_service_code(
-                tool_error("device observation unavailable"),
+                tool_error(if method == "observe_targets" {
+                    "native targets unavailable; request image-only observation (capture=image_only, tree_format=omit)"
+                } else {
+                    "device observation unavailable"
+                }),
                 &code,
             );
         }
-        _ => return tool_error("device observation unavailable"),
+        _ => {
+            return tool_error(if method == "observe_targets" {
+                "native targets unavailable; request image-only observation (capture=image_only, tree_format=omit)"
+            } else {
+                "device observation unavailable"
+            });
+        }
     };
     if &observation.device != device {
         return response::with_service_code(
@@ -363,8 +424,94 @@ where
             "DeviceMismatch",
         );
     }
+    if native_targets.as_ref().is_some_and(Vec::is_empty) {
+        options.image = presentation::ImageMode::Always;
+    }
+    let revision = observation.revision;
+    let state = observation.state.clone();
+    let native_regions = observation
+        .accessibility_tree
+        .starts_with("<AppiumAUT source=\"native_regions\">");
     let content = session.presentation.content(observation, options);
-    json!({"content": content})
+    let mut result = json!({"content": content});
+    if options.tree_format == presentation::TreeFormat::Elements {
+        result["structuredContent"] =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+    }
+    if let Some(targets) = native_targets {
+        let mut payload: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        payload["revision"] = json!(revision);
+        payload["target_only"] = json!(true);
+        payload["metadata"]["target_only"] = json!(true);
+        payload["target_actionable"] = json!(!targets.is_empty());
+        if targets.is_empty() {
+            payload["target_reason"] = json!("no_stable_native_targets");
+        }
+        if native_regions {
+            payload["tree_scope"] = json!("native_regions");
+        }
+        let previous = session
+            .target_inventory
+            .take()
+            .filter(|b| Some(b.0) == options.since_revision && b.1 == state);
+        if let Some((base, _, old)) = previous.filter(|_| payload.get("elements_delta").is_some()) {
+            let old_ids: std::collections::BTreeMap<_, _> =
+                old.iter().map(|t| (&t.target_id, t)).collect();
+            let new_ids: std::collections::BTreeMap<_, _> =
+                targets.iter().map(|t| (&t.target_id, t)).collect();
+            let removed: Vec<_> = old
+                .iter()
+                .filter(|t| !new_ids.contains_key(&t.target_id))
+                .map(|t| &t.target_id)
+                .collect();
+            let added: Vec<_> = targets
+                .iter()
+                .filter(|t| !old_ids.contains_key(&t.target_id))
+                .collect();
+            let changed: Vec<_> = targets
+                .iter()
+                .filter(|t| {
+                    old_ids.get(&t.target_id).is_some_and(|old| {
+                        serde_json::to_value(old).unwrap() != serde_json::to_value(t).unwrap()
+                    })
+                })
+                .collect();
+            payload["targets_delta"] =
+                json!({"base_revision":base,"added":added,"removed":removed,"changed":changed});
+        } else {
+            payload["targets"] = json!(targets);
+        }
+        session.target_inventory = Some((revision, state, targets));
+        result["structuredContent"] = payload.clone();
+        result["content"][0]["text"] = json!(payload.to_string());
+    }
+    result
+}
+
+fn navigation_fallback<F>(device: &DeviceKey, session: &mut Session, exchange: &mut F) -> Value
+where
+    F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
+{
+    session.presentation.clear();
+    match exchange_reply(
+        json!({"method":"observe_navigation","device":device}),
+        exchange,
+    ) {
+        Ok(Reply::ObservedNavigation { observation }) if &observation.device == device => {
+            let content = response::navigation_content(observation, "capture_image_drift", true);
+            let payload: Value =
+                serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+            json!({"content":content,"structuredContent":payload})
+        }
+        Ok(Reply::ObservedNavigation { .. }) => {
+            response::with_service_code(tool_error("device identity mismatch"), "DeviceMismatch")
+        }
+        Ok(Reply::Error { code }) => {
+            response::with_service_code(tool_error("device observation unavailable"), &code)
+        }
+        _ => tool_error("device observation unavailable"),
+    }
 }
 
 fn tool_error(message: &str) -> Value {
@@ -587,6 +734,9 @@ mod tests {
             },
         ).unwrap();
         assert_eq!(calls, 1);
+        let mut metadata = metadata;
+        metadata["revision_scope"] = json!("navigation");
+        metadata["allowed_actions"] = json!(["home", "launch_app"]);
         let expected = json!({"jsonrpc":"2.0","id":1,
             "result":response::text_result(metadata)});
         assert_eq!(

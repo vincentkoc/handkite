@@ -308,6 +308,8 @@ pub struct ActionResult {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ObservedEffect {
+    /// Delivery acknowledged; effect verification has not finished.
+    Pending,
     Changed,
     /// Native state is locked after the request; this does not prove a transition.
     LockConfirmed,

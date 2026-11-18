@@ -2011,6 +2011,30 @@ fn identity_diagnostic_is_consumed_before_capture_or_input() {
 }
 
 #[test]
+fn failed_read_only_capture_clears_previous_input_revision() {
+    let (controller, key) = controller();
+    let first = controller.observe(&key).unwrap();
+    {
+        let mut inner = controller.inner.lock().unwrap();
+        assert_eq!(inner.last.as_ref().unwrap().revision, first.revision);
+        inner.adapter.fail_capture = true;
+        inner.adapter.error_diagnostic = Some(AdapterDiagnostic::CaptureImageDrift);
+    }
+    assert_eq!(
+        controller.observe(&key).err(),
+        Some(ControllerError::AdapterAt(
+            AdapterDiagnostic::CaptureImageDrift
+        ))
+    );
+    let inner = controller.inner.lock().unwrap();
+    assert!(inner.last.is_none());
+    assert!(inner.target_last.is_none());
+    assert_eq!(inner.revision, first.revision);
+    assert_eq!(inner.adapter.actions, 0);
+    assert_eq!(inner.adapter.image_captures, 0);
+}
+
+#[test]
 fn adapter_diagnostic_is_consumed_at_failure_without_replay() {
     for diagnostic in AdapterDiagnostic::ALL {
         let (controller, key) = controller();
@@ -2098,4 +2122,197 @@ fn non_lock_transport_error_still_fails_without_a_native_query() {
     assert_eq!(inner.adapter.actions, 1);
     assert_eq!(inner.adapter.native_queries, 0);
     assert!(inner.last.is_none());
+}
+
+#[test]
+fn renewable_lease_extends_only_after_verified_action_in_every_capture_mode() {
+    for capture in [CaptureMode::Paired, CaptureMode::ImageOnly] {
+        for (renew, effect) in [(true, true), (false, true), (true, false)] {
+            let (controller, key) = controller();
+            let lease = controller
+                .acquire_with_renewal("agent".into(), Duration::from_secs(30), renew)
+                .unwrap();
+            let expires = Instant::now() + Duration::from_secs(2);
+            controller
+                .inner
+                .lock()
+                .unwrap()
+                .lease
+                .as_mut()
+                .unwrap()
+                .expires_at = expires;
+            let result = controller
+                .act_with_capture(
+                    "agent",
+                    lease,
+                    ActionRequest {
+                        device: key,
+                        expected_revision: None,
+                        action: if effect {
+                            Action::LaunchApp {
+                                bundle_id: "com.example.clock".into(),
+                            }
+                        } else {
+                            Action::Tap {
+                                at: Point { x: 1., y: 1. },
+                            }
+                        },
+                    },
+                    capture,
+                )
+                .unwrap();
+            assert_eq!(result.effect == ObservedEffect::Changed, effect);
+            let actual = controller
+                .inner
+                .lock()
+                .unwrap()
+                .lease
+                .as_ref()
+                .unwrap()
+                .expires_at;
+            if renew && effect {
+                assert!(actual > expires);
+            } else {
+                assert_eq!(actual, expires);
+            }
+            controller.release("agent", lease).unwrap();
+            assert!(controller.inner.lock().unwrap().lease.is_none());
+        }
+    }
+}
+
+#[test]
+fn renewal_never_revives_expired_or_foreign_leases_or_uncertain_delivery() {
+    let now = Instant::now();
+    for (owner, id, expires, accepted, effect, renewal) in [
+        (
+            "agent",
+            LeaseId(1),
+            now,
+            Some(true),
+            ObservedEffect::Changed,
+            true,
+        ),
+        (
+            "other",
+            LeaseId(1),
+            now + Duration::from_secs(1),
+            Some(true),
+            ObservedEffect::Changed,
+            true,
+        ),
+        (
+            "agent",
+            LeaseId(2),
+            now + Duration::from_secs(1),
+            Some(true),
+            ObservedEffect::Changed,
+            true,
+        ),
+        (
+            "agent",
+            LeaseId(1),
+            now + Duration::from_secs(1),
+            None,
+            ObservedEffect::Changed,
+            true,
+        ),
+        (
+            "agent",
+            LeaseId(1),
+            now + Duration::from_secs(1),
+            Some(false),
+            ObservedEffect::Changed,
+            true,
+        ),
+        (
+            "agent",
+            LeaseId(1),
+            now + Duration::from_secs(1),
+            Some(true),
+            ObservedEffect::Unconfirmed,
+            true,
+        ),
+        (
+            "agent",
+            LeaseId(1),
+            now + Duration::from_secs(1),
+            Some(true),
+            ObservedEffect::Changed,
+            false,
+        ),
+    ] {
+        let mut lease = Some(Lease {
+            id: LeaseId(1),
+            owner: "agent".into(),
+            expires_at: expires,
+            renew_on_success: renewal.then_some(Duration::from_secs(30)),
+        });
+        let result = ActionResult {
+            receipt: TransportReceipt {
+                accepted,
+                action_kind: "tap".into(),
+            },
+            after: None,
+            after_image: None,
+            native_lock: None,
+            effect,
+        };
+        renew_verified_action(&mut lease, owner, id, &result, now);
+        assert_eq!(lease.unwrap().expires_at, expires);
+    }
+}
+
+#[test]
+fn observations_and_refusals_do_not_extend_a_renewable_lease() {
+    let (controller, key) = controller();
+    let lease = controller
+        .acquire_with_renewal("agent".into(), Duration::from_secs(30), true)
+        .unwrap();
+    let expires = controller
+        .inner
+        .lock()
+        .unwrap()
+        .lease
+        .as_ref()
+        .unwrap()
+        .expires_at;
+    controller.observe(&key).unwrap();
+    assert_eq!(
+        controller
+            .inner
+            .lock()
+            .unwrap()
+            .lease
+            .as_ref()
+            .unwrap()
+            .expires_at,
+        expires
+    );
+    assert_eq!(
+        controller
+            .act(
+                "other",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: None,
+                    action: Action::Home
+                }
+            )
+            .err(),
+        Some(ControllerError::InvalidLease)
+    );
+    assert_eq!(
+        controller
+            .inner
+            .lock()
+            .unwrap()
+            .lease
+            .as_ref()
+            .unwrap()
+            .expires_at,
+        expires
+    );
+    assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
 }

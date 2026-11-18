@@ -1,5 +1,7 @@
 use super::*;
-use handkite_core::controller::{AdapterError, RawObservation};
+use handkite_core::controller::{
+    AdapterError, ControllerError, RawImageObservation, RawObservation,
+};
 use handkite_core::protocol::{
     Action, DeviceState, ImageFormat, LockState, ObservationWindow, ScreenImage, TransportReceipt,
 };
@@ -13,6 +15,7 @@ struct State {
     exited: AtomicBool,
     shutdown: AtomicBool,
     observations: AtomicUsize,
+    image_observations: AtomicUsize,
     actions: AtomicUsize,
     action_finished: AtomicBool,
     cleaned: AtomicBool,
@@ -22,6 +25,7 @@ struct Adapter {
     state: Arc<State>,
     exit_on_observe: bool,
     fail_observe: bool,
+    fail_image: bool,
     shutdown_on_drop: bool,
 }
 
@@ -70,6 +74,33 @@ impl DeviceAdapter for Adapter {
         })
     }
 
+    fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
+        self.state.observations.fetch_add(1, SeqCst);
+        self.state.image_observations.fetch_add(1, SeqCst);
+        if self.exit_on_observe {
+            self.state.exited.store(true, SeqCst);
+        }
+        if self.fail_image || self.state.exited.load(SeqCst) {
+            return Err(AdapterError);
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        Ok(RawImageObservation {
+            connected_usb: hardware_id(),
+            wda_target: hardware_id(),
+            window: ObservationWindow {
+                started_unix_ms: now,
+                finished_unix_ms: now,
+            },
+            screenshot: ScreenImage {
+                format: ImageFormat::Png,
+                bytes: vec![1],
+            },
+        })
+    }
+
     fn execute(&mut self, _: &Action, _: Instant) -> Result<TransportReceipt, AdapterError> {
         self.state.actions.fetch_add(1, SeqCst);
         self.state.exited.store(true, SeqCst);
@@ -98,6 +129,7 @@ fn adapter(state: &Arc<State>) -> Adapter {
         state: Arc::clone(state),
         exit_on_observe: false,
         fail_observe: false,
+        fail_image: false,
         shutdown_on_drop: false,
     }
 }
@@ -154,7 +186,7 @@ fn runner_loss_during_readiness_has_the_fixed_exit_reason() {
 fn ordinary_readiness_failure_keeps_its_reason_after_cleanup() {
     let state = Arc::new(State::default());
     let mut adapter = adapter(&state);
-    adapter.fail_observe = true;
+    adapter.fail_image = true;
     let result = serve_controller(
         controller(adapter),
         &key(),
@@ -162,7 +194,33 @@ fn ordinary_readiness_failure_keeps_its_reason_after_cleanup() {
         || state.exited.load(SeqCst),
         |_, _| panic!("must not serve"),
     );
-    assert_eq!(result, Err("pinned device is not ready".into()));
+    assert_eq!(result, Err("pinned device is not ready: Adapter".into()));
+    assert!(state.cleaned.load(SeqCst));
+}
+
+#[test]
+fn changing_application_tree_does_not_block_readiness_or_bypass_later_capture() {
+    let state = Arc::new(State::default());
+    let mut adapter = adapter(&state);
+    adapter.fail_observe = true;
+    let result = serve_controller(
+        controller(adapter),
+        &key(),
+        || false,
+        || state.exited.load(SeqCst),
+        |controller, _| {
+            assert_eq!(state.image_observations.load(SeqCst), 1);
+            assert_eq!(state.observations.load(SeqCst), 1);
+            assert!(matches!(
+                controller.observe(&key()),
+                Err(ControllerError::Adapter)
+            ));
+            assert_eq!(state.observations.load(SeqCst), 2);
+            assert_eq!(state.actions.load(SeqCst), 0);
+            Ok(())
+        },
+    );
+    assert_eq!(result, Ok(()));
     assert!(state.cleaned.load(SeqCst));
 }
 

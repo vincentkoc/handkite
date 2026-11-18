@@ -329,6 +329,39 @@ mod tests {
     }
 
     #[test]
+    fn focused_text_renews_only_after_exact_readback() {
+        for verified in [false, true] {
+            let (controller, _, lease, request) = fixture(Adapter {
+                verified,
+                ..Adapter::default()
+            });
+            let expires = Instant::now() + Duration::from_secs(2);
+            {
+                let mut inner = controller.inner.lock().unwrap();
+                let lease = inner.lease.as_mut().unwrap();
+                lease.expires_at = expires;
+                lease.renew_on_success = Some(Duration::from_secs(30));
+            }
+            controller
+                .act_with_capture("owner", lease, request, CaptureMode::ImageOnly)
+                .unwrap();
+            let actual = controller
+                .inner
+                .lock()
+                .unwrap()
+                .lease
+                .as_ref()
+                .unwrap()
+                .expires_at;
+            if verified {
+                assert!(actual > expires);
+            } else {
+                assert_eq!(actual, expires);
+            }
+        }
+    }
+
+    #[test]
     fn unsafe_or_expired_preparation_never_sends() {
         for prepare in 1..=5 {
             let (controller, _, lease, request) = fixture(Adapter {

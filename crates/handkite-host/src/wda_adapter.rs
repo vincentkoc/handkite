@@ -23,8 +23,15 @@ use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod cache;
+mod display;
 mod focused_text;
 mod measurement;
+mod navigation;
+mod ocr;
+mod targets;
+#[cfg(test)]
+pub(crate) use targets::dispatch_native as test_dispatch_native;
+mod targets_pixels;
 pub use measurement::CaptureTimings;
 use measurement::{Stage, measure};
 
@@ -61,6 +68,24 @@ struct CapturePayload {
     finished: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CaptureFailure {
+    Adapter,
+    ImageDrift,
+}
+
+impl From<AdapterError> for CaptureFailure {
+    fn from(_: AdapterError) -> Self {
+        Self::Adapter
+    }
+}
+
+impl From<CaptureFailure> for AdapterError {
+    fn from(_: CaptureFailure) -> Self {
+        Self
+    }
+}
+
 pub struct WdaAdapter {
     expected: HardwareId,
     usb: PinnedUsb,
@@ -75,6 +100,14 @@ pub struct WdaAdapter {
     focused_text: Option<focused_text::Input>,
     text_token: u64,
     text_response_poisoned: bool,
+    targets: Option<targets::Targets>,
+    ocr_cache: ocr::Cache,
+    target_snapshot: Option<targets::Snapshot>,
+    target_input: Option<targets::Input>,
+    target_readback: Option<targets::Input>,
+    target_delta: Option<targets::DeltaBaseline>,
+    pending_effect: Option<targets::PendingEffect>,
+    effect_reports: Vec<handkite_core::controller::TargetEffectReport>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -160,6 +193,14 @@ impl WdaAdapter {
             focused_text: None,
             text_token: 0,
             text_response_poisoned: false,
+            targets: None,
+            ocr_cache: ocr::Cache::default(),
+            target_snapshot: None,
+            target_input: None,
+            target_readback: None,
+            target_delta: None,
+            pending_effect: None,
+            effect_reports: Vec::new(),
         })
     }
 
@@ -216,6 +257,14 @@ impl WdaAdapter {
             focused_text: None,
             text_token: 0,
             text_response_poisoned: false,
+            targets: None,
+            ocr_cache: ocr::Cache::default(),
+            target_snapshot: None,
+            target_input: None,
+            target_readback: None,
+            target_delta: None,
+            pending_effect: None,
+            effect_reports: Vec::new(),
         };
         let liveness = adapter
             .owned_runner
@@ -367,6 +416,14 @@ impl WdaAdapter {
         &self,
         source_path: &str,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+        self.capture_checked_diagnosed(source_path)
+            .map_err(Into::into)
+    }
+
+    fn capture_checked_diagnosed(
+        &self,
+        source_path: &str,
+    ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         let result = if crate::timing::enabled() {
             let started = Instant::now();
             let mut timings = CaptureTimings::default();
@@ -472,8 +529,13 @@ impl WdaAdapter {
         let mut timings = CaptureTimings::default();
         let started = Instant::now();
         let result = self
-            .capture_checked_recorded(SCREEN_SOURCE, Some(&mut timings))
-            .map(|(observation, _, _)| observation);
+            .finish_pending_effect(true)
+            .and_then(|_| {
+                self.capture_checked_recorded(SCREEN_SOURCE, Some(&mut timings))
+                    .map_err(AdapterError::from)
+            })
+            .map(|(observation, _, _)| observation)
+            .map_err(Into::into);
         timings.finish(started, result.is_ok());
         (result, timings)
     }
@@ -482,7 +544,7 @@ impl WdaAdapter {
         &self,
         source_path: &str,
         mut timings: Option<&mut CaptureTimings>,
-    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+    ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         measure(
             timings.as_deref_mut(),
             Stage::OwnershipBefore,
@@ -499,15 +561,19 @@ impl WdaAdapter {
                 &self.expected,
                 source_path,
                 timings.as_deref_mut(),
-            ))?;
-        measure(
-            timings,
-            Stage::OwnershipAfter,
-            &Instant::now,
-            |_| 0,
-            || self.validate_owned(),
-        )?;
-        Ok(captured)
+            ));
+        // Image drift can select a read-only fallback only after ownership has
+        // also survived the capture. Other errors keep their original refusal.
+        if captured.is_ok() || matches!(captured, Err(CaptureFailure::ImageDrift)) {
+            measure(
+                timings,
+                Stage::OwnershipAfter,
+                &Instant::now,
+                |_| 0,
+                || self.validate_owned(),
+            )?;
+        }
+        captured
     }
 
     async fn capture(
@@ -515,7 +581,7 @@ impl WdaAdapter {
         expected: &HardwareId,
         source_path: &str,
         timings: Option<&mut CaptureTimings>,
-    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+    ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         let started_unix_ms = unix_ms()?;
         let wda = UsbWda::new(usb.clone());
         Self::capture_using(
@@ -538,7 +604,7 @@ impl WdaAdapter {
         clock: &impl Fn() -> Instant,
         wall: &impl Fn() -> Result<u64, AdapterError>,
         timings: Option<&mut CaptureTimings>,
-    ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+    ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         let payload = Self::capture_payload(wda, Some(source_path), clock, timings).await?;
         let tree = payload.tree.ok_or(AdapterError)?;
         let lock = classify_lock(&payload.app, &tree, payload.reported);
@@ -567,9 +633,106 @@ impl WdaAdapter {
         wda: &impl WdaRequest,
         source_path: Option<&str>,
         clock: &impl Fn() -> Instant,
+        timings: Option<&mut CaptureTimings>,
+    ) -> Result<CapturePayload, CaptureFailure> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let result = tokio::time::timeout_at(
+            deadline,
+            Self::capture_payload_inner(wda, source_path, clock, timings),
+        )
+        .await
+        .map_err(|_| AdapterError)?;
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CaptureFailure::Adapter);
+        }
+        result
+    }
+
+    async fn capture_payload_inner(
+        wda: &impl WdaRequest,
+        source_path: Option<&str>,
+        clock: &impl Fn() -> Instant,
         mut timings: Option<&mut CaptureTimings>,
-    ) -> Result<CapturePayload, AdapterError> {
+    ) -> Result<CapturePayload, CaptureFailure> {
         let enabled = timings.is_some();
+        // The source request must finish between these two image captures.
+        // Concurrent image/source requests can otherwise describe different UI states.
+        let before = if source_path.is_some() {
+            let ((response, image_timing), (app, app_timing), (lock, lock_timing)) = tokio::join!(
+                measurement::request(
+                    enabled,
+                    Stage::ScreenshotBeforeRequest,
+                    clock,
+                    wda.request("GET", "/screenshot", b"", Duration::from_secs(20)),
+                ),
+                measurement::request(
+                    enabled,
+                    Stage::AppBeforeRequest,
+                    clock,
+                    wda.request("GET", "/wda/activeAppInfo", b"", Duration::from_secs(10)),
+                ),
+                measurement::request(
+                    enabled,
+                    Stage::LockBeforeRequest,
+                    clock,
+                    wda.request("GET", "/wda/locked", b"", Duration::from_secs(10)),
+                ),
+            );
+            if let Some(timings) = timings.as_deref_mut() {
+                timings.append([image_timing, app_timing, lock_timing]);
+            }
+            let response = response.map_err(|_| AdapterError)?;
+            let image = measure(
+                timings.as_deref_mut(),
+                Stage::ScreenshotBeforeJson,
+                clock,
+                String::len,
+                || {
+                    let value = response_value(response)?;
+                    value
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .ok_or(AdapterError)
+                },
+            )?;
+            let app = measure(
+                timings.as_deref_mut(),
+                Stage::AppBeforeJson,
+                clock,
+                String::len,
+                || {
+                    let value = response_value(app.map_err(|_| AdapterError)?)?;
+                    value["bundleId"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                        .ok_or(AdapterError)
+                },
+            )?;
+            let lock = measure(
+                timings.as_deref_mut(),
+                Stage::LockBeforeJson,
+                clock,
+                |_| 0,
+                || response_value(lock.map_err(|_| AdapterError)?).map(|v| v.as_bool()),
+            )?;
+            Some((image, app, lock))
+        } else {
+            None
+        };
+        let source = if let Some(path) = source_path {
+            let (response, timing) = measurement::request(
+                enabled,
+                Stage::SourceRequest,
+                clock,
+                wda.request("GET", path, b"", Duration::from_secs(20)),
+            )
+            .await;
+            (response.map(Some), timing)
+        } else {
+            (Ok(None), None)
+        };
         let (
             (image, image_timing),
             (source, source_timing),
@@ -582,20 +745,7 @@ impl WdaAdapter {
                 clock,
                 wda.request("GET", "/screenshot", b"", Duration::from_secs(20))
             ),
-            async {
-                if let Some(path) = source_path {
-                    let (response, timing) = measurement::request(
-                        enabled,
-                        Stage::SourceRequest,
-                        clock,
-                        wda.request("GET", path, b"", Duration::from_secs(20)),
-                    )
-                    .await;
-                    (response.map(Some), timing)
-                } else {
-                    (Ok(None), None)
-                }
-            },
+            async { source },
             measurement::request(
                 enabled,
                 Stage::AppRequest,
@@ -647,7 +797,7 @@ impl WdaAdapter {
             },
         )?;
         let (tree, app, reported_lock) = measure(
-            timings,
+            timings.as_deref_mut(),
             Stage::PayloadValidation,
             clock,
             |(tree, _, _): &(Option<String>, String, Option<bool>)| {
@@ -668,6 +818,32 @@ impl WdaAdapter {
                 Ok((tree, app, reported_lock))
             },
         )?;
+        if let Some((before_image, before_app, before_lock)) = before {
+            measure(
+                timings,
+                Stage::CaptureCoherence,
+                clock,
+                |_| 0,
+                || {
+                    if app != before_app || reported_lock != before_lock {
+                        return Err(CaptureFailure::Adapter);
+                    }
+                    if image.as_str() != Some(before_image.as_str()) {
+                        // Invalid image data or unknown lock state is not a
+                        // recoverable image-drift result.
+                        let before_pixels = base64::engine::general_purpose::STANDARD
+                            .decode(before_image)
+                            .map_err(|_| CaptureFailure::Adapter)?;
+                        if before_lock.is_none() || !before_pixels.starts_with(b"\x89PNG\r\n\x1a\n")
+                        {
+                            return Err(CaptureFailure::Adapter);
+                        }
+                        return Err(CaptureFailure::ImageDrift);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
         Ok(CapturePayload {
             tree,
             app,
@@ -684,6 +860,7 @@ impl WdaAdapter {
     /// The monotonic completion anchor bounds later diagnostic input freshness.
     /// Ordinary controller observations continue to use the smaller projection.
     pub fn observe_with_attributes(&mut self) -> Result<(RawObservation, Instant), AdapterError> {
+        self.finish_pending_effect(true)?;
         self.capture_checked(ATTRIBUTE_SOURCE)
     }
 
@@ -692,6 +869,7 @@ impl WdaAdapter {
     pub fn observe_with_attributes_and_lock_report(
         &mut self,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
+        self.finish_pending_effect(true)?;
         self.capture_checked_with_lock_report(ATTRIBUTE_SOURCE)
     }
 
@@ -699,6 +877,7 @@ impl WdaAdapter {
     pub fn observe_pin_with_attributes(
         &mut self,
     ) -> Result<(RawObservation, Instant), AdapterError> {
+        self.finish_pending_effect(true)?;
         self.capture_checked(PIN_SOURCE)
     }
 }
@@ -719,6 +898,50 @@ async fn run_until_shutdown<T, E: Copy>(
 }
 
 impl DeviceAdapter for WdaAdapter {
+    fn settle_target_effects(&mut self) -> Result<(), AdapterError> {
+        self.finish_pending_effect(true)
+    }
+    fn observe_targets_since(
+        &mut self,
+        revision: Option<handkite_core::protocol::Revision>,
+    ) -> Result<
+        (
+            RawObservation,
+            Vec<handkite_core::controller::ElementTarget>,
+        ),
+        AdapterError,
+    > {
+        if let Some(revision) = revision
+            && let Some(result) = self.capture_target_delta(revision)?
+        {
+            return Ok(result);
+        }
+        self.capture_targets()
+    }
+    fn target_effect_updates(&mut self) -> Vec<handkite_core::controller::TargetEffectReport> {
+        let _ = self.finish_pending_effect(false);
+        self.effect_reports.clone()
+    }
+    fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
+        self.finish_pending_effect(true)?;
+        self.navigation_frame()
+    }
+    fn prepare_navigation(
+        &mut self,
+        action: &Action,
+    ) -> Result<(RawObservation, ActionAdmission), AdapterError> {
+        self.finish_pending_effect(true)?;
+        self.navigation_prepare(action)
+    }
+    fn execute_navigation(
+        &mut self,
+        action: &Action,
+        deadline: Instant,
+        admission: ActionAdmission,
+        app: &str,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.navigation_execute(action, deadline, admission, app)
+    }
     fn requires_current_text_preparation(&self) -> bool {
         self.owned_runner.is_some() || self.owned_session.is_some()
     }
@@ -728,6 +951,7 @@ impl DeviceAdapter for WdaAdapter {
         action: &Action,
         baseline: &handkite_core::protocol::Observation,
     ) -> Result<Option<handkite_core::controller::PreparedText>, AdapterError> {
+        self.finish_pending_effect(true)?;
         self.prepare_focus(action, baseline)
             .inspect_err(|_| self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture))
     }
@@ -768,10 +992,60 @@ impl DeviceAdapter for WdaAdapter {
         Ok((self.expected.clone(), self.expected.clone()))
     }
 
+    fn observe_targets(
+        &mut self,
+    ) -> Result<
+        (
+            RawObservation,
+            Vec<handkite_core::controller::ElementTarget>,
+        ),
+        AdapterError,
+    > {
+        self.capture_targets()
+    }
+    fn bind_targets(
+        &mut self,
+        revision: handkite_core::protocol::Revision,
+    ) -> Result<(), AdapterError> {
+        self.bind_native_targets(revision)
+    }
+    fn prepare_target(
+        &mut self,
+        revision: handkite_core::protocol::Revision,
+        action: &handkite_core::controller::ElementAction,
+        baseline: &handkite_core::protocol::Observation,
+    ) -> Result<handkite_core::controller::PreparedTarget, AdapterError> {
+        self.prepare_native_target(revision, action, baseline)
+    }
+    fn execute_target(
+        &mut self,
+        action: &handkite_core::controller::ElementAction,
+        token: u64,
+        deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.send_native_target(action, token, deadline)
+    }
+    fn target_readback(
+        &mut self,
+        token: u64,
+    ) -> Result<handkite_core::controller::TextReadback, AdapterError> {
+        self.read_target_effect(token)
+    }
+    fn complete_target(&mut self, token: u64) -> handkite_core::controller::TargetCompletion {
+        self.finish_target_capture(token)
+    }
+
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
+        self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
-        self.capture_checked(SCREEN_SOURCE)
-            .map(|(observation, _)| observation)
+        self.capture_checked_diagnosed(SCREEN_SOURCE)
+            .map(|(observation, _, _)| observation)
+            .map_err(|error| {
+                if error == CaptureFailure::ImageDrift {
+                    self.error_diagnostic = Some(AdapterDiagnostic::CaptureImageDrift);
+                }
+                AdapterError
+            })
     }
 
     fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
@@ -846,10 +1120,11 @@ impl DeviceAdapter for WdaAdapter {
                 self.runtime
                     .as_ref()
                     .expect("adapter runtime")
-                    .block_on(before_input_deadline(
-                        until,
-                        Self::capture(&self.usb, &self.expected, SCREEN_SOURCE, timings.as_mut()),
-                    ));
+                    .block_on(before_input_deadline(until, async {
+                        Self::capture(&self.usb, &self.expected, SCREEN_SOURCE, timings.as_mut())
+                            .await
+                            .map_err(Into::into)
+                    }));
             if let (Some(started), Some(mut timings)) = (started, timings) {
                 timings.finish(started, capture.is_ok());
                 crate::timing::capture(timings);
@@ -876,6 +1151,7 @@ impl DeviceAdapter for WdaAdapter {
         &mut self,
         action: &Action,
     ) -> Result<(RawObservation, Option<ActionAdmission>), AdapterError> {
+        self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
         self.launch_admission = None;
         let owned_input = matches!(
@@ -1066,6 +1342,7 @@ impl DeviceAdapter for WdaAdapter {
         action: &Action,
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
+        self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
         self.validate_owned_with_deadline(Some(send_deadline))
             .inspect_err(|_| {
@@ -1118,6 +1395,7 @@ impl DeviceAdapter for WdaAdapter {
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
     ) -> Result<TransportReceipt, AdapterError> {
+        self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
         self.cache.clear_full();
         if self.owned_session.is_some()
@@ -1295,6 +1573,7 @@ impl DeviceAdapter for WdaAdapter {
 
 impl Drop for WdaAdapter {
     fn drop(&mut self) {
+        let _ = self.finish_pending_effect(true);
         let runtime = self.runtime.take().expect("adapter runtime");
         if let Some(runner) = self.owned_runner.take() {
             let wda = runner.write_admission().map(|admission| {

@@ -92,6 +92,7 @@ pub(crate) fn visible_current_text_input(xml: &str) -> bool {
 pub(crate) struct TextSnapshot {
     pub screen: Attributes,
     pub field: Attributes,
+    pub context: Vec<Attributes>,
     pub emoji_search: Option<EmojiSearch>,
 }
 
@@ -146,12 +147,126 @@ pub(crate) fn current_text_snapshot(xml: &str) -> Option<TextSnapshot> {
                 return Some(TextSnapshot {
                     screen: screen?,
                     field: field?,
+                    context: text_context(xml)?.1,
                     emoji_search: None,
                 });
             }
             _ => {}
         }
     }
+}
+
+/// A complete public text context, including hidden and disabled fields.
+/// Native callers must match every entry before using an active identity.
+pub(crate) fn text_context(xml: &str) -> Option<(Attributes, Vec<Attributes>)> {
+    if !safe_context(xml) {
+        return None;
+    }
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut stack = Vec::new();
+    let mut screen = None;
+    let mut fields = Vec::new();
+    let mut keyboards = 0;
+    loop {
+        let event = reader.read_event().ok()?;
+        let start = matches!(&event, Event::Start(_));
+        match event {
+            Event::Start(node) | Event::Empty(node) => {
+                let kind = std::str::from_utf8(node.name().as_ref()).ok()?.to_owned();
+                if kind == "XCUIElementTypeApplication"
+                    || matches!(
+                        kind.as_str(),
+                        "XCUIElementTypeTextField"
+                            | "XCUIElementTypeTextView"
+                            | "XCUIElementTypeSearchField"
+                            | "XCUIElementTypeKeyboard"
+                    )
+                {
+                    let mut attrs = Attributes::new();
+                    for attr in node.attributes() {
+                        let attr = attr.ok()?;
+                        attrs.insert(
+                            std::str::from_utf8(attr.key.as_ref()).ok()?.into(),
+                            attr.decode_and_unescape_value(reader.decoder())
+                                .ok()?
+                                .into_owned(),
+                        );
+                    }
+                    attrs.insert("type".into(), kind.clone());
+                    if kind == "XCUIElementTypeApplication" {
+                        screen = Some(attrs);
+                    } else {
+                        if fields.len() >= 64
+                            || !stack
+                                .iter()
+                                .any(|parent| parent == "XCUIElementTypeApplication")
+                            || ["visible", "enabled"].iter().any(|key| {
+                                !matches!(
+                                    attrs.get(*key).map(String::as_str),
+                                    Some("true" | "false")
+                                )
+                            })
+                            || attrs
+                                .get("focused")
+                                .is_some_and(|value| !matches!(value.as_str(), "true" | "false"))
+                        {
+                            return None;
+                        }
+                        if attrs["visible"] == "true" && attrs["enabled"] == "true" {
+                            if !Rect::read(screen.as_ref()?)?.encloses(Rect::read(&attrs)?) {
+                                return None;
+                            }
+                            if kind == "XCUIElementTypeKeyboard" {
+                                keyboards += 1;
+                            }
+                        }
+                        fields.push(attrs);
+                    }
+                }
+                if start {
+                    stack.push(kind);
+                }
+            }
+            Event::End(_) => {
+                stack.pop()?;
+            }
+            Event::Eof => {
+                return (keyboards == 1 && fields.len() >= 2).then_some((screen?, fields));
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Select an exact public field; the caller separately proves its native active
+/// identity. iOS's `focused=false` attribute is not an active-element identity.
+pub(crate) fn selected_text_snapshot(xml: &str, selected: &Attributes) -> Option<TextSnapshot> {
+    let (screen, fields) = text_context(xml)?;
+    let mut matches = fields.iter().filter(|field| *field == selected);
+    let field = matches.next()?;
+    if matches.next().is_some()
+        || field.get("visible").map(String::as_str) != Some("true")
+        || field.get("enabled").map(String::as_str) != Some("true")
+        || !matches!(
+            field.get("type").map(String::as_str),
+            Some(
+                "XCUIElementTypeTextField"
+                    | "XCUIElementTypeTextView"
+                    | "XCUIElementTypeSearchField"
+            )
+        )
+    {
+        return None;
+    }
+    if let Some(emoji) = emoji_text_snapshot(xml) {
+        return (emoji.field == *field).then_some(emoji);
+    }
+    Some(TextSnapshot {
+        screen,
+        field: field.clone(),
+        context: fields,
+        emoji_search: None,
+    })
 }
 
 /// Emoji search is a sibling of Keyboard in a separate input container on iOS.
@@ -306,6 +421,7 @@ fn emoji_text_snapshot(xml: &str) -> Option<TextSnapshot> {
     Some(TextSnapshot {
         screen: screen?,
         field: primary.node.attrs.clone(),
+        context: text_context(xml)?.1,
         emoji_search: Some(EmojiSearch {
             field: search.node.attrs.clone(),
             keyboard: keyboard.node.attrs.clone(),
@@ -579,6 +695,68 @@ mod tests {
     }
     fn point() -> Point {
         Point { x: 285.0, y: 505.0 }
+    }
+
+    #[test]
+    fn selected_text_snapshot_requires_an_exact_visible_public_field() {
+        let field = r#"<XCUIElementTypeTextView name="editor" visible="true" enabled="true" focused="false" x="10" y="100" width="300" height="40"/>"#;
+        let other = r#"<XCUIElementTypeTextField name="other" visible="true" enabled="true" x="10" y="200" width="300" height="40"/>"#;
+        let keyboard = r#"<XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="550" width="393" height="302"/>"#;
+        let xml = tree(&format!("{field}{other}{keyboard}"));
+        let (_, context) = text_context(&xml).unwrap();
+        let selected = &context[0];
+        assert_eq!(
+            selected_text_snapshot(&xml, selected).unwrap().field,
+            *selected
+        );
+        assert!(!visible_current_text_input(&xml));
+        assert!(current_text_snapshot(&xml).is_none());
+        for (key, value) in [
+            ("name", "another"),
+            ("x", "11"),
+            ("type", "XCUIElementTypeTextField"),
+            ("visible", "false"),
+            ("enabled", "false"),
+        ] {
+            let mut changed = selected.clone();
+            changed.insert(key.into(), value.into());
+            assert!(selected_text_snapshot(&xml, &changed).is_none(), "{key}");
+        }
+        for invalid in [
+            tree(&format!("{field}{field}{keyboard}")),
+            tree(&format!("{field}{other}")),
+            tree(&format!("{field}{other}{keyboard}{keyboard}")),
+            xml.replace("focused=\"false\"", "focused=\"unknown\""),
+            xml.replace("name=\"other\" visible=\"true\"", "name=\"other\""),
+            xml.replace("width=\"300\"", "width=\"500\""),
+            xml.replace(
+                "name=\"other\"",
+                "name=\"other\" type=\"XCUIElementTypeSecureTextField\"",
+            ),
+            tree(&format!(
+                "{field}{other}{keyboard}<XCUIElementTypeSecureTextField visible=\"false\"/>"
+            )),
+            tree(&format!(
+                "{field}{other}{keyboard}<XCUIElementTypeAlert visible=\"false\"/>"
+            )),
+            tree(&format!("{field}{other}{keyboard}<XCUIElementTypeSheet/>")),
+            tree(&format!(
+                "{field}{other}{keyboard}<node label=\"Enter Passcode\"/>"
+            )),
+            xml.replace("</AppiumAUT>", "<broken></AppiumAUT>"),
+        ] {
+            assert!(
+                selected_text_snapshot(&invalid, selected).is_none(),
+                "{invalid}"
+            );
+        }
+        for key in ["visible", "enabled"] {
+            let hidden = field.replace(&format!(r#"{key}="true""#), &format!(r#"{key}="false""#));
+            let xml = tree(&format!("{hidden}{other}{keyboard}"));
+            let (_, context) = text_context(&xml).unwrap();
+            assert!(selected_text_snapshot(&xml, &context[0]).is_none());
+            assert!(selected_text_snapshot(&xml, &context[1]).is_some());
+        }
     }
 
     #[test]

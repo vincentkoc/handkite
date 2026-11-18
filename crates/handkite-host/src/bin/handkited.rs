@@ -198,11 +198,13 @@ fn serve_controller<A: DeviceAdapter>(
         if should_stop() {
             return Ok(());
         }
-        let ready = controller.observe(key);
+        // Readiness proves the owned transport, not a stable application screen.
+        // Image observation cannot seed a revision for later input admission.
+        let ready = controller.observe_image(key);
         if should_stop() {
             return Ok(());
         }
-        ready.map_err(|_| "pinned device is not ready")?;
+        ready.map_err(|error| format!("pinned device is not ready: {error:?}"))?;
         eprintln!("handkited ready");
         serve(&controller, &should_stop)
     })();
