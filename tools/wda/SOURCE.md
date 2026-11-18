@@ -1,6 +1,6 @@
 # WebDriverAgent source pin
 
-Handkite builds its iOS XCTest runner from the private
+Handkite builds its iOS XCTest runner from the public
 [Handkite WDA fork](https://github.com/vincentkoc/handkite-wda/tree/1262085ed9a13ef4e0d0e222cf0a918ecfe4b565/packages/webdriveragent),
 commit `1262085ed9a13ef4e0d0e222cf0a918ecfe4b565`, on
 `handkite/appium-webdriveragent-17.0.6`. Its upstream base is Appium

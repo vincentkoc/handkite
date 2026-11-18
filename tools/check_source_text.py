@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Check tracked source and documentation for Han characters."""
+"""Check English source and prose while preserving Unicode fixture values."""
 
+import json
 from pathlib import Path
 import subprocess
 import unicodedata
@@ -11,6 +12,10 @@ TEXT_SUFFIXES = {
     ".sh", ".svg", ".toml", ".ts", ".txt", ".yaml", ".yml",
 }
 TEXT_NAMES = {".gitignore", "Caddyfile"}
+UNICODE_FIXTURES = {
+    "tools/benchmarks/notes-scroll.json",
+    "tools/benchmarks/notes-typing.json",
+}
 
 
 def has_han(value: str) -> bool:
@@ -20,6 +25,51 @@ def has_han(value: str) -> bool:
         )
         for char in value
     )
+
+
+def unique_object(pairs: list[tuple[str, object]]) -> dict:
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate fixture key")
+        result[key] = value
+    return result
+
+
+def invalid_constant(_value: str) -> None:
+    raise ValueError("invalid JSON constant")
+
+
+def fixture_value(path: tuple) -> bool:
+    if len(path) < 5 or path[:1] != ("cases",) or not isinstance(path[1], int):
+        return False
+    if path[2] == "measure":
+        return path[3:] == ("expect", "text", "value")
+    return (
+        path[2] in ("prepare", "cleanup")
+        and isinstance(path[3], int)
+        and path[4:] == ("expect", "text", "value")
+    )
+
+
+def forbidden_han(relative: Path, content: str) -> bool:
+    if relative.as_posix() not in UNICODE_FIXTURES:
+        return has_han(content)
+    try:
+        document = json.loads(content, object_pairs_hook=unique_object,
+                              parse_constant=invalid_constant)
+    except ValueError:
+        return True
+
+    def visit(value: object, path: tuple = ()) -> bool:
+        if isinstance(value, dict):
+            return any(has_han(key) or visit(child, (*path, key))
+                       for key, child in value.items())
+        if isinstance(value, list):
+            return any(visit(child, (*path, index)) for index, child in enumerate(value))
+        return isinstance(value, str) and not fixture_value(path) and has_han(value)
+
+    return visit(document)
 
 
 def main() -> int:
@@ -57,7 +107,7 @@ def main() -> int:
         except (UnicodeDecodeError, OSError, subprocess.CalledProcessError):
             violations.append(relative)
             continue
-        if has_han(staged) or has_han(content):
+        if forbidden_han(relative, staged) or forbidden_han(relative, content):
             violations.append(relative)
     for path in violations:
         print(f"source_han=found path={path}")

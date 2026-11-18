@@ -1,13 +1,23 @@
 # Handkite
 
-Handkite is a local-first control service for an explicitly selected iPhone. The Mac that owns the USB connection runs the device controller; an authenticated agent bridge will expose observation and guarded actions.
+Handkite is a local-first control service for one explicitly selected
+iPhone. The Mac connected to the phone over USB runs the controller. A local
+stdio MCP bridge exposes screenshots, accessibility trees and guarded actions.
 
 The design specification is kept outside this repository.
 
-Source and documentation use English. Run `python3 tools/check_source_text.py` to
-check both staged and working tracked text for Han characters without displaying
-file contents. Runtime
-app labels and accessibility text remain data and may use any language.
+Source identifiers, messages, comments and documentation use English. Unicode
+and IME test data remain in their original scripts. Run
+`python3 tools/check_source_text.py` to check staged and working tracked text
+without displaying file contents. The Han-character check exempts only the named
+Notes fixtures' exact expected-text value paths; keys and metadata remain checked.
+Runtime app labels and accessibility text may use any language.
+
+The qualified route uses a local USB connection and a separately configured PIN
+broker; MCP never receives the PIN. Signing profiles expire and must be checked
+before installing a runner. See the [runner guide](tools/wda/README.md).
+Local typing met the two-second p50/p95 target. Swipe remains above its p95
+target; see [measured results and limits](VALIDATION.md).
 
 ## Local setup
 
