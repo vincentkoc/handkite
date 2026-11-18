@@ -38,7 +38,7 @@ fn png(changed: bool) -> Vec<u8> {
     }
     out
 }
-fn input(generation: tokio::task::Id) -> Input {
+pub(in crate::wda_adapter) fn input(generation: tokio::task::Id) -> Input {
     let rich = rows()[1].clone();
     let a = attrs(&rich).unwrap();
     let region = Pixels::decode(&png(false))
@@ -89,6 +89,7 @@ struct Fake {
     app: &'static str,
     final_app_drift: bool,
     final_lock_drift: bool,
+    frame: Option<Vec<u8>>,
     calls: RefCell<Vec<String>>,
 }
 impl Default for Fake {
@@ -102,6 +103,7 @@ impl Default for Fake {
             app: "example.app",
             final_app_drift: false,
             final_lock_drift: false,
+            frame: None,
             calls: RefCell::new(vec![]),
         }
     }
@@ -137,7 +139,10 @@ impl WdaRequest for Fake {
                 > 1;
             json!(final_read && self.final_lock_drift)
         } else if path == "/screenshot" {
-            json!(base64::engine::general_purpose::STANDARD.encode(png(self.changed)))
+            json!(
+                base64::engine::general_purpose::STANDARD
+                    .encode(self.frame.clone().unwrap_or_else(|| png(self.changed)))
+            )
         } else if path.ends_with("/elements") {
             assert_eq!(method, "POST");
             let p = serde_json::from_slice::<Value>(body).unwrap()["value"]
@@ -376,6 +381,7 @@ async fn native_read_starts_only_after_target_region_validation() {
             &f,
             &input(task.id()),
             Instant::now() + Duration::from_secs(5),
+            None,
             move |_| {
                 c.store(true, Ordering::SeqCst);
                 LockState::Unlocked
@@ -406,6 +412,7 @@ async fn native_failure_or_tail_failure_drains_the_read_without_input() {
                 &f,
                 &input(task.id()),
                 Instant::now() + Duration::from_secs(5),
+                None,
                 move |_| {
                     std::thread::sleep(Duration::from_millis(10));
                     end.store(true, Ordering::SeqCst);
@@ -428,6 +435,7 @@ async fn successful_native_proof_caps_the_socket_write_age() {
         &f,
         &input(task.id()),
         Instant::now() + Duration::from_secs(5),
+        None,
         move |_| LockState::Unlocked,
     )
     .await
@@ -438,13 +446,15 @@ async fn successful_native_proof_caps_the_socket_write_age() {
     );
     assert!(Instant::now() < proof.deadline);
     let original = Instant::now() + Duration::from_millis(100);
-    let short = revalidate_with_native(&f, &input(task.id()), original, |_| LockState::Unlocked)
-        .await
-        .unwrap();
+    let short = revalidate_with_native(&f, &input(task.id()), original, None, |_| {
+        LockState::Unlocked
+    })
+    .await
+    .unwrap();
     assert_eq!(short.write_deadline().unwrap(), original);
     let past = Instant::now() - Duration::from_millis(1);
     assert!(
-        revalidate_with_native(&f, &input(task.id()), past, move |_| panic!(
+        revalidate_with_native(&f, &input(task.id()), past, None, move |_| panic!(
             "expired input must not query native state"
         ))
         .await
@@ -518,6 +528,7 @@ async fn failed_native_read_still_restores_profile_and_preserves_restore_failure
                 &f,
                 &input,
                 Instant::now() + Duration::from_secs(5),
+                None,
                 move |_| lock,
             ),
         )
@@ -537,4 +548,156 @@ async fn failed_native_read_still_restores_profile_and_preserves_restore_failure
                 .all(|p| !p.ends_with("/click"))
         );
     }
+}
+
+fn png_pixel(x: usize, y: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut data = vec![255; 4 * 8 * 4];
+    data[(y * 4 + x) * 4] = 0;
+    {
+        let mut encoder = png::Encoder::new(&mut out, 4, 8);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder
+            .write_header()
+            .unwrap()
+            .write_image_data(&data)
+            .unwrap();
+    }
+    out
+}
+
+fn basis(image: Vec<u8>, fields: Vec<[f64; 4]>, age: Duration) -> FastBasis {
+    FastBasis {
+        image: ScreenImage {
+            format: handkite_core::protocol::ImageFormat::Png,
+            bytes: image,
+        },
+        captured: Instant::now().checked_sub(age).unwrap(),
+        fields,
+    }
+}
+
+async fn frame_admission(f: &Fake, basis: FastBasis) -> bool {
+    let task = tokio::spawn(async {});
+    revalidate_with_native(
+        f,
+        &input(task.id()),
+        Instant::now() + Duration::from_secs(5),
+        Some(basis),
+        |_| LockState::Unlocked,
+    )
+    .await
+    .is_ok()
+}
+
+fn queried(f: &Fake) -> bool {
+    f.calls.borrow().iter().any(|p| p.ends_with("/elements"))
+}
+
+#[tokio::test]
+async fn unchanged_presented_frame_admits_without_a_semantic_query() {
+    let f = Fake::default();
+    assert!(frame_admission(&f, basis(png(false), vec![], Duration::ZERO)).await);
+    assert!(!queried(&f));
+    let calls = f.calls.borrow();
+    assert!(calls.iter().any(|p| p.ends_with("/attribute/hittable")));
+    assert!(calls.iter().any(|p| p.ends_with("/wda/activeAppInfo")));
+    assert_eq!(
+        calls.iter().filter(|p| p.as_str() == "/screenshot").count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn frame_drift_outside_an_editable_field_takes_full_scoped_admission() {
+    let f = Fake {
+        frame: Some(png_pixel(3, 7)),
+        ..Fake::default()
+    };
+    assert!(frame_admission(&f, basis(png(false), vec![], Duration::ZERO)).await);
+    assert!(queried(&f));
+    // A blinking caret inside a presented field keeps frame-scoped admission.
+    let f = Fake {
+        frame: Some(png_pixel(3, 7)),
+        ..Fake::default()
+    };
+    assert!(
+        frame_admission(
+            &f,
+            basis(png(false), vec![[2., 6., 2., 2.]], Duration::ZERO)
+        )
+        .await
+    );
+    assert!(!queried(&f));
+    // An old presented frame is not reused.
+    let f = Fake::default();
+    let old = basis(
+        png(false),
+        vec![],
+        FAST_FRAME_AGE + Duration::from_millis(1),
+    );
+    assert!(frame_admission(&f, old).await);
+    assert!(queried(&f));
+}
+
+#[tokio::test]
+async fn frame_admission_keeps_stale_moved_and_unhittable_refusals() {
+    // Changed target pixels refuse before any query or tail read.
+    let f = Fake {
+        changed: true,
+        ..Fake::default()
+    };
+    assert!(
+        !frame_admission(
+            &f,
+            basis(png(false), vec![[0., 0., 4., 8.]], Duration::ZERO)
+        )
+        .await
+    );
+    assert!(!queried(&f));
+    assert!(!f.calls.borrow().iter().any(|p| p.ends_with("hittable")));
+    for case in 0..3 {
+        let mut f = Fake::default();
+        match case {
+            0 => f.hittable = false,
+            1 => f.app = "unexpected.app",
+            _ => f.display = 2,
+        }
+        assert!(!frame_admission(&f, basis(png(false), vec![], Duration::ZERO)).await);
+        assert!(!f.calls.borrow().iter().any(|p| p.ends_with("click")));
+    }
+}
+
+#[test]
+fn delta_sample_classification_matches_the_standalone_effect_rules() {
+    let task_id = tokio::runtime::Runtime::new()
+        .unwrap()
+        .block_on(async { tokio::spawn(async {}).id() });
+    let bound = input(task_id).bound;
+    let same = Pixels::decode(&png(false))
+        .unwrap()
+        .region(mapping().viewport, &bound.attrs, &mut 0)
+        .unwrap();
+    let moved = Pixels::decode(&png(true))
+        .unwrap()
+        .region(mapping().viewport, &bound.attrs, &mut 0)
+        .unwrap();
+    let app = rows()[0].clone();
+    let present = rows().as_array().unwrap().clone();
+    assert_eq!(
+        classify(&bound, &present, &moved, None),
+        Outcome::Unconfirmed
+    );
+    let mut toggled = present.clone();
+    toggled[1]["attribute/selected"] = json!(true);
+    assert_eq!(classify(&bound, &toggled, &same, None), Outcome::Changed);
+    let gone = vec![app.clone()];
+    assert_eq!(classify(&bound, &gone, &moved, None), Outcome::Absent);
+    assert_eq!(classify(&bound, &gone, &same, None), Outcome::Unconfirmed);
+    let duplicate = vec![app, row("other", "XCUIElementTypeButton", [1., 1., 2., 2.])];
+    assert_eq!(
+        classify(&bound, &duplicate, &moved, None),
+        Outcome::Unconfirmed
+    );
 }

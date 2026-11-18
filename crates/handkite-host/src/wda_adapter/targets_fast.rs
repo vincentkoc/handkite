@@ -210,7 +210,7 @@ async fn sample(wda: &impl WdaRequest, input: &Input, focus: bool) -> Result<Sam
 
 #[cfg(test)]
 #[path = "targets_fast_tests.rs"]
-mod tests;
+pub(super) mod tests;
 
 fn matches_count(bound: &Bound, rows: &[Value]) -> usize {
     rows.iter()
@@ -218,7 +218,72 @@ fn matches_count(bound: &Bound, rows: &[Value]) -> usize {
         .count()
 }
 
-async fn validate_region(wda: &impl WdaRequest, input: &Input) -> Result<(), AdapterError> {
+/// The frame most recently presented with the target, at most this old.
+pub(super) const FAST_FRAME_AGE: Duration = Duration::from_secs(2);
+
+pub(super) struct FastBasis {
+    pub image: ScreenImage,
+    pub captured: Instant,
+    /// Editable fields whose caret may blink without new semantic capture.
+    pub fields: Vec<[f64; 4]>,
+}
+
+/// Frame-scoped admission from one image-only grab. `Ok(false)` means the
+/// screen drifted outside an editable field, so the full scoped query decides.
+/// A changed target region refuses exactly as the scoped path does.
+async fn validate_frame(
+    wda: &impl WdaRequest,
+    input: &Input,
+    basis: &FastBasis,
+) -> Result<bool, AdapterError> {
+    let _span = crate::timing::Span::new("target_frame_admission");
+    let mapping = input.bound.mapping.ok_or(AdapterError)?;
+    if basis.captured.elapsed() >= FAST_FRAME_AGE {
+        return Ok(false);
+    }
+    if MARKERS.iter().any(|m| input.app.contains(m)) || input.app.chars().any(char::is_control) {
+        return Err(AdapterError);
+    }
+    super::super::display::verify_selection(wda, &input.key.session, mapping.display_id).await?;
+    let (image, app) = tokio::join!(
+        screenshot(wda),
+        app_matches(wda, &input.key.session, &input.app)
+    );
+    app?;
+    let pixels = Pixels::decode(&image?.bytes)?;
+    pixels.validate_mapping(
+        mapping.viewport,
+        mapping.scale,
+        [mapping.viewport[2], mapping.viewport[3]],
+    )?;
+    super::super::display::verify_selection(wda, &input.key.session, mapping.display_id).await?;
+    let region = pixels.region(mapping.viewport, &input.bound.attrs, &mut 0)?;
+    if input.bound.region.as_ref() != Some(&region) {
+        return Err(AdapterError);
+    }
+    let base = Pixels::decode(&basis.image.bytes)?;
+    Ok(match super::delta::changes(&base, &pixels, mapping)? {
+        None => true,
+        Some(changed) => {
+            !super::delta::intersects(changed, input.bound.public.rect)
+                && basis
+                    .fields
+                    .iter()
+                    .any(|field| super::delta::contains(*field, changed))
+        }
+    })
+}
+
+async fn validate_region(
+    wda: &impl WdaRequest,
+    input: &Input,
+    basis: Option<&FastBasis>,
+) -> Result<(), AdapterError> {
+    if let Some(basis) = basis
+        && validate_frame(wda, input, basis).await?
+    {
+        return Ok(());
+    }
     let _span = crate::timing::Span::new("target_scoped_region");
     let sample = sample(wda, input, false).await?;
     let bound = &input.bound;
@@ -258,7 +323,7 @@ async fn validate_tail(wda: &impl WdaRequest, input: &Input) -> Result<(), Adapt
 
 #[cfg(test)]
 pub(super) async fn revalidate(wda: &impl WdaRequest, input: &Input) -> Result<(), AdapterError> {
-    validate_region(wda, input).await?;
+    validate_region(wda, input, None).await?;
     validate_tail(wda, input).await
 }
 
@@ -279,10 +344,11 @@ pub(super) async fn revalidate_with_native(
     wda: &impl WdaRequest,
     input: &Input,
     deadline: Instant,
+    basis: Option<FastBasis>,
     native: impl FnOnce(Instant) -> LockState + Send + 'static,
 ) -> Result<NativeProof, AdapterError> {
     let _span = crate::timing::Span::new("target_scoped_admission");
-    before_input_deadline(deadline, validate_region(wda, input)).await?;
+    before_input_deadline(deadline, validate_region(wda, input, basis.as_ref())).await?;
     let started = Instant::now();
     // A fresh query overlaps only the tail, after target pixels and identity
     // passed. Bound its age through the actual socket write, not completion.
@@ -305,7 +371,7 @@ pub(super) async fn revalidate_with_native(
     })
 }
 
-async fn absent(wda: &impl WdaRequest, input: &Input) -> Result<bool, AdapterError> {
+pub(super) async fn absent(wda: &impl WdaRequest, input: &Input) -> Result<bool, AdapterError> {
     let path = format!(
         "/session/{}/element/{}/attribute/type",
         input.key.session, input.bound.native
@@ -333,14 +399,67 @@ fn boolean(value: &Value) -> Option<bool> {
     })
 }
 
+pub(super) fn focus_target(bound: &Bound) -> bool {
+    matches!(
+        bound.public.kind.as_str(),
+        "XCUIElementTypeTextField" | "XCUIElementTypeTextView" | "XCUIElementTypeSearchField"
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Outcome {
+    /// Same identity with a changed state, value or focus.
+    Changed,
+    Unconfirmed,
+    /// No row or descriptor remains and the region changed. Changed still
+    /// requires the exact cached-ID stale response.
+    Absent,
+}
+
+/// One post-input sample: rows include the acted descriptor wherever it is.
+pub(super) fn classify(
+    bound: &Bound,
+    rows: &[Value],
+    region: &super::super::targets_pixels::Region,
+    focused: Option<&str>,
+) -> Outcome {
+    let current = rows
+        .iter()
+        .find(|row| id(row).ok().as_deref() == Some(&bound.native));
+    let same_identity = |row: &Value| {
+        ["type", "label", "attribute/name"]
+            .iter()
+            .all(|key| row.get(*key) == bound.rich.get(*key))
+    };
+    if let Some(current) = current {
+        let changed = same_identity(current)
+            && ((bound.focused == Some(false)
+                && focused == Some(bound.native.as_str())
+                && focus_target(bound))
+                || current.get("rect") == bound.rich.get("rect")
+                    && (["enabled", "displayed", "attribute/selected"]
+                        .iter()
+                        .any(|key| boolean(&current[*key]) != boolean(&bound.rich[*key]))
+                        || current.get("attribute/value") != bound.rich.get("attribute/value")));
+        if changed {
+            Outcome::Changed
+        } else {
+            Outcome::Unconfirmed
+        }
+    } else if matches_count(bound, rows) == 0
+        && bound.region.as_ref().is_some_and(|before| before != region)
+    {
+        Outcome::Absent
+    } else {
+        Outcome::Unconfirmed
+    }
+}
+
 pub(super) async fn after(
     wda: &impl WdaRequest,
     input: &Input,
 ) -> Result<(RawObservation, Vec<Bound>, bool, Instant), AdapterError> {
-    let focus = matches!(
-        input.bound.public.kind.as_str(),
-        "XCUIElementTypeTextField" | "XCUIElementTypeTextView" | "XCUIElementTypeSearchField"
-    );
+    let focus = focus_target(&input.bound);
     let sample = sample(wda, input, focus).await?;
     let bound = &input.bound;
     let mapping = bound.mapping.ok_or(AdapterError)?;
@@ -351,28 +470,10 @@ pub(super) async fn after(
         .rows
         .iter()
         .find(|row| id(row).ok().as_deref() == Some(&bound.native));
-    let same_identity = |row: &Value| {
-        ["type", "label", "attribute/name"]
-            .iter()
-            .all(|key| row.get(*key) == bound.rich.get(*key))
-    };
-    let verified = if let Some(current) = current {
-        same_identity(current)
-            && ((bound.focused == Some(false)
-                && sample.focused.as_deref() == Some(&bound.native)
-                && focus)
-                || current.get("rect") == bound.rich.get("rect")
-                    && (["enabled", "displayed", "attribute/selected"]
-                        .iter()
-                        .any(|key| boolean(&current[*key]) != boolean(&bound.rich[*key]))
-                        || current.get("attribute/value") != bound.rich.get("attribute/value")))
-    } else {
-        matches_count(bound, &sample.rows) == 0
-            && absent(wda, input).await?
-            && bound
-                .region
-                .as_ref()
-                .is_some_and(|before| before != &region)
+    let verified = match classify(bound, &sample.rows, &region, sample.focused.as_deref()) {
+        Outcome::Changed => true,
+        Outcome::Unconfirmed => false,
+        Outcome::Absent => absent(wda, input).await?,
     };
     app_matches(wda, &input.key.session, &input.app).await?;
     let window = ObservationWindow {

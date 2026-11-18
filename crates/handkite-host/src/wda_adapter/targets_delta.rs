@@ -12,6 +12,8 @@ pub(in crate::wda_adapter) struct DeltaBaseline {
     entries: Vec<(Bound, Instant)>,
     dirty: Vec<[f64; 4]>,
     until: Instant,
+    /// Start of the capture that produced `image`; bounds frame-scoped admission.
+    captured: Instant,
 }
 
 impl DeltaBaseline {
@@ -37,7 +39,26 @@ impl DeltaBaseline {
                 .collect(),
             dirty: Vec::new(),
             until: snapshot.evidence.until(),
+            captured: snapshot.evidence.started,
         })
+    }
+
+    /// Exact frame evidence for one prompt input. Editable-field rectangles
+    /// allow only caret drift; every other change requires full admission.
+    pub(super) fn fast_basis(&self, key: &cache::Key, app: &str) -> Option<fast::FastBasis> {
+        (self.key == *key && self.app == app && self.captured.elapsed() < fast::FAST_FRAME_AGE)
+            .then(|| fast::FastBasis {
+                image: self.image.clone(),
+                captured: self.captured,
+                fields: self
+                    .entries
+                    .iter()
+                    .filter(|(e, _)| {
+                        field(&e.public.kind) && e.public.kind != "XCUIElementTypeKeyboard"
+                    })
+                    .map(|(e, _)| e.public.rect)
+                    .collect(),
+            })
     }
 
     fn input_deadline(&self) -> Instant {
@@ -56,13 +77,13 @@ impl DeltaBaseline {
     }
 }
 
-fn intersects(a: [f64; 4], b: [f64; 4]) -> bool {
+pub(super) fn intersects(a: [f64; 4], b: [f64; 4]) -> bool {
     a[0] < b[0] + b[2] && b[0] < a[0] + a[2] && a[1] < b[1] + b[3] && b[1] < a[1] + a[3]
 }
-fn contains(a: [f64; 4], b: [f64; 4]) -> bool {
+pub(super) fn contains(a: [f64; 4], b: [f64; 4]) -> bool {
     a[0] <= b[0] && a[1] <= b[1] && a[0] + a[2] >= b[0] + b[2] && a[1] + a[3] >= b[1] + b[3]
 }
-fn changes(
+pub(super) fn changes(
     a: &Pixels,
     b: &Pixels,
     mapping: fast::Mapping,
@@ -112,7 +133,7 @@ fn field(kind: &str) -> bool {
             | "XCUIElementTypeKeyboard"
     )
 }
-fn predicate(rects: &[[f64; 4]]) -> Result<String, AdapterError> {
+fn predicate(rects: &[[f64; 4]], acted: Option<&Bound>) -> Result<String, AdapterError> {
     // WDA does not rewrite key paths nested inside arithmetic expressions.
     let mut areas = Vec::new();
     for &[x, y, w, h] in rects {
@@ -126,8 +147,22 @@ fn predicate(rects: &[[f64; 4]]) -> Result<String, AdapterError> {
     } else {
         areas.join(" OR ")
     };
+    // A pending tap's exact descriptor is enumerated anywhere, as in its
+    // standalone effect sample, so duplicates and moved rows stay visible.
+    let acted = match acted {
+        Some(bound) => format!(
+            "({}) OR ",
+            input_predicate(
+                bound,
+                &ElementAction::Tap {
+                    target_id: bound.public.target_id.clone(),
+                },
+            )?
+        ),
+        None => String::new(),
+    };
     Ok(format!(
-        "({}) OR (type IN {{'XCUIElementTypeTextField','XCUIElementTypeTextView','XCUIElementTypeSearchField','XCUIElementTypeKeyboard'}}) OR (({area}) AND type IN {{'XCUIElementTypeButton','XCUIElementTypeMenuItem','XCUIElementTypeCell','XCUIElementTypeStaticText','XCUIElementTypeLink','XCUIElementTypeImage','XCUIElementTypePickerWheel'}})",
+        "{acted}({}) OR (type IN {{'XCUIElementTypeTextField','XCUIElementTypeTextView','XCUIElementTypeSearchField','XCUIElementTypeKeyboard'}}) OR (({area}) AND type IN {{'XCUIElementTypeButton','XCUIElementTypeMenuItem','XCUIElementTypeCell','XCUIElementTypeStaticText','XCUIElementTypeLink','XCUIElementTypeImage','XCUIElementTypePickerWheel'}})",
         fast::context_predicate()?
     ))
 }
@@ -223,8 +258,27 @@ fn refreshed(
     after: &Pixels,
     areas: &[[f64; 4]],
 ) -> Result<Vec<(Bound, Instant)>, AdapterError> {
+    let checked = fast::checked_rows(rows, base.mapping)?;
+    // Editable fields are always enumerated in full, so caret drift inside one
+    // is covered by fresh rows. Any other drift outside the queried areas refuses.
+    let fields = checked
+        .iter()
+        .filter(|row| row["type"].as_str().is_some_and(field))
+        .filter_map(|row| {
+            let r = &row["rect"];
+            Some([
+                r["x"].as_f64()?,
+                r["y"].as_f64()?,
+                r["width"].as_f64()?,
+                r["height"].as_f64()?,
+            ])
+        })
+        .collect::<Vec<_>>();
     if let Some(changed) = changes(before, after, base.mapping)?
-        && !areas.iter().any(|area| contains(*area, changed))
+        && !areas
+            .iter()
+            .chain(&fields)
+            .any(|area| contains(*area, changed))
     {
         return Err(AdapterError);
     }
@@ -286,28 +340,71 @@ fn refreshed(
     Ok(result)
 }
 
+/// Bounded image-only polls before an incremental bracket (about 1.2 s).
+const SETTLE_FRAMES: usize = 10;
+const CARET_WIDTH: f64 = 6.;
+const CARET_HEIGHT: f64 = 80.;
+
+struct DeltaCapture {
+    raw: RawObservation,
+    entries: Vec<(Bound, Instant)>,
+    /// Request time of the presented frame.
+    after_started: Instant,
+    /// Effect sample for a pending tap and the WDA cache entries it may add.
+    effect: Option<(fast::Outcome, usize)>,
+}
+
 async fn capture(
     wda: &impl WdaRequest,
     base: &DeltaBaseline,
-) -> Result<(RawObservation, Vec<(Bound, Instant)>), AdapterError> {
+    acted: Option<&Bound>,
+) -> Result<DeltaCapture, AdapterError> {
     let _span = crate::timing::Span::new("target_delta_capture");
     let started = unix_ms()?;
     super::super::display::verify_selection(wda, &base.key.session, base.mapping.display_id)
         .await?;
-    app_matches(wda, &base.key.session, &base.app).await?;
-    let before = screenshot(wda).await?;
-    let first = Pixels::decode(&before.bytes)?;
+    let (app, before) = tokio::join!(
+        app_matches(wda, &base.key.session, &base.app),
+        screenshot(wda)
+    );
+    app?;
+    let before = before?;
+    let mut first = Pixels::decode(&before.bytes)?;
     first.validate_mapping(
         base.mapping.viewport,
         base.mapping.scale,
         [base.mapping.viewport[2], base.mapping.viewport[3]],
     )?;
+    // An observation requested right after input can start before the
+    // transition does. Begin the bracket at the first of two identical frames;
+    // an unsettled screen keeps the last frame and the bracket check decides.
+    for _ in 0..SETTLE_FRAMES {
+        let next = screenshot(wda).await?;
+        let pixels = Pixels::decode(&next.bytes)?;
+        // A caret-sized bar is not a transition; the bracket still checks it.
+        let settled = changes(&first, &pixels, base.mapping)?
+            .is_none_or(|[_, _, w, h]| w <= CARET_WIDTH && h <= CARET_HEIGHT);
+        first = pixels;
+        if settled {
+            break;
+        }
+    }
     let old = Pixels::decode(&base.image.bytes)?;
     let mut areas = base.dirty.clone();
     if let Some(area) = changes(&old, &first, base.mapping)? {
         areas.push(area);
     }
-    let rows = query_predicate(wda, &base.key.session, &predicate(&areas)?).await?;
+    let focus = acted.is_some_and(fast::focus_target);
+    let filter = predicate(&areas, acted)?;
+    let (rows, focused) = tokio::join!(query_predicate(wda, &base.key.session, &filter), async {
+        if focus {
+            active(wda, &base.key.session).await.map(Some)
+        } else {
+            Ok(None)
+        }
+    });
+    let (rows, focused) = (rows?, focused?);
+    let after_started = Instant::now();
     let after = screenshot(wda).await?;
     let last = Pixels::decode(&after.bytes)?;
     last.validate_mapping(
@@ -316,6 +413,27 @@ async fn capture(
         [base.mapping.viewport[2], base.mapping.viewport[3]],
     )?;
     let entries = refreshed(base, &rows, &first, &last, &areas)?;
+    let effect = match acted {
+        Some(bound) => {
+            let checked = fast::checked_rows(&rows, base.mapping)?;
+            // The standalone sample queried only the acted descriptor plus
+            // application context; classify exactly that row set.
+            let sample = checked
+                .iter()
+                .filter(|row| {
+                    descriptor_matches(row, &bound.attrs)
+                        || row["type"] == "XCUIElementTypeApplication"
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let region = last.region(base.mapping.viewport, &bound.attrs, &mut 0)?;
+            Some((
+                fast::classify(bound, &sample, &region, focused.as_deref()),
+                checked.len() + usize::from(focus),
+            ))
+        }
+        None => None,
+    };
     app_matches(wda, &base.key.session, &base.app).await?;
     super::super::display::verify_selection(wda, &base.key.session, base.mapping.display_id)
         .await?;
@@ -324,8 +442,8 @@ async fn capture(
     if !crate::wda_ui_admission::safe_context(&xml) {
         return Err(AdapterError);
     }
-    Ok((
-        RawObservation {
+    Ok(DeltaCapture {
+        raw: RawObservation {
             connected_usb: base.key.device.clone(),
             wda_target: base.key.device.clone(),
             window: ObservationWindow {
@@ -341,7 +459,9 @@ async fn capture(
             screenshot: after,
         },
         entries,
-    ))
+        after_started,
+        effect,
+    })
 }
 
 impl WdaAdapter {
@@ -349,9 +469,13 @@ impl WdaAdapter {
         &mut self,
         revision: Revision,
     ) -> Result<Option<(RawObservation, Vec<ElementTarget>)>, AdapterError> {
-        // Native enumeration can evict WDA's cached ID and corrupt an active
-        // disappearance proof. Do not overlap it with the verifier.
-        self.finish_pending_effect(true)?;
+        // A pending tap's sample rides on this capture. Its stale-ID proof, if
+        // needed, stays behind the cache eviction bound tracked by the proof.
+        let Some(key) = self.cache_key() else {
+            self.finish_pending_effect(true)?;
+            return Ok(None);
+        };
+        let acted = self.pending_for_delta(&key)?;
         self.error_diagnostic = Some(AdapterDiagnostic::TargetCapture);
         self.validate_owned()?;
         let Some(mut base) = self.target_delta.take().filter(|b| {
@@ -376,7 +500,12 @@ impl WdaAdapter {
                 .expect("adapter runtime")
                 .block_on(capture_with_native(
                     move || native_lock::query(&device).state,
-                    rich_context(&wda, &base.key.session, ATTRS, capture(&wda, &base)),
+                    rich_context(
+                        &wda,
+                        &base.key.session,
+                        ATTRS,
+                        capture(&wda, &base, acted.as_ref().map(|input| &input.bound)),
+                    ),
                 ));
         self.cache
             .refresh_native(Some(base.key.clone()), native_started, || lock);
@@ -385,16 +514,35 @@ impl WdaAdapter {
             self.error_diagnostic = Some(AdapterDiagnostic::TargetSettings);
             e
         })?;
-        let (raw, entries) = result?;
+        let DeltaCapture {
+            raw,
+            entries,
+            after_started,
+            effect,
+        } = result?;
         self.validate_owned()?;
         if lock != LockState::Unlocked || self.cache_key().as_ref() != Some(&base.key) {
             return Err(AdapterError);
+        }
+        if let Some((outcome, inserted)) = effect {
+            self.record_delta_effect(
+                outcome,
+                inserted,
+                RawImageObservation {
+                    connected_usb: raw.connected_usb.clone(),
+                    wda_target: raw.wda_target.clone(),
+                    window: raw.window.clone(),
+                    screenshot: raw.screenshot.clone(),
+                },
+                native_started,
+            )?;
         }
         base.image = raw.screenshot.clone();
         base.entries = entries;
         base.dirty.clear();
         base.revision = None;
         base.until = Instant::now() + AGE;
+        base.captured = after_started;
         let until = base.input_deadline();
         let entries = base
             .entries
@@ -419,7 +567,7 @@ mod tests {
     use super::*;
     #[test]
     fn region_predicate_uses_explicit_wda_paths_inside_arithmetic() {
-        let p = predicate(&[[1., 2., 3., 4.]]).unwrap();
+        let p = predicate(&[[1., 2., 3., 4.]], None).unwrap();
         assert!(p.contains("wdRect.x + wdRect.width > 1"));
         assert!(p.contains("wdRect.y + wdRect.height > 2"));
         assert!(!p.contains("(rect."));
@@ -477,6 +625,7 @@ mod tests {
             entries: vec![(bound, Instant::now() + AGE)],
             dirty: vec![],
             until: Instant::now() + AGE,
+            captured: Instant::now(),
         }
     }
     #[test]
@@ -486,7 +635,7 @@ mod tests {
         let mut b = pixels();
         b.rgba[(10 * 20 + 10) * 4] = 0;
         assert_eq!(changes(&a, &b, mapping()).unwrap(), Some([9., 9., 3., 3.]));
-        let p = predicate(&[[1., 2., 3., 4.]]).unwrap();
+        let p = predicate(&[[1., 2., 3., 4.]], None).unwrap();
         assert!(p.contains("wdRect.x + wdRect.width > 1"));
         assert!(p.contains("XCUIElementTypeSecureTextField"));
         assert!(p.contains("XCUIElementTypeKeyboard"));
@@ -497,6 +646,17 @@ mod tests {
         let mut b = pixels();
         b.rgba[19 * 20 * 4] = 0;
         assert!(refreshed(&baseline(), &json!([app()]), &a, &b, &[[0., 0., 5., 5.]]).is_err());
+    }
+    #[test]
+    fn caret_drift_is_admitted_only_inside_an_enumerated_editable_field() {
+        let a = pixels();
+        let mut b = pixels();
+        b.rgba[19 * 20 * 4] = 0;
+        let areas = [[10., 10., 5., 5.]];
+        let field = row("body", "XCUIElementTypeTextView", [0., 17., 4., 3.]);
+        assert!(refreshed(&baseline(), &json!([app(), field]), &a, &b, &areas).is_ok());
+        let button = row("body", "XCUIElementTypeButton", [0., 17., 4., 3.]);
+        assert!(refreshed(&baseline(), &json!([app(), button]), &a, &b, &areas).is_err());
     }
     #[test]
     fn hidden_global_blockers_and_duplicate_ids_refuse() {
@@ -641,7 +801,13 @@ mod tests {
         b.image.bytes = base64::engine::general_purpose::STANDARD
             .decode(result["value"].as_str().unwrap())
             .unwrap();
-        let (raw, entries) = capture(&fixture, &b).await.unwrap();
+        let DeltaCapture {
+            raw,
+            entries,
+            effect,
+            ..
+        } = capture(&fixture, &b, None).await.unwrap();
+        assert!(effect.is_none());
         assert!(
             raw.accessibility_tree
                 .starts_with("<AppiumAUT source=\"native_regions\">")

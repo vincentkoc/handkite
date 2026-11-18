@@ -194,6 +194,11 @@ pub trait DeviceAdapter {
     fn settle_target_effects(&mut self) -> Result<(), AdapterError> {
         Ok(())
     }
+    /// Settle before one element action. Adapters may defer proofs about
+    /// regions the target does not overlap; the default drains everything.
+    fn settle_target_effects_for(&mut self, _target_id: &str) -> Result<(), AdapterError> {
+        self.settle_target_effects()
+    }
     fn target_effect_updates(&mut self) -> Vec<TargetEffectReport> {
         Vec::new()
     }

@@ -119,6 +119,7 @@ impl Targets {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct Input {
     token: u64,
     key: cache::Key,
@@ -1381,7 +1382,8 @@ impl WdaAdapter {
         action: &ElementAction,
         baseline: &Observation,
     ) -> Result<PreparedTarget, AdapterError> {
-        self.finish_pending_effect(true)?;
+        let rect = self.target_rect(action.target_id());
+        self.settle_for_target(rect)?;
         self.error_diagnostic = Some(AdapterDiagnostic::TargetPrepare);
         self.target_input = None;
         self.target_readback = None;
@@ -1470,6 +1472,12 @@ impl WdaAdapter {
         if prepared_lock != LockState::Unlocked {
             return Err(AdapterError);
         }
+        // Frame evidence comes only from the exact presented baseline, which
+        // no longer contains the consumed handle.
+        let basis = self
+            .target_delta
+            .as_ref()
+            .and_then(|delta| delta.fast_basis(&input.key, &input.app));
         let runner = self.owned_runner.as_ref().ok_or(AdapterError)?;
         let context_wda = UsbWda::new(self.usb.clone())
             .with_write_admission(Some(runner.write_admission().ok_or(AdapterError)?));
@@ -1484,9 +1492,13 @@ impl WdaAdapter {
                 async {
                     if matches!(action, ElementAction::Tap { .. }) && input.bound.ocr.is_none() {
                         let device = input.key.device.clone();
-                        fast::revalidate_with_native(&context_wda, &input, deadline, move |until| {
-                            native_lock::query_until(&device, until).state
-                        })
+                        fast::revalidate_with_native(
+                            &context_wda,
+                            &input,
+                            deadline,
+                            basis,
+                            move |until| native_lock::query_until(&device, until).state,
+                        )
                         .await
                         .map(Some)
                     } else {

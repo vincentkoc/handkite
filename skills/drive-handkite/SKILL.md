@@ -17,6 +17,27 @@ pass that revision as `expected_revision` and `response.since_revision` on the
 next action. Every successful paired action can return the next observation;
 do not issue an extra observe when that response is sufficient.
 
+## Real-time loop (runbook)
+
+1. `handkite_acquire_control`, then `handkite_observe {"targets":true,
+   "tree_format":"elements","image":"omit"}` once for the full inventory.
+2. Pick one `target_id` and call `handkite_tap_element` with the target revision.
+   Expect `effect:"pending"`; never resend it.
+3. Immediately observe with `targets:true` and `since_revision` equal to the last
+   target revision. Apply `targets_delta`; read the previous tap's verdict from
+   `effect_updates`. Repeat from step 2.
+4. If the wanted control is missing (an animating screen omits unstable rows),
+   observe again. If it is still missing, OCR rows (`source:"ocr"`) or an
+   `input_source:"ocr"` row can be tapped the same way; failing that, request
+   `image:"always"` and escalate instead of guessing coordinates.
+5. Any refusal reports `delivery:"not_sent"`: observe and decide again.
+   Uncertain delivery: stop.
+
+Split the work: the strong model plans the task, private-data choices and
+recovery; a fast model executes steps 2–4 from compact elements only. One
+executor holds the lease; never run two against one phone. Measured loop cost
+and qualification status are in `VALIDATION.md`.
+
 For Home or app switching, call `handkite_status` for a cheap navigation revision,
 then `handkite_home` or `handkite_launch_app`. These do not require a coherent XML
 snapshot. A response with `revision_scope:"navigation"` admits only these two
@@ -59,13 +80,14 @@ a fresh image and a provisional `target_delta`. This is not verified success.
 The consumed handle is listed in `consumed`; no confirmed removal, fresh target
 or actionable revision is issued. Never replay that acknowledged input.
 
-Effect verification runs in the background. The next observation or action
-response includes `effect_updates`, correlated by token and target ID, with
-`pending`, `changed` or `unconfirmed`. These are historical verdicts, not new
-input authority. This implementation conservatively fences all subsequent input
-and full observations until verification and settings restoration finish; that
-includes every overlapping target. Image-only polls can remain available.
-Only verified effects renew the same still-live lease, once per action.
+The next target observation carries the tap verdict in `effect_updates`,
+correlated by token and target ID: `pending`, `changed` or `unconfirmed`. These
+are historical verdicts, not new input authority. A control that disappeared
+stays `pending` until the exact stale-ID proof runs: while the controller is
+idle, before a target overlapping the acted control, or before a full capture.
+A non-overlapping next action supersedes it as `unconfirmed`; that is not a
+failure and never a reason to replay. Only verified effects renew the lease, so
+re-acquire on `InvalidLease` during long navigation runs.
 
 Other target replies can include a fresh image and acted-element `target_delta`
 without a full tree. This is a partial result: replace the handle

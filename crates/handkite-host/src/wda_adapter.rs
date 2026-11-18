@@ -901,6 +901,10 @@ impl DeviceAdapter for WdaAdapter {
     fn settle_target_effects(&mut self) -> Result<(), AdapterError> {
         self.finish_pending_effect(true)
     }
+    fn settle_target_effects_for(&mut self, target_id: &str) -> Result<(), AdapterError> {
+        let rect = self.target_rect(target_id);
+        self.settle_for_target(rect)
+    }
     fn observe_targets_since(
         &mut self,
         revision: Option<handkite_core::protocol::Revision>,
@@ -1573,7 +1577,8 @@ impl DeviceAdapter for WdaAdapter {
 
 impl Drop for WdaAdapter {
     fn drop(&mut self) {
-        let _ = self.finish_pending_effect(true);
+        // Teardown sends no new proof request; it only drains claimed work.
+        let _ = self.abandon_pending_effect();
         let runtime = self.runtime.take().expect("adapter runtime");
         if let Some(runner) = self.owned_runner.take() {
             let wda = runner.write_admission().map(|admission| {

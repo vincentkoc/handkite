@@ -143,7 +143,7 @@ impl<A: DeviceAdapter> Controller<A> {
         }
         inner
             .adapter
-            .settle_target_effects()
+            .settle_target_effects_for(action.target_id())
             .map_err(|_| Self::adapter_error(&mut inner))?;
         self.refresh_target_effects(&mut inner);
         if !action.valid() {
