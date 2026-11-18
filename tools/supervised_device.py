@@ -485,6 +485,9 @@ def lock_confirmed(reply):
 
 def pin_result(result):
     code, out, err, fault = result
+    if profile_failure(err) and out in (b"unlock_idle=code_submitted\n",
+                                        b"unlock_idle=already_unlocked\n"):
+        return False, False
     err = pin_stderr(err)
     submitted = code == 0 and out == b"unlock_idle=code_submitted\n" and not err and not fault
     zero = code == 0 and out == b"unlock_idle=already_unlocked\n" and not err
@@ -496,14 +499,24 @@ def pin_result(result):
     return submitted, zero and not fault
 
 
+def profile_failure(stderr):
+    return any(line in (b"handkited: runner_startup_stage=profile_unavailable\n",
+                       b"handkited: runner_startup_stage=profile_expired\n")
+               for line in stderr.splitlines(keepends=True))
+
+
 def pin_diagnostic(result, fault_reason=None):
     code, out, err, fault = result
+    failed_profile = profile_failure(err)
     err = pin_stderr(err)
     summary = {"exit_code": code if type(code) is int and -255 <= code <= 255 else None,
                "child_integrity": "unproven" if fault else "checked",
                "reported_outcome": "unclassified"}
     if fault and type(fault_reason) is str and fault_reason in CHILD_FAILURES:
         summary["child_failure"] = fault_reason
+    if failed_profile and out in (b"unlock_idle=code_submitted\n",
+                                   b"unlock_idle=already_unlocked\n"):
+        return summary
     if not err and out in (b"unlock_idle=code_submitted\n", b"unlock_idle=already_unlocked\n"):
         summary["reported_outcome"] = out.removeprefix(b"unlock_idle=").strip().decode("ascii")
         return summary

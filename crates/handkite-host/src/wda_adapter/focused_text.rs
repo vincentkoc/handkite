@@ -159,10 +159,10 @@ fn rect(attrs: &Attributes) -> Option<[f64; 4]> {
 
 fn field_from_context(
     items: &Value,
-    screen: &Attributes,
-    baseline: &Attributes,
+    snapshot: &crate::wda_ui_admission::TextSnapshot,
 ) -> Result<(String, String), AdapterError> {
-    let screen = rect(screen).ok_or(AdapterError)?;
+    let baseline = &snapshot.field;
+    let screen = rect(&snapshot.screen).ok_or(AdapterError)?;
     let items = items
         .as_array()
         .filter(|items| !items.is_empty() && items.len() <= 64)
@@ -170,6 +170,7 @@ fn field_from_context(
     let mut ids = std::collections::BTreeSet::new();
     let mut field = None;
     let mut keyboards = 0;
+    let mut emoji_search_seen = false;
     for item in items {
         let identity = id(item)?;
         if !ids.insert(identity.clone()) {
@@ -205,7 +206,7 @@ fn field_from_context(
         let enabled = item["enabled"].as_bool().ok_or(AdapterError)?;
         // This attribute is false on iOS even for /element/active. The active
         // endpoint's identity is checked immediately before input instead.
-        item["attribute/focused"].as_bool().ok_or(AdapterError)?;
+        let focused = item["attribute/focused"].as_bool().ok_or(AdapterError)?;
         if !displayed || !enabled {
             continue;
         }
@@ -230,7 +231,21 @@ fn field_from_context(
             return Err(AdapterError);
         }
         if kind == "Keyboard" {
+            if let Some(search) = &snapshot.emoji_search
+                && !context_matches(item, &attrs, &search.keyboard)
+            {
+                return Err(AdapterError);
+            }
             keyboards += 1;
+            continue;
+        }
+        if let Some(search) = &snapshot.emoji_search
+            && context_matches(item, &attrs, &search.field)
+        {
+            if emoji_search_seen || focused {
+                return Err(AdapterError);
+            }
+            emoji_search_seen = true;
             continue;
         }
         if field.is_some() || rect(baseline) != Some(bounds) {
@@ -252,10 +267,30 @@ fn field_from_context(
         };
         field = Some((identity, before));
     }
-    if keyboards != 1 {
+    if keyboards != 1 || emoji_search_seen != snapshot.emoji_search.is_some() {
         return Err(AdapterError);
     }
     field.ok_or(AdapterError)
+}
+
+fn context_matches(item: &Value, attrs: &Attributes, expected: &Attributes) -> bool {
+    let bounds_match = ["x", "y", "width", "height"].iter().all(|key| {
+        item["rect"][*key].as_f64().is_some_and(|actual| {
+            expected
+                .get(*key)
+                .and_then(|value| value.parse::<f64>().ok())
+                == Some(actual)
+        })
+    });
+    bounds_match
+        && ["type", "name", "label", "placeholderValue"]
+            .iter()
+            .all(|key| attrs.get(*key) == expected.get(*key))
+        && match item.get("attribute/value") {
+            Some(Value::Null) => expected.get("value").is_none_or(String::is_empty),
+            Some(Value::String(value)) => expected.get("value") == Some(value),
+            _ => false,
+        }
 }
 
 async fn active(wda: &impl WdaRequest, session: &str) -> Result<String, AdapterError> {
@@ -322,7 +357,7 @@ impl WdaAdapter {
         if text.is_empty() {
             return Ok(None);
         }
-        let Some((screen, previous)) =
+        let Some(snapshot) =
             crate::wda_ui_admission::current_text_snapshot(&baseline.accessibility_tree)
         else {
             return Ok(None);
@@ -364,7 +399,7 @@ impl WdaAdapter {
             Ok(query) => query,
             Err(_) => return Ok(None),
         };
-        let (field, before) = match field_from_context(&items, &screen, &previous) {
+        let (field, before) = match field_from_context(&items, &snapshot) {
             Ok(field) => field,
             Err(_) => return Ok(None),
         };
@@ -537,6 +572,109 @@ mod tests {
     use std::cell::RefCell;
 
     const XML: &str = r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="400" height="800"><XCUIElementTypeTextView value="Alpha&#10;" visible="true" enabled="true" x="0" y="100" width="400" height="300"/><XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="500" width="400" height="300"/></XCUIElementTypeApplication></AppiumAUT>"#;
+    const EMOJI_XML: &str = r#"<AppiumAUT>
+<XCUIElementTypeApplication x="0" y="0" width="400" height="800">
+  <XCUIElementTypeWindow x="0" y="0" width="400" height="800">
+    <XCUIElementTypeTextView visible="true" enabled="true" x="0" y="100" width="400" height="300"/>
+  </XCUIElementTypeWindow>
+  <XCUIElementTypeWindow x="0" y="400" width="400" height="400">
+    <XCUIElementTypeOther visible="true" enabled="true" x="0" y="400" width="400" height="400">
+      <XCUIElementTypeOther>
+        <XCUIElementTypeTextField value="Search Emoji" placeholderValue="Search Emoji" visible="true" enabled="true" x="10" y="450" width="380" height="40"/>
+      </XCUIElementTypeOther>
+      <XCUIElementTypeOther>
+        <XCUIElementTypeKeyboard visible="true" enabled="true" x="0" y="500" width="400" height="300"/>
+      </XCUIElementTypeOther>
+    </XCUIElementTypeOther>
+  </XCUIElementTypeWindow>
+</XCUIElementTypeApplication></AppiumAUT>"#;
+
+    #[test]
+    fn emoji_keyboard_search_keeps_primary_editor_preparable() {
+        assert!(!crate::wda_ui_admission::visible_current_text_input(
+            EMOJI_XML
+        ));
+        assert!(crate::wda_ui_admission::current_text_snapshot(EMOJI_XML).is_some());
+    }
+
+    fn emoji_items() -> Value {
+        let mut data = items();
+        data[0]["attribute/value"] = Value::Null;
+        let mut search = element("TextField", "emoji-search");
+        search["attribute/value"] = json!("Search Emoji");
+        search["attribute/placeholderValue"] = json!("Search Emoji");
+        search["rect"] = json!({"x":10,"y":450,"width":380,"height":40});
+        data.as_array_mut().unwrap().push(search);
+        data
+    }
+
+    #[test]
+    fn emoji_context_requires_every_captured_field() {
+        let snapshot = crate::wda_ui_admission::current_text_snapshot(EMOJI_XML).unwrap();
+        assert_eq!(
+            field_from_context(&emoji_items(), &snapshot).unwrap(),
+            ("editor".into(), String::new())
+        );
+        for (key, value) in [
+            ("attribute/value", json!("changed")),
+            ("attribute/placeholderValue", json!("changed")),
+            ("attribute/name", json!("changed")),
+            ("label", json!("changed")),
+            ("attribute/focused", json!(true)),
+            ("attribute/focused", Value::Null),
+            ("enabled", json!(false)),
+            ("displayed", json!(false)),
+            ("rect", json!({"x":11,"y":450,"width":380,"height":40})),
+        ] {
+            let mut changed = emoji_items();
+            changed[2][key] = value;
+            assert!(field_from_context(&changed, &snapshot).is_err(), "{key}");
+        }
+        assert!(field_from_context(&items(), &snapshot).is_err());
+        let mut duplicate = emoji_items();
+        let extra = duplicate[2].clone();
+        duplicate.as_array_mut().unwrap().push(extra);
+        assert!(field_from_context(&duplicate, &snapshot).is_err());
+        let mut extra = emoji_items();
+        extra
+            .as_array_mut()
+            .unwrap()
+            .push(element("TextView", "another-editor"));
+        assert!(field_from_context(&extra, &snapshot).is_err());
+        let mut changed_keyboard = emoji_items();
+        changed_keyboard[1]["label"] = json!("changed");
+        assert!(field_from_context(&changed_keyboard, &snapshot).is_err());
+    }
+
+    #[test]
+    fn emoji_baseline_requires_separate_keyboard_container_and_public_signature() {
+        let primary = "<XCUIElementTypeTextView visible=\"true\" enabled=\"true\" x=\"0\" y=\"100\" width=\"400\" height=\"300\"/>";
+        let container = "<XCUIElementTypeOther visible=\"true\" enabled=\"true\" x=\"0\" y=\"400\" width=\"400\" height=\"400\">";
+        let primary_in_container = EMOJI_XML
+            .replace(primary, "")
+            .replace(container, &format!("{container}{primary}"));
+        for bad in [
+            EMOJI_XML.replace("Search Emoji", "Search"),
+            EMOJI_XML.replace("<XCUIElementTypeTextField ", "<XCUIElementTypeTextField focused=\"true\" "),
+            EMOJI_XML.replace("<XCUIElementTypeTextField ", "<XCUIElementTypeTextField focused=\"unknown\" "),
+            EMOJI_XML.replace("<XCUIElementTypeTextView ", "<XCUIElementTypeTextView focused=\"false\" "),
+            EMOJI_XML.replace("<XCUIElementTypeTextField value=\"Search Emoji\" placeholderValue=\"Search Emoji\" visible=\"true\"", "<XCUIElementTypeTextField value=\"Search Emoji\" placeholderValue=\"Search Emoji\""),
+            EMOJI_XML.replace(container, "<XCUIElementTypeOther visible=\"true\" enabled=\"true\" x=\"0\" y=\"400\" width=\"400\" height=\"100\">"),
+            EMOJI_XML.replace("</XCUIElementTypeApplication>", &format!("{primary}</XCUIElementTypeApplication>")),
+            EMOJI_XML.replace("</XCUIElementTypeApplication>", "<XCUIElementTypeSecureTextField visible=\"false\"/></XCUIElementTypeApplication>"),
+            EMOJI_XML.replace("</XCUIElementTypeApplication>", "<XCUIElementTypeAlert visible=\"false\"/></XCUIElementTypeApplication>"),
+            primary_in_container,
+        ] {
+            assert!(crate::wda_ui_admission::current_text_snapshot(&bad).is_none());
+        }
+        let split = EMOJI_XML.replace(
+            "      </XCUIElementTypeOther>\n      <XCUIElementTypeOther>\n        <XCUIElementTypeKeyboard",
+            "      </XCUIElementTypeOther></XCUIElementTypeOther><XCUIElementTypeOther><XCUIElementTypeOther>\n        <XCUIElementTypeKeyboard",
+        );
+        assert_ne!(split, EMOJI_XML);
+        assert!(crate::wda_ui_admission::current_text_snapshot(&split).is_none());
+    }
+
     fn element(kind: &str, id: &str) -> Value {
         let editor = kind == "TextView";
         json!({"ELEMENT":id,"element-6066-11e4-a52e-4f735466cecf":id,"type":format!("XCUIElementType{kind}"),
@@ -552,8 +690,8 @@ mod tests {
         ])
     }
     fn classify(items: &Value) -> Result<(String, String), AdapterError> {
-        let (screen, field) = crate::wda_ui_admission::current_text_snapshot(XML).unwrap();
-        field_from_context(items, &screen, &field)
+        let snapshot = crate::wda_ui_admission::current_text_snapshot(XML).unwrap();
+        field_from_context(items, &snapshot)
     }
 
     #[test]
@@ -567,13 +705,12 @@ mod tests {
                         &format!("XCUIElementType{kind} "),
                         &format!("XCUIElementType{kind} focused=\"true\" "),
                     );
-                let (screen, baseline) =
-                    crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
+                let snapshot = crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
                 let mut data = items();
                 data[0]["type"] = json!(format!("XCUIElementType{kind}"));
                 data[0]["attribute/value"] = Value::Null;
                 assert_eq!(
-                    field_from_context(&data, &screen, &baseline).unwrap(),
+                    field_from_context(&data, &snapshot).unwrap(),
                     ("editor".into(), String::new()),
                     "{kind} {value_attribute}"
                 );
@@ -584,7 +721,7 @@ mod tests {
     #[test]
     fn null_value_keeps_context_and_attribute_refusals() {
         let xml = XML.replace("Alpha&#10;", "");
-        let (screen, baseline) = crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
+        let snapshot = crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
         let empty = || {
             let mut data = items();
             data[0]["attribute/value"] = Value::Null;
@@ -593,10 +730,7 @@ mod tests {
         for kind in ["SecureTextField", "Alert", "Sheet", "Other"] {
             let mut data = empty();
             data[0]["type"] = json!(format!("XCUIElementType{kind}"));
-            assert!(
-                field_from_context(&data, &screen, &baseline).is_err(),
-                "{kind}"
-            );
+            assert!(field_from_context(&data, &snapshot).is_err(), "{kind}");
         }
         for kind in ["SecureTextField", "Alert", "Sheet"] {
             let mut data = empty();
@@ -604,18 +738,12 @@ mod tests {
             hidden["displayed"] = json!(false);
             hidden["attribute/value"] = Value::Null;
             data.as_array_mut().unwrap().push(hidden);
-            assert!(
-                field_from_context(&data, &screen, &baseline).is_err(),
-                "{kind}"
-            );
+            assert!(field_from_context(&data, &snapshot).is_err(), "{kind}");
         }
         for marker in MARKERS {
             let mut data = empty();
             data[1]["attribute/name"] = json!(marker);
-            assert!(
-                field_from_context(&data, &screen, &baseline).is_err(),
-                "{marker}"
-            );
+            assert!(field_from_context(&data, &snapshot).is_err(), "{marker}");
         }
         for (key, bad) in [
             ("enabled", Value::Null),
@@ -631,18 +759,12 @@ mod tests {
         ] {
             let mut data = empty();
             data[0][key] = bad;
-            assert!(
-                field_from_context(&data, &screen, &baseline).is_err(),
-                "{key}"
-            );
+            assert!(field_from_context(&data, &snapshot).is_err(), "{key}");
         }
         for key in ["attribute/value", "attribute/focused"] {
             let mut data = empty();
             data[0].as_object_mut().unwrap().remove(key);
-            assert!(
-                field_from_context(&data, &screen, &baseline).is_err(),
-                "{key}"
-            );
+            assert!(field_from_context(&data, &snapshot).is_err(), "{key}");
         }
         assert!(
             classify(&empty()).is_err(),
@@ -711,6 +833,10 @@ mod tests {
                 .replace("value=", "focused=\"false\" value="),
             XML.replace("Alpha&#10;", "")
                 .replace("value=", "focused=\"unknown\" value="),
+            XML.replace(
+                "</XCUIElementTypeApplication>",
+                "<XCUIElementTypeTextField visible=\"true\" enabled=\"true\" x=\"0\" y=\"410\" width=\"400\" height=\"40\"/></XCUIElementTypeApplication>",
+            ),
         ] {
             assert!(crate::wda_ui_admission::current_text_snapshot(&bad).is_none());
         }
@@ -736,6 +862,7 @@ mod tests {
                 match self.mode {
                     1 => json!({"ELEMENT":"another-editor"}),
                     4 => json!({}),
+                    5 => json!({"ELEMENT":"emoji-search"}),
                     _ => json!({"ELEMENT":"editor"}),
                 }
             } else if path.ends_with("/wda/activeAppInfo") {
@@ -754,12 +881,34 @@ mod tests {
     #[tokio::test]
     async fn changed_or_unknown_focus_app_or_lock_never_sends_text() {
         let xml = XML.replace("Alpha&#10;", "");
-        let (screen, baseline) = crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
+        let snapshot = crate::wda_ui_admission::current_text_snapshot(&xml).unwrap();
         let mut data = items();
         data[0]["attribute/value"] = Value::Null;
-        let (field, before) = field_from_context(&data, &screen, &baseline).unwrap();
+        let (field, before) = field_from_context(&data, &snapshot).unwrap();
         assert!(before.is_empty());
         for mode in 0..=4 {
+            let fake = FocusFake {
+                mode,
+                sends: RefCell::new(0),
+            };
+            let result = dispatch_to_focused(
+                &fake,
+                "session",
+                &field,
+                "example.editor",
+                &Action::TextCurrent { value: "X".into() },
+            )
+            .await;
+            assert_eq!(result.is_ok(), mode == 0);
+            assert_eq!(*fake.sends.borrow(), usize::from(mode == 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn emoji_search_never_becomes_the_typing_recipient() {
+        let snapshot = crate::wda_ui_admission::current_text_snapshot(EMOJI_XML).unwrap();
+        let (field, _) = field_from_context(&emoji_items(), &snapshot).unwrap();
+        for mode in [0, 5] {
             let fake = FocusFake {
                 mode,
                 sends: RefCell::new(0),

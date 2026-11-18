@@ -676,8 +676,7 @@ class BrokerTests(unittest.TestCase):
 
 class PureTests(unittest.TestCase):
     def test_runner_startup_logs_preserve_exact_result_and_failure_contracts(self):
-        startup = (b"handkited: runner_startup_stage=profile_unavailable\n"
-                   b"handkited: runner_startup_stage=runner_ready\n"
+        startup = (b"handkited: runner_startup_stage=runner_ready\n"
                    b"handkited: runner_startup_stage=ui_initializing\n"
                    b"handkited: runner_startup_stage=authorization_required owner_window_seconds=180\n"
                    b"handkited: runner_startup_stage=automation_waiting\n"
@@ -700,6 +699,20 @@ class PureTests(unittest.TestCase):
             self.assertEqual(broker.pin_stderr(startup + extra), extra)
         self.assertEqual(broker.pin_result((0, b"unlock_idle=code_submitted\nextra\n",
                                            startup, False)), (False, False))
+
+    def test_profile_failure_never_becomes_a_successful_pin_result(self):
+        for label, reason in ((b"profile_unavailable", b"ProfileUnavailable"),
+                              (b"profile_expired", b"ProfileExpired")):
+            stage = b"handkited: runner_startup_stage=" + label + b"\n"
+            for outcome in (b"code_submitted", b"already_unlocked"):
+                result = (0, b"unlock_idle=" + outcome + b"\n", stage, False)
+                self.assertEqual(broker.pin_result(result), (False, False))
+                self.assertEqual(broker.pin_diagnostic(result)["reported_outcome"],
+                                 "unclassified")
+            refusal = (1, b"", stage + b"handkite-unlock-once: unlock_idle=refused "
+                       b"reason=runner_unavailable runner=" + reason + b"\n", False)
+            self.assertEqual(broker.pin_result(refusal), (False, True))
+            self.assertEqual(broker.pin_result((*refusal[:3], True)), (False, False))
 
     def test_runner_progress_is_chunked_exact_and_once(self):
         events = []

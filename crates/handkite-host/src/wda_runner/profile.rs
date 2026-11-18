@@ -1,9 +1,9 @@
 //! Read installed provisioning-profile expiry for the runner before launch.
 //!
-//! Diagnosis only: an unexpired match never proves the runner can launch. It
-//! exists so an expired free-account (7-day) profile is named before XCTest
-//! starts, instead of surfacing as a generic initialization failure. Nothing
-//! here logs or returns team identifiers, device identifiers or serials.
+//! Profile admission precedes XCTest startup; an unexpired match does not replace
+//! the remaining native admission checks. Unavailable or incomplete inventory
+//! fails closed. Nothing here logs or returns team identifiers, device identifiers
+//! or serials.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -44,9 +44,11 @@ pub(super) fn runner_profile_expiry(
     profiles: &[Vec<u8>],
     bundle_id: &str,
 ) -> Option<ProfileExpiry> {
+    if profiles.len() > MAX_PROFILES {
+        return None;
+    }
     profiles
         .iter()
-        .take(MAX_PROFILES)
         .filter_map(|blob| profile_for(blob, bundle_id))
         .max_by_key(ProfileExpiry::effective)
 }
@@ -343,6 +345,24 @@ mod tests {
         assert_eq!(chosen.certificate, Some(at(1_830_297_600)));
         assert_eq!(chosen.effective(), at(1_830_297_600));
         assert_eq!(runner_profile_expiry(&profiles[2..], RUNNER), None);
+    }
+
+    #[test]
+    fn over_limit_inventory_is_unavailable_not_expired_or_valid() {
+        let early = at(1_800_000_000);
+        let late = at(1_900_000_000);
+        let first = profile(&format!("{TEAM}.{RUNNER}"), early, vec![]);
+        let mut profiles = vec![first; MAX_PROFILES];
+        assert_eq!(
+            runner_profile_expiry(&profiles, RUNNER).unwrap().profile,
+            early
+        );
+        profiles.push(profile(&format!("{TEAM}.{RUNNER}"), late, vec![]));
+        assert_eq!(runner_profile_expiry(&profiles, RUNNER), None);
+        assert_eq!(
+            runner_profile_expiry(&vec![profiles.pop().unwrap(); MAX_PROFILES + 1], RUNNER),
+            None
+        );
     }
 
     #[test]

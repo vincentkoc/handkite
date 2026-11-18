@@ -1219,3 +1219,116 @@ fn profile_expiry_refuses_only_when_effective_expiry_has_passed() {
     );
     assert_eq!(RunnerError::ProfileExpired.to_string(), "ProfileExpired");
 }
+
+#[tokio::test]
+async fn profile_admission_preserves_errors_before_continuation() {
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(2_000_000_000);
+    for error in [
+        RunnerError::ProfileUnavailable,
+        RunnerError::ProfileExpired,
+        RunnerError::OwnershipLost,
+    ] {
+        let continued = AtomicUsize::new(0);
+        let expected = error.clone();
+        let result = lookup_before_deadline(
+            async {
+                admit_profile(Err(error), now)?;
+                continued.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            },
+            deadline(),
+        )
+        .await;
+        assert_eq!(result, Err(expected));
+        assert_eq!(continued.load(Ordering::SeqCst), 0);
+    }
+    let expiry = ProfileExpiry {
+        profile: now + Duration::from_secs(10 * 86_400),
+        certificate: None,
+    };
+    let continued = AtomicUsize::new(0);
+    let result = lookup_before_deadline(
+        async {
+            let admitted = admit_profile(Ok(expiry), now)?;
+            continued.fetch_add(1, Ordering::SeqCst);
+            Ok(admitted)
+        },
+        deadline(),
+    )
+    .await;
+    assert_eq!(result, Ok(expiry));
+    assert_eq!(continued.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+#[ignore = "requires the owner's locked test device and exclusive device handoff"]
+fn live_locked_profile_probe() {
+    assert!(
+        std::env::var("HANDKITE_LIVE_PROFILE_PROBE").as_deref() == Ok("1"),
+        "profile_probe_opt_in"
+    );
+    let layout =
+        crate::service_layout::ServiceLayout::current_account().expect("profile_probe_layout");
+    let config =
+        crate::install_config::load_protected_config(&layout).expect("profile_probe_config");
+    let runner_id = config.wda_runner_bundle_id().expect("profile_probe_runner");
+    let usb = crate::usb::PinnedUsb::new(config.binding().usb_id.clone());
+    let deadline = Instant::now() + Duration::from_secs(20);
+    assert_eq!(
+        crate::native_lock::query_until(&config.binding().usb_id, deadline.into_std()).state,
+        handkite_core::protocol::LockState::Locked,
+        "profile_probe_before"
+    );
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("profile_probe_runtime");
+    let started = Instant::now();
+    let result = runtime.block_on(async {
+        timeout_at(deadline, async {
+            let provider = usb
+                .provider()
+                .await
+                .map_err(|_| RunnerError::ProfileUnavailable)?;
+            runner_profile(&*provider, runner_id, deadline).await
+        })
+        .await
+        .unwrap_or(Err(RunnerError::ProfileUnavailable))
+    });
+    let profile_ms = started.elapsed().as_millis();
+    let label = match &result {
+        Ok(_) => "available",
+        Err(RunnerError::ProfileExpired) => "ProfileExpired",
+        Err(RunnerError::ProfileUnavailable) => "ProfileUnavailable",
+        _ => panic!("profile_probe_unexpected_error"),
+    };
+    let admission = admit_profile(result, SystemTime::now());
+    assert_eq!(admission.is_ok(), label == "available");
+    assert_eq!(
+        crate::native_lock::query_until(&config.binding().usb_id, deadline.into_std()).state,
+        handkite_core::protocol::LockState::Locked,
+        "profile_probe_after"
+    );
+    let after =
+        crate::install_config::load_protected_config(&layout).expect("profile_probe_config_after");
+    assert!(
+        config.binding().usb_id == after.binding().usb_id,
+        "profile_probe_device_changed"
+    );
+    assert!(
+        config.binding().key == after.binding().key,
+        "profile_probe_key_changed"
+    );
+    assert!(
+        config.wda_runner_bundle_id() == after.wda_runner_bundle_id(),
+        "profile_probe_runner_changed"
+    );
+    println!(
+        "profile_probe={label} admission={} native_before=locked native_after=locked profile_ms={profile_ms}",
+        if admission.is_ok() {
+            "accepted"
+        } else {
+            "refused"
+        }
+    );
+}

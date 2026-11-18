@@ -89,10 +89,22 @@ pub(crate) fn visible_current_text_input(xml: &str) -> bool {
     parse(xml, Target::CurrentTextInput) == Some(())
 }
 
-/// Extract only after the complete baseline passed the existing text guards.
-pub(crate) fn current_text_snapshot(xml: &str) -> Option<(Attributes, Attributes)> {
+pub(crate) struct TextSnapshot {
+    pub screen: Attributes,
+    pub field: Attributes,
+    pub emoji_search: Option<EmojiSearch>,
+}
+
+pub(crate) struct EmojiSearch {
+    pub field: Attributes,
+    pub keyboard: Attributes,
+}
+
+/// Prepared text additionally binds the recipient's native active identity.
+/// Other current-selection actions keep the original single-editor rule.
+pub(crate) fn current_text_snapshot(xml: &str) -> Option<TextSnapshot> {
     if !visible_current_text_input(xml) {
-        return None;
+        return emoji_text_snapshot(xml);
     }
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut screen = None;
@@ -130,10 +142,175 @@ pub(crate) fn current_text_snapshot(xml: &str) -> Option<(Attributes, Attributes
                     field = Some(attrs);
                 }
             }
-            Event::Eof => return Some((screen?, field?)),
+            Event::Eof => {
+                return Some(TextSnapshot {
+                    screen: screen?,
+                    field: field?,
+                    emoji_search: None,
+                });
+            }
             _ => {}
         }
     }
+}
+
+/// Emoji search is a sibling of Keyboard in a separate input container on iOS.
+/// Recognize that complete structure, never an arbitrary second app field.
+fn emoji_text_snapshot(xml: &str) -> Option<TextSnapshot> {
+    if !safe_context(xml) {
+        return None;
+    }
+    #[derive(Clone)]
+    struct Node {
+        id: usize,
+        kind: String,
+        attrs: Attributes,
+    }
+    struct Candidate {
+        node: Node,
+        ancestors: Vec<Node>,
+    }
+    let mut reader = quick_xml::Reader::from_str(xml);
+    let mut stack: Vec<Node> = Vec::new();
+    let mut next_id = 0;
+    let mut screen = None;
+    let mut fields = Vec::new();
+    let mut keyboards = Vec::new();
+    loop {
+        let event = reader.read_event().ok()?;
+        let start = matches!(&event, Event::Start(_));
+        match event {
+            Event::Start(element) | Event::Empty(element) => {
+                let kind = std::str::from_utf8(element.name().as_ref())
+                    .ok()?
+                    .to_owned();
+                let mut attrs = Attributes::new();
+                for attr in element.attributes() {
+                    let attr = attr.ok()?;
+                    attrs.insert(
+                        std::str::from_utf8(attr.key.as_ref()).ok()?.into(),
+                        attr.decode_and_unescape_value(reader.decoder())
+                            .ok()?
+                            .into_owned(),
+                    );
+                }
+                attrs.insert("type".into(), kind.clone());
+                next_id += 1;
+                let node = Node {
+                    id: next_id,
+                    kind,
+                    attrs,
+                };
+                if node.kind == "XCUIElementTypeApplication" {
+                    screen = Some(node.attrs.clone());
+                }
+                if matches!(
+                    node.kind.as_str(),
+                    "XCUIElementTypeTextView"
+                        | "XCUIElementTypeTextField"
+                        | "XCUIElementTypeSearchField"
+                        | "XCUIElementTypeKeyboard"
+                ) && node.attrs.get("visible").map(String::as_str) != Some("false")
+                    && node.attrs.get("enabled").map(String::as_str) != Some("false")
+                {
+                    if node.attrs.get("visible").map(String::as_str) != Some("true")
+                        || node.attrs.get("enabled").map(String::as_str) != Some("true")
+                        || node
+                            .attrs
+                            .get("focused")
+                            .is_some_and(|v| !matches!(v.as_str(), "true" | "false"))
+                    {
+                        return None;
+                    }
+                    let bounds = Rect::read(&node.attrs)?;
+                    if !Rect::read(screen.as_ref()?)?.encloses(bounds)
+                        || !stack
+                            .iter()
+                            .any(|parent| parent.kind == "XCUIElementTypeApplication")
+                    {
+                        return None;
+                    }
+                    if (node.kind == "XCUIElementTypeKeyboard" && !keyboards.is_empty())
+                        || (node.kind != "XCUIElementTypeKeyboard" && fields.len() == 2)
+                    {
+                        return None;
+                    }
+                    let candidate = Candidate {
+                        node: node.clone(),
+                        ancestors: stack.clone(),
+                    };
+                    if node.kind == "XCUIElementTypeKeyboard" {
+                        keyboards.push(candidate);
+                    } else {
+                        fields.push(candidate);
+                    }
+                }
+                if start {
+                    stack.push(node);
+                }
+            }
+            Event::End(_) => {
+                stack.pop()?;
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+    }
+    if fields.len() != 2 || keyboards.len() != 1 {
+        return None;
+    }
+    let primary = fields
+        .iter()
+        .find(|field| field.node.kind == "XCUIElementTypeTextView")?;
+    let search = fields
+        .iter()
+        .find(|field| field.node.kind == "XCUIElementTypeTextField")?;
+    let keyboard = &keyboards[0];
+    if primary.node.attrs.get("focused").map(String::as_str) == Some("false")
+        || search.node.attrs.get("focused").map(String::as_str) == Some("true")
+        || search.node.attrs.get("value").map(String::as_str) != Some("Search Emoji")
+        || search
+            .node
+            .attrs
+            .get("placeholderValue")
+            .map(String::as_str)
+            != Some("Search Emoji")
+    {
+        return None;
+    }
+    let common: Vec<_> = search
+        .ancestors
+        .iter()
+        .zip(&keyboard.ancestors)
+        .take_while(|(a, b)| a.id == b.id)
+        .map(|(node, _)| node)
+        .collect();
+    let container = *common.last()?;
+    if container.kind != "XCUIElementTypeOther"
+        || !common
+            .iter()
+            .any(|node| node.kind == "XCUIElementTypeWindow")
+        || primary.ancestors.iter().any(|node| node.id == container.id)
+        || container.attrs.get("visible").map(String::as_str) != Some("true")
+        || container.attrs.get("enabled").map(String::as_str) != Some("true")
+    {
+        return None;
+    }
+    let container_bounds = Rect::read(&container.attrs)?;
+    if !Rect::read(screen.as_ref()?)?.encloses(container_bounds)
+        || !container_bounds.encloses(Rect::read(&search.node.attrs)?)
+        || !container_bounds.encloses(Rect::read(&keyboard.node.attrs)?)
+    {
+        return None;
+    }
+    Some(TextSnapshot {
+        screen: screen?,
+        field: primary.node.attrs.clone(),
+        emoji_search: Some(EmojiSearch {
+            field: search.node.attrs.clone(),
+            keyboard: keyboard.node.attrs.clone(),
+        }),
+    })
 }
 
 pub(crate) fn visible_text_target(xml: &str, at: Point) -> bool {

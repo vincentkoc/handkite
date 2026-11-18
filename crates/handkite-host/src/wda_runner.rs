@@ -115,8 +115,7 @@ pub enum RunnerError {
     RunnerStopUnproven,
     /// The latest installed profile (or its certificates) covering the runner has expired.
     ProfileExpired,
-    /// Installed profiles could not be read or none covers the runner. Diagnosis only:
-    /// startup logs this and continues, because profile state never admits a launch.
+    /// Installed profiles could not be read completely or none covers the runner.
     ProfileUnavailable,
     NativeProcess(NativeProcessStep),
 }
@@ -193,25 +192,10 @@ impl OwnedWdaRunner {
                         .await
                         .map_err(|error| transport_failure(&error, RunnerError::LookupFailed))?;
                 let config = authorization_runner_config(config);
-                let profile = match runner_profile(&*provider, runner_bundle_id, deadline).await {
-                    Ok(expiry) => {
-                        let hours = hours_until(expiry.effective(), SystemTime::now());
-                        if expiry.effective() <= SystemTime::now() + profile::EXPIRING_WITHIN {
-                            eprintln!(
-                                "handkited: runner_startup_stage=profile_expiring hours={hours}"
-                            );
-                        }
-                        Some(expiry)
-                    }
-                    Err(RunnerError::ProfileExpired) => {
-                        eprintln!("handkited: runner_startup_stage=profile_expired");
-                        return Err(RunnerError::ProfileExpired);
-                    }
-                    Err(_) => {
-                        eprintln!("handkited: runner_startup_stage=profile_unavailable");
-                        None
-                    }
-                };
+                let profile = Some(admit_profile(
+                    runner_profile(&*provider, runner_bundle_id, deadline).await,
+                    SystemTime::now(),
+                )?);
                 require_port_vacant(provider.connect(WDA_PORT), deadline).await?;
                 Ok((provider, config, profile))
             },
@@ -551,6 +535,31 @@ async fn runner_profile(
         profile::runner_profile_expiry(&profiles, runner_bundle_id),
         SystemTime::now(),
     )
+}
+
+fn admit_profile(
+    result: Result<ProfileExpiry, RunnerError>,
+    now: SystemTime,
+) -> Result<ProfileExpiry, RunnerError> {
+    match result {
+        Ok(expiry) => {
+            let hours = hours_until(expiry.effective(), now);
+            if expiry.effective() <= now + profile::EXPIRING_WITHIN {
+                eprintln!("handkited: runner_startup_stage=profile_expiring hours={hours}");
+            }
+            Ok(expiry)
+        }
+        Err(RunnerError::ProfileExpired) => {
+            eprintln!("handkited: runner_startup_stage=profile_expired");
+            Err(RunnerError::ProfileExpired)
+        }
+        Err(error) => {
+            if error == RunnerError::ProfileUnavailable {
+                eprintln!("handkited: runner_startup_stage=profile_unavailable");
+            }
+            Err(error)
+        }
+    }
 }
 
 fn classify_profile(
