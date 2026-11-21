@@ -16,8 +16,8 @@ use handkite_core::controller::{
     RawObservation,
 };
 use handkite_core::protocol::{
-    Action, DeviceState, HardwareId, ImageFormat, LockState, ObservationWindow, Point, ScreenImage,
-    TransportReceipt,
+    Action, DeviceState, HardwareId, ImageFormat, LockState, Motion, ObservationWindow, Point,
+    ScreenImage, TransportReceipt,
 };
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -966,7 +966,17 @@ impl DeviceAdapter for WdaAdapter {
         token: u64,
         deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
-        self.execute_focus(action, token, deadline)
+        self.execute_focus(action, token, deadline, None)
+    }
+
+    fn execute_prepared_text_with_motion(
+        &mut self,
+        action: &Action,
+        token: u64,
+        deadline: Instant,
+        motion: Option<Motion>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.execute_focus(action, token, deadline, motion)
     }
 
     fn observe_after_prepared_text(
@@ -1346,47 +1356,7 @@ impl DeviceAdapter for WdaAdapter {
         action: &Action,
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
-        self.finish_pending_effect(true)?;
-        self.error_diagnostic = None;
-        self.validate_owned_with_deadline(Some(send_deadline))
-            .inspect_err(|_| {
-                self.error_diagnostic = Some(AdapterDiagnostic::OwnedBefore);
-            })?;
-        if (matches!(action, Action::LaunchApp { .. })
-            || matches!(
-                action,
-                Action::Tap { .. }
-                    | Action::DoubleTap { .. }
-                    | Action::LongPress { .. }
-                    | Action::Swipe { .. }
-                    | Action::Text { .. }
-                    | Action::TextCurrent { .. }
-                    | Action::Key { .. }
-                    | Action::KeyCurrent { .. }
-            ) && self.owned_session.is_some())
-            && self.native_fresh(Some(send_deadline)) != LockState::Unlocked
-        {
-            self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
-            return Err(AdapterError);
-        }
-        let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
-        let receipt = self
-            .runtime
-            .as_ref()
-            .expect("adapter runtime")
-            .block_on(
-                self.actions
-                    .execute_with_existing_session_diagnostic(&wda, action),
-            )
-            .map_err(|diagnostic| {
-                self.cache.clear();
-                self.error_diagnostic = Some(diagnostic);
-                AdapterError
-            })?;
-        self.validate_owned().inspect_err(|_| {
-            self.error_diagnostic = Some(AdapterDiagnostic::OwnershipAfterAck);
-        })?;
-        Ok(receipt)
+        self.execute_motion(action, send_deadline, None)
     }
 
     fn native_lock_state(&mut self) -> LockState {
@@ -1398,6 +1368,16 @@ impl DeviceAdapter for WdaAdapter {
         action: &Action,
         send_deadline: Instant,
         admission: Option<ActionAdmission>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.execute_with_motion(action, send_deadline, admission, None)
+    }
+
+    fn execute_with_motion(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        admission: Option<ActionAdmission>,
+        motion: Option<Motion>,
     ) -> Result<TransportReceipt, AdapterError> {
         self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
@@ -1421,7 +1401,7 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            return self.execute(action, send_deadline);
+            return self.execute_motion(action, send_deadline, motion);
         }
         if let Some(ActionAdmission::NativeSwipe {
             from,
@@ -1439,7 +1419,7 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            return self.execute(action, send_deadline);
+            return self.execute_motion(action, send_deadline, motion);
         }
         if let Some(ActionAdmission::NativeKey { key, until }) = admission {
             if !matches!(action, Action::KeyCurrent { key: actual } if *actual == key)
@@ -1450,7 +1430,7 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            return self.execute(action, send_deadline);
+            return self.execute_motion(action, send_deadline, motion);
         }
         if matches!(action, Action::KeyCurrent { .. }) {
             return Err(AdapterError);
@@ -1524,7 +1504,7 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            return self.execute(action, send_deadline);
+            return self.execute_motion(action, send_deadline, motion);
         }
         if let Some(ActionAdmission::NativeTextGesture { at, until }) = admission {
             if !matches!(action, Action::DoubleTap { at: actual } | Action::LongPress { at: actual, .. } if *actual == at)
@@ -1535,7 +1515,7 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            return self.execute(action, send_deadline);
+            return self.execute_motion(action, send_deadline, motion);
         }
         if let Some(ActionAdmission::NativeModalTap { at, until }) = admission {
             if !matches!(action, Action::Tap { at: actual } if *actual == at)
@@ -1546,7 +1526,7 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            return self.execute(action, send_deadline);
+            return self.execute_motion(action, send_deadline, motion);
         }
         if let Some(ActionAdmission::NativeHome { until }) = admission {
             if !matches!(action, Action::Home)
@@ -1571,7 +1551,7 @@ impl DeviceAdapter for WdaAdapter {
                 .inspect_err(|_| self.cache.clear())?;
             return Ok(receipt);
         }
-        self.execute(action, send_deadline)
+        self.execute_motion(action, send_deadline, motion)
     }
 }
 
@@ -1965,6 +1945,58 @@ pub fn springboard_home_launch_deadline(
         return None;
     }
     captured_at.checked_add(HOME_LAUNCH_AGE)
+}
+
+impl WdaAdapter {
+    /// One send. `motion` reshapes only transport motion; every check is unchanged.
+    fn execute_motion(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        motion: Option<Motion>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.finish_pending_effect(true)?;
+        self.error_diagnostic = None;
+        self.validate_owned_with_deadline(Some(send_deadline))
+            .inspect_err(|_| {
+                self.error_diagnostic = Some(AdapterDiagnostic::OwnedBefore);
+            })?;
+        if (matches!(action, Action::LaunchApp { .. })
+            || matches!(
+                action,
+                Action::Tap { .. }
+                    | Action::DoubleTap { .. }
+                    | Action::LongPress { .. }
+                    | Action::Swipe { .. }
+                    | Action::Text { .. }
+                    | Action::TextCurrent { .. }
+                    | Action::Key { .. }
+                    | Action::KeyCurrent { .. }
+            ) && self.owned_session.is_some())
+            && self.native_fresh(Some(send_deadline)) != LockState::Unlocked
+        {
+            self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
+            return Err(AdapterError);
+        }
+        let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
+        let receipt = self
+            .runtime
+            .as_ref()
+            .expect("adapter runtime")
+            .block_on(
+                self.actions
+                    .execute_with_existing_session_diagnostic(&wda, action, motion),
+            )
+            .map_err(|diagnostic| {
+                self.cache.clear();
+                self.error_diagnostic = Some(diagnostic);
+                AdapterError
+            })?;
+        self.validate_owned().inspect_err(|_| {
+            self.error_diagnostic = Some(AdapterDiagnostic::OwnershipAfterAck);
+        })?;
+        Ok(receipt)
+    }
 }
 
 #[cfg(test)]

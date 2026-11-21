@@ -38,6 +38,23 @@ recovery; a fast model executes steps 2–4 from compact elements only. One
 executor holds the lease; never run two against one phone. Measured loop cost
 and qualification status are in `VALIDATION.md`.
 
+## Human-like pacing (opt-in)
+
+Some apps flag input that is too regular or fast. Pacing is off by default and
+adds no latency. The device owner can launch the MCP with `--pacing natural` or
+`--pacing cautious` (optionally `--pacing-seed N`), and any coordinate action
+accepts `"pacing":{"policy":"natural"}`, `"cautious"` or `"off"` for that call.
+Paced calls wait a log-normal gap since the previous action and respect an
+actions-per-minute cap. Coordinate taps move only inside the smallest element
+frame from the same revision; the host varies press timing, curves swipes and
+types short ASCII text in bursts. Every action still needs its own fresh
+`expected_revision` and passes the usual admission; a wait can make a revision
+stale, so observe again on `StaleRevision`. `PacingUnsupported`
+(`delivery:"not_sent"`) means the host predates pacing: nothing was sent, so
+retry that call with `"pacing":{"policy":"off"}`. Element tools get only the gap
+and cap. Pacing is no stealth guarantee and never a reason to replay input; see
+`VALIDATION.md` for what is live-verified.
+
 For Home or app switching, call `handkite_status` for a cheap navigation revision,
 then `handkite_home` or `handkite_launch_app`. These do not require a coherent XML
 snapshot. A response with `revision_scope:"navigation"` admits only these two

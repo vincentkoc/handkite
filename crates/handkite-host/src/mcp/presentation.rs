@@ -146,6 +146,11 @@ impl Cache {
         self.elements.clear();
     }
 
+    /// Element frames from the observation at `revision`, for pacing only.
+    pub(super) fn element_rects(&self, revision: Revision) -> Vec<[f64; 4]> {
+        self.elements.rects(revision)
+    }
+
     pub(super) fn content(
         &mut self,
         mut observation: WireObservation,

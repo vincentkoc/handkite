@@ -87,6 +87,7 @@ pub(super) fn with_service_code(mut result: Value, code: &str) -> Value {
             | "StaleRevision"
             | "ViewChanged"
             | "LockedAction"
+            | "PacingUnsupported"
     ) || handkite_core::controller::AdapterDiagnostic::ALL
         .iter()
         .any(|diagnostic| diagnostic.code() == code)

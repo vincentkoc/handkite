@@ -9,6 +9,9 @@ use serde_json::{Value, json};
 struct RevisionOnly {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
 }
 
@@ -39,6 +42,9 @@ impl ScreenPoint {
 struct TapArguments {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
     at: ScreenPoint,
 }
@@ -48,6 +54,9 @@ struct TapArguments {
 struct ButtonArguments {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
     target: ButtonTarget,
 }
@@ -57,6 +66,9 @@ struct ButtonArguments {
 struct LongPressArguments {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
     at: ScreenPoint,
     duration_ms: u32,
@@ -67,6 +79,9 @@ struct LongPressArguments {
 struct KeyArguments {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
     key: KeyboardKey,
     selection: Option<EditingSelection>,
@@ -83,6 +98,9 @@ enum EditingSelection {
 struct SwipeArguments {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
     from: ScreenPoint,
     to: ScreenPoint,
@@ -94,6 +112,9 @@ struct SwipeArguments {
 struct TextArguments {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
     value: String,
     selection: Option<EditingSelection>,
@@ -104,6 +125,9 @@ struct TextArguments {
 struct LaunchArguments {
     #[serde(default, rename = "response")]
     _response: presentation::Options,
+    // Removed and applied by the dispatch hook; accepted here for raw validation.
+    #[serde(default, rename = "pacing")]
+    _pacing: Option<crate::pacing::Override>,
     expected_revision: Revision,
     bundle_id: String,
 }
@@ -262,6 +286,7 @@ pub(super) fn schema(tool: Tool) -> Value {
     let mut properties = serde_json::Map::new();
     properties.insert("expected_revision".into(), revision);
     properties.insert("response".into(), presentation::schema());
+    properties.insert("pacing".into(), crate::pacing::override_schema());
     let mut required = vec!["expected_revision"];
     match tool {
         Tool::ClickButton => {

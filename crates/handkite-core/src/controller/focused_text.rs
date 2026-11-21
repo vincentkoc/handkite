@@ -24,6 +24,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner: &mut Inner<A>,
         request: &ActionRequest,
         capture: CaptureMode,
+        motion: Option<Motion>,
     ) -> Result<Option<ActionResult>, ControllerError> {
         if capture != CaptureMode::ImageOnly
             || !matches!(&request.action, Action::TextCurrent { .. })
@@ -128,7 +129,12 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         let receipt = inner
             .adapter
-            .execute_prepared_text(&request.action, prepared.token, send_deadline)
+            .execute_prepared_text_with_motion(
+                &request.action,
+                prepared.token,
+                send_deadline,
+                motion,
+            )
             .map_err(|_| Self::adapter_error(inner))?;
         let observed = inner.adapter.observe_after_prepared_text(prepared.token);
         let (after_image, verified) = match observed {

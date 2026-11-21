@@ -377,6 +377,29 @@ purchases or send messages; grant this profile only to a trusted personal agent
 with approval bound to the concrete action. OpenClaw integration is deferred;
 the former separate deployment is retired.
 
+Human-like pacing is opt-in and off by default, so default latency is unchanged.
+Start the MCP with `--pacing natural` or `--pacing cautious` to pace a whole
+session, and `--pacing-seed N` to replay its jitter. Every action tool also
+accepts an optional `"pacing":{"policy":"off|natural|cautious","seed":N}`
+override for one call. Paced calls wait a seeded log-normal gap measured from
+the previous action (agent think time counts) and respect an actions-per-minute
+cap: natural 40, cautious 24. Coordinate taps, double taps and long presses move
+only inside the smallest element frame known for the same revision, inset from
+its edges and within a few points; with no frame the point is unchanged.
+Long-press and swipe durations vary within bounded factors. The daemon then
+varies press duration, sends swipes along an eased, slightly curved path with
+the same endpoints and total duration, and types printable ASCII text of up to
+96 characters with per-key cadence and bursts in one W3C key-action request.
+Other text stays one whole string at a sampled frequency, so grapheme clusters
+are never split. Pacing never splits, retries or reorders input, and never
+changes `expected_revision`, admission or verification: the jittered action is
+admitted as sent. Element tools receive only the gap and cap. Motion reaches the
+one WDA send as an explicit parameter; no state outlives the request. A paced call
+needs a daemon from the same release. An older daemon refuses the field before
+dispatch, and the MCP reports `PacingUnsupported` with `delivery:"not_sent"`
+without resending; retry with pacing off or update the host. Off sends the
+unchanged request.
+
 Element target input is separately opt-in: `handkite_observe` with
 `{"targets":true}` (or `Session.observe_targets()`) returns compact target rows
 with opaque `target_id` values, rectangles and bounded public values. These are

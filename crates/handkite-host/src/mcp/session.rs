@@ -19,9 +19,19 @@ pub(super) struct Session {
         handkite_core::protocol::DeviceState,
         Vec<handkite_core::controller::ElementTarget>,
     )>,
+    pub(super) pacing: crate::pacing::Pacer,
+    /// Motion shape for the next `act` request only.
+    shape: Option<crate::pacing::Shape>,
 }
 
 impl Session {
+    pub(super) fn with_pacing(pacing: crate::pacing::Pacer) -> Self {
+        Self {
+            pacing,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn acquire<F>(&mut self, exchange: &mut F) -> Value
     where
         F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
@@ -89,6 +99,34 @@ impl Session {
         }
     }
 
+    /// Pacing hook before one coordinate action: wait, then move the point
+    /// inside a frame observed at `revision`. Off returns `action` unchanged.
+    pub(super) fn pace(
+        &mut self,
+        call: Option<crate::pacing::Override>,
+        revision: Revision,
+        action: Action,
+    ) -> Action {
+        self.shape = None;
+        if self.lease.is_none() {
+            // `act` refuses before input; never wait for a refusal.
+            return action;
+        }
+        let mut paced = self.pacing.begin(call);
+        if paced.policy == crate::pacing::Policy::Off {
+            return action;
+        }
+        let mut frames = self.presentation.element_rects(revision);
+        if let Some((observed, _, targets)) = &self.target_inventory
+            && *observed == revision
+        {
+            frames.extend(targets.iter().map(|target| target.rect));
+        }
+        let action = paced.shape_action(action, &frames);
+        self.shape = paced.shape_for(&action);
+        action
+    }
+
     pub(super) fn act<F>(
         &mut self,
         device: &DeviceKey,
@@ -101,6 +139,7 @@ impl Session {
     where
         F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
     {
+        let shape = self.shape.take();
         let Some(lease) = self.lease else {
             return tool_error("explicit control acquisition required");
         };
@@ -108,6 +147,12 @@ impl Session {
         let navigation = matches!(action, Action::Home | Action::LaunchApp { .. });
         let mut request = json!({"method": if navigation { "navigate" } else { "act" }, "owner": OWNER, "lease": lease,
             "request": {"device": device, "expected_revision": revision, "action": action}});
+        let paced = if let Some(shape) = shape.filter(|_| !navigation) {
+            request["pacing"] = json!(shape);
+            true
+        } else {
+            false
+        };
         if !navigation && options.capture != CaptureMode::Paired {
             request["capture"] = json!(options.capture);
         }
@@ -231,12 +276,15 @@ impl Session {
                 // Only explicit pre-input refusals prove that input was not sent.
                 // Identity checks and response-size limits can also fail after input.
                 if code == "AdapterPreActionCapture" {
-                    let mut result = text_result(json!({
-                        "receipt": {"accepted": false, "action_kind": kind},
-                        "effect": "unconfirmed", "after": null, "delivery": "not_sent"
-                    }));
-                    result["isError"] = json!(true);
-                    super::response::with_service_code(result, &code)
+                    not_sent(kind, &code)
+                } else if paced && code == "InvalidRequest" {
+                    // The socket rejects a request it cannot parse before any
+                    // dispatch: an older daemon refuses the pacing field. Never
+                    // resend it automatically; the caller may retry with pacing off.
+                    let mut result = not_sent(kind, "PacingUnsupported");
+                    result["content"].as_array_mut().unwrap().push(json!({"type":"text",
+                        "text":"PacingUnsupported: the device service does not accept pacing; nothing was sent. Retry with pacing off or update the host."}));
+                    result
                 } else if navigation && code == "StaleObservation" {
                     service_error(&code)
                 } else if matches!(
@@ -251,6 +299,15 @@ impl Session {
             _ => uncertain_result(kind),
         }
     }
+}
+
+fn not_sent(kind: &str, code: &str) -> Value {
+    let mut result = text_result(json!({
+        "receipt": {"accepted": false, "action_kind": kind},
+        "effect": "unconfirmed", "after": null, "delivery": "not_sent"
+    }));
+    result["isError"] = json!(true);
+    super::response::with_service_code(result, code)
 }
 
 fn uncertain_result(kind: &str) -> Value {

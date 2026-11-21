@@ -891,6 +891,8 @@ pub(crate) async fn dispatch_native(
                 value: value.clone(),
             },
             session,
+            // Element text keeps its qualified unshaped request.
+            None,
         )
         .await
         .map_err(|_| AdapterError)?;

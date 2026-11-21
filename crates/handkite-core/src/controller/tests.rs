@@ -29,6 +29,7 @@ struct FakeAdapter {
     send_started: Option<Instant>,
     execution_admission: Option<ActionAdmission>,
     after_admission: Option<ActionAdmission>,
+    motion: Option<Option<crate::protocol::Motion>>,
 }
 
 impl FakeAdapter {
@@ -62,6 +63,7 @@ impl FakeAdapter {
             send_started: None,
             execution_admission: None,
             after_admission: None,
+            motion: None,
         }
     }
 }
@@ -183,6 +185,17 @@ impl DeviceAdapter for FakeAdapter {
             }
         }
         self.execute(action, send_deadline)
+    }
+
+    fn execute_with_motion(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        admission: Option<ActionAdmission>,
+        motion: Option<crate::protocol::Motion>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.motion = Some(motion);
+        self.execute_with_admission(action, send_deadline, admission)
     }
 
     fn execute(
@@ -509,6 +522,63 @@ fn lease_expiring_during_capture_cannot_dispatch_input() {
     let result = controller.act("agent", valid_lease, request()).unwrap();
     assert_eq!(result.effect, ObservedEffect::Changed);
     assert_eq!(controller.inner.lock().unwrap().adapter.actions, 1);
+}
+
+#[test]
+fn motion_reaches_only_the_send_and_changes_no_check() {
+    use crate::protocol::{Motion, MotionPolicy};
+    let motion = Motion {
+        policy: MotionPolicy::Natural,
+        seed: 9,
+    };
+    let (controller, key) = controller();
+    let lease = controller
+        .acquire("agent".into(), Duration::from_secs(30))
+        .unwrap();
+    let before = controller.observe(&key).unwrap();
+    let request = |revision| ActionRequest {
+        device: key.clone(),
+        expected_revision: Some(revision),
+        action: Action::Home,
+    };
+    let result = controller
+        .act_with_motion(
+            "agent",
+            lease,
+            request(before.revision),
+            CaptureMode::Paired,
+            Some(motion),
+        )
+        .unwrap();
+    assert_eq!(result.effect, ObservedEffect::Changed);
+    assert_eq!(
+        controller.inner.lock().unwrap().adapter.motion,
+        Some(Some(motion))
+    );
+    // A stale revision is refused before any send, motion or not.
+    controller.inner.lock().unwrap().adapter.motion = None;
+    assert_eq!(
+        controller
+            .act_with_motion(
+                "agent",
+                lease,
+                request(before.revision),
+                CaptureMode::Paired,
+                Some(motion),
+            )
+            .err(),
+        Some(ControllerError::StaleRevision)
+    );
+    let inner = controller.inner.lock().unwrap();
+    assert_eq!(inner.adapter.actions, 1);
+    assert_eq!(inner.adapter.motion, None);
+    drop(inner);
+    // The plain path sends no motion.
+    let fresh = controller.observe(&key).unwrap();
+    controller
+        .act("agent", lease, request(fresh.revision))
+        .unwrap();
+    assert_eq!(controller.inner.lock().unwrap().adapter.motion, Some(None));
 }
 
 #[test]

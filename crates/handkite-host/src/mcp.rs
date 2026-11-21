@@ -25,6 +25,8 @@ mod image_tests;
 #[cfg(test)]
 mod navigation_tests;
 #[cfg(test)]
+mod pacing_tests;
+#[cfg(test)]
 mod presentation_tests;
 
 const MAX_REQUEST: usize = 64 * 1024;
@@ -40,10 +42,34 @@ where
 }
 
 pub fn serve_with_capabilities<R, W, F>(
+    input: R,
+    output: W,
+    device: &DeviceKey,
+    capabilities: Capabilities,
+    exchange: F,
+) -> io::Result<()>
+where
+    R: BufRead,
+    W: Write,
+    F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
+{
+    serve_with_pacing(
+        input,
+        output,
+        device,
+        capabilities,
+        crate::pacing::Pacer::default(),
+        exchange,
+    )
+}
+
+/// As `serve_with_capabilities`, with a session pacing policy chosen at launch.
+pub fn serve_with_pacing<R, W, F>(
     mut input: R,
     mut output: W,
     device: &DeviceKey,
     capabilities: Capabilities,
+    pacing: crate::pacing::Pacer,
     mut exchange: F,
 ) -> io::Result<()>
 where
@@ -51,7 +77,7 @@ where
     W: Write,
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
-    let mut session = Session::default();
+    let mut session = Session::with_pacing(pacing);
     let result = serve_loop(
         &mut input,
         &mut output,
@@ -203,6 +229,10 @@ where
                 return Some(error(id, -32602, "unknown or unauthorized tool"));
             };
             if matches!(tool, Tool::TapElement | Tool::TextElement) {
+                // Gap and rate cap only: native target geometry stays daemon-owned.
+                if session.lease.is_some() {
+                    session.pacing.begin(None);
+                }
                 session.act_element(
                     tool == Tool::TextElement,
                     params.arguments,
@@ -210,11 +240,15 @@ where
                     exchange,
                 )
             } else if tool.is_action() {
-                let Ok((revision, action, options)) =
-                    interaction::parse_response(tool, params.arguments)
+                let mut arguments = params.arguments;
+                let Ok(pacing) = crate::pacing::Override::take(&mut arguments) else {
+                    return Some(error(id, -32602, "invalid action arguments"));
+                };
+                let Ok((revision, action, options)) = interaction::parse_response(tool, arguments)
                 else {
                     return Some(error(id, -32602, "invalid action arguments"));
                 };
+                let action = session.pace(pacing, revision, action);
                 session.act(
                     device,
                     revision,

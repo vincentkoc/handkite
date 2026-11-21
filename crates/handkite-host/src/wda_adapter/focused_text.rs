@@ -427,6 +427,7 @@ async fn dispatch_to_focused(
     field: &str,
     app: &str,
     action: &Action,
+    motion: Option<handkite_core::protocol::Motion>,
 ) -> Result<TransportReceipt, AdapterDiagnostic> {
     let focus_timing = crate::timing::Span::new("text_final_focus");
     let (active, app) = tokio::join!(active(wda, session), app_matches(wda, session, app));
@@ -434,7 +435,7 @@ async fn dispatch_to_focused(
         return Err(AdapterDiagnostic::PreActionCapture);
     }
     drop(focus_timing);
-    WdaActions::execute_on_diagnostic(wda, action, session).await
+    WdaActions::execute_on_diagnostic(wda, action, session, motion).await
 }
 
 impl WdaAdapter {
@@ -526,6 +527,7 @@ impl WdaAdapter {
         action: &Action,
         token: u64,
         deadline: Instant,
+        motion: Option<handkite_core::protocol::Motion>,
     ) -> Result<TransportReceipt, AdapterError> {
         let mut input = self.focused_text.take().ok_or(AdapterError)?;
         if input.sent
@@ -556,8 +558,15 @@ impl WdaAdapter {
                     .validate_existing_diagnostic(&wda)
                     .await
                     .map_err(|_| AdapterDiagnostic::SessionCheck)?;
-                dispatch_to_focused(&wda, &input.key.session, &input.field, &input.app, action)
-                    .await
+                dispatch_to_focused(
+                    &wda,
+                    &input.key.session,
+                    &input.field,
+                    &input.app,
+                    action,
+                    motion,
+                )
+                .await
             })
             .map_err(|reason| {
                 self.error_diagnostic = Some(reason);
@@ -1085,6 +1094,7 @@ mod tests {
                 &field,
                 "example.editor",
                 &Action::TextCurrent { value: "X".into() },
+                None,
             )
             .await;
             assert_eq!(result.is_ok(), mode == 0);
@@ -1107,6 +1117,7 @@ mod tests {
                 &field,
                 "example.editor",
                 &Action::TextCurrent { value: "X".into() },
+                None,
             )
             .await;
             assert_eq!(result.is_ok(), mode == 0);

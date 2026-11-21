@@ -147,6 +147,7 @@ fn status_retains_the_complete_revision_for_action_comparison() {
             &controller,
             Request::Act {
                 capture: CaptureMode::Paired,
+                pacing: None,
                 owner: "fixture".into(),
                 lease,
                 request: ActionRequest {

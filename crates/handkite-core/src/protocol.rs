@@ -280,6 +280,23 @@ impl Action {
     }
 }
 
+/// Opt-in human-like motion for one admitted action. It reshapes only the
+/// transport motion (press timing, path, key cadence) of the exact action that
+/// admission accepted; it never changes the action, admission or verification.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MotionPolicy {
+    Natural,
+    Cautious,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Motion {
+    pub policy: MotionPolicy,
+    pub seed: u64,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ActionRequest {
     pub device: DeviceKey,

@@ -1,7 +1,7 @@
 use crate::protocol::{
     Action, ActionRequest, ActionResult, CaptureMode, DeviceBinding, DeviceKey, DeviceState,
-    HardwareId, ImageObservation, LockState, Observation, ObservationWindow, ObservedEffect, Point,
-    Revision, ScreenImage, TransportReceipt,
+    HardwareId, ImageObservation, LockState, Motion, Observation, ObservationWindow,
+    ObservedEffect, Point, Revision, ScreenImage, TransportReceipt,
 };
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -300,6 +300,27 @@ pub trait DeviceAdapter {
         action: &Action,
         send_deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError>;
+    /// Like `execute_with_admission`, with optional motion shaping for this one
+    /// send. Adapters that cannot shape motion ignore it.
+    fn execute_with_motion(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        admission: Option<ActionAdmission>,
+        _motion: Option<Motion>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.execute_with_admission(action, send_deadline, admission)
+    }
+    /// Like `execute_prepared_text`, with optional typing-cadence shaping.
+    fn execute_prepared_text_with_motion(
+        &mut self,
+        action: &Action,
+        token: u64,
+        send_deadline: Instant,
+        _motion: Option<Motion>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.execute_prepared_text(action, token, send_deadline)
+    }
     /// Receives only validated private admission used by this action check.
     /// Native admissions require an additional native unlock check before sending.
     fn execute_with_admission(
@@ -602,10 +623,24 @@ impl<A: DeviceAdapter> Controller<A> {
         request: ActionRequest,
         capture: CaptureMode,
     ) -> Result<ActionResult, ControllerError> {
+        self.act_with_motion(owner, lease_id, request, capture, None)
+    }
+
+    /// As `act_with_capture`, passing opt-in motion shaping to the one send.
+    /// Every lease, revision, identity, admission and verification check is
+    /// identical with or without `motion`.
+    pub fn act_with_motion(
+        &self,
+        owner: &str,
+        lease_id: LeaseId,
+        request: ActionRequest,
+        capture: CaptureMode,
+        motion: Option<Motion>,
+    ) -> Result<ActionResult, ControllerError> {
         let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
         inner.target_last = None;
         inner.navigation_last = None;
-        let result = self.act_inner(&mut inner, owner, lease_id, request, capture);
+        let result = self.act_inner(&mut inner, owner, lease_id, request, capture, motion);
         if let Ok(result) = &result {
             renew_verified_action(&mut inner.lease, owner, lease_id, result, Instant::now());
         }
@@ -619,6 +654,7 @@ impl<A: DeviceAdapter> Controller<A> {
         lease_id: LeaseId,
         request: ActionRequest,
         capture: CaptureMode,
+        motion: Option<Motion>,
     ) -> Result<ActionResult, ControllerError> {
         if !matches!(&inner.lease, Some(lease) if lease.id == lease_id && lease.owner == owner && lease.expires_at > Instant::now())
         {
@@ -640,7 +676,7 @@ impl<A: DeviceAdapter> Controller<A> {
             .verify(&request.device, &usb, &wda)
             .map_err(|_| ControllerError::DeviceMismatch)?;
 
-        if let Some(result) = self.try_focused_text(&mut inner, &request, capture)? {
+        if let Some(result) = self.try_focused_text(&mut inner, &request, capture, motion)? {
             return Ok(result);
         }
 
@@ -819,10 +855,11 @@ impl<A: DeviceAdapter> Controller<A> {
         let execution_admission = (admitted_home_launch || pixel_drift_until.is_some())
             .then_some(admission)
             .flatten();
-        let receipt = match inner.adapter.execute_with_admission(
+        let receipt = match inner.adapter.execute_with_motion(
             &request.action,
             send_deadline,
             execution_admission,
+            motion,
         ) {
             Ok(receipt) => receipt,
             // An error can follow delivery. Keep checking the postcondition without replay.

@@ -55,6 +55,9 @@ pub enum Request {
         request: ActionRequest,
         #[serde(default)]
         capture: CaptureMode,
+        /// Opt-in motion shaping; absent unless the client paces this call.
+        #[serde(default)]
+        pacing: Option<handkite_core::protocol::Motion>,
     },
 }
 
@@ -308,8 +311,9 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
             lease,
             request,
             capture,
+            pacing,
         } if valid_owner(&owner) => controller
-            .act_with_capture(&owner, lease, request, capture)
+            .act_with_motion(&owner, lease, request, capture, pacing)
             .map(|result| Reply::Acted {
                 effect_updates: Vec::new(),
                 receipt: result.receipt,
@@ -366,6 +370,37 @@ mod tests {
                 serde_json::to_value(reply).unwrap(),
                 serde_json::json!({"type":"error", "code":diagnostic.code()})
             );
+        }
+    }
+
+    #[test]
+    fn act_carries_optional_motion_and_refuses_off_or_malformed() {
+        let lease = "1".repeat(32);
+        let act = |pacing: &str| {
+            format!(
+                r#"{{"method":"act","owner":"handkite-mcp","lease":"{lease}","request":{{"device":"phone","expected_revision":1,"action":{{"type":"tap","at":{{"x":1.0,"y":2.0}}}}}}{pacing}}}"#
+            )
+        };
+        let motion = |raw: &str| match serde_json::from_str::<Request>(raw) {
+            Ok(Request::Act { pacing, .. }) => Ok(pacing),
+            Ok(_) => panic!("not an act request"),
+            Err(_) => Err(()),
+        };
+        assert_eq!(motion(&act("")), Ok(None));
+        assert_eq!(
+            motion(&act(r#","pacing":{"policy":"cautious","seed":3}"#)),
+            Ok(Some(handkite_core::protocol::Motion {
+                policy: handkite_core::protocol::MotionPolicy::Cautious,
+                seed: 3
+            }))
+        );
+        for bad in [
+            r#","pacing":{"policy":"off","seed":3}"#,
+            r#","pacing":{"policy":"natural"}"#,
+            r#","pacing":{"policy":"natural","seed":3,"extra":1}"#,
+            r#","pacing":"natural""#,
+        ] {
+            assert_eq!(motion(&act(bad)), Err(()), "{bad}");
         }
     }
 

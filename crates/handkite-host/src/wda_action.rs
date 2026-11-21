@@ -2,7 +2,9 @@ pub(crate) use crate::pin_field::valid_id as valid_session_id;
 use crate::wda_http::HttpResponse;
 use crate::wda_transport::{UsbWda, WdaError};
 use handkite_core::controller::{AdapterDiagnostic, AdapterError};
-use handkite_core::protocol::{Action, KeyboardKey, Point, TransportReceipt, injectable_text};
+use handkite_core::protocol::{
+    Action, KeyboardKey, Motion, Point, TransportReceipt, injectable_text,
+};
 use serde_json::{Value, json};
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -157,7 +159,7 @@ impl WdaActions {
         wda: &impl WdaRequest,
         action: &Action,
     ) -> Result<TransportReceipt, AdapterError> {
-        self.execute_with_existing_session_diagnostic(wda, action)
+        self.execute_with_existing_session_diagnostic(wda, action, None)
             .await
             .map_err(|_| AdapterError)
     }
@@ -166,6 +168,7 @@ impl WdaActions {
         &mut self,
         wda: &impl WdaRequest,
         action: &Action,
+        motion: Option<Motion>,
     ) -> Result<TransportReceipt, AdapterDiagnostic> {
         self.validate_existing_diagnostic(wda)
             .await
@@ -177,7 +180,7 @@ impl WdaActions {
             .session
             .as_deref()
             .ok_or(AdapterDiagnostic::SessionCheck)?;
-        Self::execute_on_diagnostic(wda, action, session).await
+        Self::execute_on_diagnostic(wda, action, session, motion).await
     }
 
     /// Activates the Home screen once, without a button-press fallback.
@@ -308,7 +311,7 @@ impl WdaActions {
         action: &Action,
         session: &str,
     ) -> Result<TransportReceipt, AdapterError> {
-        Self::execute_on_diagnostic(wda, action, session)
+        Self::execute_on_diagnostic(wda, action, session, None)
             .await
             .map_err(|_| AdapterError)
     }
@@ -317,9 +320,10 @@ impl WdaActions {
         wda: &impl WdaRequest,
         action: &Action,
         session: &str,
+        motion: Option<Motion>,
     ) -> Result<TransportReceipt, AdapterDiagnostic> {
         let (endpoint, body) =
-            payload(action).map_err(|_| AdapterDiagnostic::InputInvalidRequest)?;
+            motion_payload(action, motion).map_err(|_| AdapterDiagnostic::InputInvalidRequest)?;
         let path = format!("/session/{session}{endpoint}");
         let body = serde_json::to_vec(&body).map_err(|_| AdapterDiagnostic::InputInvalidRequest)?;
         let response = wda
@@ -399,6 +403,18 @@ fn parse_typing_frequency(raw: Option<&str>) -> u32 {
         .ok()
         .filter(|rate| (60..=600).contains(rate))
         .unwrap_or(DEFAULT_TYPING_FREQUENCY)
+}
+
+/// Opt-in pacing reshapes only the motion of an action admitted unchanged.
+/// Without motion, or for an action it does not shape, the payload is unchanged.
+fn motion_payload(
+    action: &Action,
+    motion: Option<Motion>,
+) -> Result<(&'static str, Value), AdapterError> {
+    if let Some(shaped) = motion.and_then(|motion| crate::pacing::shaped_payload(action, motion)) {
+        return Ok(shaped);
+    }
+    payload(action)
 }
 
 fn payload(action: &Action) -> Result<(&'static str, Value), AdapterError> {
@@ -778,7 +794,7 @@ mod tests {
             let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
             assert_eq!(
                 actions
-                    .execute_with_existing_session_diagnostic(&script, &Action::Home)
+                    .execute_with_existing_session_diagnostic(&script, &Action::Home, None)
                     .await,
                 Err(expected)
             );
@@ -804,7 +820,7 @@ mod tests {
             let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
             assert_eq!(
                 actions
-                    .execute_with_existing_session_diagnostic(&script, &Action::Home)
+                    .execute_with_existing_session_diagnostic(&script, &Action::Home, None)
                     .await,
                 Err(AdapterDiagnostic::InputResponseRejected)
             );
@@ -828,7 +844,7 @@ mod tests {
             let mut actions = WdaActions::bound_to_existing("fixture-session").unwrap();
             assert_eq!(
                 actions
-                    .execute_with_existing_session_diagnostic(&script, &Action::Home)
+                    .execute_with_existing_session_diagnostic(&script, &Action::Home, None)
                     .await,
                 Err(expected)
             );
@@ -1725,5 +1741,44 @@ mod tests {
         assert_eq!(receipt.accepted, Some(true));
         assert_eq!(receipt.action_kind, "swipe");
         wda.done();
+    }
+
+    #[test]
+    fn motion_is_an_explicit_per_send_parameter() {
+        use handkite_core::protocol::{Motion, MotionPolicy};
+        let motion = Motion {
+            policy: MotionPolicy::Natural,
+            seed: 5,
+        };
+        let tap = Action::Tap {
+            at: Point { x: 120.0, y: 240.0 },
+        };
+        // No motion: byte-identical to the existing payload.
+        assert_eq!(motion_payload(&tap, None).unwrap(), payload(&tap).unwrap());
+        assert_eq!(
+            motion_payload(&tap, Some(motion)).unwrap(),
+            crate::pacing::shaped_payload(&tap, motion).unwrap()
+        );
+        // Unshaped actions keep their payload even with motion.
+        for action in [
+            Action::Home,
+            Action::Key {
+                key: KeyboardKey::Enter,
+            },
+            Action::LongPress {
+                at: Point { x: 1.0, y: 1.0 },
+                duration_ms: 500,
+            },
+        ] {
+            assert_eq!(
+                motion_payload(&action, Some(motion)).unwrap(),
+                payload(&action).unwrap()
+            );
+        }
+        // Invalid actions are still refused, shaped or not.
+        let invalid = Action::Tap {
+            at: Point { x: -1.0, y: 1.0 },
+        };
+        assert!(motion_payload(&invalid, Some(motion)).is_err());
     }
 }

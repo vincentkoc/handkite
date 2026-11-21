@@ -57,6 +57,14 @@ impl Cache {
         self.last = None;
     }
 
+    pub fn rects(&self, revision: Revision) -> Vec<[f64; 4]> {
+        self.last
+            .iter()
+            .filter(|baseline| baseline.revision == revision)
+            .flat_map(|baseline| baseline.elements.iter().map(|element| element.rect))
+            .collect()
+    }
+
     pub fn project(
         &mut self,
         observation: &WireObservation,
