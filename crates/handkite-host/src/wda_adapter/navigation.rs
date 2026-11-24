@@ -27,7 +27,9 @@ impl WdaAdapter {
             .as_ref()
             .ok_or(AdapterError)?
             .block_on(context(&wda, session))?;
-        if !same_context(&before, &frame.app, frame.reported, &after) {
+        let coherent = same_context(&before, &frame.app, frame.reported, &after);
+        crate::timing::outcome("navigation_context_coherent", coherent);
+        if !coherent {
             return Err(AdapterError);
         }
         let unlocked = native_before == LockState::Unlocked && frame.reported == Some(false);

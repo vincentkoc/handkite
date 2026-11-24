@@ -181,6 +181,8 @@ class Session:
                         self._target_update(payload, revision)
                 elif action or tool == "handkite_observe":
                     self.revision = None
+                if payload.get("revision_scope") == "navigation" or (isinstance(meta, dict) and meta.get("revision_scope") == "navigation"):
+                    self.target_revision, self.targets = None, []
                 if action and not target_action or tool in {"handkite_acquire_control", "handkite_release_control"}:
                     self.target_revision, self.targets = None, []
         return {"elapsed_ms": elapsed_ms, "result": result}

@@ -331,9 +331,11 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
     let mut reply = result.unwrap_or_else(error_reply);
     let updates = controller.target_effect_updates();
     match &mut reply {
-        Reply::ElementActed { effect_updates, .. }
-        | Reply::Acted { effect_updates, .. }
-        | Reply::Navigated { effect_updates, .. } => *effect_updates = updates,
+        Reply::ElementActed { effect_updates, .. } | Reply::Acted { effect_updates, .. } => {
+            *effect_updates = updates
+        }
+        // Keep older target verdicts available on observations, not Home's result.
+        Reply::Navigated { .. } => {}
         Reply::ObservedTargets { observation, .. }
         | Reply::Observed { observation }
         | Reply::ObservedNavigation { observation } => observation.effect_updates = updates,
@@ -357,6 +359,9 @@ fn error_reply(error: ControllerError) -> Reply {
 
 #[cfg(test)]
 mod status_tests;
+
+#[cfg(test)]
+mod navigation_tests;
 
 #[cfg(test)]
 mod tests {

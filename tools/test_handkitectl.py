@@ -51,6 +51,14 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(session.revision, 10)
         self.assertEqual(len(session.calls), 3)
 
+    def test_non_object_metadata_does_not_crash_navigation_scope_check(self):
+        for metadata in [[], None, False, "invalid"]:
+            session = Fake([result({"metadata": metadata})])
+            session.call("handkite_observe")
+            self.assertIsNone(session.revision)
+            self.assertIsNone(session.target_revision)
+            self.assertEqual(len(session.calls), 1)
+
     def test_native_targets_are_explicit_and_never_gain_coordinate_response_fields(self):
         session = Fake([result({"revision": 8, "target_only": True, "targets": []}),
                         result({"revision": 9, "target_only": True, "targets": []})])
@@ -61,6 +69,21 @@ class DriverTests(unittest.TestCase):
         session.call("handkite_tap_element", {"target_id": "t_" + "a" * 32})
         self.assertEqual(session.calls[1][1]["arguments"], {"target_id": "t_" + "a" * 32, "expected_revision": 8})
         self.assertEqual(session.revision, 9)
+
+    def test_navigation_observation_clears_old_target_handles(self):
+        for tool in ["handkite_observe", "handkite_status"]:
+            target = {"target_id": "t_" + "a" * 32, "label": "old"}
+            session = Fake([
+                result({"revision": 8, "target_only": True, "targets": [target]}),
+                result({"revision_scope": "navigation", "target_actionable": False,
+                        "metadata": {"revision": 9, "revision_scope": "navigation"}}),
+            ])
+            session.observe_targets()
+            session.call(tool)
+            self.assertEqual(session.revision, 9)
+            self.assertIsNone(session.target_revision)
+            self.assertEqual(session.targets, [])
+            self.assertEqual(len(session.calls), 2)
 
     def test_pending_tap_preserves_only_delta_baseline_until_observed(self):
         a={"target_id":"t_"+"a"*32,"label":"first"}

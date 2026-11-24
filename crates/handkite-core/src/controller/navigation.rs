@@ -26,6 +26,26 @@ fn ready(state: &DeviceState) -> bool {
             .is_some_and(|app| !app.is_empty())
 }
 
+// This limits starting a second read, not the existing per-read timeouts.
+const HOME_RETRY_START_WINDOW: Duration = Duration::from_secs(2);
+
+fn retry_home_read(
+    action: &Action,
+    accepted: Option<bool>,
+    after: Option<&NavigationObservation>,
+    source: &str,
+    elapsed: Duration,
+) -> bool {
+    matches!(action, Action::Home)
+        && accepted == Some(true)
+        && elapsed < HOME_RETRY_START_WINDOW
+        && after.is_none_or(|after| {
+            ready(&after.state)
+                && source != "com.apple.springboard"
+                && after.state.foreground_app.as_deref() == Some(source)
+        })
+}
+
 impl<A: DeviceAdapter> Controller<A> {
     fn accept_navigation(
         &self,
@@ -61,6 +81,21 @@ impl<A: DeviceAdapter> Controller<A> {
         let observation = self.accept_navigation(&mut inner, device, raw)?;
         inner.navigation_last = Some(observation.clone());
         Ok(observation)
+    }
+
+    fn navigation_readback(
+        &self,
+        inner: &mut Inner<A>,
+        device: &DeviceKey,
+    ) -> Result<Option<NavigationObservation>, ControllerError> {
+        match inner.adapter.observe_navigation() {
+            Ok(raw) => match self.accept_navigation(inner, device, raw) {
+                Ok(after) => Ok(Some(after)),
+                Err(ControllerError::DeviceMismatch) => Err(ControllerError::DeviceMismatch),
+                Err(_) => Ok(None),
+            },
+            Err(_) => Ok(None),
+        }
     }
 
     pub fn navigate(
@@ -141,16 +176,19 @@ impl<A: DeviceAdapter> Controller<A> {
                 fresh.state.foreground_app.as_deref().unwrap(),
             )
             .map_err(|_| Self::adapter_error(&mut inner))?;
-        let after = match inner.adapter.observe_navigation() {
-            Ok(raw) => match self.accept_navigation(&mut inner, &request.device, raw) {
-                Ok(after) => Some(after),
-                Err(ControllerError::DeviceMismatch) => {
-                    return Err(ControllerError::DeviceMismatch);
-                }
-                Err(_) => None,
-            },
-            Err(_) => None,
-        };
+        let verification_started = Instant::now();
+        let mut after = self.navigation_readback(&mut inner, &request.device)?;
+        if retry_home_read(
+            &request.action,
+            receipt.accepted,
+            after.as_ref(),
+            fresh.state.foreground_app.as_deref().unwrap(),
+            verification_started.elapsed(),
+        ) {
+            // Only read again. The input baseline stays consumed, and only this
+            // final read can supply a revision or confirm the Home effect.
+            after = self.navigation_readback(&mut inner, &request.device)?;
+        }
         let destination = match &request.action {
             Action::Home => "com.apple.springboard",
             Action::LaunchApp { bundle_id } => bundle_id,
@@ -220,6 +258,15 @@ mod tests {
         assert!(deadline <= Instant::now() + Duration::from_millis(10));
         assert!(navigation_deadline(&window, 900, far, far).is_err());
     }
+    #[derive(Clone, Copy)]
+    enum PostCapture {
+        Stable,
+        FailOnce,
+        OldOnce,
+        FailAlways,
+        Other,
+        WrongDevice,
+    }
     struct Adapter {
         app: String,
         locked: bool,
@@ -227,6 +274,9 @@ mod tests {
         lost: bool,
         lock_after: bool,
         pixels: u8,
+        post_reads: usize,
+        post_capture: PostCapture,
+        accepted: Option<bool>,
     }
     impl DeviceAdapter for Adapter {
         fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
@@ -237,12 +287,33 @@ mod tests {
             panic!("navigation must not fetch a tree")
         }
         fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
+            if self.sends > 0 {
+                self.post_reads += 1;
+                if matches!(self.post_capture, PostCapture::FailAlways)
+                    || (matches!(self.post_capture, PostCapture::FailOnce) && self.post_reads == 1)
+                {
+                    return Err(AdapterError);
+                }
+            }
             self.pixels = self.pixels.wrapping_add(1);
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap()
                 .as_millis() as u64;
-            let (connected_usb, wda_target) = self.identities()?;
+            let (connected_usb, mut wda_target) = self.identities()?;
+            if self.sends > 0 && matches!(self.post_capture, PostCapture::WrongDevice) {
+                wda_target = HardwareId::new("other-device").unwrap();
+            }
+            let app = if self.sends > 0 && matches!(self.post_capture, PostCapture::Other) {
+                "other.app".into()
+            } else if self.sends > 0
+                && self.post_reads == 1
+                && matches!(self.post_capture, PostCapture::OldOnce)
+            {
+                "example.animated".into()
+            } else {
+                self.app.clone()
+            };
             Ok(RawObservation {
                 connected_usb,
                 wda_target,
@@ -257,7 +328,7 @@ mod tests {
                         LockState::Unlocked
                     },
                     wda_ready: true,
-                    foreground_app: Some(self.app.clone()),
+                    foreground_app: Some(app),
                 },
                 accessibility_tree: String::new(),
                 screenshot: ScreenImage {
@@ -298,7 +369,7 @@ mod tests {
                 return Err(AdapterError);
             }
             Ok(TransportReceipt {
-                accepted: Some(true),
+                accepted: self.accepted,
                 action_kind: action.kind().into(),
             })
         }
@@ -320,6 +391,9 @@ mod tests {
                 lost: false,
                 lock_after: false,
                 pixels: 0,
+                post_reads: 0,
+                post_capture: PostCapture::Stable,
+                accepted: Some(true),
             },
             5000,
             5000,
@@ -329,6 +403,96 @@ mod tests {
             .unwrap();
         (c, key, lease)
     }
+    #[test]
+    fn home_verification_recovers_one_transition_read_without_resending_input() {
+        for mode in [PostCapture::FailOnce, PostCapture::OldOnce] {
+            let (c, key, lease) = fixture();
+            let before = c.observe_navigation(&key).unwrap();
+            c.inner.lock().unwrap().adapter.post_capture = mode;
+            let result = c
+                .navigate(
+                    "owner",
+                    lease,
+                    ActionRequest {
+                        device: key,
+                        expected_revision: Some(before.revision),
+                        action: Action::Home,
+                    },
+                )
+                .unwrap();
+            assert_eq!(result.effect, ObservedEffect::Changed);
+            assert_eq!(c.inner.lock().unwrap().adapter.sends, 1);
+            assert_eq!(c.inner.lock().unwrap().adapter.post_reads, 2);
+        }
+    }
+
+    #[test]
+    fn home_read_retry_keeps_negative_evidence_and_stops_after_two_reads() {
+        for (mode, accepted, launch, locked, reads) in [
+            (PostCapture::FailAlways, Some(true), false, false, 2),
+            (PostCapture::Other, Some(true), false, false, 1),
+            (PostCapture::WrongDevice, Some(true), false, false, 1),
+            (PostCapture::FailOnce, Some(false), false, false, 1),
+            (PostCapture::FailOnce, Some(true), true, false, 1),
+            (PostCapture::Stable, Some(true), false, true, 1),
+        ] {
+            let (c, key, lease) = fixture();
+            let before = c.observe_navigation(&key).unwrap();
+            {
+                let mut inner = c.inner.lock().unwrap();
+                inner.adapter.post_capture = mode;
+                inner.adapter.accepted = accepted;
+                inner.adapter.lock_after = locked;
+            }
+            let action = if launch {
+                Action::LaunchApp {
+                    bundle_id: "example.target".into(),
+                }
+            } else {
+                Action::Home
+            };
+            let result = c.navigate(
+                "owner",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action,
+                },
+            );
+            if matches!(mode, PostCapture::WrongDevice) {
+                assert!(matches!(result, Err(ControllerError::DeviceMismatch)));
+            } else {
+                assert_eq!(result.unwrap().effect, ObservedEffect::Unconfirmed);
+            }
+            assert_eq!(c.inner.lock().unwrap().adapter.sends, 1);
+            assert_eq!(c.inner.lock().unwrap().adapter.post_reads, reads);
+        }
+    }
+
+    #[test]
+    fn home_read_retry_cannot_start_at_or_after_its_window() {
+        assert!(retry_home_read(
+            &Action::Home,
+            Some(true),
+            None,
+            "example.app",
+            Duration::ZERO
+        ));
+        for elapsed in [
+            HOME_RETRY_START_WINDOW,
+            HOME_RETRY_START_WINDOW + Duration::from_millis(1),
+        ] {
+            assert!(!retry_home_read(
+                &Action::Home,
+                Some(true),
+                None,
+                "example.app",
+                elapsed
+            ));
+        }
+    }
+
     #[test]
     fn animated_navigation_needs_no_tree_and_returns_only_navigation_revision() {
         let (c, key, lease) = fixture();
@@ -399,6 +563,35 @@ mod tests {
             assert_eq!(c.inner.lock().unwrap().adapter.sends, 0);
         }
     }
+    #[test]
+    fn uncertain_home_baseline_refuses_before_any_input_on_an_unlocked_device() {
+        let (c, key, lease) = fixture();
+        c.inner.lock().unwrap().adapter.app = "com.apple.springboard".into();
+        let before = c.observe_navigation(&key).unwrap();
+        c.inner
+            .lock()
+            .unwrap()
+            .navigation_last
+            .as_mut()
+            .unwrap()
+            .state
+            .lock = LockState::Uncertain;
+        assert!(!c.inner.lock().unwrap().adapter.locked);
+        assert!(matches!(
+            c.navigate(
+                "owner",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action: Action::Home,
+                }
+            ),
+            Err(ControllerError::LockedAction)
+        ));
+        assert_eq!(c.inner.lock().unwrap().adapter.sends, 0);
+    }
+
     #[test]
     fn locked_destination_is_visible_but_never_confirms_or_renews() {
         let (c, key, lease) = fixture();

@@ -58,6 +58,7 @@ pub enum AdapterDiagnostic {
     InputResponseRejected,
     OwnershipAfterAck,
     TargetCapture,
+    TargetHome,
     TargetCandidates,
     TargetMapping,
     TargetOcr,
@@ -67,7 +68,7 @@ pub enum AdapterDiagnostic {
 }
 
 impl AdapterDiagnostic {
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 25] = [
         Self::IdentityCheck,
         Self::CaptureImageDrift,
         Self::PreActionCapture,
@@ -86,6 +87,7 @@ impl AdapterDiagnostic {
         Self::InputResponseRejected,
         Self::OwnershipAfterAck,
         Self::TargetCapture,
+        Self::TargetHome,
         Self::TargetCandidates,
         Self::TargetMapping,
         Self::TargetOcr,
@@ -114,6 +116,7 @@ impl AdapterDiagnostic {
             Self::InputResponseRejected => "AdapterInputResponseRejected",
             Self::OwnershipAfterAck => "AdapterOwnershipAfterAck",
             Self::TargetCapture => "AdapterTargetCapture",
+            Self::TargetHome => "AdapterTargetHome",
             Self::TargetCandidates => "AdapterTargetCandidates",
             Self::TargetMapping => "AdapterTargetMapping",
             Self::TargetOcr => "AdapterTargetOcr",

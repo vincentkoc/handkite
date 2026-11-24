@@ -21,6 +21,8 @@ use response::exchange_reply;
 use session::Session;
 
 #[cfg(test)]
+mod home_tests;
+#[cfg(test)]
 mod image_tests;
 #[cfg(test)]
 mod navigation_tests;
@@ -431,9 +433,12 @@ where
                 let result = tool_result(Tool::Observe, target_options, device, session, exchange);
                 return result;
             }
-            return navigation_fallback(device, session, exchange);
+            return navigation_fallback(device, session, exchange, "capture_image_drift");
         }
 
+        Ok(Reply::Error { code }) if method == "observe_targets" && code == "AdapterTargetHome" => {
+            return navigation_fallback(device, session, exchange, "home_navigation_only");
+        }
         Ok(Reply::Error { code }) => {
             return response::with_service_code(
                 tool_error(if method == "observe_targets" {
@@ -457,6 +462,12 @@ where
             tool_error("device identity mismatch"),
             "DeviceMismatch",
         );
+    }
+    if method == "observe"
+        && observation.state.foreground_app.as_deref() == Some("com.apple.springboard")
+        && observation.state.lock == handkite_core::protocol::LockState::Uncertain
+    {
+        return navigation_fallback(device, session, exchange, "home_navigation_only");
     }
     if native_targets.as_ref().is_some_and(Vec::is_empty) {
         options.image = presentation::ImageMode::Always;
@@ -523,17 +534,23 @@ where
     result
 }
 
-fn navigation_fallback<F>(device: &DeviceKey, session: &mut Session, exchange: &mut F) -> Value
+fn navigation_fallback<F>(
+    device: &DeviceKey,
+    session: &mut Session,
+    exchange: &mut F,
+    reason: &str,
+) -> Value
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
     session.presentation.clear();
+    session.target_inventory = None;
     match exchange_reply(
         json!({"method":"observe_navigation","device":device}),
         exchange,
     ) {
         Ok(Reply::ObservedNavigation { observation }) if &observation.device == device => {
-            let content = response::navigation_content(observation, "capture_image_drift", true);
+            let content = response::navigation_content(observation, reason, true);
             let payload: Value =
                 serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
             json!({"content":content,"structuredContent":payload})

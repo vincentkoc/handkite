@@ -346,29 +346,46 @@ pub(super) async fn revalidate_with_native(
     deadline: Instant,
     basis: Option<FastBasis>,
     native: impl FnOnce(Instant) -> LockState + Send + 'static,
-) -> Result<NativeProof, AdapterError> {
+) -> Result<Result<NativeProof, AdapterError>, AdapterError> {
     let _span = crate::timing::Span::new("target_scoped_admission");
-    before_input_deadline(deadline, validate_region(wda, input, basis.as_ref())).await?;
+    if Instant::now() >= deadline {
+        return Ok(Err(AdapterError));
+    }
+    let checked = rich_context(wda, &input.key.session, ATTRS, async {
+        before_input_deadline(deadline, validate_region(wda, input, basis.as_ref())).await?;
+        before_input_deadline(deadline, validate_tail(wda, input)).await
+    })
+    .await;
+    crate::timing::outcome("target_settings_restored", checked.is_ok());
+    let checked = checked?;
+    if let Err(error) = checked {
+        return Ok(Err(error));
+    }
     let started = Instant::now();
-    // A fresh query overlaps only the tail, after target pixels and identity
-    // passed. Bound its age through the actual socket write, not completion.
+    // Settings traffic must finish before the freshness clock starts. Only the
+    // final app check overlaps the native query; the socket write keeps its cap.
     let proof_deadline = deadline.min(started + Duration::from_millis(500));
     if started >= proof_deadline {
-        return Err(AdapterError);
+        return Ok(Err(AdapterError));
     }
     let (lock, tail) = capture_with_native(
         move || native(proof_deadline),
-        before_input_deadline(proof_deadline, validate_tail(wda, input)),
+        before_input_deadline(
+            proof_deadline,
+            app_matches(wda, &input.key.session, &input.app),
+        ),
     )
     .await;
-    tail?;
-    if lock != LockState::Unlocked || Instant::now() >= proof_deadline {
-        return Err(AdapterError);
+    if let Err(error) = tail {
+        return Ok(Err(error));
     }
-    Ok(NativeProof {
+    if lock != LockState::Unlocked || Instant::now() >= proof_deadline {
+        return Ok(Err(AdapterError));
+    }
+    Ok(Ok(NativeProof {
         started,
         deadline: proof_deadline,
-    })
+    }))
 }
 
 pub(super) async fn absent(wda: &impl WdaRequest, input: &Input) -> Result<bool, AdapterError> {

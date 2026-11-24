@@ -91,6 +91,7 @@ struct Fake {
     final_lock_drift: bool,
     frame: Option<Vec<u8>>,
     calls: RefCell<Vec<String>>,
+    settings: RefCell<Value>,
 }
 impl Default for Fake {
     fn default() -> Self {
@@ -105,6 +106,9 @@ impl Default for Fake {
             final_lock_drift: false,
             frame: None,
             calls: RefCell::new(vec![]),
+            settings: RefCell::new(
+                json!({"shouldUseCompactResponses":true,"elementResponseAttributes":"id"}),
+            ),
         }
     }
 }
@@ -119,7 +123,15 @@ impl WdaRequest for Fake {
         self.calls.borrow_mut().push(path.into());
         let mut status = 200;
         let value = if path.ends_with("/appium/settings") {
-            json!({"currentDisplayId":self.display})
+            if method == "POST" {
+                let settings: Value = serde_json::from_slice(body).unwrap();
+                for (key, value) in settings["settings"].as_object().unwrap() {
+                    self.settings.borrow_mut()[key] = value.clone();
+                }
+            }
+            let mut settings = self.settings.borrow().clone();
+            settings["currentDisplayId"] = json!(self.display);
+            settings
         } else if path.ends_with("/wda/activeAppInfo") {
             let final_read = self
                 .calls
@@ -388,13 +400,14 @@ async fn native_read_starts_only_after_target_region_validation() {
             }
         )
         .await
+        .unwrap()
         .is_err()
     );
     assert!(!called.load(Ordering::SeqCst));
 }
 
 #[tokio::test]
-async fn native_failure_or_tail_failure_drains_the_read_without_input() {
+async fn native_failure_drains_and_bad_tail_never_queries() {
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -420,9 +433,10 @@ async fn native_failure_or_tail_failure_drains_the_read_without_input() {
                 }
             )
             .await
+            .unwrap()
             .is_err()
         );
-        assert!(finished.load(Ordering::SeqCst));
+        assert_eq!(finished.load(Ordering::SeqCst), lock != LockState::Unlocked);
         assert!(f.calls.borrow().iter().all(|p| !p.ends_with("/click")));
     }
 }
@@ -439,6 +453,7 @@ async fn successful_native_proof_caps_the_socket_write_age() {
         move |_| LockState::Unlocked,
     )
     .await
+    .unwrap()
     .unwrap();
     assert_eq!(
         proof.deadline.duration_since(proof.started),
@@ -450,6 +465,7 @@ async fn successful_native_proof_caps_the_socket_write_age() {
         LockState::Unlocked
     })
     .await
+    .unwrap()
     .unwrap();
     assert_eq!(short.write_deadline().unwrap(), original);
     let past = Instant::now() - Duration::from_millis(1);
@@ -458,19 +474,26 @@ async fn successful_native_proof_caps_the_socket_write_age() {
             "expired input must not query native state"
         ))
         .await
+        .unwrap()
         .is_err()
     );
 }
 
 #[tokio::test]
-async fn failed_native_read_still_restores_profile_and_preserves_restore_failure() {
+async fn restored_settings_precede_native_proof_and_final_drift_still_refuses() {
     use std::cell::Cell;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     struct Profile {
         inner: Fake,
         settings: RefCell<Value>,
         restored: Cell<bool>,
         fail_restore: bool,
         restore_delay: Duration,
+        restore_finished: Arc<AtomicBool>,
+        drift: u8,
     }
     impl WdaRequest for Profile {
         async fn request(
@@ -480,6 +503,21 @@ async fn failed_native_read_still_restores_profile_and_preserves_restore_failure
             body: &[u8],
             timeout: Duration,
         ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+            if self.restore_finished.load(Ordering::SeqCst)
+                && ((self.drift == 1 && path.ends_with("/wda/activeAppInfo"))
+                    || (self.drift == 2 && path.ends_with("/wda/locked")))
+            {
+                let value = if self.drift == 1 {
+                    json!({"bundleId":"unexpected.app"})
+                } else {
+                    json!(true)
+                };
+                return Ok(HttpResponse {
+                    status: 200,
+                    body: serde_json::to_vec(&json!({"sessionId":"session", "value":value}))
+                        .unwrap(),
+                });
+            }
             if !path.ends_with("/appium/settings") {
                 return self.inner.request(method, path, body, timeout).await;
             }
@@ -494,6 +532,7 @@ async fn failed_native_read_still_restores_profile_and_preserves_restore_failure
                         });
                     }
                     tokio::time::sleep(self.restore_delay).await;
+                    self.restore_finished.store(true, Ordering::SeqCst);
                 }
                 for (key, value) in new["settings"].as_object().unwrap() {
                     self.settings.borrow_mut()[key] = value.clone();
@@ -509,36 +548,57 @@ async fn failed_native_read_still_restores_profile_and_preserves_restore_failure
         }
     }
     let task = tokio::spawn(async {});
-    for lock in [LockState::Locked, LockState::Uncertain, LockState::Unlocked] {
+    for (lock, fail_restore, deadline_ms, drift) in [
+        (LockState::Unlocked, false, 5000, 0),
+        (LockState::Locked, false, 5000, 0),
+        (LockState::Uncertain, false, 5000, 0),
+        (LockState::Unlocked, true, 5000, 0),
+        (LockState::Unlocked, false, 100, 0),
+        (LockState::Unlocked, false, 5000, 1),
+        (LockState::Unlocked, false, 5000, 2),
+    ] {
         let f = Profile {
             inner: Fake::default(),
             settings: RefCell::new(
                 json!({"currentDisplayId":1,"shouldUseCompactResponses":true,"elementResponseAttributes":"id"}),
             ),
             restored: Cell::new(false),
-            fail_restore: lock != LockState::Unlocked,
+            fail_restore,
             restore_delay: Duration::from_millis(550),
+            restore_finished: Arc::new(AtomicBool::new(false)),
+            drift,
         };
         let input = input(task.id());
-        let result = rich_context(
+        let restored = f.restore_finished.clone();
+        let called = Arc::new(AtomicBool::new(false));
+        let native_called = called.clone();
+        let result = revalidate_with_native(
             &f,
-            "session",
-            ATTRS,
-            revalidate_with_native(
-                &f,
-                &input,
-                Instant::now() + Duration::from_secs(5),
-                None,
-                move |_| lock,
-            ),
+            &input,
+            Instant::now() + Duration::from_millis(deadline_ms),
+            None,
+            move |_| {
+                assert!(restored.load(Ordering::SeqCst));
+                std::thread::sleep(Duration::from_millis(10));
+                native_called.store(true, Ordering::SeqCst);
+                lock
+            },
         )
         .await;
         assert!(f.restored.get());
-        if lock != LockState::Unlocked {
+        if fail_restore {
             assert!(matches!(result, Err(_)));
+            assert!(!called.load(Ordering::SeqCst));
+        } else if deadline_ms == 100 {
+            assert!(result.unwrap().is_err());
+            assert!(!called.load(Ordering::SeqCst));
+        } else if lock != LockState::Unlocked || drift != 0 {
+            assert!(result.unwrap().is_err());
+            assert!(called.load(Ordering::SeqCst));
         } else {
             let proof = result.unwrap().unwrap();
-            assert!(proof.write_deadline().is_err());
+            assert!(called.load(Ordering::SeqCst));
+            assert!(proof.write_deadline().is_ok());
         }
         assert!(
             f.inner
@@ -548,6 +608,33 @@ async fn failed_native_read_still_restores_profile_and_preserves_restore_failure
                 .all(|p| !p.ends_with("/click"))
         );
     }
+}
+
+#[tokio::test]
+async fn late_native_proof_is_drained_without_extending_the_write_deadline() {
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
+    let task = tokio::spawn(async {});
+    let f = Fake::default();
+    let completed = Arc::new(AtomicBool::new(false));
+    let done = completed.clone();
+    let result = revalidate_with_native(
+        &f,
+        &input(task.id()),
+        Instant::now() + Duration::from_secs(5),
+        None,
+        move |_| {
+            std::thread::sleep(Duration::from_millis(550));
+            done.store(true, Ordering::SeqCst);
+            LockState::Unlocked
+        },
+    )
+    .await;
+    assert!(result.unwrap().is_err());
+    assert!(completed.load(Ordering::SeqCst));
+    assert!(f.calls.borrow().iter().all(|p| !p.ends_with("/click")));
 }
 
 fn png_pixel(x: usize, y: usize) -> Vec<u8> {
@@ -588,7 +675,7 @@ async fn frame_admission(f: &Fake, basis: FastBasis) -> bool {
         |_| LockState::Unlocked,
     )
     .await
-    .is_ok()
+    .is_ok_and(|result| result.is_ok())
 }
 
 fn queried(f: &Fake) -> bool {

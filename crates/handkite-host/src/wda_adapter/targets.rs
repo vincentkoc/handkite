@@ -546,11 +546,27 @@ async fn screenshot(wda: &impl WdaRequest) -> Result<ScreenImage, AdapterError> 
     })
 }
 
+#[derive(Debug)]
+enum CaptureFailure {
+    HomeScreen,
+    Adapter,
+}
+impl From<AdapterError> for CaptureFailure {
+    fn from(_: AdapterError) -> Self {
+        Self::Adapter
+    }
+}
+impl From<CaptureFailure> for AdapterError {
+    fn from(_: CaptureFailure) -> Self {
+        AdapterError
+    }
+}
+
 async fn captured(
     wda: &impl WdaRequest,
     session: &str,
     cached: Option<&Snapshot>,
-) -> Result<Captured, AdapterError> {
+) -> Result<Captured, CaptureFailure> {
     captured_for(wda, session, cached, None, true).await
 }
 
@@ -560,9 +576,9 @@ async fn captured_for(
     cached: Option<&Snapshot>,
     predicate: Option<&str>,
     capture_focus: bool,
-) -> Result<Captured, AdapterError> {
+) -> Result<Captured, CaptureFailure> {
     if cached.is_some() && predicate.is_some() {
-        return Err(AdapterError);
+        return Err(CaptureFailure::Adapter);
     }
     let started = Instant::now();
     let started_unix_ms = unix_ms()?;
@@ -576,9 +592,12 @@ async fn captured_for(
     )
     .await?["bundleId"]
         .as_str()
-        .filter(|app| !app.is_empty() && *app != "com.apple.springboard")
+        .filter(|app| !app.is_empty())
         .ok_or(AdapterError)?
         .to_owned();
+    if app == "com.apple.springboard" {
+        return Err(CaptureFailure::HomeScreen);
+    }
     app_matches(wda, session, &app).await?;
     let mut before = {
         let _span = crate::timing::Span::new("target_image_before");
@@ -1066,7 +1085,14 @@ async fn projected_targets(
                 scale,
                 display_id,
                 reused,
-            } = captured(wda, &key.session, cached).await?;
+            } = captured(wda, &key.session, cached)
+                .await
+                .map_err(|failure| {
+                    if matches!(failure, CaptureFailure::HomeScreen) {
+                        *stage = AdapterDiagnostic::TargetHome;
+                    }
+                    AdapterError
+                })?;
             let snapshot = Snapshot {
                 key: key.clone(),
                 xml: xml.clone(),
@@ -1532,32 +1558,30 @@ impl WdaAdapter {
             .runtime
             .as_ref()
             .expect("adapter runtime")
-            .block_on(rich_context(
-                &context_wda,
-                &input.key.session,
-                ATTRS,
-                async {
-                    if matches!(action, ElementAction::Tap { .. }) && input.bound.ocr.is_none() {
-                        let device = input.key.device.clone();
-                        fast::revalidate_with_native(
-                            &context_wda,
-                            &input,
-                            deadline,
-                            basis,
-                            move |until| native_lock::query_until(&device, until).state,
-                        )
-                        .await
-                        .map(Some)
-                    } else {
+            .block_on(async {
+                if matches!(action, ElementAction::Tap { .. }) && input.bound.ocr.is_none() {
+                    let device = input.key.device.clone();
+                    fast::revalidate_with_native(
+                        &context_wda,
+                        &input,
+                        deadline,
+                        basis,
+                        move |until| native_lock::query_until(&device, until).state,
+                    )
+                    .await
+                    .map(|result| result.map(Some))
+                } else {
+                    rich_context(&context_wda, &input.key.session, ATTRS, async {
                         before_input_deadline(
                             deadline,
                             revalidate(&context_wda, &input.key, &input.app, &input.bound, action),
                         )
                         .await
-                        .map(|_| None)
-                    }
-                },
-            ));
+                    })
+                    .await
+                    .map(|result| result.map(|_| None))
+                }
+            });
         let proof = match result {
             Err(e) => {
                 self.text_response_poisoned = true;
@@ -1931,6 +1955,7 @@ mod tests {
     }
 
     struct FullCapture {
+        app: &'static str,
         xml: String,
         items: Value,
         image: ScreenImage,
@@ -1972,6 +1997,7 @@ mod tests {
                     .unwrap();
             }
             Self {
+                app: "example.app",
                 xml: XML.into(),
                 items: json!([item()]),
                 image: ScreenImage {
@@ -2145,7 +2171,7 @@ mod tests {
                 if self.first_app_read.get().is_none() {
                     self.first_app_read.set(Some(Instant::now()));
                 }
-                json!({"bundleId":"example.app"})
+                json!({"bundleId":self.app})
             } else if path.ends_with("/wda/locked") {
                 self.last_lock_read.set(Some(Instant::now()));
                 json!(false)
@@ -2286,6 +2312,53 @@ mod tests {
         assert_eq!(fake.active_reads.get(), 0);
         assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
         runner.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn home_capture_is_classified_before_images_without_input() {
+        let task = tokio::spawn(async {});
+        let mut fake = FullCapture::new();
+        fake.app = "com.apple.springboard";
+        let mut stage = AdapterDiagnostic::TargetCapture;
+        let result = projected_targets(
+            &fake,
+            &fixture_key(task.id()),
+            None,
+            |_, _, _, _, _, _| panic!("Home must not mint targets"),
+            &mut stage,
+        )
+        .await
+        .unwrap();
+        assert!(result.is_err());
+        assert_eq!(stage.code(), "AdapterTargetHome");
+        assert_eq!(fake.image_reads.get(), 0);
+        assert_eq!(fake.source_reads.get(), 0);
+        assert_eq!(fake.inputs.get(), 0);
+        assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn home_capture_does_not_hide_failed_settings_restoration() {
+        let task = tokio::spawn(async {});
+        let mut fake = FullCapture::new();
+        fake.app = "com.apple.springboard";
+        fake.restoration_fails = true;
+        let mut stage = AdapterDiagnostic::TargetCapture;
+        assert!(
+            projected_targets(
+                &fake,
+                &fixture_key(task.id()),
+                None,
+                |_, _, _, _, _, _| panic!("Home must not mint targets"),
+                &mut stage,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(fake.image_reads.get(), 0);
+        assert_eq!(fake.inputs.get(), 0);
+        task.await.unwrap();
     }
 
     #[tokio::test]
