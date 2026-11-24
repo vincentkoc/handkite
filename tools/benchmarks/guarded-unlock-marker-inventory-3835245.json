@@ -1,0 +1,134 @@
+{
+  "after": [
+    {
+      "bytes": 10,
+      "inode": 429595240,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-02b48385f06dcb8f",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429766795,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-39472e9d65844557",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429771581,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-9f6ca97f80254627",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429779560,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-9faa7f9209c7466f",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429782470,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-d11cbc352af44071",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429831561,
+      "mode": "0600",
+      "name": "UNLOCK-DISABLED",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429831366,
+      "mode": "0600",
+      "name": "UNLOCK-DISABLED.legacy-<commit>-b.hold",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429826443,
+      "mode": "0600",
+      "name": "UNLOCK-DISABLED.legacy-<commit>.hold",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    }
+  ],
+  "before": [
+    {
+      "bytes": 10,
+      "inode": 429595240,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-02b48385f06dcb8f",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429766795,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-39472e9d65844557",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429771581,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-9f6ca97f80254627",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429779560,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-9faa7f9209c7466f",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429782470,
+      "mode": "0600",
+      "name": ".UNLOCK-DISABLED.one-trial-d11cbc352af44071",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429831561,
+      "mode": "0600",
+      "name": "UNLOCK-DISABLED",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429826443,
+      "mode": "0600",
+      "name": "UNLOCK-DISABLED.hold-<commit>",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    },
+    {
+      "bytes": 10,
+      "inode": 429831366,
+      "mode": "0600",
+      "name": "UNLOCK-DISABLED.hold-<commit>-b",
+      "sha256": "2c2c27e79d6971c6e7e865045aa88361e791ba82d2b582b97aa81944903e99f6"
+    }
+  ],
+  "completed_mapping": [
+    {
+      "from": "UNLOCK-DISABLED.hold-<commit>",
+      "to": "UNLOCK-DISABLED.legacy-<commit>.hold"
+    },
+    {
+      "from": "UNLOCK-DISABLED.hold-<commit>-b",
+      "to": "UNLOCK-DISABLED.legacy-<commit>-b.hold"
+    }
+  ],
+  "mapping": {
+    "UNLOCK-DISABLED.hold-<commit>": "UNLOCK-DISABLED.legacy-<commit>.hold",
+    "UNLOCK-DISABLED.hold-<commit>-b": "UNLOCK-DISABLED.legacy-<commit>-b.hold"
+  },
+  "outcome": "renamed_in_place_all_bytes_and_inodes_preserved",
+  "source_sha": "0000000000000000000000000000000000000000"
+}
