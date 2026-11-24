@@ -22,6 +22,8 @@ const ATTRS: &str = "type,enabled,displayed,rect,label,attribute/name,attribute/
 const AGE: Duration = Duration::from_secs(15);
 // Cache reuse must fit handkited's five-second capture and freshness limits.
 const CACHE_WINDOW_MS: u64 = 5_000;
+// Limits publication after recovery; an expired read still drains restoration.
+const OCR_RECOVERY_PUBLICATION_BUDGET: Duration = Duration::from_secs(20);
 const SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,index,traits,hittable,customActions,nativeFrame,visible";
 const FULL_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,index,traits,hittable,customActions,nativeFrame";
 
@@ -1161,6 +1163,21 @@ fn snapshot_effect(input: &Input, snapshot: &Snapshot) -> Result<bool, AdapterEr
     )
 }
 
+fn recover_ocr_capture<T>(
+    mut capture: impl FnMut(bool) -> (Result<T, AdapterError>, bool),
+    mut expired: impl FnMut() -> bool,
+) -> Result<T, AdapterError> {
+    let (result, retryable) = capture(false);
+    if expired() {
+        return Err(AdapterError);
+    }
+    if result.is_ok() || !retryable {
+        return result;
+    }
+    let (result, _) = capture(true);
+    if expired() { Err(AdapterError) } else { result }
+}
+
 impl WdaAdapter {
     pub(super) fn finish_target_capture(
         &mut self,
@@ -1290,8 +1307,36 @@ impl WdaAdapter {
     pub(super) fn capture_targets(
         &mut self,
     ) -> Result<(RawObservation, Vec<ElementTarget>), AdapterError> {
-        self.finish_pending_effect(true)?;
+        let deadline = Instant::now() + OCR_RECOVERY_PUBLICATION_BUDGET;
+        let result = recover_ocr_capture(
+            |fresh| {
+                if fresh {
+                    self.target_snapshot = None;
+                    crate::timing::outcome("target_capture_ocr_retry", true);
+                }
+                let result = self.capture_targets_once();
+                let retryable = self.error_diagnostic == Some(AdapterDiagnostic::TargetOcr)
+                    && self.ocr_cache.last_failure() == Some(ocr::Failure::TimedOut)
+                    && !self.text_response_poisoned;
+                (result, retryable)
+            },
+            || Instant::now() >= deadline,
+        );
+        if result.is_err() {
+            self.targets = None;
+            self.target_snapshot = None;
+            self.error_diagnostic
+                .get_or_insert(AdapterDiagnostic::TargetCapture);
+        }
+        result
+    }
+
+    fn capture_targets_once(
+        &mut self,
+    ) -> Result<(RawObservation, Vec<ElementTarget>), AdapterError> {
         self.error_diagnostic = None;
+        self.ocr_cache.begin_attempt();
+        self.finish_pending_effect(true)?;
         self.targets = None;
         self.target_input = None;
         self.target_readback = None;
@@ -1677,6 +1722,69 @@ impl WdaAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ocr_timeout_recovery_publishes_only_the_fresh_capture() {
+        let mut calls = Vec::new();
+        let result = super::recover_ocr_capture(
+            |fresh| {
+                calls.push(fresh);
+                if fresh {
+                    (Ok(("new targets", 2)), false)
+                } else {
+                    (Err(super::AdapterError), true)
+                }
+            },
+            || false,
+        )
+        .unwrap();
+        assert_eq!(calls, [false, true]);
+        assert_eq!(result, ("new targets", 2));
+    }
+
+    #[test]
+    fn ocr_recovery_never_retries_a_second_failure_or_a_nontransient_failure() {
+        for retryable in [false, true] {
+            let mut calls = 0;
+            let result = super::recover_ocr_capture::<()>(
+                |_| {
+                    calls += 1;
+                    (Err(super::AdapterError), retryable)
+                },
+                || false,
+            );
+            assert!(result.is_err());
+            assert_eq!(calls, if retryable { 2 } else { 1 });
+        }
+    }
+
+    #[test]
+    fn ocr_recovery_budget_excludes_late_targets_without_cancelling_the_attempt() {
+        use std::cell::Cell;
+        for expire_on_check in [0, 1] {
+            let mut calls = 0;
+            let checks = Cell::new(0);
+            let mut restored = false;
+            let result = super::recover_ocr_capture(
+                |fresh| {
+                    calls += 1;
+                    restored = true;
+                    if fresh {
+                        (Ok("late targets"), false)
+                    } else {
+                        (Err(super::AdapterError), true)
+                    }
+                },
+                || {
+                    let check = checks.get();
+                    checks.set(check + 1);
+                    check >= expire_on_check
+                },
+            );
+            assert!(result.is_err());
+            assert!(restored);
+            assert_eq!(calls, expire_on_check + 1);
+        }
+    }
     use super::*;
     use std::cell::{Cell, RefCell};
 

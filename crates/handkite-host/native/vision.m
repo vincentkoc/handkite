@@ -3,6 +3,8 @@
 #import <CoreGraphics/CoreGraphics.h>
 #include <stdatomic.h>
 
+enum { HK_OCR_FAILED = 0, HK_OCR_SUCCESS = 1, HK_OCR_BUSY = 2, HK_OCR_TIMED_OUT = 3 };
+
 // The caller retains the RGBA buffer until this synchronous function returns.
 // Output is bounded JSON owned by malloc; no screenshot or text is logged.
 static char *recognize_rgba(const unsigned char *bytes, size_t width, size_t height,
@@ -74,11 +76,16 @@ static char *recognize_rgba(const unsigned char *bytes, size_t width, size_t hei
 // At most one recognition worker can outlive a timed-out caller. Every borrowed
 // buffer is copied before dispatch; late output is discarded, never admitted.
 char *handkite_recognize_rgba(const unsigned char *bytes, size_t width, size_t height,
-                             const double *rects, size_t count) {
+                             const double *rects, size_t count, int *status) {
     static atomic_bool busy = false;
+    if (!status) return NULL;
+    *status = HK_OCR_FAILED;
     bool expected = false;
-    if (!bytes || !rects || width == 0 || height == 0 || width > 4096 || height > 4096 || count == 0 || count > 32 ||
-        !atomic_compare_exchange_strong(&busy, &expected, true)) return NULL;
+    if (!bytes || !rects || width == 0 || height == 0 || width > 4096 || height > 4096 || count == 0 || count > 32) return NULL;
+    if (!atomic_compare_exchange_strong(&busy, &expected, true)) {
+        *status = HK_OCR_BUSY;
+        return NULL;
+    }
     @autoreleasepool {
         NSData *pixels = [NSData dataWithBytes:bytes length:width * height * 4];
         NSData *regions = [NSData dataWithBytes:rects length:count * 4 * sizeof(double)];
@@ -102,6 +109,7 @@ char *handkite_recognize_rgba(const unsigned char *bytes, size_t width, size_t h
             free(result); result = NULL;
         }
         char *output = result; result = NULL;
+        *status = timed_out ? HK_OCR_TIMED_OUT : (output ? HK_OCR_SUCCESS : HK_OCR_FAILED);
         [guard unlock];
         return output;
     }

@@ -16,6 +16,14 @@ pub(super) struct Cache {
     dimensions: [u32; 2],
     image_digest: Option<[u8; 32]>,
     rows: Vec<Text>,
+    last_failure: Option<Failure>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum Failure {
+    Busy,
+    TimedOut,
+    Failed,
 }
 
 fn intersects(a: [f64; 4], b: [f64; 4]) -> bool {
@@ -28,7 +36,33 @@ impl Cache {
         identity: &str,
         image: &Pixels,
     ) -> Result<Vec<Text>, AdapterError> {
-        self.update(identity, image, recognize)
+        self.recognize_with(identity, image, recognize)
+    }
+
+    fn recognize_with(
+        &mut self,
+        identity: &str,
+        image: &Pixels,
+        recognize: impl FnOnce(&Pixels, &[[f64; 4]]) -> Result<Vec<Text>, Failure>,
+    ) -> Result<Vec<Text>, AdapterError> {
+        self.last_failure = None;
+        let mut failure = None;
+        let result = self.update(identity, image, |image, regions| {
+            recognize(image, regions).map_err(|reason| {
+                failure = Some(reason);
+                AdapterError
+            })
+        });
+        self.last_failure = failure;
+        result
+    }
+
+    pub(super) fn last_failure(&self) -> Option<Failure> {
+        self.last_failure
+    }
+
+    pub(super) fn begin_attempt(&mut self) {
+        self.last_failure = None;
     }
 
     fn update(
@@ -105,6 +139,7 @@ pub(super) fn fresh(image: &Pixels) -> Result<Vec<Text>, AdapterError> {
         image,
         &[[0.0, 0.0, image.width as f64, image.height as f64]],
     )
+    .map_err(|_| AdapterError)
 }
 
 pub(super) fn same_text(rows: &[Text], expected: &Text) -> bool {
@@ -167,7 +202,7 @@ pub(super) fn safe_context(rows: &[Text]) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn recognize(image: &Pixels, regions: &[[f64; 4]]) -> Result<Vec<Text>, AdapterError> {
+fn recognize(image: &Pixels, regions: &[[f64; 4]]) -> Result<Vec<Text>, Failure> {
     unsafe extern "C" {
         fn handkite_recognize_rgba(
             bytes: *const u8,
@@ -175,11 +210,13 @@ fn recognize(image: &Pixels, regions: &[[f64; 4]]) -> Result<Vec<Text>, AdapterE
             height: usize,
             rects: *const f64,
             count: usize,
+            status: *mut libc::c_int,
         ) -> *mut libc::c_char;
     }
     let _span = crate::timing::Span::new("ocr_vision");
     // The synchronous native call borrows both bounded buffers and transfers
     // one malloc-owned, NUL-terminated JSON result back to this scope.
+    let mut status = 0;
     let raw = unsafe {
         handkite_recognize_rgba(
             image.rgba.as_ptr(),
@@ -187,28 +224,124 @@ fn recognize(image: &Pixels, regions: &[[f64; 4]]) -> Result<Vec<Text>, AdapterE
             image.height as usize,
             regions.as_ptr().cast(),
             regions.len(),
+            &mut status,
         )
     };
-    if raw.is_null() {
-        return Err(AdapterError);
+    let result = unsafe { consume_result(raw, status) };
+    if let Err(reason) = result {
+        crate::timing::outcome(
+            match reason {
+                Failure::Busy => "ocr_busy",
+                Failure::TimedOut => "ocr_timed_out",
+                Failure::Failed => "ocr_failed",
+            },
+            false,
+        );
     }
-    let result =
-        serde_json::from_slice::<Vec<Text>>(unsafe { std::ffi::CStr::from_ptr(raw) }.to_bytes())
-            .map_err(|_| AdapterError);
-    unsafe { libc::free(raw.cast()) };
     let mut rows = result?;
-    normalize_and_validate(&mut rows, image.width, image.height)?;
+    normalize_and_validate(&mut rows, image.width, image.height).map_err(|_| Failure::Failed)?;
     Ok(rows)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn recognize(_: &Pixels, _: &[[f64; 4]]) -> Result<Vec<Text>, AdapterError> {
-    Err(AdapterError)
+fn recognize(_: &Pixels, _: &[[f64; 4]]) -> Result<Vec<Text>, Failure> {
+    Err(Failure::Failed)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn consume_result(
+    raw: *mut libc::c_char,
+    status: libc::c_int,
+) -> Result<Vec<Text>, Failure> {
+    // Consume the allocation on every status; failed or late work is never parsed.
+    let result = match status {
+        1 if !raw.is_null() => {
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(raw).to_bytes() })
+                .map_err(|_| Failure::Failed)
+        }
+        2 => Err(Failure::Busy),
+        3 => Err(Failure::TimedOut),
+        _ => Err(Failure::Failed),
+    };
+    unsafe { libc::free(raw.cast()) };
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_failure_never_updates_cached_rows_and_cannot_leak_into_next_attempt() {
+        let mut cache = Cache::default();
+        let before = image();
+        cache
+            .recognize_with("same", &before, |_, _| Ok(vec![]))
+            .unwrap();
+        let digest = cache.image_digest;
+        let mut after = image();
+        after.rgba[0] = 0;
+        assert!(
+            cache
+                .recognize_with("same", &after, |_, _| Err(Failure::TimedOut))
+                .is_err()
+        );
+        assert_eq!(cache.last_failure(), Some(Failure::TimedOut));
+        assert_eq!(cache.image_digest, digest);
+        cache.begin_attempt();
+        assert_eq!(cache.last_failure(), None);
+        assert!(
+            cache
+                .recognize_with("same", &before, |_, _| panic!(
+                    "exact frame should reuse cache"
+                ))
+                .is_ok()
+        );
+        assert_eq!(cache.last_failure(), None);
+        assert!(
+            cache
+                .recognize_with("same", &after, |_, _| Err(Failure::Busy))
+                .is_err()
+        );
+        assert_eq!(cache.last_failure(), Some(Failure::Busy));
+        assert_eq!(cache.image_digest, digest);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_status_rejects_late_output_and_distinguishes_timeout_from_busy() {
+        unsafe fn allocated(bytes: &[u8]) -> *mut libc::c_char {
+            let ptr = unsafe { libc::malloc(bytes.len()) }.cast::<libc::c_char>();
+            assert!(!ptr.is_null());
+            unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr.cast(), bytes.len()) };
+            ptr
+        }
+        for (status, reason) in [
+            (0, Failure::Failed),
+            (2, Failure::Busy),
+            (3, Failure::TimedOut),
+            (99, Failure::Failed),
+        ] {
+            // Invalid JSON proves failed native output is freed without being parsed.
+            assert_eq!(
+                unsafe { consume_result(allocated(b"invalid\0"), status) }.unwrap_err(),
+                reason
+            );
+        }
+        assert_eq!(
+            unsafe { consume_result(std::ptr::null_mut(), 1) }.unwrap_err(),
+            Failure::Failed
+        );
+        assert!(
+            unsafe { consume_result(allocated(b"[]\0"), 1) }
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            unsafe { consume_result(allocated(b"invalid\0"), 1) }.unwrap_err(),
+            Failure::Failed
+        );
+    }
     fn image() -> Pixels {
         Pixels {
             width: 768,
