@@ -86,6 +86,28 @@ impl From<CaptureFailure> for AdapterError {
     }
 }
 
+fn retry_lock_capture<T>(
+    now: &impl Fn() -> Instant,
+    mut capture: impl FnMut(Instant) -> Result<T, CaptureFailure>,
+) -> Result<T, CaptureFailure> {
+    let deadline = now() + Duration::from_secs(20);
+    let first = capture(deadline);
+    if now() >= deadline {
+        return Err(CaptureFailure::Adapter);
+    }
+    if !matches!(first, Err(CaptureFailure::ImageDrift)) {
+        return first;
+    }
+    // The failed pair supplies no admission evidence. Only a second complete
+    // read, with the same deadline and ownership checks, can replace it.
+    crate::timing::outcome("lock_capture_read_retry", true);
+    let second = capture(deadline);
+    if now() >= deadline {
+        return Err(CaptureFailure::Adapter);
+    }
+    second
+}
+
 pub struct WdaAdapter {
     expected: HardwareId,
     usb: PinnedUsb,
@@ -416,23 +438,24 @@ impl WdaAdapter {
         &self,
         source_path: &str,
     ) -> Result<(RawObservation, Instant, Option<bool>), AdapterError> {
-        self.capture_checked_diagnosed(source_path)
+        self.capture_checked_diagnosed(source_path, None)
             .map_err(Into::into)
     }
 
     fn capture_checked_diagnosed(
         &self,
         source_path: &str,
+        deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         let result = if crate::timing::enabled() {
             let started = Instant::now();
             let mut timings = CaptureTimings::default();
-            let result = self.capture_checked_recorded(source_path, Some(&mut timings));
+            let result = self.capture_checked_recorded(source_path, Some(&mut timings), deadline);
             timings.finish(started, result.is_ok());
             crate::timing::capture(timings);
             result
         } else {
-            self.capture_checked_recorded(source_path, None)
+            self.capture_checked_recorded(source_path, None, deadline)
         };
         if !result.as_ref().is_ok_and(|(raw, _, reported)| {
             *reported == Some(false) && raw.state.lock == LockState::Unlocked
@@ -511,6 +534,7 @@ impl WdaAdapter {
                     None,
                     &Instant::now,
                     timings.as_deref_mut(),
+                    None,
                 ))?;
         measure(
             timings,
@@ -531,7 +555,7 @@ impl WdaAdapter {
         let result = self
             .finish_pending_effect(true)
             .and_then(|_| {
-                self.capture_checked_recorded(SCREEN_SOURCE, Some(&mut timings))
+                self.capture_checked_recorded(SCREEN_SOURCE, Some(&mut timings), None)
                     .map_err(AdapterError::from)
             })
             .map(|(observation, _, _)| observation)
@@ -544,13 +568,14 @@ impl WdaAdapter {
         &self,
         source_path: &str,
         mut timings: Option<&mut CaptureTimings>,
+        deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         measure(
             timings.as_deref_mut(),
             Stage::OwnershipBefore,
             &Instant::now,
             |_| 0,
-            || self.validate_owned(),
+            || self.validate_owned_with_deadline(deadline),
         )?;
         let captured = self
             .runtime
@@ -561,6 +586,7 @@ impl WdaAdapter {
                 &self.expected,
                 source_path,
                 timings.as_deref_mut(),
+                deadline,
             ));
         // Image drift can select a read-only fallback only after ownership has
         // also survived the capture. Other errors keep their original refusal.
@@ -570,7 +596,7 @@ impl WdaAdapter {
                 Stage::OwnershipAfter,
                 &Instant::now,
                 |_| 0,
-                || self.validate_owned(),
+                || self.validate_owned_with_deadline(deadline),
             )?;
         }
         captured
@@ -581,6 +607,7 @@ impl WdaAdapter {
         expected: &HardwareId,
         source_path: &str,
         timings: Option<&mut CaptureTimings>,
+        deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         let started_unix_ms = unix_ms()?;
         let wda = UsbWda::new(usb.clone());
@@ -592,6 +619,7 @@ impl WdaAdapter {
             &Instant::now,
             &unix_ms,
             timings,
+            deadline,
         )
         .await
     }
@@ -604,8 +632,10 @@ impl WdaAdapter {
         clock: &impl Fn() -> Instant,
         wall: &impl Fn() -> Result<u64, AdapterError>,
         timings: Option<&mut CaptureTimings>,
+        deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
-        let payload = Self::capture_payload(wda, Some(source_path), clock, timings).await?;
+        let payload =
+            Self::capture_payload(wda, Some(source_path), clock, timings, deadline).await?;
         let tree = payload.tree.ok_or(AdapterError)?;
         let lock = classify_lock(&payload.app, &tree, payload.reported);
         Ok((
@@ -634,8 +664,15 @@ impl WdaAdapter {
         source_path: Option<&str>,
         clock: &impl Fn() -> Instant,
         timings: Option<&mut CaptureTimings>,
+        deadline: Option<Instant>,
     ) -> Result<CapturePayload, CaptureFailure> {
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let default_deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+        let deadline = deadline
+            .map(tokio::time::Instant::from_std)
+            .map_or(default_deadline, |deadline| deadline.min(default_deadline));
+        if tokio::time::Instant::now() >= deadline {
+            return Err(CaptureFailure::Adapter);
+        }
         let result = tokio::time::timeout_at(
             deadline,
             Self::capture_payload_inner(wda, source_path, clock, timings),
@@ -825,6 +862,12 @@ impl WdaAdapter {
                 clock,
                 |_| 0,
                 || {
+                    crate::timing::outcome("capture_same_app", app == before_app);
+                    crate::timing::outcome("capture_same_lock", reported_lock == before_lock);
+                    crate::timing::outcome(
+                        "capture_same_image",
+                        image.as_str() == Some(before_image.as_str()),
+                    );
                     if app != before_app || reported_lock != before_lock {
                         return Err(CaptureFailure::Adapter);
                     }
@@ -1052,7 +1095,7 @@ impl DeviceAdapter for WdaAdapter {
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
         self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
-        self.capture_checked_diagnosed(SCREEN_SOURCE)
+        self.capture_checked_diagnosed(SCREEN_SOURCE, None)
             .map(|(observation, _, _)| observation)
             .map_err(|error| {
                 if error == CaptureFailure::ImageDrift {
@@ -1135,9 +1178,15 @@ impl DeviceAdapter for WdaAdapter {
                     .as_ref()
                     .expect("adapter runtime")
                     .block_on(before_input_deadline(until, async {
-                        Self::capture(&self.usb, &self.expected, SCREEN_SOURCE, timings.as_mut())
-                            .await
-                            .map_err(Into::into)
+                        Self::capture(
+                            &self.usb,
+                            &self.expected,
+                            SCREEN_SOURCE,
+                            timings.as_mut(),
+                            None,
+                        )
+                        .await
+                        .map_err(Into::into)
                     }));
             if let (Some(started), Some(mut timings)) = (started, timings) {
                 timings.finish(started, capture.is_ok());
@@ -1168,24 +1217,12 @@ impl DeviceAdapter for WdaAdapter {
         self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
         self.launch_admission = None;
-        let owned_input = matches!(
-            action,
-            Action::Tap { .. }
-                | Action::LaunchApp { .. }
-                | Action::ClickButton { .. }
-                | Action::DoubleTap { .. }
-                | Action::LongPress { .. }
-                | Action::Swipe { .. }
-                | Action::Home
-                | Action::Text { .. }
-                | Action::TextCurrent { .. }
-                | Action::KeyCurrent { .. }
-        ) && self.owned_session.is_some()
-            && self.owned_runner.is_some();
+        let owned_input =
+            owned_action(action) && self.owned_session.is_some() && self.owned_runner.is_some();
         if !matches!(action, Action::LaunchApp { .. }) && !owned_input {
             return self.observe().map(|observation| (observation, None));
         }
-        let use_hint = owned_input && !matches!(action, Action::Home);
+        let use_hint = owned_input && !matches!(action, Action::Home | Action::Lock);
         if !use_hint {
             self.cache.clear();
         }
@@ -1194,10 +1231,17 @@ impl DeviceAdapter for WdaAdapter {
         } else {
             self.native_fresh(None)
         };
-        let (mut observation, mut captured_at, mut reported_lock) =
-            self.capture_for_action(use_hint).inspect_err(|_| {
-                self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
-            })?;
+        let capture = if matches!(action, Action::Lock) {
+            retry_lock_capture(&Instant::now, |deadline| {
+                self.capture_checked_diagnosed(SCREEN_SOURCE, Some(deadline))
+            })
+            .map_err(Into::into)
+        } else {
+            self.capture_for_action(use_hint)
+        };
+        let (mut observation, mut captured_at, mut reported_lock) = capture.inspect_err(|_| {
+            self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
+        })?;
         let native_after = if use_hint && normal_hint_context(&observation, reported_lock) {
             // This is the same preparation hint, not a new native observation.
             // execute() still requires a fresh native result before sending input.
@@ -1301,6 +1345,16 @@ impl DeviceAdapter for WdaAdapter {
                 duration_ms: *duration_ms,
                 until,
             })
+        } else if matches!(action, Action::Lock) {
+            native_lock_deadline(
+                &observation,
+                owned_input,
+                native_before,
+                native_after,
+                reported_lock,
+                captured_at,
+            )
+            .map(|until| ActionAdmission::NativeLock { until })
         } else if matches!(action, Action::Home) {
             native_home_deadline(
                 &observation,
@@ -1382,6 +1436,13 @@ impl DeviceAdapter for WdaAdapter {
         self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
         self.cache.clear_full();
+        if self.owned_session.is_some()
+            && matches!(action, Action::Lock)
+            && !matches!(admission, Some(ActionAdmission::NativeLock { .. }))
+        {
+            self.error_diagnostic = Some(AdapterDiagnostic::PreActionCapture);
+            return Err(AdapterError);
+        }
         if self.owned_session.is_some()
             && matches!(action, Action::Text { .. } | Action::TextCurrent { .. })
             && !matches!(admission, Some(ActionAdmission::NativeText { .. }))
@@ -1551,6 +1612,17 @@ impl DeviceAdapter for WdaAdapter {
                 .inspect_err(|_| self.cache.clear())?;
             return Ok(receipt);
         }
+        if let Some(ActionAdmission::NativeLock { until }) = admission {
+            if !matches!(action, Action::Lock)
+                || self.owned_session.is_none()
+                || self.owned_runner.is_none()
+                || Instant::now() >= until
+                || send_deadline > until
+            {
+                return Err(AdapterError);
+            }
+            return self.execute_motion(action, send_deadline, motion);
+        }
         self.execute_motion(action, send_deadline, motion)
     }
 }
@@ -1615,6 +1687,23 @@ fn unix_ms() -> Result<u64, AdapterError> {
         .duration_since(UNIX_EPOCH)
         .map_err(|_| AdapterError)?
         .as_millis() as u64)
+}
+
+fn owned_action(action: &Action) -> bool {
+    matches!(
+        action,
+        Action::Tap { .. }
+            | Action::LaunchApp { .. }
+            | Action::ClickButton { .. }
+            | Action::DoubleTap { .. }
+            | Action::LongPress { .. }
+            | Action::Swipe { .. }
+            | Action::Home
+            | Action::Lock
+            | Action::Text { .. }
+            | Action::TextCurrent { .. }
+            | Action::KeyCurrent { .. }
+    )
 }
 
 fn classify_lock(app: &str, tree: &str, reported: Option<bool>) -> LockState {
@@ -1857,6 +1946,36 @@ fn native_home_deadline(
     captured_at.checked_add(HOME_LAUNCH_AGE)
 }
 
+fn native_lock_deadline(
+    observation: &RawObservation,
+    owned: bool,
+    native_before: LockState,
+    native_after: LockState,
+    reported_lock: Option<bool>,
+    captured_at: Instant,
+) -> Option<Instant> {
+    if !owned || !observation.state.wda_ready {
+        return None;
+    }
+    native_home_deadline(
+        observation,
+        owned,
+        native_before,
+        native_after,
+        reported_lock,
+        captured_at,
+    )
+    .or_else(|| {
+        springboard_home_launch_deadline(
+            observation,
+            native_before,
+            native_after,
+            reported_lock,
+            captured_at,
+        )
+    })
+}
+
 fn wait_for_home(
     until: Instant,
     proof_until: Instant,
@@ -1961,7 +2080,7 @@ impl WdaAdapter {
             .inspect_err(|_| {
                 self.error_diagnostic = Some(AdapterDiagnostic::OwnedBefore);
             })?;
-        if (matches!(action, Action::LaunchApp { .. })
+        if (matches!(action, Action::LaunchApp { .. } | Action::Lock)
             || matches!(
                 action,
                 Action::Tap { .. }
@@ -3050,6 +3169,92 @@ mod tests {
         assert_eq!(
             OwnedStartupError::Runner(RunnerError::PlanStartUnproven).category(),
             "runner_plan_start_unproven"
+        );
+    }
+
+    #[test]
+    fn native_lock_admission_requires_owned_fresh_unlocked_nonmodal_context() {
+        for case in 0..17 {
+            let id = HardwareId::new("fixture-device").unwrap();
+            let mut raw = RawObservation {
+                connected_usb: id.clone(), wda_target: id,
+                window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
+                state: DeviceState { lock: LockState::Uncertain, wda_ready: true,
+                    foreground_app: Some("com.apple.springboard".into()) },
+                accessibility_tree: "<XCUIElementTypeApplication><XCUIElementTypeIcon /></XCUIElementTypeApplication>".into(),
+                screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+            };
+            let (mut owned, mut before, mut after, mut reported) =
+                (true, LockState::Unlocked, LockState::Unlocked, Some(false));
+            match case {
+                1 => owned = false,
+                2 => before = LockState::Locked,
+                3 => after = LockState::Uncertain,
+                4 => reported = Some(true),
+                5 => reported = None,
+                6 => raw.state.lock = LockState::Locked,
+                7 => raw.state.wda_ready = false,
+                8 => raw.state.foreground_app = None,
+                9 => raw.accessibility_tree = "<XCUIElementTypeApplication />".into(),
+                10 => raw.accessibility_tree.push_str("<XCUIElementTypeAlert />"),
+                11 => raw.accessibility_tree.push_str("<XCUIElementTypeSheet />"),
+                12 => raw
+                    .accessibility_tree
+                    .push_str("<XCUIElementTypeSecureTextField />"),
+                13 => raw
+                    .accessibility_tree
+                    .push_str("<node name=\"proud-lock\" />"),
+                14 | 16 => {
+                    raw.state.foreground_app = Some("com.example.app".into());
+                    raw.state.lock = LockState::Unlocked;
+                    raw.accessibility_tree =
+                        r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeButton label="Clear" visible="true" enabled="true" x="270" y="490" width="30" height="30"/></XCUIElementTypeApplication></AppiumAUT>"#.into();
+                    if case == 16 {
+                        before = LockState::Locked;
+                    }
+                }
+                15 => raw.accessibility_tree.clear(),
+                _ => {}
+            }
+            let captured = Instant::now();
+            let result = native_lock_deadline(&raw, owned, before, after, reported, captured);
+            assert_eq!(
+                result,
+                matches!(case, 0 | 14).then_some(captured + HOME_LAUNCH_AGE),
+                "case {case}"
+            );
+            if case == 0 {
+                assert_eq!(
+                    classify_lock(
+                        "com.apple.springboard",
+                        &raw.accessibility_tree,
+                        Some(false)
+                    ),
+                    LockState::Uncertain
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn owned_lock_uses_native_action_preparation() {
+        assert!(owned_action(&Action::Lock));
+    }
+
+    #[test]
+    fn owned_lock_without_native_proof_refuses_before_transport() {
+        let mut adapter = WdaAdapter::new(HardwareId::new("fixture-device").unwrap()).unwrap();
+        adapter.owned_session = Some("fixture-session".into());
+        let result = adapter.execute_with_motion(
+            &Action::Lock,
+            Instant::now() + Duration::from_secs(2),
+            None,
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(
+            adapter.take_error_diagnostic(),
+            Some(AdapterDiagnostic::PreActionCapture)
         );
     }
 

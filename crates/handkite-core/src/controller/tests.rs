@@ -170,6 +170,7 @@ impl DeviceAdapter for FakeAdapter {
             admission,
             Some(
                 ActionAdmission::NativeHome { .. }
+                    | ActionAdmission::NativeLock { .. }
                     | ActionAdmission::NativeAppLaunch { .. }
                     | ActionAdmission::NativeSwipe { .. }
                     | ActionAdmission::NativeModalTap { .. }
@@ -234,7 +235,8 @@ impl DeviceAdapter for FakeAdapter {
     }
 
     fn native_lock_state(&mut self) -> LockState {
-        assert_eq!(self.actions, 1);
+        // Lock keeps its native postcondition check even when dispatch refused.
+        assert!(self.actions <= 1);
         self.native_queries += 1;
         self.native_lock
     }
@@ -1378,6 +1380,71 @@ fn visible_tap_evidence_cannot_admit_other_actions() {
             Err(ControllerError::ViewChanged(_))
         ));
         assert_eq!(controller.inner.lock().unwrap().adapter.actions, 0);
+    }
+}
+
+#[test]
+fn native_lock_admission_is_scoped_fresh_and_rechecked_before_input() {
+    for case in 0..8 {
+        let (controller, key) = controller();
+        let before = controller.observe(&key).unwrap();
+        let until = Instant::now() + Duration::from_secs(2);
+        let mut action = Action::Lock;
+        let mut expected_revision = None;
+        {
+            let mut inner = controller.inner.lock().unwrap();
+            inner.adapter.app = "com.apple.springboard".into();
+            inner.adapter.uncertain = true;
+            inner.adapter.native_lock = LockState::Unlocked;
+            inner.adapter.tap_admission = Some(ActionAdmission::NativeLock { until });
+            match case {
+                1 => inner.adapter.tap_admission = None,
+                2 => {
+                    inner.adapter.tap_admission = Some(ActionAdmission::NativeLock {
+                        until: Instant::now() - Duration::from_secs(1),
+                    })
+                }
+                3 => inner.adapter.locked = true,
+                4 => inner.adapter.wda_ready = false,
+                5 => inner.adapter.native_lock = LockState::Locked,
+                6 => {
+                    action = Action::Tap {
+                        at: Point { x: 10.0, y: 20.0 },
+                    }
+                }
+                7 => expected_revision = Some(before.revision),
+                _ => {}
+            }
+        }
+        let lease = controller
+            .acquire("agent".into(), Duration::from_secs(30))
+            .unwrap();
+        let result = controller.act(
+            "agent",
+            lease,
+            ActionRequest {
+                device: key,
+                expected_revision,
+                action,
+            },
+        );
+        let inner = controller.inner.lock().unwrap();
+        if case == 0 {
+            assert_eq!(result.unwrap().receipt.accepted, Some(true));
+            assert_eq!(inner.adapter.actions, 1);
+            assert_eq!(
+                inner.adapter.execution_admission,
+                Some(ActionAdmission::NativeLock { until })
+            );
+            assert_eq!(inner.adapter.native_queries, 2);
+            assert!(inner.adapter.send_deadline.unwrap() <= until);
+        } else if case == 5 {
+            assert_eq!(result.unwrap().receipt.accepted, None);
+            assert_eq!(inner.adapter.actions, 0);
+        } else {
+            assert!(result.is_err(), "case {case}");
+            assert_eq!(inner.adapter.actions, 0, "case {case}");
+        }
     }
 }
 

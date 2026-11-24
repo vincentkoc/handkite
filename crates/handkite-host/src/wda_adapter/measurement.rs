@@ -199,21 +199,25 @@ mod tests {
                 "/screenshot" => {
                     let call = self.screenshots.get();
                     self.screenshots.set(call + 1);
-                    let drifts = matches!(self.change, 1 | 5..=10);
+                    let drifts = matches!(self.change, 1 | 5..=12);
                     if (self.change == 9 && call == 0) || (self.change == 10 && call > 0) {
                         return Ok(HttpResponse {
                             status: 200,
                             body: br#"{"value":"not-a-png"}"#.to_vec(),
                         });
                     }
-                    let pixels: &[u8] = if call == 0 || !drifts {
-                        b"\x89PNG\r\n\x1a\nfirst-picker"
-                    } else {
-                        b"\x89PNG\r\n\x1a\nsecond-picker"
-                    };
+                    let pixels: &[u8] =
+                        if call == 0 || !drifts || (self.change == 12 && call % 2 == 0) {
+                            b"\x89PNG\r\n\x1a\nfirst-picker"
+                        } else {
+                            b"\x89PNG\r\n\x1a\nsecond-picker"
+                        };
                     json!(base64::engine::general_purpose::STANDARD.encode(pixels))
                 }
                 SCREEN_SOURCE if self.change == 8 => json!(""),
+                SCREEN_SOURCE if self.change == 11 && self.screenshots.get() > 2 => {
+                    json!("<Application><Cell label=\"second-picker\"/></Application>")
+                }
                 SCREEN_SOURCE => json!("<Application><Cell label=\"first-picker\"/></Application>"),
                 "/wda/activeAppInfo" => {
                     let call = self.apps.get();
@@ -250,6 +254,7 @@ mod tests {
                 &Instant::now,
                 &|| Ok(21),
                 None,
+                None,
             )
             .await;
             assert_eq!(
@@ -261,6 +266,35 @@ mod tests {
                 }),
                 "only valid image drift, without app/lock/schema errors, is recoverable: {change}"
             );
+        }
+    }
+
+    #[test]
+    fn lock_retry_replaces_both_halves_and_keeps_failure_boundaries() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for change in [2, 3, 5, 6, 7, 8, 9, 10, 11, 12] {
+            let reads = ChangingScreen::new(change);
+            let result = super::super::retry_lock_capture(&Instant::now, |deadline| {
+                runtime.block_on(WdaAdapter::capture_using(
+                    &reads,
+                    &HardwareId::new("fixture-device").unwrap(),
+                    SCREEN_SOURCE,
+                    17,
+                    &Instant::now,
+                    &|| Ok(21),
+                    None,
+                    Some(deadline),
+                ))
+            });
+            assert_eq!(result.is_ok(), change == 11, "change {change}");
+            assert_eq!(reads.screenshots.get(), if change >= 11 { 4 } else { 2 });
+            if let Ok((raw, _, _)) = result {
+                assert!(raw.accessibility_tree.contains("second-picker"));
+                assert!(raw.screenshot.bytes.ends_with(b"second-picker"));
+            }
         }
     }
 
@@ -277,11 +311,34 @@ mod tests {
                 &Instant::now,
                 &|| Ok(21),
                 None,
+                None,
             )
             .await
             .is_err()
         );
         assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(20));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn capture_honors_the_remaining_lock_read_budget() {
+        let start = tokio::time::Instant::now();
+        let reads = ChangingScreen::new(4);
+        let deadline = (start + Duration::from_secs(5)).into_std();
+        assert!(
+            WdaAdapter::capture_using(
+                &reads,
+                &HardwareId::new("fixture-device").unwrap(),
+                SCREEN_SOURCE,
+                17,
+                &Instant::now,
+                &|| Ok(21),
+                None,
+                Some(deadline),
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(tokio::time::Instant::now() - start, Duration::from_secs(5));
     }
 
     impl WdaRequest for Reads {
@@ -371,6 +428,7 @@ mod tests {
                     &clock,
                     &|| Ok(21),
                     enabled.then_some(&mut timings),
+                    None,
                 )
                 .await;
                 assert_eq!(result.is_ok(), matches!(case, 0 | 6), "case {case}");
@@ -440,7 +498,8 @@ mod tests {
             };
             let mut timings = CaptureTimings::default();
             let result =
-                WdaAdapter::capture_payload(&reads, None, &Instant::now, Some(&mut timings)).await;
+                WdaAdapter::capture_payload(&reads, None, &Instant::now, Some(&mut timings), None)
+                    .await;
             assert_eq!(result.is_ok(), matches!(case, 0 | 6));
             if let Ok(frame) = result {
                 assert!(frame.tree.is_none());
@@ -485,5 +544,74 @@ mod tests {
                 start.elapsed().as_nanos() / u128::from(ITERATIONS)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod lock_recovery_tests {
+    use super::super::{CaptureFailure, retry_lock_capture};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn lock_discards_drifted_capture_and_uses_one_fresh_pair() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let mut deadlines = Vec::new();
+        let result = retry_lock_capture(&|| start, |deadline| {
+            deadlines.push(deadline);
+            calls += 1;
+            if calls == 1 {
+                Err(CaptureFailure::ImageDrift)
+            } else {
+                Ok("fresh pair")
+            }
+        });
+        assert_eq!(result, Ok("fresh pair"));
+        assert_eq!(calls, 2);
+        assert_eq!(deadlines, vec![start + Duration::from_secs(20); 2]);
+    }
+
+    #[test]
+    fn lock_never_retries_non_drift_failure_or_a_second_drift() {
+        for first in [CaptureFailure::Adapter, CaptureFailure::ImageDrift] {
+            let mut calls = 0;
+            let result = retry_lock_capture(&Instant::now, |_| {
+                calls += 1;
+                Err::<(), _>(first)
+            });
+            assert_eq!(result, Err(first));
+            assert_eq!(
+                calls,
+                if first == CaptureFailure::Adapter {
+                    1
+                } else {
+                    2
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn lock_retry_does_not_renew_the_capture_deadline() {
+        let start = Instant::now();
+        let expired = Cell::new(false);
+        let mut calls = 0;
+        let result = retry_lock_capture(
+            &|| {
+                if expired.get() {
+                    start + Duration::from_secs(20)
+                } else {
+                    start
+                }
+            },
+            |_| {
+                calls += 1;
+                expired.set(true);
+                Err::<(), _>(CaptureFailure::ImageDrift)
+            },
+        );
+        assert_eq!(result, Err(CaptureFailure::Adapter));
+        assert_eq!(calls, 1);
     }
 }

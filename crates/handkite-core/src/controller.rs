@@ -143,6 +143,9 @@ pub enum ActionAdmission {
     NativeHome {
         until: Instant,
     },
+    NativeLock {
+        until: Instant,
+    },
     NativeAppLaunch {
         until: Instant,
     },
@@ -336,6 +339,7 @@ pub trait DeviceAdapter {
             admission,
             Some(
                 ActionAdmission::NativeHome { .. }
+                    | ActionAdmission::NativeLock { .. }
                     | ActionAdmission::NativeAppLaunch { .. }
                     | ActionAdmission::NativeSwipe { .. }
                     | ActionAdmission::NativeModalTap { .. }
@@ -701,6 +705,19 @@ impl<A: DeviceAdapter> Controller<A> {
                     && fresh.state.foreground_app.as_deref() == Some("com.apple.springboard")
                     && Instant::now() < until
         );
+        let lock_until = match (&request.action, admission) {
+            (Action::Lock, Some(ActionAdmission::NativeLock { until }))
+                if matches!(fresh.state.lock, LockState::Unlocked | LockState::Uncertain)
+                    && fresh.state.wda_ready
+                    && Instant::now() < until =>
+            {
+                Some(until)
+            }
+            _ => None,
+        };
+        if matches!(admission, Some(ActionAdmission::NativeLock { .. })) && lock_until.is_none() {
+            return Err(ControllerError::StaleObservation);
+        }
         let pixel_drift_until = match (&request.action, admission) {
             (_, Some(ActionAdmission::NativeModalTap { until, .. })) if admitted_modal_tap => {
                 Some(until)
@@ -819,6 +836,7 @@ impl<A: DeviceAdapter> Controller<A> {
             && fresh.state.lock != LockState::Unlocked
             && !admitted_home_launch
             && !admitted_modal_tap
+            && lock_until.is_none()
         {
             inner.last = Some(fresh);
             return Err(ControllerError::LockedAction);
@@ -855,9 +873,13 @@ impl<A: DeviceAdapter> Controller<A> {
         if let Some(until) = pixel_drift_until {
             send_deadline = send_deadline.min(until);
         }
-        let execution_admission = (admitted_home_launch || pixel_drift_until.is_some())
-            .then_some(admission)
-            .flatten();
+        if let Some(until) = lock_until {
+            send_deadline = send_deadline.min(until);
+        }
+        let execution_admission =
+            (admitted_home_launch || pixel_drift_until.is_some() || lock_until.is_some())
+                .then_some(admission)
+                .flatten();
         let receipt = match inner.adapter.execute_with_motion(
             &request.action,
             send_deadline,
