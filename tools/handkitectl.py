@@ -27,6 +27,8 @@ class Session:
         self.revision = None
         self.target_revision = None
         self.targets = []
+        self.alert_revision = None
+        self.alert = None
         self.poisoned = False
         self.control = False
 
@@ -124,6 +126,9 @@ class Session:
         args = dict(arguments or {})
         if not isinstance(tool, str) or not tool.startswith("handkite_"):
             raise DriverError("invalid_tool")
+        if tool in {"handkite_observe_alert", "handkite_tap_alert"}:
+            return self._call_alert(tool, args)
+        self.alert_revision, self.alert = None, None
         target_action = tool in {"handkite_tap_element", "handkite_text_element"}
         action = tool not in {"handkite_status", "handkite_observe", "handkite_acquire_control", "handkite_release_control"}
         if action:
@@ -186,6 +191,36 @@ class Session:
                 if action and not target_action or tool in {"handkite_acquire_control", "handkite_release_control"}:
                     self.target_revision, self.targets = None, []
         return {"elapsed_ms": elapsed_ms, "result": result}
+
+    def _call_alert(self, tool, args):
+        """A separate revision namespace; never supplies ordinary input defaults."""
+        previous = self.alert_revision
+        self.alert_revision, self.alert = None, None
+        self.revision, self.target_revision, self.targets = None, None, []
+        if tool == "handkite_tap_alert":
+            if not self.control:
+                raise DriverError("explicit_acquire_required")
+            if "expected_revision" not in args:
+                if previous is None:
+                    raise DriverError("observe_alert_required")
+                args["expected_revision"] = previous
+        started = time.monotonic()
+        result = self._rpc("tools/call", {"name": tool, "arguments": args})
+        payload = result.get("structuredContent")
+        if payload is None:
+            content = result.get("content", [])
+            if content and content[0].get("type") == "text":
+                try:
+                    payload = json.loads(content[0]["text"])
+                except (ValueError, TypeError):
+                    payload = None
+        if not result.get("isError") and tool == "handkite_observe_alert" and isinstance(payload, dict):
+            revision, alert = payload.get("revision"), payload.get("alert")
+            if payload.get("revision_scope") == "alert" and type(revision) is int and revision >= 0 and isinstance(alert, dict):
+                self.alert_revision, self.alert = revision, alert
+        if isinstance(payload, dict) and payload.get("code") == "InvalidLease":
+            self.control = False
+        return {"elapsed_ms": round((time.monotonic() - started) * 1000), "result": result}
 
     def _target_update(self, payload, revision):
         rows = payload.get("targets")

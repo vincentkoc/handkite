@@ -77,6 +77,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let capture = inner
             .adapter
             .observe_outline()
@@ -136,6 +137,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let raw = inner
             .adapter
             .observe_navigation()
@@ -264,6 +266,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let receipt = inner
             .adapter
             .execute_navigation(

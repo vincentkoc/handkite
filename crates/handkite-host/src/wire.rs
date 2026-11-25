@@ -10,6 +10,17 @@ use std::time::Duration;
 #[derive(Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Request {
+    ObserveAlert {
+        device: DeviceKey,
+    },
+    TapAlert {
+        owner: String,
+        lease: LeaseId,
+        device: DeviceKey,
+        expected_revision: Revision,
+        alert_id: String,
+        target_id: String,
+    },
     ObserveNavigation {
         device: DeviceKey,
     },
@@ -67,6 +78,14 @@ pub enum Request {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Reply {
+    ObservedAlert {
+        status: WireStatus,
+        alert: handkite_core::controller::AlertDescriptor,
+    },
+    AlertActed {
+        receipt: TransportReceipt,
+        effect: ObservedEffect,
+    },
     ObservedNavigation {
         observation: WireObservation,
     },
@@ -225,6 +244,36 @@ fn valid_owner(owner: &str) -> bool {
 pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) -> Reply {
     let _timing = crate::timing::Span::new("controller_dispatch");
     let result = match request {
+        Request::ObserveAlert { device } => {
+            controller
+                .observe_alert(&device)
+                .map(|result| Reply::ObservedAlert {
+                    status: result.observation.into(),
+                    alert: result.alert,
+                })
+        }
+        Request::TapAlert {
+            owner,
+            lease,
+            device,
+            expected_revision,
+            alert_id,
+            target_id,
+        } if valid_owner(&owner) => controller
+            .tap_alert(
+                &owner,
+                lease,
+                &device,
+                expected_revision,
+                handkite_core::controller::AlertRequest {
+                    alert_id,
+                    target_id,
+                },
+            )
+            .map(|result| Reply::AlertActed {
+                receipt: result.receipt,
+                effect: result.effect,
+            }),
         Request::ObserveNavigation { device } => {
             controller
                 .observe_navigation(&device)
@@ -538,6 +587,25 @@ mod tests {
             assert_eq!(value["native_lock"], expected_lock);
             assert_eq!(value["effect"], expected_effect);
             assert!(value["after"].is_null());
+        }
+    }
+}
+
+#[cfg(test)]
+mod alert_wire_tests {
+    use super::*;
+    #[test]
+    fn alert_methods_refuse_coordinate_and_label_extensions() {
+        assert!(
+            serde_json::from_value::<Request>(
+                serde_json::json!({"method":"observe_alert","device":"fixture"})
+            )
+            .is_ok()
+        );
+        for extra in ["at", "label", "value"] {
+            let mut request = serde_json::json!({"method":"tap_alert","owner":"owner","lease":"11111111111111111111111111111111","device":"fixture","expected_revision":1,"alert_id":"a_11111111111111111111111111111111","target_id":"ab_22222222222222222222222222222222"});
+            request[extra] = serde_json::json!("forbidden");
+            assert!(serde_json::from_value::<Request>(request).is_err());
         }
     }
 }

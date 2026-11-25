@@ -106,6 +106,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let (raw, targets) = inner
             .adapter
             .observe_targets_since(since)
@@ -196,6 +197,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let receipt = inner
             .adapter
             .execute_target(&action, prepared.token, deadline)

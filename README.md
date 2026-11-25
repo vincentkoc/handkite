@@ -19,6 +19,10 @@ before installing a runner. See the [runner guide](tools/wda/README.md).
 Local typing met the two-second p50/p95 target. Swipe remains above its p95
 target; see [measured results and limits](VALIDATION.md).
 
+Notification permission alerts have a separate native-button path and require
+an explicit user decision. See the [alert contract](ALERT_ACTIONS.md); ordinary
+targets and the PIN broker do not bypass unsupported or authentication prompts.
+
 ## Local setup
 
 Handkite controls one explicitly selected iPhone over USB from the Mac it is

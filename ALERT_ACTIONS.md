@@ -1,7 +1,8 @@
 # Guarded native alert actions
 
-Status: proposed design; no implementation, installation or live alert action
-is included in this PR. The proposed API names below are not available tools.
+Status: implementation candidate following the approved design. Synthetic
+qualification and any live result are recorded in VALIDATION.md. Notification
+permission support is deliberately narrower than generic system-alert support.
 
 ## Problem and scope
 
@@ -34,7 +35,7 @@ path. Never use the PIN broker or generic tap as an automatic fallback.
 
 ## Caller contract
 
-Proposed tools:
+Tools:
 
 - `handkite_observe_alert`: read one supported alert and return alert-scoped
   authority only. An image is omitted by default. Unsupported or ambiguous
@@ -49,7 +50,7 @@ to choose it. The agent must have the user's authorization for that particular
 permission decision; a request to observe, browse or benchmark is not permission
 to answer a prompt. No automatic allow/deny policy is introduced.
 
-Example proposed request, using synthetic opaque handles:
+Example request, using synthetic opaque handles:
 
 ```json
 {
@@ -78,7 +79,8 @@ Bind the private observation to:
 - pinned USB device, WDA runner/session, display selection and execution owner;
 - native foreground owner bundle and PID before and after capture;
 - fresh native Unlocked and WDA unlocked proofs before and after capture;
-- one complete alert tree, its native ID, versioned class and content digest;
+- two complete context snapshots bracketing the native hierarchy proof, with
+  matching alert structure, versioned class and content digest;
 - the complete native button set, descendant ancestry, IDs and attributes;
 - full alert and button rectangles, screen scale and screenshot mapping;
 - the original capture window, revision and monotonic expiry.
@@ -97,12 +99,50 @@ recognition and complete structure are required; absence of a few English
 security keywords is insufficient. When the native APIs cannot establish the
 required class or complete context, fail closed rather than infer support.
 
-Underlying app animation does not invalidate an otherwise unchanged alert.
-Require stable alert-region pixels and exact modal semantics inside the fresh
-capture bracket. Changes outside that region do not supply or invalidate alert
-identity. This exception belongs only to the new alert proof, never to ordinary
-whole-screen admission. OCR, guessed visibility and coordinate fallback cannot
-create alert authority.
+### Why the alert proof is native, not pixel-based
+
+iOS renders notification alerts as translucent material. A moving app can
+change pixels inside an unchanged alert, including behind its text and buttons.
+Exact region equality therefore rejects a stable native object. A glyph mask
+would depend on contrast thresholds and compositing; it would not establish
+OS ownership or distinguish a visually identical replacement object.
+
+For this narrow native-button path, the authority is the SpringBoard PID,
+native application/alert/button identities and ancestry, complete context,
+exact content and geometry, and current visibility/hittability. Two complete
+XML snapshots bracket the native hierarchy inventory; both must pass the
+global authentication exclusions and have identical modal fingerprints and
+viewport. This catches a title/body change or hidden authentication field
+introduced while native descendants are queried. Input also requires exact
+identity agreement with the original observation. A different native alert
+with the same words still refuses.
+
+The screenshot is decoded and its display mapping checked, but its pixels do
+not grant or invalidate alert authority. This is specific to native element-ID
+clicks; ordinary coordinate/pixel admission is unchanged. Neither the former
+pixel comparison nor this non-atomic API sequence can eliminate a change after
+the last proof. The bound native-ID click retains native stale-element checks,
+the original expiry and single-use delivery semantics; it never substitutes
+coordinates or another alert. OCR and inferred visibility cannot create
+authority.
+
+Both XML reads use the existing cheap outline source, which omits `visible`
+but does not filter nodes or content. XML supplies structure, content and the
+global authentication scan. Native descendant queries independently prove
+that the alert, both buttons and both text nodes are displayed; buttons also
+require enabled and hittable. Text enabled state must agree with XML but may
+be false, since text is not an input target. The strict legacy modal parser
+still requires explicit XML visibility.
+
+The initial native lock read overlaps the read-only capture. Both operations,
+including response-profile restoration, drain before any authority is
+published. A second fresh native lock proof remains required afterward. The
+five-second capture budget is unchanged. Content-free timing records identify
+the active predicate when a failure or timeout interrupts capture.
+
+Dismissal requires two safe, complete contexts without an alert, scoped native
+absence and an explicit no-such-alert response. Moving background pixels are
+not evidence that the alert remains present, or that it was dismissed.
 
 Fresh native lock proof must retain the existing deadline and transport guards.
 `AdapterNativeBefore` is not assumed to mean an alert is present; preserve its
@@ -120,7 +160,7 @@ returns no authority. An image of an unlocked-looking app is not a lock proof.
 3. Settle prior input verification. Immediately recapture the complete alert and
    its native descendants, with fresh lock/app/owner proofs. Require the same
    owner, alert native ID, class, title/body, complete button set, chosen native
-   button identity, attributes, geometry and region pixels. Do not refresh the
+   button identity, attributes, geometry and complete modal fingerprint. Do not refresh the
    original observation's expiry to make a stale request usable.
 4. Restore and verify any temporary WDA response settings before input. If
    restoration is uncertain, poison further input through the existing path.
@@ -131,7 +171,13 @@ returns no authority. An image of an unlocked-looking app is not a lock proof.
    uncertain send is never replayed. Only failures proven before entering the
    dispatch future may report `delivery: not_sent`; all other missing delivery
    evidence reports `unknown`.
-7. Make one bounded, fresh post-action observation. Report `Changed` only when
+7. Make a bounded, fresh post-action observation. A safely parsed dismissal or
+   SpringBoard/app-return transition, or the unchanged original alert still
+   present, permits one second read under the same five-second deadline. A
+   same-bundle PID change, replacement alert, authentication context, malformed
+   evidence, lost ownership/session, lock failure or uncertain settings
+   restoration does not permit a retry. Neither read can resend input.
+   Report `Changed` only when
    complete context and fresh lock/owner proof establish dismissal of the exact
    original alert, with no replacement/unsupported modal. Cache eviction or a
    missing old element-ID lookup alone does not prove dismissal. Owner may

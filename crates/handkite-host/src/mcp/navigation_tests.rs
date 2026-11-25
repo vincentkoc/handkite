@@ -280,7 +280,11 @@ fn payload(response: &Value) -> Value {
 
 #[test]
 fn capability_catalog_and_dispatch_are_separate_guards() {
-    let observation = ["handkite_status", "handkite_observe"];
+    let observation = [
+        "handkite_status",
+        "handkite_observe",
+        "handkite_observe_alert",
+    ];
     let navigation = [
         "handkite_acquire_control",
         "handkite_release_control",
@@ -288,6 +292,7 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
         "handkite_launch_clock",
     ];
     let interaction = [
+        "handkite_tap_alert",
         "handkite_tap_element",
         "handkite_text_element",
         "handkite_tap",
@@ -326,12 +331,15 @@ fn capability_catalog_and_dispatch_are_separate_guards() {
             &mut no_exchange,
         )
         .unwrap();
-        let names: Vec<_> = catalog["result"]["tools"]
+        let mut names: Vec<_> = catalog["result"]["tools"]
             .as_array()
             .unwrap()
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
+        let mut expected = expected;
+        names.sort_unstable();
+        expected.sort_unstable();
         assert_eq!(names, expected);
         for name in observation
             .iter()

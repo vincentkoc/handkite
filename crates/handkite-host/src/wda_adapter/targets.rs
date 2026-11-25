@@ -530,7 +530,7 @@ fn same_target(expected: &Bound, current: &[Bound]) -> bool {
         })
 }
 
-async fn screenshot(wda: &impl WdaRequest) -> Result<ScreenImage, AdapterError> {
+pub(super) async fn screenshot(wda: &impl WdaRequest) -> Result<ScreenImage, AdapterError> {
     let image = response_value(
         wda.request("GET", "/screenshot", b"", Duration::from_secs(10))
             .await
@@ -1058,7 +1058,7 @@ fn tap_effect(
 
 type TargetCapture = (RawObservation, Vec<Bound>, Snapshot);
 
-async fn capture_with_native<T>(
+pub(super) async fn capture_with_native<T>(
     native: impl FnOnce() -> LockState + Send + 'static,
     capture: impl Future<Output = Result<T, AdapterError>>,
 ) -> (LockState, Result<T, AdapterError>) {

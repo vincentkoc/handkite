@@ -22,6 +22,33 @@ class Fake(Session):
 
 
 class DriverTests(unittest.TestCase):
+    def test_alert_namespace_never_reuses_an_ordinary_revision(self):
+        session = Fake([])
+        session.control = True
+        session.revision = 8
+        with self.assertRaisesRegex(DriverError, "observe_alert_required"):
+            session.call("handkite_tap_alert", {"alert_id": "a_" + "1"*32, "target_id": "ab_" + "2"*32})
+        self.assertEqual(session.calls, [])
+        self.assertIsNone(session.revision)
+
+    def test_alert_observe_and_tap_use_no_generic_response_options(self):
+        session = Fake([result({"revision": 9, "revision_scope": "alert", "alert": {"class": "notification_permission_en_v1"}}), result({"receipt": {"accepted": True}, "effect": "changed"})])
+        session.control = True
+        session.call("handkite_observe_alert")
+        self.assertEqual(session.alert_revision, 9)
+        self.assertIsNone(session.revision)
+        session.call("handkite_tap_alert", {"alert_id": "a_" + "1"*32, "target_id": "ab_" + "2"*32})
+        self.assertEqual(session.calls[1][1]["arguments"], {"alert_id": "a_" + "1"*32, "target_id": "ab_" + "2"*32, "expected_revision": 9})
+        self.assertIsNone(session.alert_revision)
+        self.assertIsNone(session.revision)
+
+    def test_ordinary_status_discards_alert_authority(self):
+        session = Fake([result({"revision": 10, "revision_scope": "navigation"})])
+        session.alert_revision, session.alert = 9, {}
+        session.call("handkite_status")
+        self.assertIsNone(session.alert_revision)
+        self.assertIsNone(session.alert)
+
     def test_one_session_reuses_observed_revision_and_action_delta(self):
         session = Fake([
             result({"control": "acquired"}),

@@ -6,6 +6,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
+mod alert_tools;
 mod catalog;
 mod compact;
 mod elements;
@@ -235,7 +236,9 @@ where
             if !matches!(tool, Tool::Observe | Tool::Status) {
                 session.home_observe_hint = false;
             }
-            if matches!(tool, Tool::TapElement | Tool::TextElement) {
+            if matches!(tool, Tool::ObserveAlert | Tool::TapAlert) {
+                alert_tools::call(tool, params.arguments, device, session, exchange)
+            } else if matches!(tool, Tool::TapElement | Tool::TextElement) {
                 // Gap and rate cap only: native target geometry stays daemon-owned.
                 if session.lease.is_some() {
                     session.pacing.begin(None);
@@ -348,6 +351,9 @@ fn valid_tool_frame(bytes: &[u8]) -> bool {
     };
     let arguments = envelope.params.arguments.map_or("{}", |raw| raw.get());
     match Tool::from_name(&envelope.params.name) {
+        Some(tool @ (Tool::ObserveAlert | Tool::TapAlert)) => {
+            alert_tools::valid_raw(tool, arguments)
+        }
         Some(Tool::TapElement) => target_tools::valid_raw(false, arguments),
         Some(Tool::TextElement) => target_tools::valid_raw(true, arguments),
         Some(tool) if tool.is_action() => interaction::valid_raw(tool, arguments),
@@ -741,7 +747,7 @@ mod tests {
         assert_eq!(replies.len(), 2);
         assert_eq!(replies[0]["result"]["protocolVersion"], "2025-11-25");
         let tools = replies[1]["result"]["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 2);
+        assert_eq!(tools.len(), 3);
         assert!(
             tools
                 .iter()

@@ -6,6 +6,11 @@ use crate::protocol::{
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod alerts;
+pub use alerts::{
+    AlertButton, AlertCompletion, AlertDescriptor, AlertObservation, AlertRequest,
+    RawAlertObservation,
+};
 mod focused_text;
 mod navigation;
 mod targets;
@@ -76,10 +81,13 @@ pub enum AdapterDiagnostic {
     TargetSettings,
     TargetPrepare,
     TargetRevalidation,
+    AlertCapture,
+    AlertUnsupported,
+    AlertRevalidation,
 }
 
 impl AdapterDiagnostic {
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 29] = [
         Self::IdentityCheck,
         Self::CaptureImageDrift,
         Self::CaptureHome,
@@ -106,6 +114,9 @@ impl AdapterDiagnostic {
         Self::TargetSettings,
         Self::TargetPrepare,
         Self::TargetRevalidation,
+        Self::AlertCapture,
+        Self::AlertUnsupported,
+        Self::AlertRevalidation,
     ];
 
     pub const fn code(self) -> &'static str {
@@ -136,6 +147,9 @@ impl AdapterDiagnostic {
             Self::TargetSettings => "AdapterTargetSettings",
             Self::TargetPrepare => "AdapterTargetPrepare",
             Self::TargetRevalidation => "AdapterTargetRevalidation",
+            Self::AlertCapture => "AdapterAlertCapture",
+            Self::AlertUnsupported => "AdapterAlertUnsupported",
+            Self::AlertRevalidation => "AdapterAlertRevalidation",
         }
     }
 }
@@ -246,6 +260,26 @@ pub trait DeviceAdapter {
     }
     fn target_effect_updates(&mut self) -> Vec<TargetEffectReport> {
         Vec::new()
+    }
+    fn observe_alert(&mut self) -> Result<RawAlertObservation, AdapterError> {
+        Err(AdapterError)
+    }
+    fn prepare_alert(
+        &mut self,
+        _request: &AlertRequest,
+        _baseline: &AlertObservation,
+    ) -> Result<PreparedText, AdapterError> {
+        Err(AdapterError)
+    }
+    fn execute_alert(
+        &mut self,
+        _token: u64,
+        _deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        Err(AdapterError)
+    }
+    fn complete_alert(&mut self, _token: u64) -> Result<AlertCompletion, AdapterError> {
+        Err(AdapterError)
     }
     fn observe(&mut self) -> Result<RawObservation, AdapterError>;
     fn observe_targets(&mut self) -> Result<(RawObservation, Vec<ElementTarget>), AdapterError> {
@@ -563,6 +597,7 @@ struct Inner<A> {
     adapter: A,
     last: Option<Observation>,
     target_last: Option<Observation>,
+    alert_last: Option<AlertObservation>,
     navigation_last: Option<NavigationObservation>,
     revision: Revision,
     lease: Option<Lease>,
@@ -587,6 +622,7 @@ impl<A: DeviceAdapter> Controller<A> {
                 adapter,
                 last: None,
                 target_last: None,
+                alert_last: None,
                 navigation_last: None,
                 revision: Revision(0),
                 lease: None,
@@ -623,6 +659,7 @@ impl<A: DeviceAdapter> Controller<A> {
             .settle_target_effects()
             .map_err(|_| Self::adapter_error(&mut inner))?;
         inner.pending_target_lease = None;
+        inner.alert_last = None;
         getrandom::fill(&mut token).map_err(|_| ControllerError::Randomness)?;
         let id = LeaseId(u128::from_be_bytes(token));
         inner.lease = Some(Lease {
@@ -645,6 +682,7 @@ impl<A: DeviceAdapter> Controller<A> {
             .map_err(|_| Self::adapter_error(&mut inner))?;
         inner.lease = None;
         inner.pending_target_lease = None;
+        inner.alert_last = None;
         Ok(())
     }
 
@@ -686,6 +724,7 @@ impl<A: DeviceAdapter> Controller<A> {
         let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let result = self.act_inner(&mut inner, owner, lease_id, request, capture, motion);
         if let Ok(result) = &result {
             renew_verified_action(&mut inner.lease, owner, lease_id, result, Instant::now());
@@ -1029,6 +1068,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let (observation, _) = self.capture(inner, requested, None)?;
         inner.last = Some(observation.clone());
         Ok(observation)
@@ -1042,6 +1082,7 @@ impl<A: DeviceAdapter> Controller<A> {
         inner.last = None;
         inner.target_last = None;
         inner.navigation_last = None;
+        inner.alert_last = None;
         let raw = inner
             .adapter
             .observe_image()

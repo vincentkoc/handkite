@@ -22,6 +22,7 @@ use handkite_core::protocol::{
 use std::future::Future;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+mod alerts;
 mod cache;
 mod display;
 mod focused_text;
@@ -168,6 +169,7 @@ fn retry_coherent_capture<T>(
 }
 
 pub struct WdaAdapter {
+    alert_state: alerts::State,
     expected: HardwareId,
     usb: PinnedUsb,
     runtime: Option<tokio::runtime::Runtime>,
@@ -262,6 +264,7 @@ impl WdaAdapter {
             .build()
             .map_err(|_| AdapterError)?;
         Ok(Self {
+            alert_state: alerts::State::default(),
             usb: PinnedUsb::new(expected.clone()),
             expected,
             runtime: Some(runtime),
@@ -327,6 +330,7 @@ impl WdaAdapter {
             }
         };
         let mut adapter = Self {
+            alert_state: alerts::State::default(),
             expected,
             usb,
             runtime: Some(runtime),
@@ -1291,6 +1295,31 @@ impl DeviceAdapter for WdaAdapter {
         self.finish_target_capture(token)
     }
 
+    fn observe_alert(
+        &mut self,
+    ) -> Result<handkite_core::controller::RawAlertObservation, AdapterError> {
+        self.observe_notification()
+    }
+    fn prepare_alert(
+        &mut self,
+        request: &handkite_core::controller::AlertRequest,
+        baseline: &handkite_core::controller::AlertObservation,
+    ) -> Result<handkite_core::controller::PreparedText, AdapterError> {
+        self.prepare_notification(request, baseline)
+    }
+    fn execute_alert(
+        &mut self,
+        token: u64,
+        deadline: Instant,
+    ) -> Result<TransportReceipt, AdapterError> {
+        self.send_notification(token, deadline)
+    }
+    fn complete_alert(
+        &mut self,
+        token: u64,
+    ) -> Result<handkite_core::controller::AlertCompletion, AdapterError> {
+        self.finish_notification(token)
+    }
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
         self.observe_with_source(CaptureSource::NavigateHome(SCREEN_SOURCE))
     }
@@ -1994,6 +2023,7 @@ fn native_modal_tap_deadline(
         || observation.state.lock != LockState::Uncertain
         || !observation.state.wda_ready
         || observation.state.foreground_app.as_deref() != Some("com.apple.springboard")
+        || !alerts::supported_notification(&observation.accessibility_tree)
         || !crate::wda_ui_admission::visible_modal_button(&observation.accessibility_tree, at)
     {
         return None;
@@ -3122,16 +3152,27 @@ mod tests {
     fn native_modal_tap_requires_owned_unlocked_springboard_and_keeps_home_refused() {
         let id = HardwareId::new("fixture-device").unwrap();
         let mut observation = RawObservation {
-            connected_usb: id.clone(), wda_target: id,
-            window: ObservationWindow { started_unix_ms: 0, finished_unix_ms: 1 },
-            state: DeviceState { lock: LockState::Uncertain, wda_ready: true,
-                foreground_app: Some("com.apple.springboard".into()) },
-            accessibility_tree: r#"<AppiumAUT><XCUIElementTypeApplication x="0" y="0" width="393" height="852"><XCUIElementTypeAlert visible="true" enabled="true" x="30" y="100" width="330" height="650"><XCUIElementTypeButton label="Decline" visible="true" enabled="true" x="50" y="680" width="290" height="50"/></XCUIElementTypeAlert></XCUIElementTypeApplication></AppiumAUT>"#.into(),
-            screenshot: ScreenImage { format: ImageFormat::Png, bytes: vec![] },
+            connected_usb: id.clone(),
+            wda_target: id,
+            window: ObservationWindow {
+                started_unix_ms: 0,
+                finished_unix_ms: 1,
+            },
+            state: DeviceState {
+                lock: LockState::Uncertain,
+                wda_ready: true,
+                foreground_app: Some("com.apple.springboard".into()),
+            },
+            accessibility_tree: alerts::test_fixture(),
+            screenshot: ScreenImage {
+                format: ImageFormat::Png,
+                bytes: vec![],
+            },
         };
-        let at = Point { x: 195.0, y: 705.0 };
+        let at = Point { x: 30.0, y: 145.0 };
         let captured = Instant::now();
-        for change in 0..10 {
+        for change in 0..12 {
+            observation.accessibility_tree = alerts::test_fixture();
             let mut owned = true;
             let mut before = LockState::Unlocked;
             let mut after = LockState::Unlocked;
@@ -3146,6 +3187,8 @@ mod tests {
                 7 => observation.state.wda_ready = false,
                 8 => observation.state.foreground_app = Some("com.example.app".into()),
                 9 => observation.accessibility_tree = "<root/>".into(),
+                10 => observation.accessibility_tree = observation.accessibility_tree.replace("</XCUIElementTypeApplication>", "<XCUIElementTypeSecureTextField visible='false'/></XCUIElementTypeApplication>"),
+                11 => observation.accessibility_tree = observation.accessibility_tree.replace("Would Like to Send You Notifications", "Authentication Required"),
                 _ => {}
             }
             let result =

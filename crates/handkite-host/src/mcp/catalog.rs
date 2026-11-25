@@ -13,6 +13,8 @@ pub enum Capabilities {
 #[derive(Clone, Copy, PartialEq)]
 pub(super) enum Tool {
     Status,
+    ObserveAlert,
+    TapAlert,
     Observe,
     Acquire,
     Release,
@@ -33,6 +35,8 @@ pub(super) enum Tool {
 impl Tool {
     pub(super) fn from_name(name: &str) -> Option<Self> {
         match name {
+            "handkite_observe_alert" => Some(Self::ObserveAlert),
+            "handkite_tap_alert" => Some(Self::TapAlert),
             "handkite_status" => Some(Self::Status),
             "handkite_observe" => Some(Self::Observe),
             "handkite_acquire_control" => Some(Self::Acquire),
@@ -55,7 +59,8 @@ impl Tool {
 
     pub(super) fn allowed(self, capabilities: Capabilities) -> bool {
         match self {
-            Self::TapElement
+            Self::TapAlert
+            | Self::TapElement
             | Self::TextElement
             | Self::Tap
             | Self::ClickButton
@@ -67,7 +72,7 @@ impl Tool {
             | Self::LaunchApp => {
                 matches!(capabilities, Capabilities::ObservationNavigationInteraction)
             }
-            Self::Status | Self::Observe => matches!(
+            Self::Status | Self::Observe | Self::ObserveAlert => matches!(
                 capabilities,
                 Capabilities::Observation
                     | Capabilities::ObservationAndNavigation
@@ -101,6 +106,14 @@ impl Tool {
 
 pub(super) fn catalog(capabilities: Capabilities) -> Value {
     let definitions = [
+        (
+            "handkite_observe_alert",
+            "Observe one supported notification-permission alert as native alert-scoped buttons. Never grants permission to answer it; unsupported/authentication prompts refuse. No screenshots returned.",
+        ),
+        (
+            "handkite_tap_alert",
+            "Click one caller-selected native notification-alert button once after explicit user authorization. Requires exact alert revision and IDs. No coordinate fallback or replay; verifies dismissal, not permission state.",
+        ),
         (
             "handkite_status",
             "Observe the pinned iPhone and return lock state and capture metadata without screen content.",
@@ -171,7 +184,9 @@ pub(super) fn catalog(capabilities: Capabilities) -> Value {
         .filter_map(|(name, description)| {
             let tool = Tool::from_name(name)?;
             tool.allowed(capabilities).then(|| {
-                let schema = if matches!(tool, Tool::TapElement | Tool::TextElement) {
+                let schema = if matches!(tool, Tool::ObserveAlert | Tool::TapAlert) {
+                    super::alert_tools::schema(tool)
+                } else if matches!(tool, Tool::TapElement | Tool::TextElement) {
                     super::target_tools::schema(tool == Tool::TextElement)
                 } else if tool.is_action() {
                     super::interaction::schema(tool)

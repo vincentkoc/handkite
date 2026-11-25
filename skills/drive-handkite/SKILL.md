@@ -193,3 +193,24 @@ with Session() as phone:
 `python3 tools/handkitectl.py` also accepts one JSON object per line:
 `{"tool":"handkite_observe","arguments":{}}`. Keep the process open across
 steps. See the README's MCP section for native client registration.
+
+
+## Notification permission alerts
+
+Only answer a permission prompt when the user authorized that exact decision.
+Use `handkite_observe_alert` to obtain the dedicated alert revision, alert ID and
+native button IDs. It currently accepts only the supported English notification
+permission template owned by SpringBoard. Unknown, location, authentication,
+PIN, trust and XCTest prompts refuse. Do not work around a refusal with generic
+taps or the PIN broker.
+
+After acquiring control, pass the observed `expected_revision`, `alert_id` and
+chosen `target_id` to `handkite_tap_alert` once. These IDs cannot be used with
+ordinary element or coordinate tools. No screenshot is returned; alert text
+and button metadata are sufficient. In the Python driver the separate
+`alert_revision` and `alert` fields hold this state. Other calls invalidate it.
+
+`changed` means the alert was dismissed, not that a permission setting was
+verified. `unconfirmed` or unknown delivery must never be replayed. A new alert
+or the underlying app needs a new explicit observation. Keep all Photos images
+and library content out of logs, reports and Git history.
