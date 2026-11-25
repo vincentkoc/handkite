@@ -136,6 +136,28 @@ class BenchmarkTests(unittest.TestCase):
                 {"stage":"wda_write_request", "started_us":110, "elapsed_us":40}]
         self.assertEqual(operation_stages(rows)["input_request"], .04)
 
+    def test_outline_profile_records_optional_enrichment_without_hiding_missing_stages(self):
+        names = ("service_request", "service_serialization", "service_write", "controller_dispatch",
+                 "wire_image_encode", "wda_read_request", "usb_discovery", "usb_connect",
+                 "wda_send", "wda_response", "owned_session_checks")
+        rows = [{"stage": name, "started_us": 0, "elapsed_us": 1} for name in names]
+        for enriched in (False, True):
+            stages = CAPTURE_NAMES | {"outline_source_request", "outline_cost"}
+            if not enriched:
+                stages -= {"source_request"}
+            capture = {"outline_nodes": 54 if enriched else 1881,
+                       "stages": [{"stage": stage, "elapsed_us": 1, "ok": True}
+                                  for stage in sorted(stages)]}
+            trace = rows + [{"capture": capture}]
+            validate_measured_stages("observe_tree", trace, "paired")
+            self.assertIn("capture_0.outline_source_request", operation_stages(trace))
+            for missing in ("outline_cost", "source_json", "ownership_after"):
+                invalid = copy.deepcopy(trace)
+                invalid[-1]["capture"]["stages"] = [sample for sample in capture["stages"]
+                                                     if sample["stage"] != missing]
+                with self.assertRaises(BenchError):
+                    validate_measured_stages("observe_tree", invalid, "paired")
+
     def test_extract_requires_whole_completed_cases_and_keeps_parent_failure(self):
         rows = [{"case": case, "ordinal": n, "warmup": False, "outcome": "pass",
                  "elapsed_ms": 10, "cleanup_ms": 1, "fixture_verification_ms": 2,

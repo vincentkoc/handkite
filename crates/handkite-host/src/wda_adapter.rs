@@ -29,6 +29,7 @@ mod focused_text;
 mod measurement;
 mod navigation;
 mod ocr;
+mod outline;
 mod targets;
 #[cfg(test)]
 pub(crate) use targets::dispatch_native as test_dispatch_native;
@@ -98,15 +99,10 @@ impl<'a> CaptureSource<'a> {
         }
     }
 
-    fn for_app(self, app: Option<&str>, locked: Option<bool>) -> &'a str {
-        if matches!(self, Self::Outline(_))
-            && app == Some("com.apple.mobilesafari")
+    fn profile_outline(self, app: Option<&str>, locked: Option<bool>) -> bool {
+        matches!(self, Self::Outline(_))
+            && app.is_some_and(|app| !app.is_empty())
             && locked == Some(false)
-        {
-            OUTLINE_SOURCE
-        } else {
-            self.path()
-        }
     }
 }
 
@@ -923,20 +919,48 @@ impl WdaAdapter {
         let source = if let Some(path) = source_path {
             let app = before.as_ref().map(|(_, app, _)| app.as_str());
             let lock = before.as_ref().and_then(|(_, _, lock)| *lock);
-            let selected_source = path.for_app(app, lock);
-            presentation_only = selected_source == OUTLINE_SOURCE;
-            crate::timing::outcome(
-                "outline_visibility_omitted",
-                selected_source == OUTLINE_SOURCE,
-            );
-            let (response, timing) = measurement::request(
-                enabled,
-                Stage::SourceRequest,
-                clock,
-                wda.request("GET", selected_source, b"", Duration::from_secs(20)),
-            )
-            .await;
-            (response.map(Some), timing)
+            // One fresh, complete cheap hierarchy selects the cost profile. It is
+            // never an input baseline; small trees still need full visibility.
+            let cheap_source = if path.profile_outline(app, lock) {
+                let (response, sample) = measurement::request(
+                    enabled,
+                    Stage::OutlineSourceRequest,
+                    clock,
+                    wda.request("GET", OUTLINE_SOURCE, b"", Duration::from_secs(20)),
+                )
+                .await;
+                if let Some(timings) = timings.as_deref_mut() {
+                    timings.append([sample]);
+                }
+                let response = response.map_err(|_| AdapterError)?;
+                let cost = measure(
+                    timings.as_deref_mut(),
+                    Stage::OutlineCost,
+                    clock,
+                    |_| response.body.len(),
+                    || outline::cost(&response),
+                )?;
+                if let Some(timings) = timings.as_deref_mut() {
+                    timings.outline_nodes(cost.nodes);
+                }
+                presentation_only = !cost.enrich_visibility();
+                presentation_only.then_some(response)
+            } else {
+                None
+            };
+            crate::timing::outcome("outline_visibility_omitted", presentation_only);
+            if let Some(response) = cheap_source {
+                (Ok(Some(response)), None)
+            } else {
+                let (response, timing) = measurement::request(
+                    enabled,
+                    Stage::SourceRequest,
+                    clock,
+                    wda.request("GET", path.path(), b"", Duration::from_secs(20)),
+                )
+                .await;
+                (response.map(Some), timing)
+            }
         } else {
             (Ok(None), None)
         };

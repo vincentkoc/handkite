@@ -52,6 +52,7 @@ CAPTURE_NAMES = {"ownership_before", "screenshot_request", "source_request", "ap
                  "image_decode", "payload_validation", "ownership_after", "capture_total"}
 COHERENCE_NAMES = {"screenshot_before_request", "screenshot_before_json", "capture_coherence",
                    "app_before_request", "app_before_json", "lock_before_request", "lock_before_json"}
+OUTLINE_NAMES = {"outline_source_request", "outline_cost"}
 
 
 class BenchError(Exception):
@@ -143,7 +144,8 @@ def operation_stages(rows):
                 writes.append((interval, value / 1000))
         if "capture" in row:
             for sample in row["capture"]["stages"]:
-                require(sample.get("stage") in CAPTURE_NAMES | COHERENCE_NAMES, "unknown_capture_stage")
+                require(sample.get("stage") in CAPTURE_NAMES | COHERENCE_NAMES | OUTLINE_NAMES,
+                        "unknown_capture_stage")
                 require(sample.get("ok") is True, "failed_capture_trace")
                 require(type(sample.get("elapsed_us")) is int and sample["elapsed_us"] >= 0,
                         "invalid_trace_duration")
@@ -196,8 +198,15 @@ def validate_measured_stages(case, rows, capture_kind):
             expected -= {"source_request", "source_json"}
         samples = capture["stages"]
         present = {sample.get("stage") for sample in samples}
+        if present & OUTLINE_NAMES:
+            require(not reused and capture_kind == "paired" and OUTLINE_NAMES <= present
+                    and type(capture.get("outline_nodes")) is int and capture["outline_nodes"] > 0,
+                    "invalid_outline_trace")
+            expected |= OUTLINE_NAMES
+            if "source_request" not in present:
+                expected -= {"source_request"}
         if present & COHERENCE_NAMES:
-            require(not reused and "source_request" in expected, "invalid_coherence_trace")
+            require(not reused and "source_json" in expected, "invalid_coherence_trace")
             expected |= COHERENCE_NAMES
         require(expected == {sample.get("stage") for sample in samples}
                 and len(expected) == len(samples), "missing_capture_stage")
@@ -597,7 +606,7 @@ def reference_report(report, digest):
         f"{prefix}span.{stage}.{kind}" for prefix in ("", "mcp.")
         for stage in SPAN_NAMES for kind in ("work", "covered")
     } | {f"{prefix}capture_{index}.{stage}" for prefix in ("", "mcp.")
-         for index in (0, 1) for stage in CAPTURE_NAMES}
+         for index in (0, 1) for stage in CAPTURE_NAMES | OUTLINE_NAMES}
     for case in CASES:
         row = summary[case]
         require(qualified_summary(row)

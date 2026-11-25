@@ -19,6 +19,8 @@ pub(super) enum Stage {
     AppRequest,
     LockRequest,
     ScreenshotJson,
+    OutlineSourceRequest,
+    OutlineCost,
     SourceJson,
     AppJson,
     LockJson,
@@ -35,6 +37,8 @@ pub struct CaptureTimings {
     stages: Vec<Sample>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     reused_tree: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outline_nodes: Option<usize>,
 }
 
 #[derive(Serialize)]
@@ -46,6 +50,9 @@ pub(super) struct Sample {
 }
 
 impl CaptureTimings {
+    pub(super) fn outline_nodes(&mut self, nodes: usize) {
+        self.outline_nodes = Some(nodes);
+    }
     pub(super) fn mark_reused_tree(&mut self) {
         self.reused_tree = true;
     }
@@ -376,7 +383,14 @@ mod tests {
                         json!("private-tree"),
                     )
                 }
-                super::super::OUTLINE_SOURCE => (1, json!("private-tree")),
+                super::super::OUTLINE_SOURCE => (
+                    1,
+                    json!(if self.case >= 14 {
+                        "<XCUIElementTypeApplication><XCUIElementTypeWebView/></XCUIElementTypeApplication>"
+                    } else {
+                        "<XCUIElementTypeApplication/>"
+                    }),
+                ),
                 "/wda/activeAppInfo" => (2, json!({"bundleId":"private-app"})),
                 "/wda/locked" => (3, json!(false)),
                 _ => panic!("unexpected request"),
@@ -454,7 +468,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn safari_outline_omits_only_visibility_without_extra_reads() {
+    async fn outline_cost_profile_keeps_full_and_locked_paths_unchanged() {
         use super::super::{CaptureFailure, CaptureSource, OUTLINE_SOURCE};
         for (case, source, light) in [
             (14, CaptureSource::Outline(SCREEN_SOURCE), true),
@@ -486,13 +500,14 @@ mod tests {
                 assert_eq!(result.unwrap().1, light);
             }
             let calls = reads.calls.borrow();
-            assert_eq!(calls.len(), 7);
+            let profiled = matches!(source, CaptureSource::Outline(_)) && !matches!(case, 15 | 16);
+            assert_eq!(calls.len(), 7 + usize::from(profiled && !light));
             assert_eq!(
                 calls
                     .iter()
                     .filter(|p| p.as_str() == OUTLINE_SOURCE)
                     .count(),
-                usize::from(light)
+                usize::from(profiled)
             );
             assert_eq!(
                 calls.iter().filter(|p| p.as_str() == SCREEN_SOURCE).count(),
