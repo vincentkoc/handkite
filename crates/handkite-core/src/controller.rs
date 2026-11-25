@@ -79,6 +79,7 @@ pub enum AdapterDiagnostic {
     TargetMapping,
     TargetOcr,
     TargetSettings,
+    TargetBudget,
     TargetPrepare,
     TargetRevalidation,
     AlertCapture,
@@ -87,7 +88,7 @@ pub enum AdapterDiagnostic {
 }
 
 impl AdapterDiagnostic {
-    pub const ALL: [Self; 29] = [
+    pub const ALL: [Self; 30] = [
         Self::IdentityCheck,
         Self::CaptureImageDrift,
         Self::CaptureHome,
@@ -112,6 +113,7 @@ impl AdapterDiagnostic {
         Self::TargetMapping,
         Self::TargetOcr,
         Self::TargetSettings,
+        Self::TargetBudget,
         Self::TargetPrepare,
         Self::TargetRevalidation,
         Self::AlertCapture,
@@ -145,6 +147,7 @@ impl AdapterDiagnostic {
             Self::TargetMapping => "AdapterTargetMapping",
             Self::TargetOcr => "AdapterTargetOcr",
             Self::TargetSettings => "AdapterTargetSettings",
+            Self::TargetBudget => "AdapterTargetBudget",
             Self::TargetPrepare => "AdapterTargetPrepare",
             Self::TargetRevalidation => "AdapterTargetRevalidation",
             Self::AlertCapture => "AdapterAlertCapture",

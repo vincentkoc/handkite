@@ -374,6 +374,7 @@ fn unrelated_capture_failure_does_not_take_home_fallback() {
     for code in [
         "AdapterTargetCapture",
         "AdapterTargetSettings",
+        "AdapterTargetBudget",
         "AdapterTargetOcr",
         "AdapterNativeBefore",
     ] {

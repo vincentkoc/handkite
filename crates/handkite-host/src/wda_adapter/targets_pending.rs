@@ -26,6 +26,7 @@ const CANCELLED: u8 = 2;
 enum Verdict {
     Complete(RawImageObservation, bool, LockState, Instant, u64),
     Unconfirmed,
+    Budget,
     RestorationFailed,
 }
 
@@ -105,12 +106,13 @@ async fn full(wda: UsbWda, input: Input) -> Verdict {
     let started = Instant::now();
     let (lock, result) = capture_with_native(
         move || native_lock::query(&device).state,
-        rich_context(&wda, &input.key.session, ATTRS, fast::after(&wda, &input)),
+        target_context(&wda, &input.key.session, fast::after(&wda, &input)),
     )
     .await;
     match result {
         Err(_) => Verdict::RestorationFailed,
-        Ok(Err(_)) => Verdict::Unconfirmed,
+        Ok(Err(TargetWorkError::Budget)) => Verdict::Budget,
+        Ok(Err(TargetWorkError::Capture)) => Verdict::Unconfirmed,
         Ok(Ok((raw, _, verified, _))) => match unix_ms() {
             Ok(completed) => Verdict::Complete(image(raw), verified, lock, started, completed),
             Err(_) => Verdict::Unconfirmed,
@@ -285,6 +287,7 @@ impl WdaAdapter {
         let mut proof = None;
         let mut verified = false;
         let mut poisoned = false;
+        let mut budget = false;
         let mut completed = 0;
         match verdict {
             Some(Verdict::Complete(raw, effect, lock, started, finished)) => {
@@ -294,6 +297,7 @@ impl WdaAdapter {
                 proof = Some(Arc::new(raw));
             }
             Some(Verdict::Unconfirmed) => {}
+            Some(Verdict::Budget) => budget = true,
             Some(Verdict::RestorationFailed) | None => poisoned = true,
         }
         if let Some(report) = self
@@ -312,6 +316,11 @@ impl WdaAdapter {
         if poisoned {
             self.text_response_poisoned = true;
             self.error_diagnostic = Some(AdapterDiagnostic::TargetSettings);
+            return Err(AdapterError);
+        }
+        if budget {
+            self.clear_budget_targets();
+            self.error_diagnostic = Some(AdapterDiagnostic::TargetBudget);
             return Err(AdapterError);
         }
         Ok(())
@@ -524,6 +533,91 @@ mod tests {
         assert!(adapter.finish_pending_effect(true).is_err());
         assert!(adapter.text_response_poisoned);
         assert!(adapter.validate_owned().is_err());
+        assert_eq!(
+            adapter.effect_reports[0].update.effect,
+            ObservedEffect::Unconfirmed
+        );
+    }
+
+    #[test]
+    fn budget_refusal_preserves_acknowledged_history_without_poison_or_replay() {
+        let mut adapter = WdaAdapter::new(HardwareId::new("fixture").unwrap()).unwrap();
+        pending(
+            &mut adapter,
+            Verdict::Budget,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert!(adapter.finish_pending_effect(true).is_err());
+        assert!(adapter.pending_effect.is_none());
+        assert!(!adapter.text_response_poisoned);
+        assert_eq!(
+            adapter.error_diagnostic,
+            Some(AdapterDiagnostic::TargetBudget)
+        );
+        assert_eq!(adapter.effect_reports.len(), 1);
+        assert_eq!(
+            adapter.effect_reports[0].update.effect,
+            ObservedEffect::Unconfirmed
+        );
+        adapter.finish_pending_effect(true).unwrap();
+        assert_eq!(adapter.effect_reports.len(), 1);
+    }
+
+    #[test]
+    fn delta_budget_ends_deferred_proof_without_a_runner_or_new_capture() {
+        let mut adapter = WdaAdapter::new(HardwareId::new("fixture").unwrap()).unwrap();
+        let task_id = adapter.runtime.as_ref().unwrap().spawn(async {}).id();
+        let input = fast::tests::input(task_id);
+        adapter.effect_reports.push(TargetEffectReport {
+            update: TargetEffect {
+                token: input.token,
+                target_id: input.bound.public.target_id.clone(),
+                effect: ObservedEffect::Pending,
+                region: input.bound.public.rect,
+            },
+            proof: None,
+            completed_unix_ms: 0,
+        });
+        adapter.pending_effect = Some(PendingEffect {
+            key: input.key.clone(),
+            token: input.token,
+            stage: Stage::Deferred(Box::new(input)),
+        });
+        assert_eq!(
+            adapter.target_work::<()>(Err(TargetWorkError::Budget)),
+            Err(AdapterError)
+        );
+        assert!(adapter.pending_effect.is_none());
+        assert!(!adapter.text_response_poisoned);
+        assert_eq!(
+            adapter.error_diagnostic,
+            Some(AdapterDiagnostic::TargetBudget)
+        );
+        assert_eq!(
+            adapter.effect_reports[0].update.effect,
+            ObservedEffect::Unconfirmed
+        );
+        adapter.finish_pending_effect(true).unwrap();
+        assert_eq!(adapter.effect_reports.len(), 1);
+    }
+
+    #[test]
+    fn budget_refusal_cannot_hide_an_inflight_restoration_failure() {
+        let mut adapter = WdaAdapter::new(HardwareId::new("fixture").unwrap()).unwrap();
+        pending(
+            &mut adapter,
+            Verdict::RestorationFailed,
+            Arc::new(AtomicBool::new(false)),
+        );
+        assert_eq!(
+            adapter.target_work::<()>(Err(TargetWorkError::Budget)),
+            Err(AdapterError)
+        );
+        assert!(adapter.text_response_poisoned);
+        assert_eq!(
+            adapter.error_diagnostic,
+            Some(AdapterDiagnostic::TargetSettings)
+        );
         assert_eq!(
             adapter.effect_reports[0].update.effect,
             ObservedEffect::Unconfirmed

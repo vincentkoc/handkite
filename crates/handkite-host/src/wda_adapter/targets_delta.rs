@@ -14,6 +14,8 @@ pub(in crate::wda_adapter) struct DeltaBaseline {
     until: Instant,
     /// Start of the capture that produced `image`; bounds frame-scoped admission.
     captured: Instant,
+    /// Only an untouched complete snapshot can use immutable replay.
+    snapshot_replay: bool,
 }
 
 impl DeltaBaseline {
@@ -40,7 +42,32 @@ impl DeltaBaseline {
             dirty: Vec::new(),
             until: snapshot.evidence.until(),
             captured: snapshot.evidence.started,
+            snapshot_replay: true,
         })
+    }
+
+    fn can_replay_snapshot(
+        &self,
+        snapshot: &Snapshot,
+        key: &cache::Key,
+        revision: Revision,
+        pending_effect: bool,
+    ) -> bool {
+        self.snapshot_replay
+            && !pending_effect
+            && self.dirty.is_empty()
+            && self.revision == Some(revision)
+            && self.key == *key
+            && snapshot.key == *key
+            && self.app == snapshot.app
+            && self.mapping.display_id == snapshot.display_id
+            && self.mapping.scale == snapshot.scale
+            && self.image == snapshot.image
+            && self.captured == snapshot.evidence.started
+            && self.until == snapshot.evidence.until()
+            && snapshot.bracket_equal
+            && snapshot.cost.within_visibility_budget()
+            && snapshot.evidence.actionable().unwrap_or(false)
     }
 
     /// Exact frame evidence for one prompt input. Editable-field rectangles
@@ -71,6 +98,7 @@ impl DeltaBaseline {
     }
 
     pub(super) fn consume(&mut self, target: &ElementTarget) {
+        self.snapshot_replay = false;
         self.entries
             .retain(|(e, _)| e.public.target_id != target.target_id);
         self.dirty.push(target.rect);
@@ -258,7 +286,10 @@ fn refreshed(
     after: &Pixels,
     areas: &[[f64; 4]],
 ) -> Result<Vec<(Bound, Instant)>, AdapterError> {
-    let checked = fast::checked_rows(rows, base.mapping)?;
+    let checked = fast::checked_rows(rows, base.mapping).inspect_err(|_| {
+        crate::timing::outcome("target_delta_rows_valid", false);
+    })?;
+    crate::timing::outcome("target_delta_rows_valid", true);
     // Editable fields are always enumerated in full, so caret drift inside one
     // is covered by fresh rows. Any other drift outside the queried areas refuses.
     let fields = checked
@@ -280,8 +311,10 @@ fn refreshed(
             .chain(&fields)
             .any(|area| contains(*area, changed))
     {
+        crate::timing::outcome("target_delta_changes_covered", false);
         return Err(AdapterError);
     }
+    crate::timing::outcome("target_delta_changes_covered", true);
     let rows = fast::checked_rows(rows, base.mapping)?;
     let now = Instant::now();
     let mut result = Vec::new();
@@ -439,7 +472,9 @@ async fn capture(
         .await?;
     let public = entries.iter().map(|(e, _)| e.clone()).collect::<Vec<_>>();
     let xml = presentation(base.mapping, &base.app, &public);
-    if !crate::wda_ui_admission::safe_context(&xml) {
+    let safe_context = crate::wda_ui_admission::safe_context(&xml);
+    crate::timing::outcome("target_delta_source_safe", safe_context);
+    if !safe_context {
         return Err(AdapterError);
     }
     Ok(DeltaCapture {
@@ -475,6 +510,20 @@ impl WdaAdapter {
             self.finish_pending_effect(true)?;
             return Ok(None);
         };
+        if self
+            .target_delta
+            .as_ref()
+            .zip(self.target_snapshot.as_ref())
+            .is_some_and(|(base, snapshot)| {
+                base.can_replay_snapshot(snapshot, &key, revision, self.pending_effect.is_some())
+            })
+        {
+            // The ordinary full path proves current native/app/frame identity
+            // and replays immutable data without a rich transaction. MCP still
+            // computes a compact delta against the acknowledged presentation.
+            crate::timing::outcome("target_delta_snapshot_route", true);
+            return Ok(None);
+        }
         let acted = self.pending_for_delta(&key)?;
         self.error_diagnostic = Some(AdapterDiagnostic::TargetCapture);
         self.validate_owned()?;
@@ -485,6 +534,7 @@ impl WdaAdapter {
         }) else {
             return Ok(None);
         };
+        base.snapshot_replay = false;
         self.targets = None;
         self.target_snapshot = None;
         self.target_input = None;
@@ -500,10 +550,9 @@ impl WdaAdapter {
                 .expect("adapter runtime")
                 .block_on(capture_with_native(
                     move || native_lock::query(&device).state,
-                    rich_context(
+                    target_context(
                         &wda,
                         &base.key.session,
-                        ATTRS,
                         capture(&wda, &base, acted.as_ref().map(|input| &input.bound)),
                     ),
                 ));
@@ -519,7 +568,7 @@ impl WdaAdapter {
             entries,
             after_started,
             effect,
-        } = result?;
+        } = self.target_work(result)?;
         self.validate_owned()?;
         if lock != LockState::Unlocked || self.cache_key().as_ref() != Some(&base.key) {
             return Err(AdapterError);
@@ -626,6 +675,102 @@ mod tests {
             dirty: vec![],
             until: Instant::now() + AGE,
             captured: Instant::now(),
+            snapshot_replay: true,
+        }
+    }
+
+    fn complete_snapshot() -> (DeltaBaseline, Snapshot) {
+        let base = baseline();
+        let now = Instant::now();
+        let now_ms = unix_ms().unwrap();
+        let xml = "<AppiumAUT><XCUIElementTypeApplication name='example.app' visible='true' enabled='true' x='0' y='0' width='20' height='20'><XCUIElementTypeButton name='old' label='old' visible='true' enabled='true' x='2' y='2' width='3' height='3'/></XCUIElementTypeApplication></AppiumAUT>".to_owned();
+        let snapshot = Snapshot {
+            key: base.key.clone(),
+            cost: super::super::super::outline::xml_cost(&xml).unwrap(),
+            xml,
+            items: json!([app(), base.entries[0].0.rich.clone()]),
+            app: base.app.clone(),
+            image: base.image.clone(),
+            evidence: EvidenceWindow {
+                window: ObservationWindow {
+                    started_unix_ms: now_ms - 2200,
+                    finished_unix_ms: now_ms - 2100,
+                },
+                started: now - Duration::from_millis(2200),
+                finished: now - Duration::from_millis(2100),
+            },
+            scale: base.mapping.scale,
+            display_id: base.mapping.display_id,
+            focused: None,
+            bracket_equal: true,
+        };
+        let entries = base
+            .entries
+            .iter()
+            .map(|(bound, _)| bound.clone())
+            .collect::<Vec<_>>();
+        let base = DeltaBaseline::from_full(Revision(1), &snapshot, &entries).unwrap();
+        (base, snapshot)
+    }
+
+    #[test]
+    fn immutable_delta_fallback_preserves_original_fast_frame_age_and_expiry() {
+        let (base, snapshot) = complete_snapshot();
+        assert!(base.can_replay_snapshot(&snapshot, &base.key, Revision(1), false));
+        assert!(base.fast_basis(&base.key, &base.app).is_none());
+        let entries = base
+            .entries
+            .iter()
+            .map(|(bound, _)| bound.clone())
+            .collect::<Vec<_>>();
+        let next = DeltaBaseline::from_full(Revision(2), &snapshot, &entries).unwrap();
+        assert_eq!(next.captured, base.captured);
+        assert_eq!(next.until, base.until);
+        assert_eq!(next.entries[0].1, base.entries[0].1);
+        assert!(next.fast_basis(&next.key, &next.app).is_none());
+    }
+
+    #[test]
+    fn consumed_or_partial_delta_cannot_revive_snapshot_replay() {
+        let (mut base, snapshot) = complete_snapshot();
+        let target = base.entries[0].0.public.clone();
+        base.consume(&target);
+        base.dirty.clear();
+        assert!(!base.can_replay_snapshot(&snapshot, &base.key, Revision(1), false));
+        let (mut partial, snapshot) = complete_snapshot();
+        partial.snapshot_replay = false;
+        assert!(!partial.can_replay_snapshot(&snapshot, &partial.key, Revision(1), false));
+    }
+
+    #[test]
+    fn delta_snapshot_route_refuses_pending_or_changed_context() {
+        let (base, snapshot) = complete_snapshot();
+        assert!(!base.can_replay_snapshot(&snapshot, &base.key, Revision(1), true));
+        assert!(!base.can_replay_snapshot(&snapshot, &base.key, Revision(2), false));
+        let mut other_key = base.key.clone();
+        other_key.session = "other-session".into();
+        assert!(!base.can_replay_snapshot(&snapshot, &other_key, Revision(1), false));
+        for mode in 0..7 {
+            let mut changed = snapshot.clone();
+            match mode {
+                0 => changed.app = "other.app".into(),
+                1 => changed.display_id = Some(2),
+                2 => changed.image.bytes.push(1),
+                3 => changed.bracket_equal = false,
+                4 => {
+                    changed.evidence.window.started_unix_ms -= 5001;
+                    changed.evidence.window.finished_unix_ms -= 5001;
+                }
+                5 => changed.scale *= 2.,
+                _ => {
+                    changed.xml = format!(
+                        "<AppiumAUT>{}</AppiumAUT>",
+                        "<XCUIElementTypeOther/>".repeat(351)
+                    );
+                    changed.cost = super::super::super::outline::xml_cost(&changed.xml).unwrap();
+                }
+            }
+            assert!(!base.can_replay_snapshot(&changed, &base.key, Revision(1), false));
         }
     }
     #[test]

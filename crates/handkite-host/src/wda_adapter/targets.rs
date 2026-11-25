@@ -7,6 +7,9 @@ use handkite_core::protocol::{Observation, Revision};
 use quick_xml::events::Event;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
+#[path = "targets_budget.rs"]
+mod budget;
+use budget::{TargetWorkError, target_context};
 #[path = "targets_delta.rs"]
 mod delta;
 pub(super) use delta::DeltaBaseline;
@@ -24,6 +27,9 @@ const ATTRS: &str = "type,enabled,displayed,rect,label,attribute/name,attribute/
 const AGE: Duration = Duration::from_secs(15);
 // Cache reuse must fit handkited's five-second capture and freshness limits.
 const CACHE_WINDOW_MS: u64 = 5_000;
+// Reserve a two-second next-action budget inside the existing freshness limit.
+// Recapture instead of publishing a cached target near its original expiry.
+const ACTION_HEADROOM_MS: u64 = 2_000;
 // Limits publication after recovery; an expired read still drains restoration.
 const OCR_RECOVERY_PUBLICATION_BUDGET: Duration = Duration::from_secs(20);
 const SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,index,traits,hittable,customActions,nativeFrame,visible";
@@ -71,6 +77,21 @@ impl EvidenceWindow {
     fn reusable(&self) -> Result<bool, AdapterError> {
         Ok(self.reusable_at(Instant::now(), unix_ms()?))
     }
+
+    fn actionable_at(&self, now: Instant, unix_ms: u64) -> bool {
+        let age_limit = CACHE_WINDOW_MS - ACTION_HEADROOM_MS;
+        self.reusable_at(now, unix_ms)
+            && now
+                .checked_duration_since(self.finished)
+                .is_some_and(|age| age < Duration::from_millis(age_limit))
+            && unix_ms
+                .checked_sub(self.window.finished_unix_ms)
+                .is_some_and(|age| age < age_limit)
+    }
+
+    fn actionable(&self) -> Result<bool, AdapterError> {
+        Ok(self.actionable_at(Instant::now(), unix_ms()?))
+    }
 }
 
 struct Captured {
@@ -86,6 +107,19 @@ struct Captured {
     reused: bool,
 }
 
+enum CapturePlan {
+    Snapshot(Captured),
+    Fresh(CaptureStart),
+}
+
+struct CaptureStart {
+    started: Instant,
+    started_unix_ms: u64,
+    display_id: Option<u64>,
+    app: String,
+    before: ScreenImage,
+}
+
 #[derive(Clone)]
 pub(super) struct Snapshot {
     key: cache::Key,
@@ -98,6 +132,7 @@ pub(super) struct Snapshot {
     display_id: Option<u64>,
     focused: Option<String>,
     bracket_equal: bool,
+    cost: super::outline::Cost,
 }
 
 pub(super) struct Targets {
@@ -583,6 +618,20 @@ async fn captured_for(
     if cached.is_some() && predicate.is_some() {
         return Err(CaptureFailure::Adapter);
     }
+    match capture_plan(wda, session, cached, capture_focus).await? {
+        CapturePlan::Snapshot(captured) => Ok(captured),
+        CapturePlan::Fresh(start) => {
+            captured_fresh(wda, session, start, predicate, capture_focus).await
+        }
+    }
+}
+
+async fn capture_plan(
+    wda: &impl WdaRequest,
+    session: &str,
+    cached: Option<&Snapshot>,
+    capture_focus: bool,
+) -> Result<CapturePlan, CaptureFailure> {
     let started = Instant::now();
     let started_unix_ms = unix_ms()?;
     let display_id = super::display::selection(wda, session).await?;
@@ -609,9 +658,10 @@ async fn captured_for(
     let now_ms = unix_ms()?;
     let reused = cached.filter(|cache| {
         cache.bracket_equal
+            && cache.cost.within_visibility_budget()
             && cache.display_id == display_id
             && cache.app == app
-            && cache.evidence.reusable_at(Instant::now(), now_ms)
+            && cache.evidence.actionable_at(Instant::now(), now_ms)
             && cache.image.bytes == before.bytes
     });
     if let Some(cache) = reused {
@@ -623,9 +673,9 @@ async fn captured_for(
         let after = screenshot(wda).await?;
         app_matches(wda, session, &app).await?;
         super::display::verify_selection(wda, session, display_id).await?;
-        if before.bytes == after.bytes && cache.evidence.reusable()? {
+        if before.bytes == after.bytes && cache.evidence.actionable()? {
             crate::timing::outcome("target_snapshot_reuse", true);
-            return Ok(Captured {
+            return Ok(CapturePlan::Snapshot(Captured {
                 xml: cache.xml.clone(),
                 items: cache.items.clone(),
                 before,
@@ -636,13 +686,36 @@ async fn captured_for(
                 scale: cache.scale,
                 display_id,
                 reused: true,
-            });
+            }));
         }
         // The rejected cache frame is the new bracket start. Comparing the
         // first and third frames could hide an observed A-to-B-to-A change.
         before = after;
     }
     crate::timing::outcome("target_snapshot_reuse", false);
+    Ok(CapturePlan::Fresh(CaptureStart {
+        started,
+        started_unix_ms,
+        display_id,
+        app,
+        before,
+    }))
+}
+
+async fn captured_fresh(
+    wda: &impl WdaRequest,
+    session: &str,
+    start: CaptureStart,
+    predicate: Option<&str>,
+    capture_focus: bool,
+) -> Result<Captured, CaptureFailure> {
+    let CaptureStart {
+        started,
+        started_unix_ms,
+        display_id,
+        app,
+        before,
+    } = start;
     // All four reads share the established response profile and remain inside
     // the same screenshot/app/lock brackets. No input runs in this interval.
     let window_path = format!("/session/{session}/window/size");
@@ -1084,7 +1157,31 @@ async fn projected_targets(
 ) -> Result<Result<TargetCapture, AdapterError>, AdapterError> {
     loop {
         *stage = AdapterDiagnostic::TargetCapture;
-        let result = rich_context(wda, &key.session, ATTRS, async {
+        let cached_for_key = cached.filter(|snapshot| {
+            snapshot.key == *key
+                && snapshot.bracket_equal
+                && snapshot.cost.within_visibility_budget()
+                && snapshot.evidence.actionable().unwrap_or(false)
+        });
+        // Prove immutable replay before settings. A miss still needs fresh
+        // preflight, and carries its rejected frame forward so an observed
+        // A-to-B-to-A transition cannot disappear from the new bracket.
+        let plan = if cached_for_key.is_some() {
+            match capture_plan(wda, &key.session, cached_for_key, true).await {
+                Ok(plan) => Some(plan),
+                Err(failure) => {
+                    if matches!(failure, CaptureFailure::HomeScreen) {
+                        *stage = AdapterDiagnostic::TargetHome;
+                    }
+                    return Ok(Err(AdapterError));
+                }
+            }
+        } else {
+            None
+        };
+        let snapshot_cost = matches!(&plan, Some(CapturePlan::Snapshot(_)))
+            .then(|| cached_for_key.expect("proven snapshot reuse").cost.clone());
+        let work = async {
             let Captured {
                 xml,
                 items,
@@ -1096,16 +1193,22 @@ async fn projected_targets(
                 scale,
                 display_id,
                 reused,
-            } = captured(wda, &key.session, cached)
-                .await
-                .map_err(|failure| {
-                    if matches!(failure, CaptureFailure::HomeScreen) {
-                        *stage = AdapterDiagnostic::TargetHome;
-                    }
-                    AdapterError
-                })?;
+            } = match plan {
+                Some(CapturePlan::Snapshot(captured)) => Ok(captured),
+                Some(CapturePlan::Fresh(start)) => {
+                    captured_fresh(wda, &key.session, start, None, true).await
+                }
+                None => captured(wda, &key.session, None).await,
+            }
+            .map_err(|failure| {
+                if matches!(failure, CaptureFailure::HomeScreen) {
+                    *stage = AdapterDiagnostic::TargetHome;
+                }
+                AdapterError
+            })?;
             let snapshot = Snapshot {
                 key: key.clone(),
+                cost: super::outline::xml_cost(&xml)?,
                 xml: xml.clone(),
                 items: items.clone(),
                 app: app.clone(),
@@ -1163,16 +1266,24 @@ async fn projected_targets(
                 return Err(AdapterError);
             }
             Ok((raw, entries, snapshot, reused))
-        })
-        .await?;
+        };
+        let result = match snapshot_cost {
+            Some(cost) => budget::snapshot_context(&cost, work).await?,
+            None => target_context(wda, &key.session, work).await?,
+        };
         let (raw, entries, snapshot, was_reused) = match result {
             Ok(result) => result,
-            Err(error) => return Ok(Err(error)),
+            Err(error) => {
+                if error == TargetWorkError::Budget {
+                    *stage = AdapterDiagnostic::TargetBudget;
+                }
+                return Ok(Err(AdapterError));
+            }
         };
         // Projection and settings restoration spend the original evidence's age.
         // A reused snapshot gets at most one fresh recapture, never a new timestamp.
         if was_reused {
-            match snapshot.evidence.reusable() {
+            match snapshot.evidence.actionable() {
                 Ok(false) => {
                     cached = None;
                     continue;
@@ -1296,7 +1407,7 @@ impl WdaAdapter {
                     .expect("adapter runtime")
                     .block_on(capture_with_native(
                         move || native_lock::query(&device).state,
-                        rich_context(&wda, &input.key.session, ATTRS, fast::after(&wda, &input)),
+                        target_context(&wda, &input.key.session, fast::after(&wda, &input)),
                     ));
             self.cache
                 .refresh_native(Some(input.key.clone()), native_started, || lock);
@@ -1304,7 +1415,7 @@ impl WdaAdapter {
                 self.text_response_poisoned = true;
                 e
             })?;
-            let (raw, entries, verified, started) = result?;
+            let (raw, entries, verified, started) = self.target_work(result)?;
             if lock != LockState::Unlocked {
                 return Err(AdapterError);
             }
@@ -1363,6 +1474,9 @@ impl WdaAdapter {
         if result.is_err() {
             self.targets = None;
             self.target_snapshot = None;
+            if self.error_diagnostic == Some(AdapterDiagnostic::TargetBudget) {
+                self.clear_budget_targets();
+            }
             self.error_diagnostic
                 .get_or_insert(AdapterDiagnostic::TargetCapture);
         }
@@ -1736,7 +1850,7 @@ impl WdaAdapter {
             .runtime
             .as_ref()
             .expect("adapter runtime")
-            .block_on(rich_context(&wda, &input.key.session, ATTRS, async {
+            .block_on(target_context(&wda, &input.key.session, async {
                 let Captured {
                     xml,
                     items,
@@ -1757,7 +1871,7 @@ impl WdaAdapter {
                 self.text_response_poisoned = true;
                 return Err(e);
             }
-            Ok(r) => r?,
+            Ok(r) => self.target_work(r)?,
         };
         self.validate_owned()?;
         if self.cache_key().as_ref() != Some(&input.key) {
@@ -1992,6 +2106,7 @@ mod tests {
         image: ScreenImage,
         settings: RefCell<Value>,
         source_reads: Cell<usize>,
+        preflight_reads: Cell<usize>,
         inventory_reads: Cell<usize>,
         image_reads: Cell<usize>,
         inputs: Cell<usize>,
@@ -2004,6 +2119,7 @@ mod tests {
         second_image_delay: Duration,
         restoration_fails: bool,
         settings_requests: Cell<usize>,
+        settings_writes: Cell<usize>,
         first_app_read: Cell<Option<Instant>>,
         last_lock_read: Cell<Option<Instant>>,
         active_id: String,
@@ -2041,6 +2157,7 @@ mod tests {
                 },
                 settings: RefCell::new(Self::original_settings()),
                 source_reads: Cell::new(0),
+                preflight_reads: Cell::new(0),
                 inventory_reads: Cell::new(0),
                 image_reads: Cell::new(0),
                 inputs: Cell::new(0),
@@ -2053,6 +2170,7 @@ mod tests {
                 second_image_delay: Duration::ZERO,
                 restoration_fails: false,
                 settings_requests: Cell::new(0),
+                settings_writes: Cell::new(0),
                 first_app_read: Cell::new(None),
                 last_lock_read: Cell::new(None),
                 active_id: "native-one".into(),
@@ -2112,6 +2230,7 @@ mod tests {
             let now_ms = unix_ms().unwrap();
             Snapshot {
                 key: key.clone(),
+                cost: super::super::outline::xml_cost(&self.xml).unwrap(),
                 xml: self.xml.clone(),
                 items: self.items.clone(),
                 app: "example.app".into(),
@@ -2149,6 +2268,7 @@ mod tests {
                     tokio::time::sleep(self.setup_delay).await;
                 }
                 if method == "POST" {
+                    self.settings_writes.set(self.settings_writes.get() + 1);
                     let settings =
                         serde_json::from_slice::<Value>(body).unwrap()["settings"].clone();
                     let restoring = settings == Self::original_settings();
@@ -2169,6 +2289,15 @@ mod tests {
                 }
                 result
             } else if path == SOURCE {
+                // Cost preflight runs before the rich transaction; only the
+                // paired source participates in the inventory overlap fixture.
+                if self.settings.borrow()["shouldUseCompactResponses"] == true {
+                    self.preflight_reads.set(self.preflight_reads.get() + 1);
+                    return Ok(HttpResponse {
+                        status: 200,
+                        body: serde_json::to_vec(&json!({"value":self.xml})).unwrap(),
+                    });
+                }
                 self.source_reads.set(self.source_reads.get() + 1);
                 if self.overlap {
                     self.source_started.notify_one();
@@ -2269,6 +2398,93 @@ mod tests {
         .await??;
         let mut actions = WdaActions::bound_to_existing(&input.key.session)?;
         dispatch_target(fake, &mut actions, input, deadline).await
+    }
+
+    #[tokio::test]
+    async fn oversized_target_capture_never_enters_settings_even_with_cached_snapshot() {
+        let runner = tokio::spawn(async {});
+        let key = fixture_key(runner.id());
+        let mut fake = FullCapture::new();
+        for nodes in [351, 1881] {
+            fake.xml = format!(
+                "<AppiumAUT>{}</AppiumAUT>",
+                "<XCUIElementTypeOther/>".repeat(nodes)
+            );
+            let cached = fake.snapshot(&key, Duration::ZERO);
+            for snapshot in [None, Some(&cached)] {
+                let mut stage = AdapterDiagnostic::TargetCapture;
+                let result = projected_targets(
+                    &fake,
+                    &key,
+                    snapshot,
+                    |_, _, _, _, _, _| panic!("budget must refuse before OCR"),
+                    &mut stage,
+                )
+                .await;
+                assert!(result.unwrap().is_err());
+                assert_eq!(stage, AdapterDiagnostic::TargetBudget);
+                assert_eq!(fake.settings_requests.get(), 0);
+                assert_eq!(fake.inventory_reads.get(), 0);
+                assert_eq!(fake.image_reads.get(), 0);
+                assert_eq!(fake.inputs.get(), 0);
+            }
+        }
+        assert_eq!(fake.preflight_reads.get(), 4);
+        fake.xml = XML.into();
+        assert!(
+            projected_targets(
+                &fake,
+                &key,
+                None,
+                fixture_projection,
+                &mut AdapterDiagnostic::TargetCapture
+            )
+            .await
+            .unwrap()
+            .is_ok()
+        );
+        assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
+        assert_eq!(fake.inventory_reads.get(), 1);
+        assert_eq!(fake.inputs.get(), 0);
+        runner.await.unwrap();
+    }
+
+    #[test]
+    fn budget_refusal_invalidates_all_prepared_and_cached_target_authority() {
+        let mut adapter = WdaAdapter::new(HardwareId::new("fixture").unwrap()).unwrap();
+        let task = adapter.runtime.as_ref().unwrap().spawn(async {});
+        let key = fixture_key(task.id());
+        let fake = FullCapture::new();
+        let snapshot = fake.snapshot(&key, Duration::ZERO);
+        let input = fake.input(key.clone(), Instant::now() + AGE);
+        let entries = vec![input.bound.clone()];
+        adapter.target_delta =
+            Some(delta::DeltaBaseline::from_full(Revision(7), &snapshot, &entries).unwrap());
+        adapter.target_snapshot = Some(snapshot);
+        adapter.targets = Some(Targets {
+            key,
+            revision: Some(Revision(7)),
+            app: input.app.clone(),
+            until: input.until,
+            entries,
+        });
+        adapter.target_input = Some(input.clone());
+        adapter.target_readback = Some(input);
+        assert_eq!(
+            adapter.target_work::<()>(Err(TargetWorkError::Budget)),
+            Err(AdapterError)
+        );
+        assert_eq!(
+            adapter.error_diagnostic,
+            Some(AdapterDiagnostic::TargetBudget)
+        );
+        assert!(!adapter.text_response_poisoned);
+        assert!(adapter.targets.is_none());
+        assert!(adapter.target_snapshot.is_none());
+        assert!(adapter.target_delta.is_none());
+        assert!(adapter.target_input.is_none());
+        assert!(adapter.target_readback.is_none());
+        assert!(adapter.target_rect("unused").is_none());
     }
 
     #[tokio::test]
@@ -2702,6 +2918,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn target_publication_recaptures_a_snapshot_near_original_expiry() {
+        let runner = tokio::spawn(async {});
+        let key = fixture_key(runner.id());
+        let fake = FullCapture::new();
+        let original = fake.snapshot(&key, Duration::from_millis(4500));
+        assert!(original.evidence.reusable().unwrap());
+        assert!(!original.evidence.actionable().unwrap());
+        let (raw, _, fresh) = projected_targets(
+            &fake,
+            &key,
+            Some(&original),
+            fixture_projection,
+            &mut AdapterDiagnostic::TargetCapture,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_ne!(raw.window, original.evidence.window);
+        assert!(fresh.evidence.actionable().unwrap());
+        assert_eq!(fake.preflight_reads.get(), 1);
+        assert_eq!(fake.source_reads.get(), 1);
+        assert_eq!(fake.inventory_reads.get(), 1);
+        assert_eq!(fake.inputs.get(), 0);
+        runner.await.unwrap();
+    }
+
+    #[test]
+    fn publication_headroom_bounds_both_original_clocks_without_renewing_them() {
+        let now = Instant::now();
+        let window = EvidenceWindow {
+            window: ObservationWindow {
+                started_unix_ms: 9900,
+                finished_unix_ms: 10000,
+            },
+            started: now - Duration::from_millis(100),
+            finished: now,
+        };
+        let limit = CACHE_WINDOW_MS - ACTION_HEADROOM_MS;
+        assert!(window.actionable_at(now + Duration::from_millis(limit - 1), 10000 + limit - 1));
+        assert!(!window.actionable_at(now + Duration::from_millis(limit), 10000));
+        assert!(!window.actionable_at(now, 10000 + limit));
+        assert!(window.reusable_at(now + Duration::from_millis(limit), 10000 + limit));
+        assert_eq!(window.window.finished_unix_ms, 10000);
+        assert_eq!(window.finished, now);
+    }
+
+    #[tokio::test]
+    async fn immutable_snapshot_replay_skips_only_the_budget_and_enumeration_reads() {
+        let runner = tokio::spawn(async {});
+        let key = fixture_key(runner.id());
+        let mut fake = FullCapture::new();
+        let cached = fake.snapshot(&key, Duration::from_millis(100));
+        fake.restoration_fails = true;
+        // Unseen hierarchy growth cannot trigger a fresh broad enumeration
+        // through a count hint: this path only replays bounded original data.
+        fake.xml = format!(
+            "<AppiumAUT>{}</AppiumAUT>",
+            "<XCUIElementTypeOther/>".repeat(1881)
+        );
+        let (raw, _, replayed) = projected_targets(
+            &fake,
+            &key,
+            Some(&cached),
+            fixture_projection,
+            &mut AdapterDiagnostic::TargetCapture,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(raw.window, cached.evidence.window);
+        assert_eq!(replayed.xml, cached.xml);
+        assert_eq!(replayed.evidence.until(), cached.evidence.until());
+        assert_eq!(replayed.cost.nodes, cached.cost.nodes);
+        assert_eq!(fake.settings_writes.get(), 0);
+        assert_eq!(fake.preflight_reads.get(), 0);
+        assert_eq!(fake.source_reads.get(), 0);
+        assert_eq!(fake.inventory_reads.get(), 0);
+        assert_eq!(fake.image_reads.get(), 2);
+        assert_eq!(fake.inputs.get(), 0);
+        assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
+        runner.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn changed_same_app_frame_cannot_lend_a_small_snapshot_count_to_city() {
+        let runner = tokio::spawn(async {});
+        let key = fixture_key(runner.id());
+        let mut fake = FullCapture::new();
+        let cached = fake.snapshot(&key, Duration::ZERO);
+        fake.image.bytes.push(0);
+        fake.xml = format!(
+            "<AppiumAUT>{}</AppiumAUT>",
+            "<XCUIElementTypeOther/>".repeat(1881)
+        );
+        let mut stage = AdapterDiagnostic::TargetCapture;
+        assert!(
+            projected_targets(
+                &fake,
+                &key,
+                Some(&cached),
+                |_, _, _, _, _, _| panic!("no projection after budget refusal"),
+                &mut stage,
+            )
+            .await
+            .unwrap()
+            .is_err()
+        );
+        assert_eq!(stage, AdapterDiagnostic::TargetBudget);
+        assert_eq!(fake.preflight_reads.get(), 1);
+        assert_eq!(fake.settings_writes.get(), 0);
+        assert_eq!(fake.inventory_reads.get(), 0);
+        assert_eq!(fake.inputs.get(), 0);
+        runner.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_preserves_evidence_window_and_expiry_but_recaptures_stale_or_invalid_evidence() {
         let runner = tokio::spawn(async {});
         let key = fixture_key(runner.id());
@@ -2720,6 +3052,7 @@ mod tests {
         assert_eq!(raw.window, original.evidence.window);
         assert_eq!(reused.evidence.until(), original.evidence.until());
         assert_eq!(fake.source_reads.get(), 0);
+        assert_eq!(fake.preflight_reads.get(), 0);
         assert!(accept_fixture_capture(raw).is_ok());
         for mode in 0..3 {
             let fake = FullCapture::new();
@@ -2742,6 +3075,7 @@ mod tests {
             assert_ne!(raw.window, stale.evidence.window);
             assert!(fresh.evidence.until() > stale.evidence.until());
             assert_eq!(fake.source_reads.get(), 1);
+            assert_eq!(fake.preflight_reads.get(), 1);
             assert_eq!(fake.inventory_reads.get(), 1);
             assert_eq!(fake.inputs.get(), 0);
         }
@@ -3163,19 +3497,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cache_aging_during_reads_projection_or_restoration_gets_one_fresh_capture() {
+    async fn cache_aging_during_reads_or_projection_gets_one_fresh_capture() {
         let runner = tokio::spawn(async {});
         let key = fixture_key(runner.id());
-        for mode in 0..3 {
+        for mode in 0..2 {
             let mut fake = FullCapture::new();
             let delay = Duration::from_millis(600);
             if mode == 0 {
                 fake.second_image_delay = delay;
             }
-            if mode == 2 {
-                fake.restoration_delay = delay;
-            }
-            let original = fake.snapshot(&key, Duration::from_millis(4_500));
+            let original = fake.snapshot(&key, Duration::from_millis(2_500));
             let projections = Cell::new(0);
             let (raw, _, fresh) = projected_targets(
                 &fake,

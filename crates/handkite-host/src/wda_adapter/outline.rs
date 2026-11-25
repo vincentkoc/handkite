@@ -8,14 +8,19 @@ use quick_xml::events::Event;
 // original bracket/deadline still decides whether a capture is admissible.
 const VISIBILITY_NODE_LIMIT: usize = 350;
 
+#[derive(Clone)]
 pub(super) struct Cost {
     pub nodes: usize,
     web_view: bool,
 }
 
 impl Cost {
+    pub fn within_visibility_budget(&self) -> bool {
+        self.nodes <= VISIBILITY_NODE_LIMIT
+    }
+
     pub fn enrich_visibility(&self) -> bool {
-        self.nodes <= VISIBILITY_NODE_LIMIT && !self.web_view
+        self.within_visibility_budget() && !self.web_view
     }
 }
 
@@ -26,6 +31,10 @@ pub(super) fn cost(response: &HttpResponse) -> Result<Cost, AdapterError> {
     let value: serde_json::Value =
         serde_json::from_slice(&response.body).map_err(|_| AdapterError)?;
     let xml = value["value"].as_str().ok_or(AdapterError)?;
+    xml_cost(xml)
+}
+
+pub(super) fn xml_cost(xml: &str) -> Result<Cost, AdapterError> {
     let mut reader = quick_xml::Reader::from_str(xml);
     let mut cost = Cost {
         nodes: 0,

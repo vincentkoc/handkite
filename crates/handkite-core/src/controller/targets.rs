@@ -356,6 +356,7 @@ mod tests {
         stale_readback: bool,
         updates: Vec<TargetEffectReport>,
         fresh_report_on_read: bool,
+        diagnostic: Option<AdapterDiagnostic>,
     }
     fn raw() -> RawObservation {
         let now = SystemTime::now()
@@ -382,6 +383,10 @@ mod tests {
         }
     }
     impl DeviceAdapter for Adapter {
+        fn take_error_diagnostic(&mut self) -> Option<AdapterDiagnostic> {
+            self.diagnostic.take()
+        }
+
         fn target_effect_updates(&mut self) -> Vec<TargetEffectReport> {
             if self.fresh_report_on_read {
                 std::thread::sleep(Duration::from_millis(2));
@@ -524,6 +529,24 @@ mod tests {
         ElementAction::Tap {
             target_id: ID.into(),
         }
+    }
+
+    #[test]
+    fn target_budget_refusal_clears_old_revision_without_poisoning_other_observes() {
+        let (c, d, l, r) = fixture(Adapter {
+            diagnostic: Some(AdapterDiagnostic::TargetBudget),
+            ..Default::default()
+        });
+        assert!(matches!(
+            c.observe_targets_since(&d, Some(r)),
+            Err(ControllerError::AdapterAt(AdapterDiagnostic::TargetBudget))
+        ));
+        assert!(matches!(
+            c.act_element("owner", l, &d, r, tap()),
+            Err(ControllerError::StaleRevision)
+        ));
+        assert_eq!(c.inner.lock().unwrap().adapter.sends, 0);
+        assert!(c.observe(&d).is_ok());
     }
     fn effect_report(effect: ObservedEffect) -> TargetEffectReport {
         let raw = raw();
