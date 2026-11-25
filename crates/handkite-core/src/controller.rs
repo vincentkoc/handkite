@@ -193,6 +193,15 @@ pub trait DeviceAdapter {
     ) -> Result<LaunchReadback, AdapterError> {
         self.observe_navigation().map(LaunchReadback::Observation)
     }
+    /// The existing second launch read, with expected apps available for diagnostics.
+    /// It must return a complete observation, never a transition marker.
+    fn observe_launch_retry(
+        &mut self,
+        _source: &str,
+        _destination: &str,
+    ) -> Result<RawObservation, AdapterError> {
+        self.observe_navigation()
+    }
     fn prepare_navigation(
         &mut self,
         _action: &Action,

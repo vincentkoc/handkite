@@ -837,6 +837,7 @@ mod tests {
             };
             let input = Input {
                 token: 1,
+                text_basis: None,
                 key: b.key.clone(),
                 app: b.app.clone(),
                 bound: b.entries[0].0.clone(),
@@ -881,6 +882,7 @@ mod tests {
         let mut adapter = WdaAdapter::new(HardwareId::new("fixture").unwrap()).unwrap();
         adapter.target_input = Some(Input {
             token: 1,
+            text_basis: None,
             key: b.key.clone(),
             app: b.app.clone(),
             bound: bound.clone(),

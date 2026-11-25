@@ -14,6 +14,8 @@ pub(super) use delta::DeltaBaseline;
 mod fast;
 #[path = "targets_pending.rs"]
 mod pending;
+#[path = "targets_text.rs"]
+mod text;
 pub(super) use pending::PendingEffect;
 #[path = "targets_ocr.rs"]
 mod vision;
@@ -129,6 +131,7 @@ pub(super) struct Input {
     bound: Bound,
     action: ElementAction,
     until: Instant,
+    text_basis: Option<Snapshot>,
 }
 
 impl Input {
@@ -855,6 +858,13 @@ async fn revalidate(
     app_matches(wda, &key.session, app).await
 }
 
+async fn revalidate_input(wda: &impl WdaRequest, input: &Input) -> Result<(), AdapterError> {
+    match &input.text_basis {
+        Some(snapshot) => text::revalidate(wda, input, snapshot).await,
+        None => revalidate(wda, &input.key, &input.app, &input.bound, &input.action).await,
+    }
+}
+
 async fn dispatch_target(
     wda: &impl WdaRequest,
     actions: &mut WdaActions,
@@ -906,6 +916,7 @@ pub(crate) async fn dispatch_native(
         return Err(AdapterError);
     }
     if let ElementAction::Text { value, .. } = action {
+        let _keys = crate::timing::Span::new("target_keys");
         let mut receipt = WdaActions::execute_on_diagnostic(
             wda,
             &Action::TextCurrent {
@@ -1220,6 +1231,7 @@ impl WdaAdapter {
                 .is_some_and(|input| input.bound.ocr.is_some())
         {
             let readback = self.read_target_effect(token);
+            let _next = crate::timing::Span::new("target_next_capture");
             let next = self.capture_targets();
             return TargetCompletion { readback, next };
         }
@@ -1455,6 +1467,7 @@ impl WdaAdapter {
         action: &ElementAction,
         baseline: &Observation,
     ) -> Result<PreparedTarget, AdapterError> {
+        let _timing = crate::timing::Span::new("target_prepare");
         let rect = self.target_rect(action.target_id());
         self.settle_for_target(rect)?;
         self.error_diagnostic = Some(AdapterDiagnostic::TargetPrepare);
@@ -1501,6 +1514,18 @@ impl WdaAdapter {
             return Err(AdapterError);
         }
         self.text_token = self.text_token.checked_add(1).ok_or(AdapterError)?;
+        let text_basis = if matches!(action, ElementAction::Text { .. }) {
+            self.target_snapshot
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot.key == key
+                        && snapshot.app == app
+                        && snapshot.evidence.window == baseline.window
+                })
+                .and_then(|snapshot| text::basis(snapshot, &bound))
+        } else {
+            None
+        };
         let input = Input {
             token: self.text_token,
             key,
@@ -1508,6 +1533,7 @@ impl WdaAdapter {
             bound,
             action: action.clone(),
             until,
+            text_basis,
         };
         let prepared = input.prepared(&self.expected, baseline);
         self.target_input = Some(input);
@@ -1521,6 +1547,7 @@ impl WdaAdapter {
         token: u64,
         deadline: Instant,
     ) -> Result<TransportReceipt, AdapterError> {
+        let _timing = crate::timing::Span::new("target_send");
         self.error_diagnostic = Some(AdapterDiagnostic::TargetRevalidation);
         // Consume before any dispatch, including an uncertain transport result.
         let input = self.target_input.take().ok_or(AdapterError)?;
@@ -1571,12 +1598,14 @@ impl WdaAdapter {
                     .await
                     .map(|result| result.map(Some))
                 } else {
+                    let _precheck = crate::timing::Span::new("target_text_precheck");
+                    crate::timing::outcome(
+                        "target_text_context_reused",
+                        input.text_basis.is_some(),
+                    );
                     rich_context(&context_wda, &input.key.session, ATTRS, async {
-                        before_input_deadline(
-                            deadline,
-                            revalidate(&context_wda, &input.key, &input.app, &input.bound, action),
-                        )
-                        .await
+                        before_input_deadline(deadline, revalidate_input(&context_wda, &input))
+                            .await
                     })
                     .await
                     .map(|result| result.map(|_| None))
@@ -1616,6 +1645,7 @@ impl WdaAdapter {
         // Once the dispatch future is entered, a timeout or transport error may
         // have followed delivery. Never report those results as not sent.
         self.error_diagnostic = None;
+        let dispatch_timing = crate::timing::Span::new("target_input_dispatch");
         let receipt = self
             .runtime
             .as_ref()
@@ -1626,6 +1656,7 @@ impl WdaAdapter {
                 &input,
                 dispatch_deadline,
             ))?;
+        drop(dispatch_timing);
         if let ElementAction::Text { value, .. } = action {
             self.focused_text = Some(super::focused_text::Input {
                 token,
@@ -1981,6 +2012,10 @@ mod tests {
         display_change_after_images: Option<usize>,
         changed_second_image: bool,
         active_reads: Cell<usize>,
+        hittable: bool,
+        last_predicate: RefCell<String>,
+        scale: f64,
+        window_size: [f64; 2],
     }
 
     impl FullCapture {
@@ -2026,6 +2061,10 @@ mod tests {
                 display_change_after_images: None,
                 changed_second_image: false,
                 active_reads: Cell::new(0),
+                hittable: true,
+                last_predicate: RefCell::new(String::new()),
+                scale: 1.,
+                window_size: [400., 800.],
             }
         }
 
@@ -2039,6 +2078,7 @@ mod tests {
             let bound = entries.remove(0);
             Input {
                 token: 17,
+                text_basis: None,
                 key,
                 app: "example.app".into(),
                 action: ElementAction::Tap {
@@ -2140,6 +2180,11 @@ mod tests {
                 json!(self.xml)
             } else if path.ends_with("/elements") {
                 assert_eq!(method, "POST");
+                *self.last_predicate.borrow_mut() = serde_json::from_slice::<Value>(body).unwrap()
+                    ["value"]
+                    .as_str()
+                    .unwrap()
+                    .into();
                 self.inventory_reads.set(self.inventory_reads.get() + 1);
                 if self.overlap {
                     self.inventory_started.notify_one();
@@ -2179,13 +2224,18 @@ mod tests {
                 self.active_reads.set(self.active_reads.get() + 1);
                 json!({"ELEMENT":self.active_id})
             } else if path == "/wda/screen" {
-                json!({"scale":1.0})
+                json!({"scale":self.scale})
             } else if path == "/wda/screens" {
                 json!([{"displayId":1,"scale":1.0}])
             } else if path.ends_with("/window/size") {
-                json!({"width":400,"height":800})
+                json!({"width":self.window_size[0],"height":self.window_size[1]})
             } else if path.ends_with("/attribute/hittable") {
-                json!(true)
+                json!(self.hittable)
+            } else if path.ends_with("/wda/keys") {
+                assert_eq!(method, "POST");
+                assert_eq!(*self.settings.borrow(), Self::original_settings());
+                self.inputs.set(self.inputs.get() + 1);
+                Value::Null
             } else if path.ends_with("/element/native-one/click") {
                 assert_eq!(method, "POST");
                 assert_eq!(*self.settings.borrow(), Self::original_settings());
@@ -2214,10 +2264,7 @@ mod tests {
             fake,
             &input.key.session,
             ATTRS,
-            before_input_deadline(
-                deadline,
-                revalidate(fake, &input.key, &input.app, &input.bound, &input.action),
-            ),
+            before_input_deadline(deadline, revalidate_input(fake, input)),
         )
         .await??;
         let mut actions = WdaActions::bound_to_existing(&input.key.session)?;
@@ -2720,6 +2767,232 @@ mod tests {
         bound.public.can_type = true;
         bound.public.text_only = true;
         (fake, bound)
+    }
+
+    fn text_context_fixture(key: cache::Key) -> (FullCapture, Input, Snapshot) {
+        let (mut fake, mut bound) = text_fixture();
+        bound.public.text_only = true;
+        bound.mapping = Some(fast::Mapping {
+            viewport: [0., 0., 400., 800.],
+            scale: 1.,
+            display_id: None,
+        });
+        let snapshot = fake.snapshot(&key, Duration::ZERO);
+        assert!(text::basis(&snapshot, &bound).is_some());
+        let mut app = item();
+        app["ELEMENT"] = json!("application");
+        app["element-6066-11e4-a52e-4f735466cecf"] = json!("application");
+        app["type"] = json!("XCUIElementTypeApplication");
+        app["rect"] = json!({"x":0,"y":0,"width":400,"height":800});
+        fake.items.as_array_mut().unwrap().push(app);
+        let input = Input {
+            token: 17,
+            key,
+            app: "example.app".into(),
+            action: ElementAction::Text {
+                target_id: bound.public.target_id.clone(),
+                value: "fixture".into(),
+            },
+            bound,
+            until: Instant::now() + AGE,
+            text_basis: Some(snapshot.clone()),
+        };
+        (fake, input, snapshot)
+    }
+
+    #[tokio::test]
+    async fn recent_full_text_context_uses_live_native_facts_without_source() {
+        let runner = tokio::spawn(async {});
+        let (fake, input, snapshot) = text_context_fixture(fixture_key(runner.id()));
+        let result = rich_context(
+            &fake,
+            "session",
+            ATTRS,
+            text::revalidate(&fake, &input, &snapshot),
+        )
+        .await
+        .unwrap();
+        assert!(result.is_ok());
+        assert_eq!(fake.source_reads.get(), 0);
+        assert_eq!(fake.inventory_reads.get(), 1);
+        assert_eq!(fake.image_reads.get(), 2);
+        assert_eq!(fake.inputs.get(), 0);
+        assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
+        for kind in [
+            "Application",
+            "Alert",
+            "Sheet",
+            "SecureTextField",
+            "TextField",
+            "TextView",
+            "SearchField",
+            "Keyboard",
+        ] {
+            assert!(
+                fake.last_predicate
+                    .borrow()
+                    .contains(&format!("XCUIElementType{kind}"))
+            );
+        }
+        assert!(fake.last_predicate.borrow().contains(r"\p{Cc}"));
+    }
+
+    #[tokio::test]
+    async fn default_text_selects_narrow_or_full_proof_before_one_send() {
+        let runner = tokio::spawn(async {});
+        for narrow in [true, false] {
+            let (fake, mut input, _) = text_context_fixture(fixture_key(runner.id()));
+            if !narrow {
+                input.text_basis = None;
+            }
+            let receipt = checked_dispatch(&fake, &input, Instant::now() + Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(receipt.accepted, Some(true));
+            assert_eq!(receipt.action_kind, "text_element");
+            assert_eq!(fake.source_reads.get() == 0, narrow);
+            assert_eq!(fake.inputs.get(), 1);
+            assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
+        }
+    }
+
+    #[tokio::test]
+    async fn fresh_text_contradictions_refuse_without_source_fallback() {
+        let runner = tokio::spawn(async {});
+        for mode in 0..16 {
+            let (mut fake, input, _) = text_context_fixture(fixture_key(runner.id()));
+            match mode {
+                0 => fake.active_id = "different".into(),
+                1 => fake.items[0]["attribute/value"] = json!("changed"),
+                2 => fake.items[0]["attribute/selected"] = json!(true),
+                3 => fake.items[0]["attribute/focused"] = json!(true),
+                4 => fake.items[0]["rect"]["x"] = json!(11),
+                5 => fake.items[0]["displayed"] = json!(false),
+                6 => fake.items[0]["enabled"] = json!(false),
+                7 => {
+                    fake.items.as_array_mut().unwrap().remove(1);
+                }
+                8..=10 => {
+                    let mut unsafe_row = item();
+                    unsafe_row["ELEMENT"] = json!("unsafe");
+                    unsafe_row["element-6066-11e4-a52e-4f735466cecf"] = json!("unsafe");
+                    unsafe_row["type"] = json!(match mode {
+                        8 => "XCUIElementTypeSecureTextField",
+                        9 => "XCUIElementTypeAlert",
+                        _ => "XCUIElementTypeSheet",
+                    });
+                    unsafe_row["displayed"] = json!(false);
+                    fake.items.as_array_mut().unwrap().push(unsafe_row);
+                }
+                11 => fake.items[2]["rect"]["width"] = json!(399),
+                12 => fake.items[0]["label"] = json!("Enter\u{0001} Passcode"),
+                13 => fake.app = "unexpected.app",
+                14 => fake.hittable = false,
+                _ => {
+                    fake.items[0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("attribute/selected");
+                }
+            }
+            let result =
+                checked_dispatch(&fake, &input, Instant::now() + Duration::from_secs(5)).await;
+            assert!(result.is_err(), "mode {mode}");
+            assert_eq!(fake.source_reads.get(), 0);
+            assert_eq!(fake.inputs.get(), 0);
+            assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_text_region_changes_and_restoration_failure_never_send() {
+        let runner = tokio::spawn(async {});
+        for mode in 0..4 {
+            let (mut fake, mut input, _) = text_context_fixture(fixture_key(runner.id()));
+            input.bound.public.text_only = false;
+            input.bound.region = Some(
+                super::super::targets_pixels::Pixels::decode(&fake.image.bytes)
+                    .unwrap()
+                    .region([0., 0., 400., 800.], &input.bound.attrs, &mut 0)
+                    .unwrap(),
+            );
+            if mode == 1 {
+                fake.changed_second_image = true;
+            } else if mode == 2 {
+                let mut bytes = Vec::new();
+                let mut pixels = vec![255; 400 * 800];
+                pixels[25 * 400 + 25] = 0;
+                let mut encoder = png::Encoder::new(&mut bytes, 400, 800);
+                encoder.set_color(png::ColorType::Grayscale);
+                encoder.set_depth(png::BitDepth::Eight);
+                encoder
+                    .write_header()
+                    .unwrap()
+                    .write_image_data(&pixels)
+                    .unwrap();
+                fake.image.bytes = bytes;
+            } else if mode == 3 {
+                fake.restoration_fails = true;
+            }
+            let result =
+                checked_dispatch(&fake, &input, Instant::now() + Duration::from_secs(5)).await;
+            assert_eq!(result.is_ok(), mode == 0);
+            assert_eq!(fake.inputs.get(), usize::from(mode == 0));
+            assert_eq!(fake.source_reads.get(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_text_context_never_gets_a_new_capture_timestamp() {
+        let runner = tokio::spawn(async {});
+        let (fake, input, mut snapshot) = text_context_fixture(fixture_key(runner.id()));
+        snapshot.evidence.started -= Duration::from_secs(6);
+        snapshot.evidence.finished -= Duration::from_secs(6);
+        assert!(text::basis(&snapshot, &input.bound).is_none());
+        assert!(text::revalidate(&fake, &input, &snapshot).await.is_err());
+        assert_eq!(fake.inventory_reads.get(), 0);
+        assert_eq!(fake.source_reads.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn text_only_mapping_changes_refuse_before_dispatch() {
+        let runner = tokio::spawn(async {});
+        for mode in 0..4 {
+            let (mut fake, mut input, _) = text_context_fixture(fixture_key(runner.id()));
+            assert!(input.bound.public.text_only);
+            match mode {
+                0 => {
+                    fake.display_change_after_images = Some(2);
+                    input.bound.mapping.as_mut().unwrap().display_id = Some(1);
+                    input.text_basis.as_mut().unwrap().display_id = Some(1);
+                }
+                1 => fake.scale = 2.,
+                2 => fake.window_size[0] = 399.,
+                _ => {
+                    let mut bytes = Vec::new();
+                    let mut encoder = png::Encoder::new(&mut bytes, 399, 800);
+                    encoder.set_color(png::ColorType::Grayscale);
+                    encoder.set_depth(png::BitDepth::Eight);
+                    encoder
+                        .write_header()
+                        .unwrap()
+                        .write_image_data(&vec![255; 399 * 800])
+                        .unwrap();
+                    fake.image.bytes = bytes;
+                }
+            }
+            assert!(
+                checked_dispatch(&fake, &input, Instant::now() + Duration::from_secs(5))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(fake.inputs.get(), 0);
+            assert_eq!(fake.source_reads.get(), 0);
+            assert_eq!(*fake.settings.borrow(), FullCapture::original_settings());
+            if mode == 0 {
+                assert_eq!(fake.image_reads.get(), 2);
+            }
+        }
     }
 
     #[test]

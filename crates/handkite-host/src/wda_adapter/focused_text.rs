@@ -184,7 +184,7 @@ fn rect(attrs: &Attributes) -> Option<[f64; 4]> {
     ])
 }
 
-fn field_from_context(
+pub(super) fn field_from_context(
     items: &Value,
     snapshot: &crate::wda_ui_admission::TextSnapshot,
 ) -> Result<(String, String), AdapterError> {
@@ -377,6 +377,7 @@ fn context_matches(item: &Value, attrs: &Attributes, expected: &Attributes) -> b
 }
 
 pub(super) async fn active(wda: &impl WdaRequest, session: &str) -> Result<String, AdapterError> {
+    let _focus = crate::timing::Span::new("text_focus_query");
     id(&value(
         wda,
         session,

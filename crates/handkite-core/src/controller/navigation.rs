@@ -111,11 +111,16 @@ impl<A: DeviceAdapter> Controller<A> {
         device: &DeviceKey,
         home_retry: Option<bool>,
         launch: Option<(&str, &str)>,
+        launch_retry: bool,
     ) -> Result<Readback, ControllerError> {
         let raw = match (home_retry, launch) {
             (Some(retry), _) => inner
                 .adapter
                 .observe_home_readback(retry)
+                .map(LaunchReadback::Observation),
+            (None, Some((source, destination))) if launch_retry => inner
+                .adapter
+                .observe_launch_retry(source, destination)
                 .map(LaunchReadback::Observation),
             (None, Some((source, destination))) => {
                 inner.adapter.observe_launch_readback(source, destination)
@@ -126,7 +131,7 @@ impl<A: DeviceAdapter> Controller<A> {
                 .map(LaunchReadback::Observation),
         };
         match raw {
-            Ok(LaunchReadback::Transition) if launch.is_some() => Ok(Readback {
+            Ok(LaunchReadback::Transition) if launch.is_some() && !launch_retry => Ok(Readback {
                 observation: None,
                 transition: true,
             }),
@@ -243,6 +248,7 @@ impl<A: DeviceAdapter> Controller<A> {
             &request.device,
             home_readback.then_some(false),
             launch,
+            false,
         )?;
         let mut after = first.observation;
         if retry_navigation_read(
@@ -260,7 +266,8 @@ impl<A: DeviceAdapter> Controller<A> {
                     &mut inner,
                     &request.device,
                     home_readback.then_some(true),
-                    None,
+                    launch,
+                    true,
                 )?
                 .observation;
         }
@@ -361,6 +368,7 @@ mod tests {
         accepted: Option<bool>,
         home_reads: Vec<bool>,
         launch_reads: usize,
+        launch_retries: Vec<(String, String)>,
     }
     impl DeviceAdapter for Adapter {
         fn observe_home_readback(&mut self, retry: bool) -> Result<RawObservation, AdapterError> {
@@ -387,6 +395,15 @@ mod tests {
                 return Ok(LaunchReadback::Transition);
             }
             self.observe_navigation().map(LaunchReadback::Observation)
+        }
+        fn observe_launch_retry(
+            &mut self,
+            source: &str,
+            destination: &str,
+        ) -> Result<RawObservation, AdapterError> {
+            self.launch_retries
+                .push((source.into(), destination.into()));
+            self.observe_navigation()
         }
         fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
             let id = HardwareId::new("fixture").unwrap();
@@ -525,6 +542,7 @@ mod tests {
                 accepted: Some(true),
                 home_reads: Vec::new(),
                 launch_reads: 0,
+                launch_retries: Vec::new(),
             },
             5000,
             5000,
@@ -569,6 +587,7 @@ mod tests {
             assert_eq!(inner.adapter.home_reads, expected);
             assert_eq!(inner.adapter.sends, 1);
             assert!(inner.adapter.post_reads <= 2);
+            assert!(inner.adapter.launch_retries.is_empty());
         }
     }
 
@@ -622,6 +641,10 @@ mod tests {
         assert_eq!(inner.adapter.sends, 1);
         assert_eq!(inner.adapter.post_reads, 2);
         assert!(inner.adapter.home_reads.is_empty());
+        assert_eq!(
+            inner.adapter.launch_retries,
+            [("example.animated".into(), "example.target".into())]
+        );
     }
 
     #[test]
@@ -668,6 +691,7 @@ mod tests {
                 usize::from(accepted == Some(true))
             );
             assert!(inner.adapter.home_reads.is_empty());
+            assert_eq!(inner.adapter.launch_retries.len(), reads.saturating_sub(1));
         }
     }
 

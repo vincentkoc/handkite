@@ -47,6 +47,7 @@ pub(in crate::wda_adapter) fn input(generation: tokio::task::Id) -> Input {
         .unwrap();
     Input {
         token: 1,
+        text_basis: None,
         key: cache::Key {
             device: HardwareId::new("fixture").unwrap(),
             session: "session".into(),

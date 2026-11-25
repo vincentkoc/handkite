@@ -1096,6 +1096,15 @@ impl DeviceAdapter for WdaAdapter {
         self.finish_pending_effect(true)?;
         self.launch_navigation_frame(source, destination)
     }
+    fn observe_launch_retry(
+        &mut self,
+        source: &str,
+        destination: &str,
+    ) -> Result<RawObservation, AdapterError> {
+        let result = self.observe_navigation();
+        navigation::log_launch_retry(source, destination, &result);
+        result
+    }
     fn prepare_navigation(
         &mut self,
         action: &Action,

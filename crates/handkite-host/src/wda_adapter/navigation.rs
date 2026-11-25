@@ -399,6 +399,52 @@ fn same_context(
     before == after && before.0 == app && Some(before.1) == lock
 }
 
+pub(super) fn log_launch_retry(
+    source: &str,
+    destination: &str,
+    result: &Result<RawObservation, AdapterError>,
+) {
+    if !crate::timing::enabled() {
+        return;
+    }
+    crate::timing::outcome("launch_retry_available", result.is_ok());
+    if let Ok(raw) = result {
+        // Adapter facts only: core identity/window admission still follows.
+        for (stage, value) in launch_retry_state(source, destination, &raw.state) {
+            crate::timing::outcome(stage, value);
+        }
+    }
+}
+
+fn launch_retry_state(
+    source: &str,
+    destination: &str,
+    state: &DeviceState,
+) -> [(&'static str, bool); 7] {
+    let app = state
+        .foreground_app
+        .as_deref()
+        .filter(|app| !app.is_empty());
+    [
+        ("launch_retry_app_known", app.is_some()),
+        ("launch_retry_app_source", app == Some(source)),
+        ("launch_retry_app_destination", app == Some(destination)),
+        (
+            "launch_retry_app_other",
+            app.is_some_and(|app| app != source && app != destination),
+        ),
+        (
+            "launch_retry_lock_unlocked",
+            state.lock == LockState::Unlocked,
+        ),
+        ("launch_retry_lock_locked", state.lock == LockState::Locked),
+        (
+            "launch_retry_lock_uncertain",
+            state.lock == LockState::Uncertain,
+        ),
+    ]
+}
+
 fn readback_state(
     native_before: LockState,
     native_after: LockState,
@@ -424,6 +470,34 @@ fn readback_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn second_launch_read_reports_categories_without_app_content() {
+        for (app, expected) in [
+            (Some("private.source"), [true, true, false, false]),
+            (Some("private.destination"), [true, false, true, false]),
+            (Some("private.other"), [true, false, false, true]),
+            (Some(""), [false; 4]),
+            (None, [false; 4]),
+        ] {
+            for lock in [LockState::Unlocked, LockState::Locked, LockState::Uncertain] {
+                let state = DeviceState {
+                    foreground_app: app.map(str::to_owned),
+                    lock,
+                    wda_ready: true,
+                };
+                let outcomes = launch_retry_state("private.source", "private.destination", &state);
+                assert_eq!(
+                    outcomes[..4].iter().map(|(_, ok)| *ok).collect::<Vec<_>>(),
+                    expected
+                );
+                assert_eq!(outcomes[4].1, lock == LockState::Unlocked);
+                assert_eq!(outcomes[5].1, lock == LockState::Locked);
+                assert_eq!(outcomes[6].1, lock == LockState::Uncertain);
+                assert!(outcomes.iter().all(|(stage, _)| !stage.contains("private")));
+            }
+        }
+    }
 
     #[test]
     fn launch_transition_requires_only_expected_unlocked_apps_and_rejects_old_frame() {
