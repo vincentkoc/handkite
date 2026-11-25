@@ -423,3 +423,47 @@ fn wrong_device_home_tree_never_reaches_fallback() {
     assert_eq!(methods, ["observe"]);
     assert_eq!(result["structuredContent"]["code"], "DeviceMismatch");
 }
+
+#[test]
+fn cold_home_marker_requires_fresh_guarded_navigation_and_clears_authority() {
+    for next in [
+        json!({"type":"observed_navigation","observation":observation("unlocked")}),
+        json!({"type":"error","code":"AdapterNativeBefore"}),
+    ] {
+        let mut session = Session::default();
+        session.target_inventory = Some((
+            Revision(3),
+            serde_json::from_value(observation("unlocked")["state"].clone()).unwrap(),
+            vec![],
+        ));
+        let fails = next["type"] == "error";
+        let mut replies =
+            VecDeque::from([json!({"type":"error","code":"AdapterCaptureHome"}), next]);
+        let mut methods = vec![];
+        let result = tool_result(
+            Tool::Observe,
+            presentation::Options {
+                image: presentation::ImageMode::Omit,
+                ..Default::default()
+            },
+            &DeviceKey::new("phone").unwrap(),
+            &mut session,
+            &mut |bytes| {
+                let request: Value = serde_json::from_slice(bytes).unwrap();
+                methods.push(request["method"].as_str().unwrap().to_owned());
+                Ok(serde_json::to_vec(&replies.pop_front().expect("extra capture")).unwrap())
+            },
+        );
+        assert_eq!(methods, ["observe", "observe_navigation"]);
+        assert!(session.target_inventory.is_none());
+        if fails {
+            assert_eq!(result["isError"], true);
+            assert!(!session.home_observe_hint);
+        } else {
+            assert_ne!(result["isError"], true);
+            assert_eq!(result["structuredContent"]["revision_scope"], "navigation");
+            assert_eq!(result["structuredContent"]["target_actionable"], false);
+            assert!(session.home_observe_hint);
+        }
+    }
+}

@@ -434,6 +434,15 @@ where
             return response::text_result(payload);
         }
         Ok(Reply::Observed { observation }) if method == "observe" => observation,
+        Ok(Reply::Error { code }) if method == "observe" && code == "AdapterCaptureHome" => {
+            return navigation_fallback(
+                device,
+                session,
+                exchange,
+                "home_navigation_only",
+                options.image,
+            );
+        }
         Ok(Reply::Error { code })
             if matches!(method, "observe" | "observe_targets")
                 && code == "AdapterCaptureImageDrift" =>

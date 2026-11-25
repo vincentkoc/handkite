@@ -72,6 +72,27 @@ struct CapturePayload {
 enum CaptureFailure {
     Adapter,
     ImageDrift,
+    HomeNavigation,
+}
+
+#[derive(Clone, Copy)]
+enum CaptureSource<'a> {
+    FullTree(&'a str),
+    NavigateHome(&'a str),
+}
+
+impl<'a> From<&'a str> for CaptureSource<'a> {
+    fn from(path: &'a str) -> Self {
+        Self::FullTree(path)
+    }
+}
+
+impl<'a> CaptureSource<'a> {
+    fn path(self) -> &'a str {
+        match self {
+            Self::FullTree(path) | Self::NavigateHome(path) => path,
+        }
+    }
 }
 
 impl From<AdapterError> for CaptureFailure {
@@ -471,6 +492,14 @@ impl WdaAdapter {
         source_path: &str,
         deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
+        self.capture_with_source(source_path.into(), deadline)
+    }
+
+    fn capture_with_source(
+        &self,
+        source_path: CaptureSource<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
         let result = if crate::timing::enabled() {
             let started = Instant::now();
             let mut timings = CaptureTimings::default();
@@ -486,7 +515,7 @@ impl WdaAdapter {
         }) {
             self.cache.clear();
         }
-        if source_path == SCREEN_SOURCE {
+        if source_path.path() == SCREEN_SOURCE {
             if let Ok((raw, captured, reported)) = &result {
                 self.cache
                     .record_full(self.cache_key(), raw, *captured, *reported);
@@ -495,6 +524,26 @@ impl WdaAdapter {
             self.cache.clear_full();
         }
         result
+    }
+
+    fn observe_with_source(
+        &mut self,
+        source: CaptureSource<'_>,
+    ) -> Result<RawObservation, AdapterError> {
+        self.finish_pending_effect(true)?;
+        self.error_diagnostic = None;
+        retry_observe_capture(&Instant::now, |deadline| {
+            self.capture_with_source(source, Some(deadline))
+        })
+        .map(|(observation, _, _)| observation)
+        .map_err(|error| {
+            self.error_diagnostic = match error {
+                CaptureFailure::ImageDrift => Some(AdapterDiagnostic::CaptureImageDrift),
+                CaptureFailure::HomeNavigation => Some(AdapterDiagnostic::CaptureHome),
+                CaptureFailure::Adapter => None,
+            };
+            AdapterError
+        })
     }
 
     fn capture_for_action(&self, allow_reuse: bool) -> Result<CheckedCapture, AdapterError> {
@@ -579,7 +628,7 @@ impl WdaAdapter {
         let result = self
             .finish_pending_effect(true)
             .and_then(|_| {
-                self.capture_checked_recorded(SCREEN_SOURCE, Some(&mut timings), None)
+                self.capture_checked_recorded(SCREEN_SOURCE.into(), Some(&mut timings), None)
                     .map_err(AdapterError::from)
             })
             .map(|(observation, _, _)| observation)
@@ -590,7 +639,7 @@ impl WdaAdapter {
 
     fn capture_checked_recorded(
         &self,
-        source_path: &str,
+        source_path: CaptureSource<'_>,
         mut timings: Option<&mut CaptureTimings>,
         deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
@@ -612,9 +661,14 @@ impl WdaAdapter {
                 timings.as_deref_mut(),
                 deadline,
             ));
-        // Image drift can select a read-only fallback only after ownership has
-        // also survived the capture. Other errors keep their original refusal.
-        if captured.is_ok() || matches!(captured, Err(CaptureFailure::ImageDrift)) {
+        // Read-only fallback markers still require final ownership agreement.
+        // Other errors keep their original refusal.
+        if captured.is_ok()
+            || matches!(
+                captured,
+                Err(CaptureFailure::ImageDrift | CaptureFailure::HomeNavigation)
+            )
+        {
             measure(
                 timings,
                 Stage::OwnershipAfter,
@@ -629,7 +683,7 @@ impl WdaAdapter {
     async fn capture(
         usb: &PinnedUsb,
         expected: &HardwareId,
-        source_path: &str,
+        source_path: CaptureSource<'_>,
         timings: Option<&mut CaptureTimings>,
         deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
@@ -651,7 +705,7 @@ impl WdaAdapter {
     async fn capture_using(
         wda: &impl WdaRequest,
         expected: &HardwareId,
-        source_path: &str,
+        source_path: CaptureSource<'_>,
         started_unix_ms: u64,
         clock: &impl Fn() -> Instant,
         wall: &impl Fn() -> Result<u64, AdapterError>,
@@ -685,7 +739,7 @@ impl WdaAdapter {
 
     async fn capture_payload(
         wda: &impl WdaRequest,
-        source_path: Option<&str>,
+        source_path: Option<CaptureSource<'_>>,
         clock: &impl Fn() -> Instant,
         timings: Option<&mut CaptureTimings>,
         deadline: Option<Instant>,
@@ -711,7 +765,7 @@ impl WdaAdapter {
 
     async fn capture_payload_inner(
         wda: &impl WdaRequest,
-        source_path: Option<&str>,
+        source_path: Option<CaptureSource<'_>>,
         clock: &impl Fn() -> Instant,
         mut timings: Option<&mut CaptureTimings>,
     ) -> Result<CapturePayload, CaptureFailure> {
@@ -782,12 +836,26 @@ impl WdaAdapter {
         } else {
             None
         };
+        if matches!(source_path, Some(CaptureSource::NavigateHome(_)))
+            && let Some((image, app, Some(false))) = &before
+            && app == "com.apple.springboard"
+        {
+            let image = base64::engine::general_purpose::STANDARD
+                .decode(image)
+                .map_err(|_| AdapterError)?;
+            if !image.starts_with(b"\x89PNG\r\n\x1a\n") {
+                return Err(CaptureFailure::Adapter);
+            }
+            // This only selects a fresh navigation capture. It supplies no
+            // image, revision, cached target or input-admission authority.
+            return Err(CaptureFailure::HomeNavigation);
+        }
         let source = if let Some(path) = source_path {
             let (response, timing) = measurement::request(
                 enabled,
                 Stage::SourceRequest,
                 clock,
-                wda.request("GET", path, b"", Duration::from_secs(20)),
+                wda.request("GET", path.path(), b"", Duration::from_secs(20)),
             )
             .await;
             (response.map(Some), timing)
@@ -1118,18 +1186,7 @@ impl DeviceAdapter for WdaAdapter {
     }
 
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
-        self.finish_pending_effect(true)?;
-        self.error_diagnostic = None;
-        retry_observe_capture(&Instant::now, |deadline| {
-            self.capture_checked_diagnosed(SCREEN_SOURCE, Some(deadline))
-        })
-        .map(|(observation, _, _)| observation)
-        .map_err(|error| {
-            if error == CaptureFailure::ImageDrift {
-                self.error_diagnostic = Some(AdapterDiagnostic::CaptureImageDrift);
-            }
-            AdapterError
-        })
+        self.observe_with_source(CaptureSource::NavigateHome(SCREEN_SOURCE))
     }
 
     fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
@@ -1172,7 +1229,7 @@ impl DeviceAdapter for WdaAdapter {
             || !matches!(admission, Some(ActionAdmission::NativeHome { .. }))
             || receipt.accepted != Some(true)
         {
-            return self.observe();
+            return self.observe_with_source(CaptureSource::FullTree(SCREEN_SOURCE));
         }
         let _confirmation = crate::timing::Span::new("home_confirmation");
         let until = Instant::now() + HOME_COMPLETION_BUDGET;
@@ -1208,7 +1265,7 @@ impl DeviceAdapter for WdaAdapter {
                         Self::capture(
                             &self.usb,
                             &self.expected,
-                            SCREEN_SOURCE,
+                            SCREEN_SOURCE.into(),
                             timings.as_mut(),
                             None,
                         )

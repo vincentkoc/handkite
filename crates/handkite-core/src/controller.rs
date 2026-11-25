@@ -42,6 +42,7 @@ pub struct AdapterError;
 pub enum AdapterDiagnostic {
     IdentityCheck,
     CaptureImageDrift,
+    CaptureHome,
     PreActionCapture,
     OwnedBefore,
     NativeBefore,
@@ -68,9 +69,10 @@ pub enum AdapterDiagnostic {
 }
 
 impl AdapterDiagnostic {
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::IdentityCheck,
         Self::CaptureImageDrift,
+        Self::CaptureHome,
         Self::PreActionCapture,
         Self::OwnedBefore,
         Self::NativeBefore,
@@ -100,6 +102,7 @@ impl AdapterDiagnostic {
         match self {
             Self::IdentityCheck => "AdapterIdentityCheck",
             Self::CaptureImageDrift => "AdapterCaptureImageDrift",
+            Self::CaptureHome => "AdapterCaptureHome",
             Self::PreActionCapture => "AdapterPreActionCapture",
             Self::OwnedBefore => "AdapterOwnedBefore",
             Self::NativeBefore => "AdapterNativeBefore",

@@ -249,7 +249,7 @@ mod tests {
             let result = WdaAdapter::capture_using(
                 &reads,
                 &HardwareId::new("fixture-device").unwrap(),
-                SCREEN_SOURCE,
+                SCREEN_SOURCE.into(),
                 17,
                 &Instant::now,
                 &|| Ok(21),
@@ -281,7 +281,7 @@ mod tests {
                 runtime.block_on(WdaAdapter::capture_using(
                     &reads,
                     &HardwareId::new("fixture-device").unwrap(),
-                    SCREEN_SOURCE,
+                    SCREEN_SOURCE.into(),
                     17,
                     &Instant::now,
                     &|| Ok(21),
@@ -306,7 +306,7 @@ mod tests {
             WdaAdapter::capture_using(
                 &reads,
                 &HardwareId::new("fixture-device").unwrap(),
-                SCREEN_SOURCE,
+                SCREEN_SOURCE.into(),
                 17,
                 &Instant::now,
                 &|| Ok(21),
@@ -328,7 +328,7 @@ mod tests {
             WdaAdapter::capture_using(
                 &reads,
                 &HardwareId::new("fixture-device").unwrap(),
-                SCREEN_SOURCE,
+                SCREEN_SOURCE.into(),
                 17,
                 &Instant::now,
                 &|| Ok(21),
@@ -365,7 +365,10 @@ mod tests {
                 }
                 SCREEN_SOURCE => {
                     assert_eq!(budget, Duration::from_secs(20));
-                    (1, json!("private-tree"))
+                    (
+                        if self.case == 13 { 12_000 } else { 1 },
+                        json!("private-tree"),
+                    )
                 }
                 "/wda/activeAppInfo" => (2, json!({"bundleId":"private-app"})),
                 "/wda/locked" => (3, json!(false)),
@@ -393,6 +396,22 @@ mod tests {
             if self.case == 6 && path == "/wda/locked" {
                 value = json!(null);
             }
+            if (8..=13).contains(&self.case) && path == "/wda/activeAppInfo" {
+                value = if self.case == 12 {
+                    json!({})
+                } else {
+                    json!({"bundleId":"com.apple.springboard"})
+                };
+            }
+            if self.case == 9 && path == "/wda/locked" {
+                value = json!(true);
+            }
+            if self.case == 10 && path == "/wda/locked" {
+                value = json!(null);
+            }
+            if self.case == 11 && path == "/screenshot" {
+                value = json!("invalid-image");
+            }
             Ok(HttpResponse {
                 status: if self.case == 7 && path == "/wda/locked" {
                     500
@@ -401,6 +420,70 @@ mod tests {
                 },
                 body: serde_json::to_vec(&json!({"value":value})).unwrap(),
             })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_home_routes_before_xml_only_for_passive_unlocked_capture() {
+        use super::super::{CaptureFailure, CaptureSource};
+        for (case, passive) in [
+            (8, true),
+            (8, false),
+            (13, true),
+            (13, false),
+            (0, true),
+            (9, true),
+            (10, true),
+            (11, true),
+            (12, true),
+        ] {
+            let reads = Reads {
+                case,
+                calls: RefCell::new(Vec::new()),
+            };
+            let started = tokio::time::Instant::now();
+            let source = if passive {
+                CaptureSource::NavigateHome(SCREEN_SOURCE)
+            } else {
+                CaptureSource::FullTree(SCREEN_SOURCE)
+            };
+            let result = WdaAdapter::capture_using(
+                &reads,
+                &HardwareId::new("fixture-device").unwrap(),
+                source,
+                17,
+                &Instant::now,
+                &|| Ok(21),
+                None,
+                None,
+            )
+            .await;
+            let routed = result.as_ref().err() == Some(&CaptureFailure::HomeNavigation);
+            assert_eq!(
+                routed,
+                matches!(case, 8 | 13) && passive,
+                "case {case}, passive {passive}"
+            );
+            if case == 13 {
+                if passive {
+                    assert!(started.elapsed() < Duration::from_secs(1));
+                } else {
+                    assert!(started.elapsed() >= Duration::from_secs(12));
+                }
+            }
+            let calls = reads.calls.borrow();
+            if routed {
+                assert!(!calls.iter().any(|path| path == SCREEN_SOURCE));
+                assert_eq!(
+                    calls
+                        .iter()
+                        .filter(|path| path.as_str() == "/screenshot")
+                        .count(),
+                    1
+                );
+            } else if matches!(case, 0 | 8 | 9 | 10 | 13) {
+                assert!(calls.iter().any(|path| path == SCREEN_SOURCE));
+            }
         }
     }
 
@@ -423,7 +506,7 @@ mod tests {
                 let result = WdaAdapter::capture_using(
                     &reads,
                     &HardwareId::new("fixture-device").unwrap(),
-                    SCREEN_SOURCE,
+                    SCREEN_SOURCE.into(),
                     17,
                     &clock,
                     &|| Ok(21),
@@ -444,7 +527,7 @@ mod tests {
                     vec![
                         "/screenshot",
                         "/screenshot",
-                        SCREEN_SOURCE,
+                        SCREEN_SOURCE.into(),
                         "/wda/activeAppInfo",
                         "/wda/locked",
                         "/wda/activeAppInfo",
@@ -630,6 +713,17 @@ mod observe_recovery_tests {
             Ok("first coherent pair")
         });
         assert_eq!(result, Ok("first coherent pair"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn home_route_marker_is_never_retried_as_image_drift() {
+        let mut calls = 0;
+        let result = retry_observe_capture(&Instant::now, |_| {
+            calls += 1;
+            Err::<(), _>(CaptureFailure::HomeNavigation)
+        });
+        assert_eq!(result, Err(CaptureFailure::HomeNavigation));
         assert_eq!(calls, 1);
     }
 
