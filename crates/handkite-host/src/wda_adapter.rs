@@ -88,19 +88,43 @@ impl From<CaptureFailure> for AdapterError {
 
 fn retry_lock_capture<T>(
     now: &impl Fn() -> Instant,
+    capture: impl FnMut(Instant) -> Result<T, CaptureFailure>,
+) -> Result<T, CaptureFailure> {
+    retry_coherent_capture(now, "lock_capture_read_retry", None, capture)
+}
+
+fn retry_observe_capture<T>(
+    now: &impl Fn() -> Instant,
+    capture: impl FnMut(Instant) -> Result<T, CaptureFailure>,
+) -> Result<T, CaptureFailure> {
+    retry_coherent_capture(
+        now,
+        "observe_capture_read_retry",
+        Some(Duration::from_secs(1)),
+        capture,
+    )
+}
+
+fn retry_coherent_capture<T>(
+    now: &impl Fn() -> Instant,
+    stage: &'static str,
+    max_first_duration: Option<Duration>,
     mut capture: impl FnMut(Instant) -> Result<T, CaptureFailure>,
 ) -> Result<T, CaptureFailure> {
-    let deadline = now() + Duration::from_secs(20);
+    let started = now();
+    let deadline = started + Duration::from_secs(20);
     let first = capture(deadline);
     if now() >= deadline {
         return Err(CaptureFailure::Adapter);
     }
-    if !matches!(first, Err(CaptureFailure::ImageDrift)) {
+    if !matches!(first, Err(CaptureFailure::ImageDrift))
+        || max_first_duration.is_some_and(|limit| now().saturating_duration_since(started) >= limit)
+    {
         return first;
     }
     // The failed pair supplies no admission evidence. Only a second complete
     // read, with the same deadline and ownership checks, can replace it.
-    crate::timing::outcome("lock_capture_read_retry", true);
+    crate::timing::outcome(stage, true);
     let second = capture(deadline);
     if now() >= deadline {
         return Err(CaptureFailure::Adapter);
@@ -1095,14 +1119,16 @@ impl DeviceAdapter for WdaAdapter {
     fn observe(&mut self) -> Result<RawObservation, AdapterError> {
         self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
-        self.capture_checked_diagnosed(SCREEN_SOURCE, None)
-            .map(|(observation, _, _)| observation)
-            .map_err(|error| {
-                if error == CaptureFailure::ImageDrift {
-                    self.error_diagnostic = Some(AdapterDiagnostic::CaptureImageDrift);
-                }
-                AdapterError
-            })
+        retry_observe_capture(&Instant::now, |deadline| {
+            self.capture_checked_diagnosed(SCREEN_SOURCE, Some(deadline))
+        })
+        .map(|(observation, _, _)| observation)
+        .map_err(|error| {
+            if error == CaptureFailure::ImageDrift {
+                self.error_diagnostic = Some(AdapterDiagnostic::CaptureImageDrift);
+            }
+            AdapterError
+        })
     }
 
     fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
@@ -1220,7 +1246,16 @@ impl DeviceAdapter for WdaAdapter {
         let owned_input =
             owned_action(action) && self.owned_session.is_some() && self.owned_runner.is_some();
         if !matches!(action, Action::LaunchApp { .. }) && !owned_input {
-            return self.observe().map(|observation| (observation, None));
+            // Passive observation recovery must not retry input preparation.
+            return self
+                .capture_checked_diagnosed(SCREEN_SOURCE, None)
+                .map(|(observation, _, _)| (observation, None))
+                .map_err(|error| {
+                    if error == CaptureFailure::ImageDrift {
+                        self.error_diagnostic = Some(AdapterDiagnostic::CaptureImageDrift);
+                    }
+                    AdapterError
+                });
         }
         let use_hint = owned_input && !matches!(action, Action::Home | Action::Lock);
         if !use_hint {

@@ -615,3 +615,88 @@ mod lock_recovery_tests {
         assert_eq!(calls, 1);
     }
 }
+
+#[cfg(test)]
+mod observe_recovery_tests {
+    use super::super::{CaptureFailure, retry_observe_capture};
+    use std::cell::Cell;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn successful_observe_never_replays_its_capture() {
+        let mut calls = 0;
+        let result = retry_observe_capture(&Instant::now, |_| {
+            calls += 1;
+            Ok("first coherent pair")
+        });
+        assert_eq!(result, Ok("first coherent pair"));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn slow_drift_keeps_the_existing_fallback_without_another_capture() {
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let mut calls = 0;
+        let result = retry_observe_capture(&|| now.get(), |_| {
+            calls += 1;
+            now.set(start + Duration::from_secs(1));
+            Err::<(), _>(CaptureFailure::ImageDrift)
+        });
+        assert_eq!(result, Err(CaptureFailure::ImageDrift));
+        assert_eq!(calls, 1);
+    }
+
+    #[test]
+    fn transient_observe_drift_uses_only_a_complete_replacement_pair() {
+        let start = Instant::now();
+        let mut calls = 0;
+        let mut deadlines = vec![];
+        let result = retry_observe_capture(&|| start, |deadline| {
+            deadlines.push(deadline);
+            calls += 1;
+            if calls == 1 {
+                Err(CaptureFailure::ImageDrift)
+            } else {
+                Ok(("new tree", "new image"))
+            }
+        });
+        assert_eq!(result, Ok(("new tree", "new image")));
+        assert_eq!(deadlines, [start + Duration::from_secs(20); 2]);
+    }
+
+    #[test]
+    fn observe_preserves_second_failure_and_never_tries_a_third_pair() {
+        for second in [CaptureFailure::Adapter, CaptureFailure::ImageDrift] {
+            let mut calls = 0;
+            let result = retry_observe_capture(&Instant::now, |_| {
+                calls += 1;
+                Err::<(), _>(if calls == 1 {
+                    CaptureFailure::ImageDrift
+                } else {
+                    second
+                })
+            });
+            assert_eq!(result, Err(second));
+            assert_eq!(calls, 2);
+        }
+    }
+
+    #[test]
+    fn replacement_observe_cannot_renew_the_original_deadline() {
+        let start = Instant::now();
+        let now = Cell::new(start);
+        let mut calls = 0;
+        let result = retry_observe_capture(&|| now.get(), |_| {
+            calls += 1;
+            if calls == 1 {
+                Err(CaptureFailure::ImageDrift)
+            } else {
+                now.set(start + Duration::from_secs(20));
+                Ok("late pair")
+            }
+        });
+        assert_eq!(result, Err(CaptureFailure::Adapter));
+        assert_eq!(calls, 2);
+    }
+}
