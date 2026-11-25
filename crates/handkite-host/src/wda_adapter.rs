@@ -12,8 +12,8 @@ use crate::wda_settings::{IdleSettingsLease, Restoration};
 use crate::wda_transport::UsbWda;
 use base64::Engine;
 use handkite_core::controller::{
-    ActionAdmission, AdapterDiagnostic, AdapterError, DeviceAdapter, RawImageObservation,
-    RawObservation,
+    ActionAdmission, AdapterDiagnostic, AdapterError, DeviceAdapter, LaunchReadback,
+    RawImageObservation, RawObservation,
 };
 use handkite_core::protocol::{
     Action, DeviceState, HardwareId, ImageFormat, LockState, Motion, ObservationWindow, Point,
@@ -1085,6 +1085,16 @@ impl DeviceAdapter for WdaAdapter {
             return Err(error);
         }
         self.home_navigation_frame(retry)
+    }
+    fn observe_launch_readback(
+        &mut self,
+        source: &str,
+        destination: &str,
+    ) -> Result<LaunchReadback, AdapterError> {
+        let _timing = crate::timing::Span::new("navigation_observe");
+        self.home_readback_proof = None;
+        self.finish_pending_effect(true)?;
+        self.launch_navigation_frame(source, destination)
     }
     fn prepare_navigation(
         &mut self,

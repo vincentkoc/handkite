@@ -10,7 +10,7 @@ mod focused_text;
 mod navigation;
 mod targets;
 pub use focused_text::{PreparedText, TextReadback};
-pub use navigation::{NavigationObservation, NavigationResult};
+pub use navigation::{LaunchReadback, NavigationObservation, NavigationResult};
 pub use targets::{
     ElementAction, ElementTarget, PreparedTarget, TargetActionResult, TargetCompletion,
     TargetEffect, TargetEffectReport, TargetObservation,
@@ -183,6 +183,15 @@ pub trait DeviceAdapter {
     /// only a just-completed proof; adapters without that support read anew.
     fn observe_home_readback(&mut self, _retry: bool) -> Result<RawObservation, AdapterError> {
         self.observe_navigation()
+    }
+    /// A first launch read may identify a proven transition without returning
+    /// an observation. It cannot authorize input or confirm the launch.
+    fn observe_launch_readback(
+        &mut self,
+        _source: &str,
+        _destination: &str,
+    ) -> Result<LaunchReadback, AdapterError> {
+        self.observe_navigation().map(LaunchReadback::Observation)
     }
     fn prepare_navigation(
         &mut self,

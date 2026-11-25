@@ -41,7 +41,7 @@ fn reusable_home_context(
 impl WdaAdapter {
     pub(super) fn navigation_frame(&mut self) -> Result<RawObservation, AdapterError> {
         self.home_readback_proof = None;
-        self.navigation_frame_with_proof(None, false)
+        only_observation(self.navigation_frame_with_proof(None, false, None)?)
     }
 
     pub(super) fn home_navigation_frame(
@@ -49,18 +49,28 @@ impl WdaAdapter {
         retry: bool,
     ) -> Result<RawObservation, AdapterError> {
         let proof = self.home_readback_proof.take().filter(|_| retry);
-        self.navigation_frame_with_proof(proof, !retry)
+        only_observation(self.navigation_frame_with_proof(proof, !retry, None)?)
+    }
+
+    pub(super) fn launch_navigation_frame(
+        &mut self,
+        source: &str,
+        destination: &str,
+    ) -> Result<LaunchReadback, AdapterError> {
+        self.navigation_frame_with_proof(None, false, Some((source, destination)))
     }
 
     fn navigation_frame_with_proof(
         &mut self,
         proof: Option<HomeProof>,
         allow_handoff: bool,
-    ) -> Result<RawObservation, AdapterError> {
+        launch: Option<(&str, &str)>,
+    ) -> Result<LaunchReadback, AdapterError> {
         self.error_diagnostic = None;
         self.cache.clear_full();
         let mut started_unix_ms = unix_ms()?;
         self.validate_owned()?;
+        let initial_key = self.cache_key();
         if self.owned_session.is_none() || self.owned_runner.is_none() {
             self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
             return Err(AdapterError);
@@ -144,6 +154,43 @@ impl WdaAdapter {
             self.home_readback_proof.is_some(),
         );
         crate::timing::outcome("navigation_context_coherent", coherent);
+        if let Some((source, destination)) = launch {
+            for (stage, value) in [
+                ("launch_before_source", before.0 == source),
+                ("launch_before_destination", before.0 == destination),
+                ("launch_frame_source", frame.app == source),
+                ("launch_frame_destination", frame.app == destination),
+                ("launch_after_destination", after.0 == destination),
+                (
+                    "launch_native_unlocked",
+                    native_before == LockState::Unlocked && native_after == LockState::Unlocked,
+                ),
+                (
+                    "launch_wda_unlocked",
+                    !before.1 && !after.1 && frame.reported == Some(false),
+                ),
+            ] {
+                crate::timing::outcome(stage, value);
+            }
+        }
+        if !coherent
+            && launch.is_some_and(|expected| {
+                launch_transition(
+                    expected,
+                    (native_before, native_after),
+                    &before,
+                    (&frame.app, frame.reported),
+                    &after,
+                )
+            })
+        {
+            transition_owner(initial_key, || {
+                self.validate_owned()?;
+                Ok(self.cache_key())
+            })?;
+            crate::timing::outcome("navigation_launch_transition", true);
+            return Ok(LaunchReadback::Transition);
+        }
         let state = readback_state(
             native_before,
             native_after,
@@ -153,7 +200,7 @@ impl WdaAdapter {
             &after,
         )?;
         self.validate_owned()?;
-        Ok(RawObservation {
+        Ok(LaunchReadback::Observation(RawObservation {
             connected_usb: self.expected.clone(),
             wda_target: self.expected.clone(),
             window: ObservationWindow {
@@ -163,7 +210,7 @@ impl WdaAdapter {
             state,
             accessibility_tree: String::new(),
             screenshot: frame.screenshot,
-        })
+        }))
     }
 
     fn navigation_context(
@@ -263,6 +310,44 @@ impl WdaAdapter {
     }
 }
 
+fn only_observation(readback: LaunchReadback) -> Result<RawObservation, AdapterError> {
+    match readback {
+        LaunchReadback::Observation(raw) => Ok(raw),
+        LaunchReadback::Transition => Err(AdapterError),
+    }
+}
+
+fn launch_transition(
+    (source, destination): (&str, &str),
+    native: (LockState, LockState),
+    before: &(String, bool),
+    (frame_app, reported): (&str, Option<bool>),
+    after: &(String, bool),
+) -> bool {
+    let allowed_app = |app: &str| app == source || app == destination;
+    !source.is_empty()
+        && !destination.is_empty()
+        && source != destination
+        && native == (LockState::Unlocked, LockState::Unlocked)
+        && !before.1
+        && !after.1
+        && reported == Some(false)
+        && allowed_app(&before.0)
+        && allowed_app(frame_app)
+        && after.0 == destination
+        && !same_context(before, frame_app, reported, after)
+}
+
+fn transition_owner(
+    initial: Option<cache::Key>,
+    final_check: impl FnOnce() -> Result<Option<cache::Key>, AdapterError>,
+) -> Result<(), AdapterError> {
+    let initial = initial.ok_or(AdapterError)?;
+    (final_check()? == Some(initial))
+        .then_some(())
+        .ok_or(AdapterError)
+}
+
 async fn native_app_before_input(
     native: impl FnOnce() -> LockState + Send + 'static,
     app: impl Future<Output = Result<(), AdapterError>>,
@@ -339,6 +424,143 @@ fn readback_state(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_transition_requires_only_expected_unlocked_apps_and_rejects_old_frame() {
+        let old = (String::from("example.source"), false);
+        let new = (String::from("example.destination"), false);
+        let unlocked = (LockState::Unlocked, LockState::Unlocked);
+        let expected = (old.0.as_str(), new.0.as_str());
+        for (before, frame) in [
+            (&old, old.0.as_str()),
+            (&old, new.0.as_str()),
+            (&new, old.0.as_str()),
+        ] {
+            assert!(launch_transition(
+                expected,
+                unlocked,
+                before,
+                (frame, Some(false)),
+                &new
+            ));
+            assert!(
+                readback_state(
+                    LockState::Unlocked,
+                    LockState::Unlocked,
+                    before,
+                    frame,
+                    Some(false),
+                    &new
+                )
+                .is_err()
+            );
+        }
+        assert!(!launch_transition(
+            expected,
+            unlocked,
+            &new,
+            (&new.0, Some(false)),
+            &new
+        ));
+        for native in [LockState::Locked, LockState::Uncertain] {
+            assert!(!launch_transition(
+                expected,
+                (native, LockState::Unlocked),
+                &old,
+                (&old.0, Some(false)),
+                &new
+            ));
+            assert!(!launch_transition(
+                expected,
+                (LockState::Unlocked, native),
+                &old,
+                (&old.0, Some(false)),
+                &new
+            ));
+        }
+        for context in [
+            ("other.app".into(), false),
+            ("".into(), false),
+            (old.0.clone(), true),
+        ] {
+            assert!(!launch_transition(
+                expected,
+                unlocked,
+                &context,
+                (&old.0, Some(false)),
+                &new
+            ));
+            assert!(!launch_transition(
+                expected,
+                unlocked,
+                &old,
+                (&old.0, Some(false)),
+                &context
+            ));
+        }
+        assert!(!launch_transition(
+            expected,
+            unlocked,
+            &old,
+            ("other.app", Some(false)),
+            &new
+        ));
+        assert!(!launch_transition(
+            expected,
+            unlocked,
+            &old,
+            (&old.0, Some(false)),
+            &(new.0.clone(), true),
+        ));
+        for reported in [None, Some(true)] {
+            assert!(!launch_transition(
+                expected,
+                unlocked,
+                &old,
+                (&old.0, reported),
+                &new
+            ));
+        }
+        for expected in [
+            ("", new.0.as_str()),
+            (old.0.as_str(), ""),
+            (old.0.as_str(), old.0.as_str()),
+        ] {
+            assert!(!launch_transition(
+                expected,
+                unlocked,
+                &old,
+                (&old.0, Some(false)),
+                &new
+            ));
+        }
+        assert!(only_observation(LaunchReadback::Transition).is_err());
+    }
+
+    #[test]
+    fn launch_transition_requires_final_ownership_and_unchanged_nonempty_key() {
+        let key = proof_key();
+        assert!(transition_owner(Some(key.clone()), || Ok(Some(key.clone()))).is_ok());
+        assert!(transition_owner(None, || panic!("no initial identity")).is_err());
+        assert!(transition_owner(Some(key.clone()), || Err(AdapterError)).is_err());
+        assert!(transition_owner(Some(key.clone()), || Ok(None)).is_err());
+        for changed in [
+            cache::Key {
+                device: HardwareId::new("other").unwrap(),
+                ..key.clone()
+            },
+            cache::Key {
+                session: "other".into(),
+                ..key.clone()
+            },
+            cache::Key {
+                runner: proof_key().runner,
+                ..key.clone()
+            },
+        ] {
+            assert!(transition_owner(Some(key.clone()), || Ok(Some(changed))).is_err());
+        }
+    }
 
     fn proof_key() -> cache::Key {
         let runtime = tokio::runtime::Builder::new_current_thread()
