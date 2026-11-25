@@ -4,6 +4,57 @@ Status: implementation candidate following the approved design. Synthetic
 qualification and any live result are recorded in VALIDATION.md. Notification
 permission support is deliberately narrower than generic system-alert support.
 
+## Ordinary native taps over moving app content
+
+A native tap binds a unique native ID, exact attributes and rectangle, display
+mapping, and a pixel digest of the target rectangle plus the existing
+one-raster-pixel margin. Admission reads fresh native identity and attributes
+between two screenshots. Both guarded crops must equal the published digest;
+changes outside the crop do not decide this proof. A matching whole image alone
+cannot skip native revalidation. App, lock, execution owner, runner/session,
+revision, single-use handle and original deadline checks remain mandatory.
+
+Moving pixels inside the target crop still refuse, including translucent app
+surfaces whose background shows through. This does not change coordinate, text
+or alert admission or native tap effect verification. A freshness refusal is
+not assumed to be a pixel failure. Qualification and latency are recorded
+separately in VALIDATION.md.
+
+### Why native element staleness does not prove attribute freshness
+
+The unchanged-frame alternative was tested against main's actual admission
+path. A synthetic native button keeps its ID, geometry and identical pixels
+while its accessibility `value` or `selected` changes. The frame shortcut
+admits it; fresh scoped admission refuses it. The reproducible fixture and
+results are in [VALIDATION.md](VALIDATION.md).
+
+Pinned WDA's [element-ID click](https://github.com/vincentkoc/handkite-wda/blob/1262085ed9a13ef4e0d0e222cf0a918ecfe4b565/packages/webdriveragent/WebDriverAgentLib/Commands/FBElementCommands.m#L241-L253)
+resolves the [cached object](https://github.com/vincentkoc/handkite-wda/blob/1262085ed9a13ef4e0d0e222cf0a918ecfe4b565/packages/webdriveragent/WebDriverAgentLib/Routing/FBElementCache.m#L59-L87)
+with a [snapshot existence check](https://github.com/vincentkoc/handkite-wda/blob/1262085ed9a13ef4e0d0e222cf0a918ecfe4b565/packages/webdriveragent/WebDriverAgentLib/Categories/XCUIElement%2BFBUtilities.m#L90-L108),
+then taps that object. The request carries no expected old attributes. A
+still-live object whose semantics changed therefore need not produce a
+stale-element error. App/lock/owner checks and a two-second identical-frame
+window constrain other risks but do not prove these attributes unchanged. This is a synthetic
+contract counterexample, not a live phone incident. The owner accepted this gap
+and retained fresh attributes on every tap; the remaining gate is latency.
+
+### Overlap processing without moving the acquisition bracket
+
+The first screenshot response still completes before native identity/attribute
+reads start, and those reads complete before the last screenshot starts.
+Joining an image request directly with the native query could place the query
+outside the two images; unchanged pixels would then hide same-ID semantic
+changes outside the narrowed bracket. The acquisition order therefore remains mandatory.
+
+The first frame's decoding, mapping and crop computation overlap the native,
+app and optional focus reads. Final screenshot acquisition overlaps validation
+of the returned native rows. Final image decoding/crop comparison overlap the
+post-image display read. Each group uses `join!`, not `try_join!`, so ordinary
+failures await every started sibling before returning to settings restoration.
+All results remain required before dispatch. No worker or detached task is
+introduced; original outer timeouts and settings-restoration behavior remain.
+The final hittability/app checks and fresh native-lock proof keep their order.
+
 ## Problem and scope
 
 A system alert can own the foreground as SpringBoard while another app remains

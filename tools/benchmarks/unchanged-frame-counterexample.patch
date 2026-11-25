@@ -1,0 +1,35 @@
+--- a/crates/handkite-host/src/wda_adapter/targets_fast_tests.rs
++++ b/crates/handkite-host/src/wda_adapter/targets_fast_tests.rs
+@@ -789,3 +789,32 @@
+         Outcome::Unconfirmed
+     );
+ }
++
++
++// Synthetic same-object semantic drift; the object remains live and hittable.
++async fn same_live_id_attribute_drift_must_refuse(attribute: &str, changed: Value) {
++    let task = tokio::spawn(async {});
++    let bound = input(task.id());
++    let mut f = Fake::default();
++    f.rows[1][attribute] = changed;
++    assert_eq!(f.rows[1]["ELEMENT"], bound.bound.native);
++    assert_ne!(f.rows[1], bound.bound.rich);
++    // The full scoped path already treats this exact mutation as stale.
++    assert!(revalidate(&f, &bound).await.is_err());
++    f.calls.borrow_mut().clear();
++    // All pixels, geometry, app, display, lock and hittability stay unchanged.
++    let admitted = frame_admission(&f, basis(png(false), vec![], Duration::ZERO)).await;
++    assert!(!queried(&f), "this witness must take the actual frame shortcut");
++    assert!(f.calls.borrow().iter().any(|p| p.ends_with("/attribute/hittable")));
++    assert!(!admitted, "same live native ID with changed {attribute} was admitted");
++}
++
++#[tokio::test]
++async fn same_live_id_value_drift_must_refuse() {
++    same_live_id_attribute_drift_must_refuse("attribute/value", json!("changed")).await;
++}
++
++#[tokio::test]
++async fn same_live_id_selected_drift_must_refuse() {
++    same_live_id_attribute_drift_must_refuse("attribute/selected", json!(true)).await;
++}

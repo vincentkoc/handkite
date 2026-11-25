@@ -91,6 +91,7 @@ struct Fake {
     final_app_drift: bool,
     final_lock_drift: bool,
     frame: Option<Vec<u8>>,
+    frames: RefCell<std::collections::VecDeque<Vec<u8>>>,
     calls: RefCell<Vec<String>>,
     settings: RefCell<Value>,
 }
@@ -106,6 +107,7 @@ impl Default for Fake {
             final_app_drift: false,
             final_lock_drift: false,
             frame: None,
+            frames: RefCell::new(Default::default()),
             calls: RefCell::new(vec![]),
             settings: RefCell::new(
                 json!({"shouldUseCompactResponses":true,"elementResponseAttributes":"id"}),
@@ -153,8 +155,13 @@ impl WdaRequest for Fake {
             json!(final_read && self.final_lock_drift)
         } else if path == "/screenshot" {
             json!(
-                base64::engine::general_purpose::STANDARD
-                    .encode(self.frame.clone().unwrap_or_else(|| png(self.changed)))
+                base64::engine::general_purpose::STANDARD.encode(
+                    self.frames
+                        .borrow_mut()
+                        .pop_front()
+                        .or_else(|| self.frame.clone())
+                        .unwrap_or_else(|| png(self.changed))
+                )
             )
         } else if path.ends_with("/elements") {
             assert_eq!(method, "POST");
@@ -198,7 +205,7 @@ async fn fresh_region_and_identity_need_no_source_or_input() {
             .iter()
             .filter(|p| p.as_str() == "/screenshot")
             .count(),
-        1
+        2
     );
     assert!(
         !f.calls
@@ -394,7 +401,6 @@ async fn native_read_starts_only_after_target_region_validation() {
             &f,
             &input(task.id()),
             Instant::now() + Duration::from_secs(5),
-            None,
             move |_| {
                 c.store(true, Ordering::SeqCst);
                 LockState::Unlocked
@@ -426,7 +432,6 @@ async fn native_failure_drains_and_bad_tail_never_queries() {
                 &f,
                 &input(task.id()),
                 Instant::now() + Duration::from_secs(5),
-                None,
                 move |_| {
                     std::thread::sleep(Duration::from_millis(10));
                     end.store(true, Ordering::SeqCst);
@@ -450,7 +455,6 @@ async fn successful_native_proof_caps_the_socket_write_age() {
         &f,
         &input(task.id()),
         Instant::now() + Duration::from_secs(5),
-        None,
         move |_| LockState::Unlocked,
     )
     .await
@@ -462,16 +466,14 @@ async fn successful_native_proof_caps_the_socket_write_age() {
     );
     assert!(Instant::now() < proof.deadline);
     let original = Instant::now() + Duration::from_millis(100);
-    let short = revalidate_with_native(&f, &input(task.id()), original, None, |_| {
-        LockState::Unlocked
-    })
-    .await
-    .unwrap()
-    .unwrap();
+    let short = revalidate_with_native(&f, &input(task.id()), original, |_| LockState::Unlocked)
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(short.write_deadline().unwrap(), original);
     let past = Instant::now() - Duration::from_millis(1);
     assert!(
-        revalidate_with_native(&f, &input(task.id()), past, None, move |_| panic!(
+        revalidate_with_native(&f, &input(task.id()), past, move |_| panic!(
             "expired input must not query native state"
         ))
         .await
@@ -577,7 +579,6 @@ async fn restored_settings_precede_native_proof_and_final_drift_still_refuses() 
             &f,
             &input,
             Instant::now() + Duration::from_millis(deadline_ms),
-            None,
             move |_| {
                 assert!(restored.load(Ordering::SeqCst));
                 std::thread::sleep(Duration::from_millis(10));
@@ -625,7 +626,6 @@ async fn late_native_proof_is_drained_without_extending_the_write_deadline() {
         &f,
         &input(task.id()),
         Instant::now() + Duration::from_secs(5),
-        None,
         move |_| {
             std::thread::sleep(Duration::from_millis(550));
             done.store(true, Ordering::SeqCst);
@@ -655,105 +655,68 @@ fn png_pixel(x: usize, y: usize) -> Vec<u8> {
     out
 }
 
-fn basis(image: Vec<u8>, fields: Vec<[f64; 4]>, age: Duration) -> FastBasis {
-    FastBasis {
-        image: ScreenImage {
-            format: handkite_core::protocol::ImageFormat::Png,
-            bytes: image,
-        },
-        captured: Instant::now().checked_sub(age).unwrap(),
-        fields,
-    }
-}
-
-async fn frame_admission(f: &Fake, basis: FastBasis) -> bool {
+#[tokio::test]
+async fn outside_animation_admits_but_inside_and_margin_pixels_refuse() {
     let task = tokio::spawn(async {});
-    revalidate_with_native(
-        f,
-        &input(task.id()),
-        Instant::now() + Duration::from_secs(5),
-        Some(basis),
-        |_| LockState::Unlocked,
-    )
-    .await
-    .is_ok_and(|result| result.is_ok())
-}
-
-fn queried(f: &Fake) -> bool {
-    f.calls.borrow().iter().any(|p| p.ends_with("/elements"))
-}
-
-#[tokio::test]
-async fn unchanged_presented_frame_admits_without_a_semantic_query() {
-    let f = Fake::default();
-    assert!(frame_admission(&f, basis(png(false), vec![], Duration::ZERO)).await);
-    assert!(!queried(&f));
-    let calls = f.calls.borrow();
-    assert!(calls.iter().any(|p| p.ends_with("/attribute/hittable")));
-    assert!(calls.iter().any(|p| p.ends_with("/wda/activeAppInfo")));
-    assert_eq!(
-        calls.iter().filter(|p| p.as_str() == "/screenshot").count(),
-        1
-    );
-}
-
-#[tokio::test]
-async fn frame_drift_outside_an_editable_field_takes_full_scoped_admission() {
-    let f = Fake {
-        frame: Some(png_pixel(3, 7)),
+    for (x, y, admitted) in [(3, 7, true), (1, 1, false), (0, 1, false)] {
+        let f = Fake {
+            frames: RefCell::new([png(false), png_pixel(x, y)].into()),
+            ..Fake::default()
+        };
+        assert_eq!(revalidate(&f, &input(task.id())).await.is_ok(), admitted);
+        assert!(
+            !f.calls
+                .borrow()
+                .iter()
+                .any(|p| p.ends_with("/click") || p.ends_with("/actions"))
+        );
+        assert!(f.calls.borrow().iter().any(|p| p.ends_with("/elements")));
+        assert!(
+            !f.calls
+                .borrow()
+                .iter()
+                .any(|p| p.contains("source") || p.ends_with("/click"))
+        );
+    }
+    let transient = Fake {
+        frames: RefCell::new([png_pixel(1, 1), png(false)].into()),
         ..Fake::default()
     };
-    assert!(frame_admission(&f, basis(png(false), vec![], Duration::ZERO)).await);
-    assert!(queried(&f));
-    // A blinking caret inside a presented field keeps frame-scoped admission.
-    let f = Fake {
-        frame: Some(png_pixel(3, 7)),
-        ..Fake::default()
-    };
+    assert!(revalidate(&transient, &input(task.id())).await.is_err());
     assert!(
-        frame_admission(
-            &f,
-            basis(png(false), vec![[2., 6., 2., 2.]], Duration::ZERO)
-        )
-        .await
+        !transient
+            .calls
+            .borrow()
+            .iter()
+            .any(|p| p.ends_with("/click") || p.ends_with("/actions"))
     );
-    assert!(!queried(&f));
-    // An old presented frame is not reused.
-    let f = Fake::default();
-    let old = basis(
-        png(false),
-        vec![],
-        FAST_FRAME_AGE + Duration::from_millis(1),
-    );
-    assert!(frame_admission(&f, old).await);
-    assert!(queried(&f));
 }
 
 #[tokio::test]
-async fn frame_admission_keeps_stale_moved_and_unhittable_refusals() {
-    // Changed target pixels refuse before any query or tail read.
-    let f = Fake {
-        changed: true,
-        ..Fake::default()
-    };
-    assert!(
-        !frame_admission(
-            &f,
-            basis(png(false), vec![[0., 0., 4., 8.]], Duration::ZERO)
-        )
-        .await
-    );
-    assert!(!queried(&f));
-    assert!(!f.calls.borrow().iter().any(|p| p.ends_with("hittable")));
-    for case in 0..3 {
+async fn unchanged_pixels_never_bypass_fresh_native_identity_and_attributes() {
+    let task = tokio::spawn(async {});
+    for case in 0..7 {
         let mut f = Fake::default();
         match case {
-            0 => f.hittable = false,
-            1 => f.app = "unexpected.app",
-            _ => f.display = 2,
+            0 => f.rows[1]["ELEMENT"] = json!("replacement"),
+            1 => f.rows[1]["rect"]["x"] = json!(1.25),
+            2 => f.rows[1]["attribute/value"] = json!("changed"),
+            3 => f.rows[1]["attribute/selected"] = json!(true),
+            4 => f.rows[1]["enabled"] = json!(false),
+            5 => f.rows[1]["displayed"] = json!(false),
+            _ => {
+                let duplicate = f.rows[1].clone();
+                f.rows.as_array_mut().unwrap().push(duplicate);
+            }
         }
-        assert!(!frame_admission(&f, basis(png(false), vec![], Duration::ZERO)).await);
-        assert!(!f.calls.borrow().iter().any(|p| p.ends_with("click")));
+        assert!(revalidate(&f, &input(task.id())).await.is_err());
+        assert!(f.calls.borrow().iter().any(|p| p.ends_with("/elements")));
+        assert!(
+            !f.calls
+                .borrow()
+                .iter()
+                .any(|p| p.ends_with("/click") || p.ends_with("/actions"))
+        );
     }
 }
 
@@ -788,4 +751,163 @@ fn delta_sample_classification_matches_the_standalone_effect_rules() {
         classify(&bound, &duplicate, &moved, None),
         Outcome::Unconfirmed
     );
+}
+
+// Same object, not a replacement ID that WDA's stale-element check can reject.
+async fn same_live_id_attribute_drift_must_refuse(attribute: &str, changed: Value) {
+    let task = tokio::spawn(async {});
+    let bound = input(task.id());
+    let mut f = Fake::default();
+    f.rows[1][attribute] = changed;
+    assert_eq!(f.rows[1]["ELEMENT"], bound.bound.native);
+    assert_ne!(f.rows[1], bound.bound.rich);
+    let result =
+        revalidate_with_native(&f, &bound, Instant::now() + Duration::from_secs(5), |_| {
+            LockState::Unlocked
+        })
+        .await;
+    assert!(result.unwrap().is_err());
+    let calls = f.calls.borrow();
+    assert!(calls.iter().any(|p| p.ends_with("/elements")));
+    assert!(
+        !calls
+            .iter()
+            .any(|p| p.ends_with("/click") || p.ends_with("/actions"))
+    );
+}
+
+#[tokio::test]
+async fn same_live_id_value_drift_must_refuse() {
+    same_live_id_attribute_drift_must_refuse("attribute/value", json!("changed")).await;
+}
+
+#[tokio::test]
+async fn same_live_id_selected_drift_must_refuse() {
+    same_live_id_attribute_drift_must_refuse("attribute/selected", json!(true)).await;
+}
+
+#[tokio::test]
+async fn overlapping_validation_keeps_image_brackets_and_drains_read_failures() {
+    use std::cell::Cell;
+    struct Ordered {
+        inner: Fake,
+        fail_items: bool,
+        images: Cell<usize>,
+        images_done: Cell<usize>,
+        items_done: Cell<bool>,
+        apps_started: Cell<usize>,
+        apps_done: Cell<usize>,
+        display_after_started: Cell<bool>,
+        display_after_done: Cell<bool>,
+    }
+    impl WdaRequest for Ordered {
+        async fn request(
+            &self,
+            method: &str,
+            path: &str,
+            body: &[u8],
+            timeout: Duration,
+        ) -> Result<HttpResponse, crate::wda_transport::WdaError> {
+            if path == "/screenshot" {
+                let index = self.images.get() + 1;
+                self.images.set(index);
+                if index == 2 {
+                    assert!(
+                        self.items_done.get(),
+                        "final image preceded native response"
+                    );
+                }
+                tokio::task::yield_now().await;
+                let result = self.inner.request(method, path, body, timeout).await;
+                self.images_done.set(index);
+                return result;
+            }
+            if path.ends_with("/elements") {
+                assert_eq!(
+                    self.images_done.get(),
+                    1,
+                    "native read preceded first image"
+                );
+                tokio::task::yield_now().await;
+                self.items_done.set(true);
+                if self.fail_items {
+                    return Err(crate::wda_transport::WdaError::NotConnected);
+                }
+            }
+            if path.ends_with("/wda/activeAppInfo") {
+                self.apps_started.set(self.apps_started.get() + 1);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                self.apps_done.set(self.apps_done.get() + 1);
+            }
+            if path.ends_with("/appium/settings") && method == "GET" && self.images_done.get() == 2
+            {
+                if self.display_after_started.replace(true) {
+                    // A restoration read must not mask cancellation of the
+                    // display read joined with final image validation.
+                    assert!(self.display_after_done.get());
+                } else {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    self.display_after_done.set(true);
+                }
+            }
+            if path.ends_with("/appium/settings") && method == "POST" {
+                let settings: Value = serde_json::from_slice(body).unwrap();
+                if settings["settings"]["elementResponseAttributes"] == "id" {
+                    assert_eq!(self.apps_started.get(), self.apps_done.get());
+                    assert!(self.items_done.get());
+                    assert_eq!(self.images.get(), self.images_done.get());
+                }
+            }
+            self.inner.request(method, path, body, timeout).await
+        }
+    }
+    for fault in 0..4 {
+        let f = Ordered {
+            inner: Fake {
+                frames: RefCell::new(
+                    [
+                        if fault == 1 { vec![] } else { png(false) },
+                        if fault == 3 { vec![] } else { png(false) },
+                    ]
+                    .into(),
+                ),
+                ..Fake::default()
+            },
+            fail_items: fault == 2,
+            images: Cell::new(0),
+            images_done: Cell::new(0),
+            items_done: Cell::new(false),
+            apps_started: Cell::new(0),
+            apps_done: Cell::new(0),
+            display_after_started: Cell::new(false),
+            display_after_done: Cell::new(false),
+        };
+        let task = tokio::spawn(async {});
+        let result = revalidate_with_native(
+            &f,
+            &input(task.id()),
+            Instant::now() + Duration::from_secs(5),
+            |_| LockState::Unlocked,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.is_ok(), fault == 0, "fault {fault}");
+        assert!(f.items_done.get());
+        assert_eq!(f.apps_started.get(), f.apps_done.get());
+        assert_eq!(f.images.get(), f.images_done.get());
+        if fault != 1 {
+            assert_eq!(f.images_done.get(), 2);
+        }
+        if fault == 0 || fault == 3 {
+            assert!(f.display_after_done.get());
+        }
+        assert_eq!(f.inner.settings.borrow()["elementResponseAttributes"], "id");
+        assert!(
+            !f.inner
+                .calls
+                .borrow()
+                .iter()
+                .any(|p| p.ends_with("/click") || p.ends_with("/actions"))
+        );
+    }
 }

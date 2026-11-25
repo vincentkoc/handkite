@@ -1686,12 +1686,6 @@ impl WdaAdapter {
         if prepared_lock != LockState::Unlocked {
             return Err(AdapterError);
         }
-        // Frame evidence comes only from the exact presented baseline, which
-        // no longer contains the consumed handle.
-        let basis = self
-            .target_delta
-            .as_ref()
-            .and_then(|delta| delta.fast_basis(&input.key, &input.app));
         let runner = self.owned_runner.as_ref().ok_or(AdapterError)?;
         let context_wda = UsbWda::new(self.usb.clone())
             .with_write_admission(Some(runner.write_admission().ok_or(AdapterError)?));
@@ -1702,13 +1696,9 @@ impl WdaAdapter {
             .block_on(async {
                 if matches!(action, ElementAction::Tap { .. }) && input.bound.ocr.is_none() {
                     let device = input.key.device.clone();
-                    fast::revalidate_with_native(
-                        &context_wda,
-                        &input,
-                        deadline,
-                        basis,
-                        move |until| native_lock::query_until(&device, until).state,
-                    )
+                    fast::revalidate_with_native(&context_wda, &input, deadline, move |until| {
+                        native_lock::query_until(&device, until).state
+                    })
                     .await
                     .map(|result| result.map(Some))
                 } else {

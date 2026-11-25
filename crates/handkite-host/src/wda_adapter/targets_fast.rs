@@ -1,4 +1,4 @@
-//! Target-scoped tap evidence. Full trees are produced by explicit observes.
+//! Exact native tap region evidence. Full trees require explicit observes.
 use super::super::targets_pixels::Pixels;
 use super::*;
 
@@ -174,7 +174,22 @@ async fn sample_part<T>(
     result
 }
 
-async fn sample(wda: &impl WdaRequest, input: &Input, focus: bool) -> Result<Sample, AdapterError> {
+fn sample_pixels(image: &ScreenImage, mapping: Mapping) -> Result<Pixels, AdapterError> {
+    let pixels = Pixels::decode(&image.bytes)?;
+    pixels.validate_mapping(
+        mapping.viewport,
+        mapping.scale,
+        [mapping.viewport[2], mapping.viewport[3]],
+    )?;
+    Ok(pixels)
+}
+
+async fn sample(
+    wda: &impl WdaRequest,
+    input: &Input,
+    focus: bool,
+    admission: bool,
+) -> Result<Sample, AdapterError> {
     let _span = crate::timing::Span::new("target_scoped_capture");
     let mapping = input.bound.mapping.ok_or(AdapterError)?;
     if MARKERS.iter().any(|m| input.app.contains(m)) || input.app.chars().any(char::is_control) {
@@ -188,14 +203,30 @@ async fn sample(wda: &impl WdaRequest, input: &Input, focus: bool) -> Result<Sam
         super::super::display::verify_selection(wda, &input.key.session, mapping.display_id),
     )
     .await?;
+    let before = if admission {
+        Some(
+            sample_part(
+                "target_sample_image_before",
+                "target_sample_image_before_ok",
+                screenshot(wda),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let filter = predicate(&input.bound)?;
     crate::timing::outcome("target_sample_focus_requested", focus);
-    let (image, items, app, focused) = tokio::join!(
-        sample_part(
-            "target_sample_image",
-            "target_sample_image_ok",
-            screenshot(wda)
-        ),
+    // Preserve image-before -> native response -> image-after. The first
+    // frame's pure decoding can overlap the reads, not its acquisition.
+    let (image, items, app, focused, before) = tokio::join!(
+        sample_part("target_sample_image", "target_sample_image_ok", async {
+            if admission {
+                Ok(None)
+            } else {
+                screenshot(wda).await.map(Some)
+            }
+        }),
         sample_part(
             "target_sample_items",
             "target_sample_items_ok",
@@ -213,22 +244,70 @@ async fn sample(wda: &impl WdaRequest, input: &Input, focus: bool) -> Result<Sam
                 Ok(None)
             }
         }),
+        sample_part(
+            "target_sample_decode_before",
+            "target_sample_decode_before_ok",
+            async {
+                before
+                    .as_ref()
+                    .map(|image| {
+                        let pixels = sample_pixels(image, mapping)?;
+                        pixels.region(mapping.viewport, &input.bound.attrs, &mut 0)
+                    })
+                    .transpose()
+            }
+        ),
     );
+    // join!, never try_join!: finish every started read before returning an
+    // ordinary failure to the response-settings restoration scope.
     app?;
+    let before = before?;
+    let (image, rows) = tokio::join!(
+        async {
+            match image? {
+                Some(image) => Ok(image),
+                None => {
+                    sample_part(
+                        "target_sample_image_after",
+                        "target_sample_image_after_ok",
+                        screenshot(wda),
+                    )
+                    .await
+                }
+            }
+        },
+        async { checked_rows(&items?, mapping) },
+    );
     let image = image?;
-    let rows = checked_rows(&items?, mapping)?;
-    let pixels = Pixels::decode(&image.bytes)?;
-    pixels.validate_mapping(
-        mapping.viewport,
-        mapping.scale,
-        [mapping.viewport[2], mapping.viewport[3]],
-    )?;
-    sample_part(
-        "target_sample_display_after",
-        "target_sample_display_after_ok",
-        super::super::display::verify_selection(wda, &input.key.session, mapping.display_id),
-    )
-    .await?;
+    let rows = rows?;
+    // The final display read remains after image acquisition. Its I/O can
+    // overlap pure final-frame validation; both results remain mandatory.
+    let (display, pixels) = tokio::join!(
+        sample_part(
+            "target_sample_display_after",
+            "target_sample_display_after_ok",
+            super::super::display::verify_selection(wda, &input.key.session, mapping.display_id),
+        ),
+        sample_part(
+            "target_sample_decode_after",
+            "target_sample_decode_after_ok",
+            async {
+                let pixels = sample_pixels(&image, mapping)?;
+                if let Some(first) = before {
+                    let expected = input.bound.region.as_ref().ok_or(AdapterError)?;
+                    let last = pixels.region(mapping.viewport, &input.bound.attrs, &mut 0)?;
+                    crate::timing::outcome("target_region_before_ok", &first == expected);
+                    crate::timing::outcome("target_region_after_ok", &last == expected);
+                    if &first != expected || &last != expected {
+                        return Err(AdapterError);
+                    }
+                }
+                Ok(pixels)
+            }
+        ),
+    );
+    display?;
+    let pixels = pixels?;
     Ok(Sample {
         rows,
         image,
@@ -252,86 +331,23 @@ fn matches_count(bound: &Bound, rows: &[Value]) -> usize {
         .count()
 }
 
-/// The frame most recently presented with the target, at most this old.
-pub(super) const FAST_FRAME_AGE: Duration = Duration::from_secs(2);
-
-pub(super) struct FastBasis {
-    pub image: ScreenImage,
-    pub captured: Instant,
-    /// Editable fields whose caret may blink without new semantic capture.
-    pub fields: Vec<[f64; 4]>,
-}
-
-/// Frame-scoped admission from one image-only grab. `Ok(false)` means the
-/// screen drifted outside an editable field, so the full scoped query decides.
-/// A changed target region refuses exactly as the scoped path does.
-async fn validate_frame(
-    wda: &impl WdaRequest,
-    input: &Input,
-    basis: &FastBasis,
-) -> Result<bool, AdapterError> {
-    let _span = crate::timing::Span::new("target_frame_admission");
-    let mapping = input.bound.mapping.ok_or(AdapterError)?;
-    if basis.captured.elapsed() >= FAST_FRAME_AGE {
-        return Ok(false);
-    }
-    if MARKERS.iter().any(|m| input.app.contains(m)) || input.app.chars().any(char::is_control) {
-        return Err(AdapterError);
-    }
-    super::super::display::verify_selection(wda, &input.key.session, mapping.display_id).await?;
-    let (image, app) = tokio::join!(
-        screenshot(wda),
-        app_matches(wda, &input.key.session, &input.app)
-    );
-    app?;
-    let pixels = Pixels::decode(&image?.bytes)?;
-    pixels.validate_mapping(
-        mapping.viewport,
-        mapping.scale,
-        [mapping.viewport[2], mapping.viewport[3]],
-    )?;
-    super::super::display::verify_selection(wda, &input.key.session, mapping.display_id).await?;
-    let region = pixels.region(mapping.viewport, &input.bound.attrs, &mut 0)?;
-    if input.bound.region.as_ref() != Some(&region) {
-        return Err(AdapterError);
-    }
-    let base = Pixels::decode(&basis.image.bytes)?;
-    Ok(match super::delta::changes(&base, &pixels, mapping)? {
-        None => true,
-        Some(changed) => {
-            !super::delta::intersects(changed, input.bound.public.rect)
-                && basis
-                    .fields
-                    .iter()
-                    .any(|field| super::delta::contains(*field, changed))
-        }
-    })
-}
-
-async fn validate_region(
-    wda: &impl WdaRequest,
-    input: &Input,
-    basis: Option<&FastBasis>,
-) -> Result<(), AdapterError> {
-    if let Some(basis) = basis
-        && validate_frame(wda, input, basis).await?
-    {
-        return Ok(());
-    }
+async fn validate_region(wda: &impl WdaRequest, input: &Input) -> Result<(), AdapterError> {
     let _span = crate::timing::Span::new("target_scoped_region");
-    let sample = sample(wda, input, false).await?;
+    let sample = sample(wda, input, false, true).await?;
     let bound = &input.bound;
     let current = sample
         .rows
         .iter()
         .find(|row| id(row).ok().as_deref() == Some(&bound.native))
         .ok_or(AdapterError)?;
-    if matches_count(bound, &sample.rows) != 1
-        || current != &bound.rich
-        || !identity_matches(current, &bound.attrs)
-        || current["enabled"] != true
-        || current["displayed"] != true
-    {
+    let identity_ok = matches_count(bound, &sample.rows) == 1;
+    let attributes_ok = current == &bound.rich
+        && identity_matches(current, &bound.attrs)
+        && current["enabled"] == true
+        && current["displayed"] == true;
+    crate::timing::outcome("target_identity_ok", identity_ok);
+    crate::timing::outcome("target_attributes_ok", attributes_ok);
+    if !identity_ok || !attributes_ok {
         return Err(AdapterError);
     }
     let mapping = bound.mapping.ok_or(AdapterError)?;
@@ -357,7 +373,7 @@ async fn validate_tail(wda: &impl WdaRequest, input: &Input) -> Result<(), Adapt
 
 #[cfg(test)]
 pub(super) async fn revalidate(wda: &impl WdaRequest, input: &Input) -> Result<(), AdapterError> {
-    validate_region(wda, input, None).await?;
+    validate_region(wda, input).await?;
     validate_tail(wda, input).await
 }
 
@@ -378,7 +394,6 @@ pub(super) async fn revalidate_with_native(
     wda: &impl WdaRequest,
     input: &Input,
     deadline: Instant,
-    basis: Option<FastBasis>,
     native: impl FnOnce(Instant) -> LockState + Send + 'static,
 ) -> Result<Result<NativeProof, AdapterError>, AdapterError> {
     let _span = crate::timing::Span::new("target_scoped_admission");
@@ -386,7 +401,7 @@ pub(super) async fn revalidate_with_native(
         return Ok(Err(AdapterError));
     }
     let checked = rich_context(wda, &input.key.session, ATTRS, async {
-        before_input_deadline(deadline, validate_region(wda, input, basis.as_ref())).await?;
+        before_input_deadline(deadline, validate_region(wda, input)).await?;
         before_input_deadline(deadline, validate_tail(wda, input)).await
     })
     .await;
@@ -538,7 +553,7 @@ pub(super) async fn after(
     input: &Input,
 ) -> Result<(RawObservation, Vec<Bound>, bool, Instant), AdapterError> {
     let focus = focus_target(&input.bound);
-    let sample = sample(wda, input, focus).await?;
+    let sample = sample(wda, input, focus, false).await?;
     let bound = &input.bound;
     let mapping = bound.mapping.ok_or(AdapterError)?;
     let region = sample

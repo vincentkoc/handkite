@@ -12,7 +12,7 @@ pub(in crate::wda_adapter) struct DeltaBaseline {
     entries: Vec<(Bound, Instant)>,
     dirty: Vec<[f64; 4]>,
     until: Instant,
-    /// Start of the capture that produced `image`; bounds frame-scoped admission.
+    /// Original complete capture time; bounds immutable snapshot replay.
     captured: Instant,
     /// Only an untouched complete snapshot can use immutable replay.
     snapshot_replay: bool,
@@ -68,24 +68,6 @@ impl DeltaBaseline {
             && snapshot.bracket_equal
             && snapshot.cost.within_visibility_budget()
             && snapshot.evidence.actionable().unwrap_or(false)
-    }
-
-    /// Exact frame evidence for one prompt input. Editable-field rectangles
-    /// allow only caret drift; every other change requires full admission.
-    pub(super) fn fast_basis(&self, key: &cache::Key, app: &str) -> Option<fast::FastBasis> {
-        (self.key == *key && self.app == app && self.captured.elapsed() < fast::FAST_FRAME_AGE)
-            .then(|| fast::FastBasis {
-                image: self.image.clone(),
-                captured: self.captured,
-                fields: self
-                    .entries
-                    .iter()
-                    .filter(|(e, _)| {
-                        field(&e.public.kind) && e.public.kind != "XCUIElementTypeKeyboard"
-                    })
-                    .map(|(e, _)| e.public.rect)
-                    .collect(),
-            })
     }
 
     fn input_deadline(&self) -> Instant {
@@ -381,8 +363,6 @@ const CARET_HEIGHT: f64 = 80.;
 struct DeltaCapture {
     raw: RawObservation,
     entries: Vec<(Bound, Instant)>,
-    /// Request time of the presented frame.
-    after_started: Instant,
     /// Effect sample for a pending tap and the WDA cache entries it may add.
     effect: Option<(fast::Outcome, usize)>,
 }
@@ -437,7 +417,6 @@ async fn capture(
         }
     });
     let (rows, focused) = (rows?, focused?);
-    let after_started = Instant::now();
     let after = screenshot(wda).await?;
     let last = Pixels::decode(&after.bytes)?;
     last.validate_mapping(
@@ -494,7 +473,6 @@ async fn capture(
             screenshot: after,
         },
         entries,
-        after_started,
         effect,
     })
 }
@@ -566,7 +544,6 @@ impl WdaAdapter {
         let DeltaCapture {
             raw,
             entries,
-            after_started,
             effect,
         } = self.target_work(result)?;
         self.validate_owned()?;
@@ -591,7 +568,6 @@ impl WdaAdapter {
         base.dirty.clear();
         base.revision = None;
         base.until = Instant::now() + AGE;
-        base.captured = after_started;
         let until = base.input_deadline();
         let entries = base
             .entries
@@ -714,10 +690,9 @@ mod tests {
     }
 
     #[test]
-    fn immutable_delta_fallback_preserves_original_fast_frame_age_and_expiry() {
+    fn immutable_delta_fallback_preserves_original_capture_time_and_expiry() {
         let (base, snapshot) = complete_snapshot();
         assert!(base.can_replay_snapshot(&snapshot, &base.key, Revision(1), false));
-        assert!(base.fast_basis(&base.key, &base.app).is_none());
         let entries = base
             .entries
             .iter()
@@ -727,7 +702,6 @@ mod tests {
         assert_eq!(next.captured, base.captured);
         assert_eq!(next.until, base.until);
         assert_eq!(next.entries[0].1, base.entries[0].1);
-        assert!(next.fast_basis(&next.key, &next.app).is_none());
     }
 
     #[test]
