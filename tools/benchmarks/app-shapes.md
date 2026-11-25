@@ -43,16 +43,34 @@ fixture unchanged for its before/after measurement.
 | Photos | Existing library or album grid | Browse only; no changes, sharing or deletion |
 | App Store | Existing public browse pages | Browse only; no Get, Buy, account or subscription action |
 | Notes compose | New disposable note with a unique synthetic title | Type, verify and discard only the note created by this run |
-| Maps | Existing map or public place results | Browse and pan only; no saved places or route changes |
+| Maps | Existing map or public place results, with no location prompt | Browse and pan only; skip location-dependent flows, saved places and route changes |
 | Long native list | A read-only picker or list | Scroll without selecting or changing an entry |
 
 Repeat a three-scroll sequence eight times when the page has enough content.
 Record the initial position and scroll geometry, and distinguish scrolling from
 a boundary bounce. Address-bar Go is URL navigation; do not submit a web form.
 Never sign in, download, answer a permission prompt, change Settings or enter a
-PIN. If a prompt appears, capture its category without private text, press Home
-through normal guarded navigation, and mark that app blocked. Uncertain delivery
+PIN. Avoid setup that requests a new permission. If a prompt appears, capture its
+category without private text and report it. Try Home only through normal guarded
+navigation; if the alert remains over SpringBoard, stop that fixture and let the
+owner choose the permission response. Do not treat a Home revision as authority
+to tap the alert. Mark that app blocked. Uncertain delivery
 stops its input sequence; it is not permission to retry or bypass admission.
 
 Run summaries and qualified changes belong in `VALIDATION.md`. Keep detailed
 private evidence only while the active task needs it.
+
+## Home-to-Clock regression fixture
+
+First confirm native Unlocked and inspect a fresh image for system alerts.
+With one persistent client, run at least ten trials on the same installed build:
+Home, ten outline observations with `targets:false` and `image:"omit"`, then
+launch `com.apple.mobiletimer`. Record each Home and launch receipt, verified
+effect, latency and timing stages. All ten intermediate observations must prove
+unlocked Home. Do not substitute app-to-app launches for this fixture.
+
+After an unconfirmed launch, use a fresh read-only status and image to resolve
+the screen before another trial. Preserve the original unconfirmed result;
+never resend that launch. Stop on a permission prompt or unresolved state.
+Report source/destination evidence only where the trace actually records it:
+a coherent capture alone does not identify the foreground app.
