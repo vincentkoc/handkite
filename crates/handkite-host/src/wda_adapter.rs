@@ -994,6 +994,7 @@ impl DeviceAdapter for WdaAdapter {
         self.effect_reports.clone()
     }
     fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
+        let _timing = crate::timing::Span::new("navigation_observe");
         self.finish_pending_effect(true)?;
         self.navigation_frame()
     }
@@ -1468,6 +1469,31 @@ impl DeviceAdapter for WdaAdapter {
         admission: Option<ActionAdmission>,
         motion: Option<Motion>,
     ) -> Result<TransportReceipt, AdapterError> {
+        self.execute_in_navigation_context(action, send_deadline, admission, motion, None)
+    }
+}
+
+impl WdaAdapter {
+    fn execute_in_navigation_context(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        admission: Option<ActionAdmission>,
+        motion: Option<Motion>,
+        navigation_app: Option<&str>,
+    ) -> Result<TransportReceipt, AdapterError> {
+        if navigation_app.is_some()
+            && !matches!(
+                (action, admission),
+                (Action::Home, Some(ActionAdmission::NativeHome { .. }))
+                    | (
+                        Action::LaunchApp { .. },
+                        Some(ActionAdmission::NativeAppLaunch { .. })
+                    )
+            )
+        {
+            return Err(AdapterError);
+        }
         self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
         self.cache.clear_full();
@@ -1497,7 +1523,12 @@ impl DeviceAdapter for WdaAdapter {
             {
                 return Err(AdapterError);
             }
-            return self.execute_motion(action, send_deadline, motion);
+            return self.execute_motion_in_navigation_context(
+                action,
+                send_deadline,
+                motion,
+                navigation_app,
+            );
         }
         if let Some(ActionAdmission::NativeSwipe {
             from,
@@ -1634,8 +1665,12 @@ impl DeviceAdapter for WdaAdapter {
                 return Err(AdapterError);
             }
             self.validate_owned_with_deadline(Some(send_deadline))?;
-            if native_lock::query_until(&self.expected, send_deadline).state != LockState::Unlocked
-            {
+            let native = if let Some(app) = navigation_app {
+                self.native_navigation_input(app, send_deadline)?
+            } else {
+                native_lock::query_until(&self.expected, send_deadline).state
+            };
+            if native != LockState::Unlocked {
                 return Err(AdapterError);
             }
             let wda = UsbWda::new(self.usb.clone()).with_write_deadline(send_deadline);
@@ -2109,6 +2144,16 @@ impl WdaAdapter {
         send_deadline: Instant,
         motion: Option<Motion>,
     ) -> Result<TransportReceipt, AdapterError> {
+        self.execute_motion_in_navigation_context(action, send_deadline, motion, None)
+    }
+
+    fn execute_motion_in_navigation_context(
+        &mut self,
+        action: &Action,
+        send_deadline: Instant,
+        motion: Option<Motion>,
+        navigation_app: Option<&str>,
+    ) -> Result<TransportReceipt, AdapterError> {
         self.finish_pending_effect(true)?;
         self.error_diagnostic = None;
         self.validate_owned_with_deadline(Some(send_deadline))
@@ -2127,7 +2172,11 @@ impl WdaAdapter {
                     | Action::Key { .. }
                     | Action::KeyCurrent { .. }
             ) && self.owned_session.is_some())
-            && self.native_fresh(Some(send_deadline)) != LockState::Unlocked
+            && if let Some(app) = navigation_app {
+                self.native_navigation_input(app, send_deadline)?
+            } else {
+                self.native_fresh(Some(send_deadline))
+            } != LockState::Unlocked
         {
             self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
             return Err(AdapterError);

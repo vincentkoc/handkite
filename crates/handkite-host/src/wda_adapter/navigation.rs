@@ -89,6 +89,7 @@ impl WdaAdapter {
         &mut self,
         action: &Action,
     ) -> Result<(RawObservation, ActionAdmission), AdapterError> {
+        let _timing = crate::timing::Span::new("navigation_prepare");
         if !matches!(action, Action::Home | Action::LaunchApp { .. }) {
             return Err(AdapterError);
         }
@@ -120,6 +121,7 @@ impl WdaAdapter {
         admission: ActionAdmission,
         app: &str,
     ) -> Result<TransportReceipt, AdapterError> {
+        let _timing = crate::timing::Span::new("navigation_dispatch");
         if !matches!(
             (action, admission),
             (Action::Home, ActionAdmission::NativeHome { .. })
@@ -131,17 +133,54 @@ impl WdaAdapter {
             return Err(AdapterError);
         }
         self.validate_owned_with_deadline(Some(deadline))?;
+        self.execute_in_navigation_context(action, deadline, Some(admission), None, Some(app))
+    }
+
+    pub(super) fn native_navigation_input(
+        &self,
+        app: &str,
+        deadline: Instant,
+    ) -> Result<LockState, AdapterError> {
+        let _timing = crate::timing::Span::new("navigation_final_proof");
         let wda = UsbWda::new(self.usb.clone()).with_write_deadline(deadline);
         let session = self.owned_session.as_ref().ok_or(AdapterError)?;
-        self.runtime
+        let expected = self.expected.clone();
+        let started = Instant::now();
+        let result = self
+            .runtime
             .as_ref()
             .ok_or(AdapterError)?
-            .block_on(before_input_deadline(
-                deadline,
+            .block_on(native_app_before_input(
+                move || native_lock::query_until(&expected, deadline).state,
                 focused_text::app_matches(&wda, session, app),
-            ))?;
-        self.execute_with_admission(action, deadline, Some(admission))
+                deadline,
+            ));
+        match &result {
+            Ok(native) => self.cache.record_native(self.cache_key(), *native, started),
+            Err(_) => self.cache.clear(),
+        }
+        result
     }
+}
+
+async fn native_app_before_input(
+    native: impl FnOnce() -> LockState + Send + 'static,
+    app: impl Future<Output = Result<(), AdapterError>>,
+    deadline: Instant,
+) -> Result<LockState, AdapterError> {
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or(AdapterError)?;
+    // Bound the response read itself, independently of the write deadline.
+    let app = tokio::time::timeout(remaining, app);
+    let (native, app) =
+        context_with_native(native, async move { app.await.map_err(|_| AdapterError)? }).await;
+    app?;
+    if Instant::now() >= deadline {
+        return Err(AdapterError);
+    }
+    Ok(native)
 }
 
 async fn context_with_native<T>(
@@ -177,6 +216,150 @@ fn same_context(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unresolved_app_read_times_out_and_drains_native_before_returning() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let drained = Arc::new(AtomicBool::new(false));
+        let worker_drained = drained.clone();
+        let limit = Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let real_start = Instant::now();
+        let proof = tokio::spawn(native_app_before_input(
+            move || {
+                worker_drained.store(true, Ordering::SeqCst);
+                LockState::Unlocked
+            },
+            std::future::pending(),
+            Instant::now() + limit,
+        ));
+        // Keep the test runnable until the blocking worker has returned; this
+        // prevents paused-time auto-advance from racing thread-pool startup.
+        while !drained.load(Ordering::SeqCst) {
+            assert!(real_start.elapsed() < Duration::from_secs(5));
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(limit).await;
+        let result = tokio::time::timeout(Duration::from_millis(1), proof)
+            .await
+            .expect("app read exceeded its deadline")
+            .unwrap();
+        assert_eq!(result, Err(AdapterError));
+        assert!(drained.load(Ordering::SeqCst));
+        assert!(started.elapsed() <= limit);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn app_timeout_does_not_detach_a_native_query_still_finishing() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let started = Arc::new(AtomicBool::new(false));
+        let worker_started = started.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let real_start = Instant::now();
+        let limit = Duration::from_secs(10);
+        let proof = tokio::spawn(native_app_before_input(
+            move || {
+                worker_started.store(true, Ordering::SeqCst);
+                wait.recv_timeout(Duration::from_secs(5)).unwrap();
+                LockState::Unlocked
+            },
+            std::future::pending(),
+            Instant::now() + limit,
+        ));
+        while !started.load(Ordering::SeqCst) {
+            assert!(real_start.elapsed() < Duration::from_secs(5));
+            tokio::task::yield_now().await;
+        }
+        tokio::time::advance(limit).await;
+        assert!(!proof.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(proof.await.unwrap(), Err(AdapterError));
+    }
+
+    #[tokio::test]
+    async fn final_app_check_overlaps_native_but_cannot_send_before_both_finish() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        let (release, wait) = std::sync::mpsc::channel();
+        let (app_done, completed) = tokio::sync::oneshot::channel();
+        let proof = tokio::spawn(native_app_before_input(
+            move || {
+                counted.fetch_add(1, Ordering::SeqCst);
+                wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                LockState::Unlocked
+            },
+            async move {
+                app_done.send(()).unwrap();
+                Ok(())
+            },
+            Instant::now() + Duration::from_secs(2),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), completed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!proof.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(proof.await.unwrap(), Ok(LockState::Unlocked));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_final_app_check_drains_native_and_preserves_refusal() {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (app_done, completed) = tokio::sync::oneshot::channel();
+        let proof = tokio::spawn(native_app_before_input(
+            move || {
+                wait.recv_timeout(Duration::from_secs(2)).unwrap();
+                LockState::Unlocked
+            },
+            async move {
+                app_done.send(()).unwrap();
+                Err(AdapterError)
+            },
+            Instant::now() + Duration::from_secs(2),
+        ));
+        tokio::time::timeout(Duration::from_secs(1), completed)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!proof.is_finished());
+        release.send(()).unwrap();
+        assert_eq!(proof.await.unwrap(), Err(AdapterError));
+    }
+
+    #[tokio::test]
+    async fn final_proof_keeps_locked_uncertain_and_expired_states_unusable() {
+        for state in [LockState::Locked, LockState::Uncertain] {
+            let result = native_app_before_input(
+                move || state,
+                async { Ok(()) },
+                Instant::now() + Duration::from_secs(1),
+            )
+            .await;
+            assert_eq!(result, Ok(state));
+            assert_ne!(result, Ok(LockState::Unlocked));
+        }
+        assert!(
+            native_app_before_input(
+                || panic!("expired proof queried native state"),
+                async { panic!("expired proof queried app state") },
+                Instant::now()
+            )
+            .await
+            .is_err()
+        );
+    }
 
     #[tokio::test]
     async fn context_runs_while_native_is_pending_but_cannot_publish_early() {
