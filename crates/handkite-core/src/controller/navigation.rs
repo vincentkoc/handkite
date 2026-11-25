@@ -87,8 +87,13 @@ impl<A: DeviceAdapter> Controller<A> {
         &self,
         inner: &mut Inner<A>,
         device: &DeviceKey,
+        home_retry: Option<bool>,
     ) -> Result<Option<NavigationObservation>, ControllerError> {
-        match inner.adapter.observe_navigation() {
+        let raw = match home_retry {
+            Some(retry) => inner.adapter.observe_home_readback(retry),
+            None => inner.adapter.observe_navigation(),
+        };
+        match raw {
             Ok(raw) => match self.accept_navigation(inner, device, raw) {
                 Ok(after) => Ok(Some(after)),
                 Err(ControllerError::DeviceMismatch) => Err(ControllerError::DeviceMismatch),
@@ -177,7 +182,10 @@ impl<A: DeviceAdapter> Controller<A> {
             )
             .map_err(|_| Self::adapter_error(&mut inner))?;
         let verification_started = Instant::now();
-        let mut after = self.navigation_readback(&mut inner, &request.device)?;
+        let home_readback =
+            matches!(request.action, Action::Home) && receipt.accepted == Some(true);
+        let mut after =
+            self.navigation_readback(&mut inner, &request.device, home_readback.then_some(false))?;
         if retry_home_read(
             &request.action,
             receipt.accepted,
@@ -187,7 +195,7 @@ impl<A: DeviceAdapter> Controller<A> {
         ) {
             // Only read again. The input baseline stays consumed, and only this
             // final read can supply a revision or confirm the Home effect.
-            after = self.navigation_readback(&mut inner, &request.device)?;
+            after = self.navigation_readback(&mut inner, &request.device, Some(true))?;
         }
         let destination = match &request.action {
             Action::Home => "com.apple.springboard",
@@ -277,8 +285,13 @@ mod tests {
         post_reads: usize,
         post_capture: PostCapture,
         accepted: Option<bool>,
+        home_reads: Vec<bool>,
     }
     impl DeviceAdapter for Adapter {
+        fn observe_home_readback(&mut self, retry: bool) -> Result<RawObservation, AdapterError> {
+            self.home_reads.push(retry);
+            self.observe_navigation()
+        }
         fn identities(&mut self) -> Result<(HardwareId, HardwareId), AdapterError> {
             let id = HardwareId::new("fixture").unwrap();
             Ok((id.clone(), id))
@@ -394,6 +407,7 @@ mod tests {
                 post_reads: 0,
                 post_capture: PostCapture::Stable,
                 accepted: Some(true),
+                home_reads: Vec::new(),
             },
             5000,
             5000,
@@ -403,6 +417,44 @@ mod tests {
             .unwrap();
         (c, key, lease)
     }
+    #[test]
+    fn home_proof_handoff_is_only_the_existing_acknowledged_second_read() {
+        for (launch, accepted, mode, expected) in [
+            (false, Some(true), PostCapture::FailOnce, vec![false, true]),
+            (false, Some(true), PostCapture::Stable, vec![false]),
+            (false, Some(false), PostCapture::FailOnce, vec![]),
+            (true, Some(true), PostCapture::Stable, vec![]),
+        ] {
+            let (c, key, lease) = fixture();
+            let before = c.observe_navigation(&key).unwrap();
+            {
+                let mut inner = c.inner.lock().unwrap();
+                inner.adapter.accepted = accepted;
+                inner.adapter.post_capture = mode;
+            }
+            c.navigate(
+                "owner",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.revision),
+                    action: if launch {
+                        Action::LaunchApp {
+                            bundle_id: "example.target".into(),
+                        }
+                    } else {
+                        Action::Home
+                    },
+                },
+            )
+            .unwrap();
+            let inner = c.inner.lock().unwrap();
+            assert_eq!(inner.adapter.home_reads, expected);
+            assert_eq!(inner.adapter.sends, 1);
+            assert!(inner.adapter.post_reads <= 2);
+        }
+    }
+
     #[test]
     fn home_verification_recovers_one_transition_read_without_resending_input() {
         for mode in [PostCapture::FailOnce, PostCapture::OldOnce] {

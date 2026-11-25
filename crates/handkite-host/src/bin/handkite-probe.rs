@@ -1,5 +1,4 @@
 use handkite_core::controller::Controller;
-use handkite_core::controller::DeviceAdapter;
 use handkite_core::protocol::{
     Action, ActionRequest, DeviceBinding, DeviceKey, HardwareId, LockState, Observation,
 };
@@ -534,7 +533,9 @@ fn pin_screenshot(expected: HardwareId, path: &Path) -> Result<(), String> {
         return Err("screenshot directory must be private".into());
     }
     let mut adapter = WdaAdapter::new(expected).map_err(|_| "WDA unavailable")?;
-    let observation = adapter.observe().map_err(|_| "screenshot unavailable")?;
+    let observation = adapter
+        .observe_full_tree()
+        .map_err(|_| "screenshot unavailable")?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

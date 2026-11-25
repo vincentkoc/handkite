@@ -1,10 +1,65 @@
 use super::*;
 
+const HOME_PROOF_HANDOFF: Duration = Duration::from_millis(50);
+
+pub(super) struct HomeProof {
+    key: cache::Key,
+    native: LockState,
+    context: (String, bool),
+    started_unix_ms: u64,
+    finished: Instant,
+}
+
+impl HomeProof {
+    fn matches(&self, key: Option<&cache::Key>, now: Instant) -> bool {
+        key == Some(&self.key)
+            && self.native == LockState::Unlocked
+            && self.context.0 == "com.apple.springboard"
+            && !self.context.1
+            && now
+                .checked_duration_since(self.finished)
+                .is_some_and(|age| age < HOME_PROOF_HANDOFF)
+    }
+}
+
+fn reusable_home_context(
+    native_before: LockState,
+    native_after: LockState,
+    before: &(String, bool),
+    after: &(String, bool),
+    reported: Option<bool>,
+) -> bool {
+    reported == Some(false)
+        && native_before == LockState::Unlocked
+        && native_after == LockState::Unlocked
+        && !before.0.is_empty()
+        && !before.1
+        && after.0 == "com.apple.springboard"
+        && !after.1
+}
+
 impl WdaAdapter {
     pub(super) fn navigation_frame(&mut self) -> Result<RawObservation, AdapterError> {
+        self.home_readback_proof = None;
+        self.navigation_frame_with_proof(None, false)
+    }
+
+    pub(super) fn home_navigation_frame(
+        &mut self,
+        retry: bool,
+    ) -> Result<RawObservation, AdapterError> {
+        let proof = self.home_readback_proof.take().filter(|_| retry);
+        self.navigation_frame_with_proof(proof, !retry)
+    }
+
+    fn navigation_frame_with_proof(
+        &mut self,
+        proof: Option<HomeProof>,
+        allow_handoff: bool,
+    ) -> Result<RawObservation, AdapterError> {
         self.error_diagnostic = None;
         self.cache.clear_full();
-        let started_unix_ms = unix_ms()?;
+        let mut started_unix_ms = unix_ms()?;
         self.validate_owned()?;
         if self.owned_session.is_none() || self.owned_runner.is_none() {
             self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
@@ -14,7 +69,16 @@ impl WdaAdapter {
         let wda = UsbWda::new(self.usb.clone());
         let (native_before, before) = {
             let _timing = crate::timing::Span::new("navigation_before_proof");
-            self.navigation_context(&wda, session)?
+            let proof =
+                proof.filter(|proof| proof.matches(self.cache_key().as_ref(), Instant::now()));
+            crate::timing::outcome("navigation_before_proof_reused", proof.is_some());
+            if let Some(proof) = proof {
+                // Keep the original evidence window, never a fresh handoff timestamp.
+                started_unix_ms = proof.started_unix_ms;
+                (proof.native, Ok(proof.context))
+            } else {
+                self.navigation_context(&wda, session)?
+            }
         };
         if native_before == LockState::Uncertain {
             self.error_diagnostic = Some(AdapterDiagnostic::NativeBefore);
@@ -27,27 +91,67 @@ impl WdaAdapter {
             let _timing = crate::timing::Span::new("navigation_capture");
             self.capture_frame(None)?
         };
+        let after_started_unix_ms = unix_ms()?;
         let (native_after, after) = {
             let _timing = crate::timing::Span::new("navigation_after_proof");
             self.navigation_context(&wda, session)?
         };
+        let proof_finished = Instant::now();
         let after = after?;
         let coherent = same_context(&before, &frame.app, frame.reported, &after);
+        crate::timing::outcome("home_proof_allowed", allow_handoff);
+        if allow_handoff {
+            for (stage, value) in [
+                (
+                    "home_proof_frame_home",
+                    frame.app == "com.apple.springboard",
+                ),
+                ("home_proof_frame_unlocked", frame.reported == Some(false)),
+                ("home_proof_before_known", !before.0.is_empty()),
+                ("home_proof_before_unlocked", !before.1),
+                ("home_proof_after_home", after.0 == "com.apple.springboard"),
+                ("home_proof_after_unlocked", !after.1),
+                (
+                    "home_proof_native_before",
+                    native_before == LockState::Unlocked,
+                ),
+                (
+                    "home_proof_native_after",
+                    native_after == LockState::Unlocked,
+                ),
+                ("home_proof_key_available", self.cache_key().is_some()),
+            ] {
+                crate::timing::outcome(stage, value);
+            }
+        }
+        if allow_handoff
+            && !coherent
+            && reusable_home_context(native_before, native_after, &before, &after, frame.reported)
+        {
+            // Discard this frame. Only the later independent after-proof can
+            // precede the retry's new frame, after final ownership validation.
+            self.validate_owned()?;
+            self.home_readback_proof = self.cache_key().map(|key| HomeProof {
+                key,
+                native: native_after,
+                context: after.clone(),
+                started_unix_ms: after_started_unix_ms,
+                finished: proof_finished,
+            });
+        }
+        crate::timing::outcome(
+            "navigation_home_proof_handoff",
+            self.home_readback_proof.is_some(),
+        );
         crate::timing::outcome("navigation_context_coherent", coherent);
-        if !coherent {
-            return Err(AdapterError);
-        }
-        let unlocked = native_before == LockState::Unlocked && frame.reported == Some(false);
-        let locked = native_before == LockState::Locked && frame.reported == Some(true);
-        if !unlocked && !locked {
-            return Err(AdapterError);
-        }
-        if unlocked && frame.app.is_empty() {
-            return Err(AdapterError);
-        }
-        if native_after != native_before {
-            return Err(AdapterError);
-        }
+        let state = readback_state(
+            native_before,
+            native_after,
+            &before,
+            &frame.app,
+            frame.reported,
+            &after,
+        )?;
         self.validate_owned()?;
         Ok(RawObservation {
             connected_usb: self.expected.clone(),
@@ -56,11 +160,7 @@ impl WdaAdapter {
                 started_unix_ms,
                 finished_unix_ms: unix_ms()?,
             },
-            state: DeviceState {
-                lock: native_before,
-                wda_ready: true,
-                foreground_app: Some(frame.app),
-            },
+            state,
             accessibility_tree: String::new(),
             screenshot: frame.screenshot,
         })
@@ -213,9 +313,204 @@ fn same_context(
 ) -> bool {
     before == after && before.0 == app && Some(before.1) == lock
 }
+
+fn readback_state(
+    native_before: LockState,
+    native_after: LockState,
+    before: &(String, bool),
+    app: &str,
+    reported: Option<bool>,
+    after: &(String, bool),
+) -> Result<DeviceState, AdapterError> {
+    if !same_context(before, app, reported, after) || native_after != native_before {
+        return Err(AdapterError);
+    }
+    let unlocked = native_before == LockState::Unlocked && reported == Some(false);
+    let locked = native_before == LockState::Locked && reported == Some(true);
+    if (!unlocked && !locked) || (unlocked && app.is_empty()) {
+        return Err(AdapterError);
+    }
+    Ok(DeviceState {
+        lock: native_before,
+        wda_ready: true,
+        foreground_app: Some(app.to_owned()),
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn proof_key() -> cache::Key {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let task = runtime.spawn(std::future::pending::<()>());
+        let runner = task.id();
+        task.abort();
+        cache::Key {
+            device: HardwareId::new("fixture").unwrap(),
+            session: "session".into(),
+            runner,
+        }
+    }
+
+    fn home_proof(key: cache::Key, now: Instant) -> HomeProof {
+        HomeProof {
+            key,
+            native: LockState::Unlocked,
+            context: ("com.apple.springboard".into(), false),
+            started_unix_ms: 123,
+            finished: now,
+        }
+    }
+
+    #[test]
+    fn home_proof_preserves_identity_window_and_strict_handoff_age() {
+        let key = proof_key();
+        let now = Instant::now();
+        let proof = home_proof(key.clone(), now);
+        assert!(proof.matches(Some(&key), now));
+        assert!(proof.matches(
+            Some(&key),
+            now + HOME_PROOF_HANDOFF - Duration::from_nanos(1)
+        ));
+        assert!(!proof.matches(Some(&key), now + HOME_PROOF_HANDOFF));
+        assert!(!proof.matches(Some(&key), now - Duration::from_nanos(1)));
+        assert!(!proof.matches(None, now));
+        let mut changed = key.clone();
+        changed.session = "other".into();
+        assert!(!proof.matches(Some(&changed), now));
+        changed = key.clone();
+        changed.device = HardwareId::new("other").unwrap();
+        assert!(!proof.matches(Some(&changed), now));
+        changed = key.clone();
+        changed.runner = proof_key().runner;
+        assert!(!proof.matches(Some(&changed), now));
+        assert_eq!(proof.started_unix_ms, 123);
+        assert_eq!(proof.finished, now);
+    }
+
+    #[test]
+    fn only_known_unlocked_home_after_context_can_supply_a_proof() {
+        let before = ("example.old-app".into(), false);
+        let after = ("com.apple.springboard".into(), false);
+        assert!(reusable_home_context(
+            LockState::Unlocked,
+            LockState::Unlocked,
+            &before,
+            &after,
+            Some(false)
+        ));
+        for native in [LockState::Locked, LockState::Uncertain] {
+            assert!(!reusable_home_context(
+                native,
+                LockState::Unlocked,
+                &before,
+                &after,
+                Some(false)
+            ));
+            assert!(!reusable_home_context(
+                LockState::Unlocked,
+                native,
+                &before,
+                &after,
+                Some(false)
+            ));
+        }
+        for context in [
+            ("example.app".into(), false),
+            ("".into(), false),
+            ("com.apple.springboard".into(), true),
+        ] {
+            assert!(!reusable_home_context(
+                LockState::Unlocked,
+                LockState::Unlocked,
+                &before,
+                &context,
+                Some(false)
+            ));
+        }
+        for reported in [Some(true), None] {
+            assert!(!reusable_home_context(
+                LockState::Unlocked,
+                LockState::Unlocked,
+                &before,
+                &after,
+                reported
+            ));
+        }
+        assert!(!reusable_home_context(
+            LockState::Unlocked,
+            LockState::Unlocked,
+            &("".into(), false),
+            &after,
+            Some(false)
+        ));
+    }
+
+    #[test]
+    fn old_frame_is_rejected_but_its_later_proof_can_bracket_a_new_frame() {
+        let unlocked = LockState::Unlocked;
+        let old = ("example.old-app".into(), false);
+        let home = ("com.apple.springboard".into(), false);
+        assert!(readback_state(unlocked, unlocked, &old, &old.0, Some(false), &home).is_err());
+        assert!(reusable_home_context(
+            unlocked,
+            unlocked,
+            &old,
+            &home,
+            Some(false)
+        ));
+
+        // Only the independent after-proof survives, never the rejected frame.
+        let key = proof_key();
+        let now = Instant::now();
+        let mut slot = Some(home_proof(key.clone(), now));
+        let proof = slot.take().filter(|p| p.matches(Some(&key), now)).unwrap();
+        assert!(slot.is_none());
+        assert_eq!(proof.started_unix_ms, 123);
+        assert!(
+            readback_state(
+                unlocked,
+                unlocked,
+                &proof.context,
+                &home.0,
+                Some(false),
+                &home
+            )
+            .is_ok()
+        );
+        for (app, reported, after, native) in [
+            (old.0.as_str(), Some(false), &home, unlocked),
+            (home.0.as_str(), Some(false), &old, unlocked),
+            (home.0.as_str(), Some(true), &home, unlocked),
+            (home.0.as_str(), None, &home, unlocked),
+            (home.0.as_str(), Some(false), &home, LockState::Locked),
+            (home.0.as_str(), Some(false), &home, LockState::Uncertain),
+        ] {
+            assert!(
+                readback_state(unlocked, native, &proof.context, app, reported, after).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn normal_first_and_failed_retry_calls_consume_any_old_proof_without_io() {
+        for mode in 0..3 {
+            let key = proof_key();
+            let mut adapter = WdaAdapter::new(key.device.clone()).unwrap();
+            adapter.home_readback_proof = Some(home_proof(key, Instant::now()));
+            // Refuse locally, before any device lookup, on all three entry paths.
+            adapter.text_response_poisoned = true;
+            let result = match mode {
+                0 => adapter.observe_navigation(),
+                1 => adapter.observe_home_readback(false),
+                _ => adapter.observe_home_readback(true),
+            };
+            assert!(result.is_err());
+            assert!(adapter.home_readback_proof.is_none());
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn unresolved_app_read_times_out_and_drains_native_before_returning() {

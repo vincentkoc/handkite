@@ -179,6 +179,11 @@ pub trait DeviceAdapter {
     fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
         Err(AdapterError)
     }
+    /// Readback within one acknowledged Home operation. A retry may carry
+    /// only a just-completed proof; adapters without that support read anew.
+    fn observe_home_readback(&mut self, _retry: bool) -> Result<RawObservation, AdapterError> {
+        self.observe_navigation()
+    }
     fn prepare_navigation(
         &mut self,
         _action: &Action,

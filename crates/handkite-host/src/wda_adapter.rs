@@ -164,6 +164,7 @@ pub struct WdaAdapter {
     launch_admission: Option<(String, Instant)>,
     cache: cache::Cache,
     error_diagnostic: Option<AdapterDiagnostic>,
+    home_readback_proof: Option<navigation::HomeProof>,
     focused_text: Option<focused_text::Input>,
     text_token: u64,
     text_response_poisoned: bool,
@@ -252,6 +253,7 @@ impl WdaAdapter {
             runtime: Some(runtime),
             actions: WdaActions::default(),
             error_diagnostic: None,
+            home_readback_proof: None,
             owned_runner: None,
             owned_session: None,
             owned_idle: None,
@@ -321,6 +323,7 @@ impl WdaAdapter {
             launch_admission: None,
             cache: cache::Cache::default(),
             error_diagnostic: None,
+            home_readback_proof: None,
             focused_text: None,
             text_token: 0,
             text_response_poisoned: false,
@@ -524,6 +527,11 @@ impl WdaAdapter {
             self.cache.clear_full();
         }
         result
+    }
+
+    /// Complete paired capture for diagnostics that require tree-based state.
+    pub fn observe_full_tree(&mut self) -> Result<RawObservation, AdapterError> {
+        self.observe_with_source(CaptureSource::FullTree(SCREEN_SOURCE))
     }
 
     fn observe_with_source(
@@ -1063,8 +1071,20 @@ impl DeviceAdapter for WdaAdapter {
     }
     fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
         let _timing = crate::timing::Span::new("navigation_observe");
+        self.home_readback_proof = None;
         self.finish_pending_effect(true)?;
         self.navigation_frame()
+    }
+    fn observe_home_readback(&mut self, retry: bool) -> Result<RawObservation, AdapterError> {
+        let _timing = crate::timing::Span::new("navigation_observe");
+        if !retry {
+            self.home_readback_proof = None;
+        }
+        if let Err(error) = self.finish_pending_effect(true) {
+            self.home_readback_proof = None;
+            return Err(error);
+        }
+        self.home_navigation_frame(retry)
     }
     fn prepare_navigation(
         &mut self,
@@ -1229,7 +1249,7 @@ impl DeviceAdapter for WdaAdapter {
             || !matches!(admission, Some(ActionAdmission::NativeHome { .. }))
             || receipt.accepted != Some(true)
         {
-            return self.observe_with_source(CaptureSource::FullTree(SCREEN_SOURCE));
+            return self.observe_full_tree();
         }
         let _confirmation = crate::timing::Span::new("home_confirmation");
         let until = Instant::now() + HOME_COMPLETION_BUDGET;
