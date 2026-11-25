@@ -69,6 +69,46 @@ fn retry_navigation_read(
 }
 
 impl<A: DeviceAdapter> Controller<A> {
+    pub fn observe_outline(
+        &self,
+        device: &DeviceKey,
+    ) -> Result<OutlineObservation, ControllerError> {
+        let mut inner = self.inner.lock().map_err(|_| ControllerError::Poisoned)?;
+        inner.last = None;
+        inner.target_last = None;
+        inner.navigation_last = None;
+        let capture = inner
+            .adapter
+            .observe_outline()
+            .map_err(|_| Self::adapter_error(&mut inner))?;
+        let (raw, navigation_only) = match capture {
+            OutlineCapture::Full(raw) => (raw, false),
+            OutlineCapture::NavigationOnly(raw) => (raw, true),
+        };
+        if raw.screenshot.bytes.is_empty() {
+            return Err(ControllerError::Adapter);
+        }
+        if navigation_only && (!ready(&raw.state) || raw.accessibility_tree.is_empty()) {
+            return Err(ControllerError::LockedAction);
+        }
+        let observation = self.accept_capture(&mut inner, device, raw)?;
+        if navigation_only {
+            inner.navigation_last = Some(NavigationObservation {
+                device: observation.device.clone(),
+                revision: observation.revision,
+                window: observation.window.clone(),
+                state: observation.state.clone(),
+                screenshot: observation.screenshot.clone(),
+            });
+        } else {
+            inner.last = Some(observation.clone());
+        }
+        Ok(OutlineObservation {
+            observation,
+            navigation_only,
+        })
+    }
+
     fn accept_navigation(
         &self,
         inner: &mut Inner<A>,
@@ -356,6 +396,13 @@ mod tests {
         Other,
         WrongDevice,
     }
+    #[derive(Clone, Copy)]
+    enum OutlineFault {
+        None,
+        Device,
+        Window,
+        Image,
+    }
     struct Adapter {
         app: String,
         locked: bool,
@@ -369,8 +416,25 @@ mod tests {
         home_reads: Vec<bool>,
         launch_reads: usize,
         launch_retries: Vec<(String, String)>,
+        outline_navigation: bool,
+        outline_fault: OutlineFault,
     }
     impl DeviceAdapter for Adapter {
+        fn observe_outline(&mut self) -> Result<OutlineCapture, AdapterError> {
+            let mut raw = self.observe_navigation()?;
+            raw.accessibility_tree = "<Application><Text value=\"complete\"/></Application>".into();
+            match self.outline_fault {
+                OutlineFault::None => {}
+                OutlineFault::Device => raw.wda_target = HardwareId::new("other").unwrap(),
+                OutlineFault::Window => raw.window.started_unix_ms -= 10_000,
+                OutlineFault::Image => raw.screenshot.bytes.clear(),
+            }
+            Ok(if self.outline_navigation {
+                OutlineCapture::NavigationOnly(raw)
+            } else {
+                OutlineCapture::Full(raw)
+            })
+        }
         fn observe_home_readback(&mut self, retry: bool) -> Result<RawObservation, AdapterError> {
             self.home_reads.push(retry);
             self.observe_navigation()
@@ -543,6 +607,8 @@ mod tests {
                 home_reads: Vec::new(),
                 launch_reads: 0,
                 launch_retries: Vec::new(),
+                outline_navigation: false,
+                outline_fault: OutlineFault::None,
             },
             5000,
             5000,
@@ -551,6 +617,133 @@ mod tests {
             .acquire_with_renewal("owner".into(), Duration::from_secs(30), true)
             .unwrap();
         (c, key, lease)
+    }
+    #[test]
+    fn presentation_outline_only_admits_fresh_navigation() {
+        let (c, key, lease) = fixture();
+        let old = c.observe_outline(&key).unwrap().observation;
+        {
+            let mut inner = c.inner.lock().unwrap();
+            inner.target_last = Some(old.clone());
+            inner.adapter.outline_navigation = true;
+        }
+        let result = c.observe_outline(&key).unwrap();
+        assert!(result.navigation_only);
+        assert!(result.observation.accessibility_tree.contains("complete"));
+        {
+            let inner = c.inner.lock().unwrap();
+            assert!(inner.last.is_none() && inner.target_last.is_none());
+            assert_eq!(
+                inner.navigation_last.as_ref().unwrap().window,
+                result.observation.window
+            );
+        }
+        let request = |action| ActionRequest {
+            device: key.clone(),
+            expected_revision: Some(result.observation.revision),
+            action,
+        };
+        for action in [
+            Action::Tap {
+                at: Point { x: 10.0, y: 10.0 },
+            },
+            Action::Text {
+                value: "text".into(),
+            },
+        ] {
+            assert!(c.act("owner", lease, request(action)).is_err());
+        }
+        assert!(
+            c.act_element(
+                "owner",
+                lease,
+                &key,
+                result.observation.revision,
+                ElementAction::Tap {
+                    target_id: "t_0123456789abcdef0123456789abcdef".into()
+                }
+            )
+            .is_err()
+        );
+        assert_eq!(c.inner.lock().unwrap().adapter.sends, 0);
+        let fresh = c.observe_outline(&key).unwrap();
+        let after = c
+            .navigate(
+                "owner",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(fresh.observation.revision),
+                    action: Action::Home,
+                },
+            )
+            .unwrap();
+        assert_eq!(after.effect, ObservedEffect::Changed);
+        assert_eq!(c.inner.lock().unwrap().adapter.sends, 1);
+    }
+
+    #[test]
+    fn presentation_navigation_still_checks_the_fresh_source_app() {
+        let (c, key, lease) = fixture();
+        c.inner.lock().unwrap().adapter.outline_navigation = true;
+        let before = c.observe_outline(&key).unwrap();
+        c.inner.lock().unwrap().adapter.app = "other.app".into();
+        assert!(matches!(
+            c.navigate(
+                "owner",
+                lease,
+                ActionRequest {
+                    device: key,
+                    expected_revision: Some(before.observation.revision),
+                    action: Action::Home,
+                }
+            ),
+            Err(ControllerError::StaleObservation)
+        ));
+        assert_eq!(c.inner.lock().unwrap().adapter.sends, 0);
+    }
+
+    #[test]
+    fn outline_retains_window_device_image_and_state_checks() {
+        for fault in [
+            OutlineFault::Device,
+            OutlineFault::Window,
+            OutlineFault::Image,
+        ] {
+            let (c, key, _) = fixture();
+            let mut inner = c.inner.lock().unwrap();
+            inner.adapter.outline_navigation = true;
+            inner.adapter.outline_fault = fault;
+            drop(inner);
+            assert!(c.observe_outline(&key).is_err());
+            let inner = c.inner.lock().unwrap();
+            assert!(
+                inner.last.is_none()
+                    && inner.target_last.is_none()
+                    && inner.navigation_last.is_none()
+            );
+            assert_eq!(inner.adapter.sends, 0);
+        }
+        let (c, key, _) = fixture();
+        {
+            let mut inner = c.inner.lock().unwrap();
+            inner.adapter.outline_navigation = true;
+            inner.adapter.locked = true;
+        }
+        assert!(matches!(
+            c.observe_outline(&key),
+            Err(ControllerError::LockedAction)
+        ));
+    }
+
+    #[test]
+    fn full_outline_keeps_ordinary_capture_authority() {
+        let (c, key, _) = fixture();
+        let result = c.observe_outline(&key).unwrap();
+        assert!(!result.navigation_only);
+        let inner = c.inner.lock().unwrap();
+        assert!(inner.last.is_some());
+        assert!(inner.navigation_last.is_none() && inner.target_last.is_none());
     }
     #[test]
     fn home_proof_handoff_is_only_the_existing_acknowledged_second_read() {

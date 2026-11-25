@@ -27,6 +27,8 @@ mod image_tests;
 #[cfg(test)]
 mod navigation_tests;
 #[cfg(test)]
+mod outline_tests;
+#[cfg(test)]
 mod pacing_tests;
 #[cfg(test)]
 mod presentation_tests;
@@ -387,10 +389,13 @@ where
         "observe_targets"
     } else if options.capture == handkite_core::protocol::CaptureMode::ImageOnly {
         "observe_image"
+    } else if options.tree_format == presentation::TreeFormat::Outline {
+        "observe_outline"
     } else {
         "observe"
     };
     let mut native_targets = None;
+    let mut navigation_only = false;
     let mut request = json!({"method": method, "device": device});
     if method == "observe_targets"
         && let Some(revision) = options.since_revision
@@ -433,8 +438,17 @@ where
             payload["allowed_actions"] = json!(["home", "launch_app"]);
             return response::text_result(payload);
         }
+        Ok(Reply::ObservedOutline {
+            observation,
+            navigation_only: limited,
+        }) if method == "observe_outline" => {
+            navigation_only = limited;
+            observation
+        }
         Ok(Reply::Observed { observation }) if method == "observe" => observation,
-        Ok(Reply::Error { code }) if method == "observe" && code == "AdapterCaptureHome" => {
+        Ok(Reply::Error { code })
+            if matches!(method, "observe" | "observe_outline") && code == "AdapterCaptureHome" =>
+        {
             return navigation_fallback(
                 device,
                 session,
@@ -444,7 +458,7 @@ where
             );
         }
         Ok(Reply::Error { code })
-            if matches!(method, "observe" | "observe_targets")
+            if matches!(method, "observe" | "observe_outline" | "observe_targets")
                 && code == "AdapterCaptureImageDrift" =>
         {
             session.presentation.clear();
@@ -498,7 +512,7 @@ where
             "DeviceMismatch",
         );
     }
-    if method == "observe"
+    if matches!(method, "observe" | "observe_outline")
         && observation.state.foreground_app.as_deref() == Some("com.apple.springboard")
         && observation.state.lock == handkite_core::protocol::LockState::Uncertain
     {
@@ -518,8 +532,26 @@ where
     let native_regions = observation
         .accessibility_tree
         .starts_with("<AppiumAUT source=\"native_regions\">");
+    if navigation_only {
+        session.presentation.clear();
+        session.target_inventory = None;
+        session.home_observe_hint = false;
+    }
     let content = session.presentation.content(observation, options);
     let mut result = json!({"content": content});
+    if navigation_only {
+        let mut payload: Value =
+            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+        payload["revision"] = json!(revision);
+        payload["revision_scope"] = json!("navigation");
+        payload["metadata"]["revision_scope"] = json!("navigation");
+        payload["tree_scope"] = json!("presentation");
+        payload["visibility"] = json!("unknown");
+        payload["allowed_actions"] = json!(["home", "launch_app"]);
+        payload["target_actionable"] = json!(false);
+        result["content"][0]["text"] = json!(payload.to_string());
+        result["structuredContent"] = payload;
+    }
     if options.tree_format == presentation::TreeFormat::Elements {
         result["structuredContent"] =
             serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();

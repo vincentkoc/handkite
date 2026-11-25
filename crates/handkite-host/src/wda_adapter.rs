@@ -13,7 +13,7 @@ use crate::wda_transport::UsbWda;
 use base64::Engine;
 use handkite_core::controller::{
     ActionAdmission, AdapterDiagnostic, AdapterError, DeviceAdapter, LaunchReadback,
-    RawImageObservation, RawObservation,
+    OutlineCapture, RawImageObservation, RawObservation,
 };
 use handkite_core::protocol::{
     Action, DeviceState, HardwareId, ImageFormat, LockState, Motion, ObservationWindow, Point,
@@ -36,6 +36,7 @@ pub use measurement::CaptureTimings;
 use measurement::{Stage, measure};
 
 pub(crate) const SCREEN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,index,traits,hittable,customActions,nativeFrame";
+const OUTLINE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,index,traits,hittable,customActions,nativeFrame,visible";
 const ATTRIBUTE_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const PIN_SOURCE: &str = "/source?format=xml&excluded_attributes=accessible,focused,selected,index,traits,placeholderValue,hittable,customActions,nativeFrame";
 const HOME_LAUNCH_AGE: Duration = Duration::from_secs(2);
@@ -61,6 +62,7 @@ async fn before_input_deadline<T>(
 }
 
 struct CapturePayload {
+    presentation_only: bool,
     tree: Option<String>,
     app: String,
     reported: Option<bool>,
@@ -79,6 +81,7 @@ enum CaptureFailure {
 enum CaptureSource<'a> {
     FullTree(&'a str),
     NavigateHome(&'a str),
+    Outline(&'a str),
 }
 
 impl<'a> From<&'a str> for CaptureSource<'a> {
@@ -90,7 +93,18 @@ impl<'a> From<&'a str> for CaptureSource<'a> {
 impl<'a> CaptureSource<'a> {
     fn path(self) -> &'a str {
         match self {
-            Self::FullTree(path) | Self::NavigateHome(path) => path,
+            Self::FullTree(path) | Self::NavigateHome(path) | Self::Outline(path) => path,
+        }
+    }
+
+    fn for_app(self, app: Option<&str>, locked: Option<bool>) -> &'a str {
+        if matches!(self, Self::Outline(_))
+            && app == Some("com.apple.mobilesafari")
+            && locked == Some(false)
+        {
+            OUTLINE_SOURCE
+        } else {
+            self.path()
         }
     }
 }
@@ -503,6 +517,15 @@ impl WdaAdapter {
         source_path: CaptureSource<'_>,
         deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
+        self.capture_with_scope(source_path, deadline)
+            .map(|(capture, _)| capture)
+    }
+
+    fn capture_with_scope(
+        &self,
+        source_path: CaptureSource<'_>,
+        deadline: Option<Instant>,
+    ) -> Result<(CheckedCapture, bool), CaptureFailure> {
         let result = if crate::timing::enabled() {
             let started = Instant::now();
             let mut timings = CaptureTimings::default();
@@ -513,15 +536,19 @@ impl WdaAdapter {
         } else {
             self.capture_checked_recorded(source_path, None, deadline)
         };
-        if !result.as_ref().is_ok_and(|(raw, _, reported)| {
+        if !result.as_ref().is_ok_and(|((raw, _, reported), _)| {
             *reported == Some(false) && raw.state.lock == LockState::Unlocked
         }) {
             self.cache.clear();
         }
         if source_path.path() == SCREEN_SOURCE {
-            if let Ok((raw, captured, reported)) = &result {
-                self.cache
-                    .record_full(self.cache_key(), raw, *captured, *reported);
+            if let Ok(((raw, captured, reported), presentation_only)) = &result {
+                if *presentation_only {
+                    self.cache.clear_full();
+                } else {
+                    self.cache
+                        .record_full(self.cache_key(), raw, *captured, *reported);
+                }
             }
         } else {
             self.cache.clear_full();
@@ -639,7 +666,7 @@ impl WdaAdapter {
                 self.capture_checked_recorded(SCREEN_SOURCE.into(), Some(&mut timings), None)
                     .map_err(AdapterError::from)
             })
-            .map(|(observation, _, _)| observation)
+            .map(|((observation, _, _), _)| observation)
             .map_err(Into::into);
         timings.finish(started, result.is_ok());
         (result, timings)
@@ -650,7 +677,7 @@ impl WdaAdapter {
         source_path: CaptureSource<'_>,
         mut timings: Option<&mut CaptureTimings>,
         deadline: Option<Instant>,
-    ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
+    ) -> Result<(CheckedCapture, bool), CaptureFailure> {
         measure(
             timings.as_deref_mut(),
             Stage::OwnershipBefore,
@@ -694,10 +721,10 @@ impl WdaAdapter {
         source_path: CaptureSource<'_>,
         timings: Option<&mut CaptureTimings>,
         deadline: Option<Instant>,
-    ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
+    ) -> Result<(CheckedCapture, bool), CaptureFailure> {
         let started_unix_ms = unix_ms()?;
         let wda = UsbWda::new(usb.clone());
-        Self::capture_using(
+        Self::capture_using_scoped(
             &wda,
             expected,
             source_path,
@@ -710,6 +737,7 @@ impl WdaAdapter {
         .await
     }
 
+    #[cfg(test)]
     async fn capture_using(
         wda: &impl WdaRequest,
         expected: &HardwareId,
@@ -720,28 +748,55 @@ impl WdaAdapter {
         timings: Option<&mut CaptureTimings>,
         deadline: Option<Instant>,
     ) -> Result<(RawObservation, Instant, Option<bool>), CaptureFailure> {
+        Self::capture_using_scoped(
+            wda,
+            expected,
+            source_path,
+            started_unix_ms,
+            clock,
+            wall,
+            timings,
+            deadline,
+        )
+        .await
+        .map(|(capture, _)| capture)
+    }
+
+    async fn capture_using_scoped(
+        wda: &impl WdaRequest,
+        expected: &HardwareId,
+        source_path: CaptureSource<'_>,
+        started_unix_ms: u64,
+        clock: &impl Fn() -> Instant,
+        wall: &impl Fn() -> Result<u64, AdapterError>,
+        timings: Option<&mut CaptureTimings>,
+        deadline: Option<Instant>,
+    ) -> Result<(CheckedCapture, bool), CaptureFailure> {
         let payload =
             Self::capture_payload(wda, Some(source_path), clock, timings, deadline).await?;
         let tree = payload.tree.ok_or(AdapterError)?;
         let lock = classify_lock(&payload.app, &tree, payload.reported);
         Ok((
-            RawObservation {
-                connected_usb: expected.clone(),
-                wda_target: expected.clone(),
-                window: ObservationWindow {
-                    started_unix_ms,
-                    finished_unix_ms: wall()?,
+            (
+                RawObservation {
+                    connected_usb: expected.clone(),
+                    wda_target: expected.clone(),
+                    window: ObservationWindow {
+                        started_unix_ms,
+                        finished_unix_ms: wall()?,
+                    },
+                    state: DeviceState {
+                        lock,
+                        wda_ready: true,
+                        foreground_app: Some(payload.app),
+                    },
+                    accessibility_tree: tree,
+                    screenshot: payload.screenshot,
                 },
-                state: DeviceState {
-                    lock,
-                    wda_ready: true,
-                    foreground_app: Some(payload.app),
-                },
-                accessibility_tree: tree,
-                screenshot: payload.screenshot,
-            },
-            payload.finished,
-            payload.reported,
+                payload.finished,
+                payload.reported,
+            ),
+            payload.presentation_only,
         ))
     }
 
@@ -844,8 +899,10 @@ impl WdaAdapter {
         } else {
             None
         };
-        if matches!(source_path, Some(CaptureSource::NavigateHome(_)))
-            && let Some((image, app, Some(false))) = &before
+        if matches!(
+            source_path,
+            Some(CaptureSource::NavigateHome(_) | CaptureSource::Outline(_))
+        ) && let Some((image, app, Some(false))) = &before
             && app == "com.apple.springboard"
         {
             let image = base64::engine::general_purpose::STANDARD
@@ -858,12 +915,21 @@ impl WdaAdapter {
             // image, revision, cached target or input-admission authority.
             return Err(CaptureFailure::HomeNavigation);
         }
+        let mut presentation_only = false;
         let source = if let Some(path) = source_path {
+            let app = before.as_ref().map(|(_, app, _)| app.as_str());
+            let lock = before.as_ref().and_then(|(_, _, lock)| *lock);
+            let selected_source = path.for_app(app, lock);
+            presentation_only = selected_source == OUTLINE_SOURCE;
+            crate::timing::outcome(
+                "outline_visibility_omitted",
+                selected_source == OUTLINE_SOURCE,
+            );
             let (response, timing) = measurement::request(
                 enabled,
                 Stage::SourceRequest,
                 clock,
-                wda.request("GET", path.path(), b"", Duration::from_secs(20)),
+                wda.request("GET", selected_source, b"", Duration::from_secs(20)),
             )
             .await;
             (response.map(Some), timing)
@@ -988,6 +1054,7 @@ impl WdaAdapter {
             )?;
         }
         Ok(CapturePayload {
+            presentation_only,
             tree,
             app,
             reported: reported_lock,
@@ -1228,6 +1295,32 @@ impl DeviceAdapter for WdaAdapter {
         self.observe_with_source(CaptureSource::NavigateHome(SCREEN_SOURCE))
     }
 
+    fn observe_outline(&mut self) -> Result<OutlineCapture, AdapterError> {
+        self.finish_pending_effect(true)?;
+        self.error_diagnostic = None;
+        let ((raw, _, _), presentation_only) = retry_observe_capture(&Instant::now, |deadline| {
+            self.capture_with_scope(CaptureSource::Outline(SCREEN_SOURCE), Some(deadline))
+        })
+        .map_err(|error| {
+            self.error_diagnostic = match error {
+                CaptureFailure::ImageDrift => Some(AdapterDiagnostic::CaptureImageDrift),
+                CaptureFailure::HomeNavigation => Some(AdapterDiagnostic::CaptureHome),
+                CaptureFailure::Adapter => None,
+            };
+            AdapterError
+        })?;
+        if presentation_only {
+            self.targets = None;
+            self.target_input = None;
+            self.target_readback = None;
+            self.target_delta = None;
+            self.cache.clear_full();
+            Ok(OutlineCapture::NavigationOnly(raw))
+        } else {
+            Ok(OutlineCapture::Full(raw))
+        }
+    }
+
     fn observe_image(&mut self) -> Result<RawImageObservation, AdapterError> {
         self.error_diagnostic = None;
         self.cache.clear_full();
@@ -1315,7 +1408,7 @@ impl DeviceAdapter for WdaAdapter {
                 timings.finish(started, capture.is_ok());
                 crate::timing::capture(timings);
             }
-            let (raw, captured, reported) = capture?;
+            let ((raw, captured, reported), _) = capture?;
             let after = native_lock::query_until(&self.expected, proof_until).state;
             crate::timing::outcome("home_native_after_unlocked", after == LockState::Unlocked);
             self.validate_owned_with_deadline(Some(proof_until))

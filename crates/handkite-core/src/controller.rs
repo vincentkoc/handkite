@@ -26,6 +26,16 @@ pub struct RawObservation {
     pub screenshot: ScreenImage,
 }
 
+pub enum OutlineCapture {
+    Full(RawObservation),
+    NavigationOnly(RawObservation),
+}
+
+pub struct OutlineObservation {
+    pub observation: Observation,
+    pub navigation_only: bool,
+}
+
 #[derive(Clone)]
 pub struct RawImageObservation {
     pub connected_usb: HardwareId,
@@ -175,6 +185,9 @@ pub enum ActionAdmission {
 }
 
 pub trait DeviceAdapter {
+    fn observe_outline(&mut self) -> Result<OutlineCapture, AdapterError> {
+        self.observe().map(OutlineCapture::Full)
+    }
     /// Image plus fresh native lock, foreground and ownership evidence. No XML authority.
     fn observe_navigation(&mut self) -> Result<RawObservation, AdapterError> {
         Err(AdapterError)

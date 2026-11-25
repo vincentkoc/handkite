@@ -366,10 +366,17 @@ mod tests {
                 SCREEN_SOURCE => {
                     assert_eq!(budget, Duration::from_secs(20));
                     (
-                        if self.case == 13 { 12_000 } else { 1 },
+                        if self.case == 13 {
+                            12_000
+                        } else if self.case >= 14 {
+                            6_200
+                        } else {
+                            1
+                        },
                         json!("private-tree"),
                     )
                 }
+                super::super::OUTLINE_SOURCE => (1, json!("private-tree")),
                 "/wda/activeAppInfo" => (2, json!({"bundleId":"private-app"})),
                 "/wda/locked" => (3, json!(false)),
                 _ => panic!("unexpected request"),
@@ -412,6 +419,29 @@ mod tests {
             if self.case == 11 && path == "/screenshot" {
                 value = json!("invalid-image");
             }
+            if self.case >= 14 && path == "/wda/activeAppInfo" {
+                value = json!({"bundleId":"com.apple.mobilesafari"});
+            }
+            if self.case == 15 && path == "/wda/locked" {
+                value = json!(true);
+            }
+            if self.case == 16 && path == "/wda/locked" {
+                value = json!(null);
+            }
+            if self.case == 17
+                && path == "/screenshot"
+                && self
+                    .calls
+                    .borrow()
+                    .iter()
+                    .filter(|p| p.as_str() == "/screenshot")
+                    .count()
+                    == 2
+            {
+                value = json!(
+                    base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\nchanged")
+                );
+            }
             Ok(HttpResponse {
                 status: if self.case == 7 && path == "/wda/locked" {
                     500
@@ -420,6 +450,54 @@ mod tests {
                 },
                 body: serde_json::to_vec(&json!({"value":value})).unwrap(),
             })
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn safari_outline_omits_only_visibility_without_extra_reads() {
+        use super::super::{CaptureFailure, CaptureSource, OUTLINE_SOURCE};
+        for (case, source, light) in [
+            (14, CaptureSource::Outline(SCREEN_SOURCE), true),
+            (14, CaptureSource::FullTree(SCREEN_SOURCE), false),
+            (14, CaptureSource::NavigateHome(SCREEN_SOURCE), false),
+            (0, CaptureSource::Outline(SCREEN_SOURCE), false),
+            (15, CaptureSource::Outline(SCREEN_SOURCE), false),
+            (16, CaptureSource::Outline(SCREEN_SOURCE), false),
+            (17, CaptureSource::Outline(SCREEN_SOURCE), true),
+        ] {
+            let reads = Reads {
+                case,
+                calls: RefCell::new(Vec::new()),
+            };
+            let result = WdaAdapter::capture_using_scoped(
+                &reads,
+                &HardwareId::new("fixture-device").unwrap(),
+                source,
+                17,
+                &Instant::now,
+                &|| Ok(21),
+                None,
+                None,
+            )
+            .await;
+            if case == 17 {
+                assert_eq!(result.err(), Some(CaptureFailure::ImageDrift));
+            } else {
+                assert_eq!(result.unwrap().1, light);
+            }
+            let calls = reads.calls.borrow();
+            assert_eq!(calls.len(), 7);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|p| p.as_str() == OUTLINE_SOURCE)
+                    .count(),
+                usize::from(light)
+            );
+            assert_eq!(
+                calls.iter().filter(|p| p.as_str() == SCREEN_SOURCE).count(),
+                usize::from(!light)
+            );
         }
     }
 

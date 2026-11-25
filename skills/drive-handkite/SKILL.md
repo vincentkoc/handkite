@@ -64,6 +64,12 @@ interacting. A drifting paired capture can fall back to locally stable XML/OCR
 targets, or an image with navigation-only authority. Do not treat that image as a
 full-tree revision.
 
+Safari's plain outline (`targets:false`) is a presentation tree with unknown
+visibility and a navigation-only revision. It includes the hierarchy without
+the expensive visibility pass. Use `targets:true` for native element actions;
+do not use an outline's coordinates as input authority. Full-tree requests keep
+their existing capture path.
+
 For consecutive target observations, request `tree_format:"elements"` and
 `since_revision` equal to the last target observation received. The Python
 `observe_targets()` method keeps this baseline across a pending tap; it remains

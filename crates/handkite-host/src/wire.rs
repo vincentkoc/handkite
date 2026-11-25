@@ -36,6 +36,9 @@ pub enum Request {
     Observe {
         device: DeviceKey,
     },
+    ObserveOutline {
+        device: DeviceKey,
+    },
     ObserveImage {
         device: DeviceKey,
     },
@@ -92,6 +95,10 @@ pub enum Reply {
     },
     Observed {
         observation: WireObservation,
+    },
+    ObservedOutline {
+        observation: WireObservation,
+        navigation_only: bool,
     },
     ObservedImage {
         observation: WireImageObservation,
@@ -282,6 +289,14 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
                     effect_updates: Vec::new(),
                 }
             }),
+        Request::ObserveOutline { device } => {
+            controller
+                .observe_outline(&device)
+                .map(|result| Reply::ObservedOutline {
+                    observation: result.observation.into(),
+                    navigation_only: result.navigation_only,
+                })
+        }
         Request::Observe { device } => {
             controller
                 .observe(&device)
@@ -337,6 +352,7 @@ pub fn dispatch<A: DeviceAdapter>(controller: &Controller<A>, request: Request) 
         // Keep older target verdicts available on observations, not Home's result.
         Reply::Navigated { .. } => {}
         Reply::ObservedTargets { observation, .. }
+        | Reply::ObservedOutline { observation, .. }
         | Reply::Observed { observation }
         | Reply::ObservedNavigation { observation } => observation.effect_updates = updates,
         Reply::ObservedImage { observation } => observation.effect_updates = updates,

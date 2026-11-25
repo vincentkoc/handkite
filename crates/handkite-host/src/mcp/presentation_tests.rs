@@ -27,9 +27,16 @@ fn call(request: &Value, captured: &[u8]) -> Value {
             calls += 1;
             assert_eq!(
                 serde_json::from_slice::<Value>(bytes).unwrap(),
-                json!({"method":"observe","device":"phone"})
+                json!({"method": if request["params"]["arguments"]["tree_format"] == "outline" {
+                    "observe_outline"
+                } else { "observe" }, "device":"phone"})
             );
-            Ok(captured.to_vec())
+            let mut reply: Value = serde_json::from_slice(captured).unwrap();
+            if request["params"]["arguments"]["tree_format"] == "outline" {
+                reply["type"] = json!("observed_outline");
+                reply["navigation_only"] = json!(false);
+            }
+            Ok(serde_json::to_vec(&reply).unwrap())
         },
     )
     .unwrap();
@@ -503,6 +510,11 @@ fn selective_and_delta_synthetic_wire_bytes() {
         &first,
     );
     let mut next: Value = serde_json::from_slice(&first).unwrap();
+    next["type"] = json!("observed_outline");
+    next["navigation_only"] = json!(false);
+    let mut outline_first: Value = serde_json::from_slice(&first).unwrap();
+    outline_first["type"] = json!("observed_outline");
+    outline_first["navigation_only"] = json!(false);
     next["observation"]["revision"] = json!(4);
     next["observation"]["accessibility_tree"] = json!(tree.replacen("Café", "Coffee", 2));
     let mut session = Session::default();
@@ -512,7 +524,7 @@ fn selective_and_delta_synthetic_wire_bytes() {
         &device,
         Capabilities::Observation,
         &mut session,
-        &mut |_| Ok(first.clone()),
+        &mut |_| Ok(serde_json::to_vec(&outline_first).unwrap()),
     )
     .unwrap();
     let delta = process(
@@ -543,6 +555,8 @@ fn selective_and_delta_synthetic_wire_bytes() {
 fn action_delta_uses_its_post_action_capture_and_preserves_the_receipt() {
     let mut before: Value =
         serde_json::from_slice(&captured(&synthetic_tree(100, true, false), "png")).unwrap();
+    before["type"] = json!("observed_outline");
+    before["navigation_only"] = json!(false);
     before["observation"]["state"] =
         json!({"lock":"unlocked","wda_ready":true,"foreground_app":"com.apple.mobiletimer"});
     let mut after = before["observation"].clone();
@@ -605,7 +619,7 @@ fn action_delta_uses_its_post_action_capture_and_preserves_the_receipt() {
             .iter()
             .map(|call| call["method"].as_str().unwrap())
             .collect::<Vec<_>>(),
-        ["observe", "acquire", "act"]
+        ["observe_outline", "acquire", "act"]
     );
     assert_eq!(calls[2]["request"]["expected_revision"], 3);
     assert!(calls[2]["request"].get("response").is_none());

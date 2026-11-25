@@ -82,7 +82,7 @@ fn paired_image_drift_returns_navigation_revision_without_stale_tree() {
                 let request: Value = serde_json::from_slice(bytes).unwrap();
                 calls.push(request["method"].as_str().unwrap().to_owned());
                 let reply = match request["method"].as_str().unwrap() {
-                    "observe" | "observe_targets" => {
+                    "observe" | "observe_outline" | "observe_targets" => {
                         json!({"type":"error","code":"AdapterCaptureImageDrift"})
                     }
                     "observe_navigation" => json!({"type":"observed_navigation","observation":{
@@ -98,6 +98,8 @@ fn paired_image_drift_returns_navigation_revision_without_stale_tree() {
             calls,
             if format == "elements" {
                 vec!["observe", "observe_targets", "observe_navigation"]
+            } else if format == "outline" {
+                vec!["observe_outline", "observe_navigation"]
             } else {
                 vec!["observe", "observe_navigation"]
             }

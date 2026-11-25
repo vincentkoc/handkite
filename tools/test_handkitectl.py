@@ -85,6 +85,21 @@ class DriverTests(unittest.TestCase):
             self.assertEqual(session.targets, [])
             self.assertEqual(len(session.calls), 2)
 
+    def test_presentation_tree_does_not_retain_target_authority(self):
+        session = Fake([
+            result({"revision": 8, "target_only": True, "targets": [
+                {"target_id": "t_" + "a" * 32, "label": "old"}]}),
+            result({"revision": 9, "revision_scope": "navigation",
+                    "tree_scope": "presentation", "tree": {"included": True},
+                    "accessibility_tree": "Text label=example",
+                    "metadata": {"revision": 9, "revision_scope": "navigation"}}),
+        ])
+        session.observe_targets()
+        session.call("handkite_observe", {"tree_format": "outline", "targets": False})
+        self.assertEqual(session.revision, 9)
+        self.assertIsNone(session.target_revision)
+        self.assertEqual(session.targets, [])
+
     def test_pending_tap_preserves_only_delta_baseline_until_observed(self):
         a={"target_id":"t_"+"a"*32,"label":"first"}
         b={"target_id":"t_"+"b"*32,"label":"second"}

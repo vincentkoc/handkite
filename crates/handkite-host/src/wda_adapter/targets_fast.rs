@@ -163,6 +163,17 @@ struct Sample {
     started: Instant,
 }
 
+async fn sample_part<T>(
+    stage: &'static str,
+    outcome: &'static str,
+    read: impl Future<Output = Result<T, AdapterError>>,
+) -> Result<T, AdapterError> {
+    let _span = crate::timing::Span::new(stage);
+    let result = read.await;
+    crate::timing::outcome(outcome, result.is_ok());
+    result
+}
+
 async fn sample(wda: &impl WdaRequest, input: &Input, focus: bool) -> Result<Sample, AdapterError> {
     let _span = crate::timing::Span::new("target_scoped_capture");
     let mapping = input.bound.mapping.ok_or(AdapterError)?;
@@ -171,19 +182,37 @@ async fn sample(wda: &impl WdaRequest, input: &Input, focus: bool) -> Result<Sam
     }
     let started = Instant::now();
     let start_ms = unix_ms()?;
-    super::super::display::verify_selection(wda, &input.key.session, mapping.display_id).await?;
+    sample_part(
+        "target_sample_display_before",
+        "target_sample_display_before_ok",
+        super::super::display::verify_selection(wda, &input.key.session, mapping.display_id),
+    )
+    .await?;
     let filter = predicate(&input.bound)?;
+    crate::timing::outcome("target_sample_focus_requested", focus);
     let (image, items, app, focused) = tokio::join!(
-        screenshot(wda),
-        query_predicate(wda, &input.key.session, &filter),
-        app_matches(wda, &input.key.session, &input.app),
-        async {
+        sample_part(
+            "target_sample_image",
+            "target_sample_image_ok",
+            screenshot(wda)
+        ),
+        sample_part(
+            "target_sample_items",
+            "target_sample_items_ok",
+            query_predicate(wda, &input.key.session, &filter),
+        ),
+        sample_part(
+            "target_sample_app",
+            "target_sample_app_ok",
+            app_matches(wda, &input.key.session, &input.app),
+        ),
+        sample_part("target_sample_focus", "target_sample_focus_ok", async {
             if focus {
                 active(wda, &input.key.session).await.map(Some)
             } else {
                 Ok(None)
             }
-        },
+        }),
     );
     app?;
     let image = image?;
@@ -194,7 +223,12 @@ async fn sample(wda: &impl WdaRequest, input: &Input, focus: bool) -> Result<Sam
         mapping.scale,
         [mapping.viewport[2], mapping.viewport[3]],
     )?;
-    super::super::display::verify_selection(wda, &input.key.session, mapping.display_id).await?;
+    sample_part(
+        "target_sample_display_after",
+        "target_sample_display_after_ok",
+        super::super::display::verify_selection(wda, &input.key.session, mapping.display_id),
+    )
+    .await?;
     Ok(Sample {
         rows,
         image,
@@ -448,6 +482,33 @@ pub(super) fn classify(
             .iter()
             .all(|key| row.get(*key) == bound.rich.get(*key))
     };
+    for (stage, value) in [
+        ("target_effect_prior_focus_known", bound.focused.is_some()),
+        (
+            "target_effect_prior_unfocused",
+            bound.focused == Some(false),
+        ),
+        ("target_effect_current_id_found", current.is_some()),
+        (
+            "target_effect_type_equal",
+            current.is_some_and(|row| row.get("type") == bound.rich.get("type")),
+        ),
+        (
+            "target_effect_label_equal",
+            current.is_some_and(|row| row.get("label") == bound.rich.get("label")),
+        ),
+        (
+            "target_effect_name_equal",
+            current
+                .is_some_and(|row| row.get("attribute/name") == bound.rich.get("attribute/name")),
+        ),
+        (
+            "target_effect_active_id_equal",
+            focused == Some(bound.native.as_str()),
+        ),
+    ] {
+        crate::timing::outcome(stage, value);
+    }
     if let Some(current) = current {
         let changed = same_identity(current)
             && ((bound.focused == Some(false)
