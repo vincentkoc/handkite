@@ -114,7 +114,8 @@ fn paired_image_drift_returns_navigation_revision_without_stale_tree() {
             assert!(payload.get(key).is_none());
             assert!(payload["metadata"].get(key).is_none());
         }
-        assert_eq!(result["content"][1]["type"], "image");
+        assert_eq!(result["content"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["image"]["reason"], "requested");
         if format == "elements" {
             assert_eq!(result["structuredContent"], payload);
         }

@@ -230,6 +230,9 @@ where
             else {
                 return Some(error(id, -32602, "unknown or unauthorized tool"));
             };
+            if !matches!(tool, Tool::Observe | Tool::Status) {
+                session.home_observe_hint = false;
+            }
             if matches!(tool, Tool::TapElement | Tool::TextElement) {
                 // Gap and rate cap only: native target geometry stays daemon-owned.
                 if session.lease.is_some() {
@@ -368,6 +371,16 @@ fn tool_result<F>(
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
 {
+    if tool == Tool::Observe
+        && options.capture == handkite_core::protocol::CaptureMode::Paired
+        && session.home_observe_hint
+        && let Some(result) = observe_known_home(options, device, session, exchange)
+    {
+        return result;
+    }
+    if tool == Tool::Status {
+        session.home_observe_hint = false;
+    }
     let method = if tool == Tool::Status {
         "status"
     } else if options.targets {
@@ -414,6 +427,7 @@ where
                     "DeviceMismatch",
                 );
             }
+            session.home_observe_hint = is_unlocked_home(&status.state);
             let mut payload = json!(status);
             payload["revision_scope"] = json!("navigation");
             payload["allowed_actions"] = json!(["home", "launch_app"]);
@@ -433,11 +447,23 @@ where
                 let result = tool_result(Tool::Observe, target_options, device, session, exchange);
                 return result;
             }
-            return navigation_fallback(device, session, exchange, "capture_image_drift");
+            return navigation_fallback(
+                device,
+                session,
+                exchange,
+                "capture_image_drift",
+                options.image,
+            );
         }
 
         Ok(Reply::Error { code }) if method == "observe_targets" && code == "AdapterTargetHome" => {
-            return navigation_fallback(device, session, exchange, "home_navigation_only");
+            return navigation_fallback(
+                device,
+                session,
+                exchange,
+                "home_navigation_only",
+                options.image,
+            );
         }
         Ok(Reply::Error { code }) => {
             return response::with_service_code(
@@ -467,7 +493,13 @@ where
         && observation.state.foreground_app.as_deref() == Some("com.apple.springboard")
         && observation.state.lock == handkite_core::protocol::LockState::Uncertain
     {
-        return navigation_fallback(device, session, exchange, "home_navigation_only");
+        return navigation_fallback(
+            device,
+            session,
+            exchange,
+            "home_navigation_only",
+            options.image,
+        );
     }
     if native_targets.as_ref().is_some_and(Vec::is_empty) {
         options.image = presentation::ImageMode::Always;
@@ -539,6 +571,7 @@ fn navigation_fallback<F>(
     session: &mut Session,
     exchange: &mut F,
     reason: &str,
+    image: presentation::ImageMode,
 ) -> Value
 where
     F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
@@ -550,7 +583,12 @@ where
         exchange,
     ) {
         Ok(Reply::ObservedNavigation { observation }) if &observation.device == device => {
-            let content = response::navigation_content(observation, reason, true);
+            session.home_observe_hint = is_unlocked_home(&observation.state);
+            let content = response::navigation_content(
+                observation,
+                reason,
+                image != presentation::ImageMode::Omit,
+            );
             let payload: Value =
                 serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
             json!({"content":content,"structuredContent":payload})
@@ -562,6 +600,55 @@ where
             response::with_service_code(tool_error("device observation unavailable"), &code)
         }
         _ => tool_error("device observation unavailable"),
+    }
+}
+
+fn is_unlocked_home(state: &handkite_core::protocol::DeviceState) -> bool {
+    state.wda_ready
+        && state.lock == handkite_core::protocol::LockState::Unlocked
+        && state.foreground_app.as_deref() == Some("com.apple.springboard")
+}
+
+fn observe_known_home<F>(
+    options: presentation::Options,
+    device: &DeviceKey,
+    session: &mut Session,
+    exchange: &mut F,
+) -> Option<Value>
+where
+    F: FnMut(&[u8]) -> io::Result<Vec<u8>>,
+{
+    session.home_observe_hint = false;
+    session.presentation.clear();
+    session.target_inventory = None;
+    match exchange_reply(
+        json!({"method":"observe_navigation","device":device}),
+        exchange,
+    ) {
+        Ok(Reply::ObservedNavigation { observation }) if &observation.device == device => {
+            if !is_unlocked_home(&observation.state) {
+                // The hint cannot suppress a real app or lock-screen tree.
+                return None;
+            }
+            session.home_observe_hint = true;
+            let content = response::navigation_content(
+                observation,
+                "home_navigation_only",
+                options.image != presentation::ImageMode::Omit,
+            );
+            let payload: Value =
+                serde_json::from_str(content[0]["text"].as_str().unwrap()).unwrap();
+            Some(json!({"content":content,"structuredContent":payload}))
+        }
+        Ok(Reply::ObservedNavigation { .. }) => Some(response::with_service_code(
+            tool_error("device identity mismatch"),
+            "DeviceMismatch",
+        )),
+        Ok(Reply::Error { code }) => Some(response::with_service_code(
+            tool_error("device observation unavailable"),
+            &code,
+        )),
+        _ => Some(tool_error("device observation unavailable")),
     }
 }
 

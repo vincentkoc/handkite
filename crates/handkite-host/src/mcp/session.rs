@@ -20,6 +20,8 @@ pub(super) struct Session {
         Vec<handkite_core::controller::ElementTarget>,
     )>,
     pub(super) pacing: crate::pacing::Pacer,
+    /// Routing only: every use still requests a fresh guarded navigation frame.
+    pub(super) home_observe_hint: bool,
     /// Motion shape for the next `act` request only.
     shape: Option<crate::pacing::Shape>,
 }
@@ -171,6 +173,12 @@ impl Session {
                 if after.as_ref().is_some_and(|after| &after.device != device) {
                     return uncertain_result(kind);
                 }
+                self.home_observe_hint = kind == "home"
+                    && receipt.accepted == Some(true)
+                    && effect == ObservedEffect::Changed
+                    && after
+                        .as_ref()
+                        .is_some_and(|after| super::is_unlocked_home(&after.state));
                 let mut payload = json!({"receipt":receipt,"effect":effect,
                     "after":after.as_ref().map(metadata)});
                 if !effect_updates.is_empty() {
